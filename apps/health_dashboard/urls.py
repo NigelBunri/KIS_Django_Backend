@@ -1,0 +1,78 @@
+from django.urls import path
+
+from .views import (
+    HealthDashboardAnalyticsView,
+    HealthDashboardAvailabilityView,
+    HealthDashboardComplianceView,
+    HealthDashboardFinancialView,
+    HealthDashboardInstitutionDetailView,
+    HealthDashboardInstitutionListView,
+    HealthDashboardLandingPageView,
+    HealthDashboardProfileEditorView,
+    HealthDashboardScheduleView,
+    HealthDashboardServicesView,
+)
+
+
+urlpatterns = [
+    path(
+        "health-dashboard/institutions/",
+        HealthDashboardInstitutionListView.as_view(),
+        name="health-dashboard-institutions",
+    ),
+    path(
+        "health-dashboard/institutions/<str:institution_id>/",
+        HealthDashboardInstitutionDetailView.as_view(),
+        name="health-dashboard-institution-detail",
+    ),
+    path(
+        "health-dashboard/institutions/<str:institution_id>/analytics/",
+        HealthDashboardAnalyticsView.as_view(),
+        name="health-dashboard-institution-analytics",
+    ),
+    path(
+        "health-dashboard/institutions/<str:institution_id>/schedule/",
+        HealthDashboardScheduleView.as_view(),
+        name="health-dashboard-institution-schedule",
+    ),
+    path(
+        "health-dashboard/institutions/<str:institution_id>/services/",
+        HealthDashboardServicesView.as_view(),
+        name="health-dashboard-institution-services",
+    ),
+    path(
+        "health-dashboard/institutions/<str:institution_id>/financial/",
+        HealthDashboardFinancialView.as_view(),
+        name="health-dashboard-institution-financial",
+    ),
+    path(
+        "health-dashboard/institutions/<str:institution_id>/compliance/",
+        HealthDashboardComplianceView.as_view(),
+        name="health-dashboard-institution-compliance",
+    ),
+    path(
+        "health-dashboard/institutions/<str:institution_id>/profile-editor/",
+        HealthDashboardProfileEditorView.as_view(),
+        name="health-dashboard-institution-profile-editor",
+    ),
+    path(
+        "health-dashboard/institutions/<str:institution_id>/availability/",
+        HealthDashboardAvailabilityView.as_view(),
+        name="health-dashboard-institution-availability",
+    ),
+    path(
+        "health-dashboard/institutions/<str:institution_id>/landing-page/",
+        HealthDashboardLandingPageView.as_view(),
+        name="health-dashboard-institution-landing-page",
+    ),
+    path(
+        "health/institutions/<str:institution_id>/landing-page",
+        HealthDashboardLandingPageView.as_view(),
+        name="health-institution-landing-page",
+    ),
+    path(
+        "health/institutions/<str:institution_id>/landing-page/",
+        HealthDashboardLandingPageView.as_view(),
+        name="health-institution-landing-page-slash",
+    ),
+]

@@ -1,0 +1,13 @@
+.env
+../env
+./env
+env/
+env
+/media
+media/
+/static
+static/
+/logs
+logs/
+*.log
+*.log.*

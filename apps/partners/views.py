@@ -1,0 +1,2377 @@
+# apps/partners/views.py
+import csv
+import json
+import os
+
+from django.conf import settings
+from django.db import models  # 👈 for models.Q
+from django.utils import timezone
+
+from rest_framework import viewsets, status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied, ValidationError
+
+from apps.partners.models import (
+    Partner,
+    PartnerPost,
+    PartnerPostComment,
+    PartnerPostReaction,
+    PartnerFeatureFlag,
+    PartnerJoinConfig,
+    PartnerMembership,
+    PartnerMembershipStatus,
+    PartnerApplication,
+    PartnerJobPost,
+    PartnerApplicationStatus,
+    PartnerPolicy,
+    PartnerRole,
+    PartnerRoleAssignment,
+    PartnerAuditEvent,
+    PartnerIntegration,
+    PartnerWebhook,
+    PartnerWebhookDelivery,
+    PartnerAutomationRule,
+    PartnerReportSnapshot,
+    PartnerExportJob,
+    PartnerExportStatus,
+    PartnerAccessRequest,
+    PartnerAccessRequestStatus,
+    PartnerAccessReview,
+    PartnerAccessReviewStatus,
+    PartnerExportSchedule,
+    PartnerExportScheduleFrequency,
+    PartnerSetting,
+    PartnerOrganizationProfile,
+    PartnerOrganizationApp,
+    PartnerOrganizationAppType,
+    PartnerOrganizationAppAccessLog,
+    PartnerProfileLink,
+)
+from apps.feed_personalization import (
+    get_affinity_profile,
+    log_feed_interaction,
+    rank_feed_items,
+    resolve_personalization_sample_limit,
+)
+from apps.partners.settings_catalog import PARTNER_SETTINGS_SECTIONS
+from apps.chat.models import (
+    BaseConversationRole,
+    Conversation,
+    ConversationMember,
+    ConversationSettings,
+    ConversationType,
+    ConversationSendPolicy,
+    ConversationJoinPolicy as ChatConversationJoinPolicy,
+)
+from apps.partners.serializers import (
+    PartnerListSerializer,
+    PartnerDetailSerializer,
+    PartnerCreateSerializer,
+    PartnerDiscoverSerializer,
+    PartnerApplicationSerializer,
+    PartnerApplicationDetailSerializer,
+    PartnerJobPostSerializer,
+    PartnerOrganizationAppAccessLogSerializer,
+    PartnerPostSerializer,
+    PartnerPostCreateSerializer,
+    PartnerPostCommentSerializer,
+    PartnerPolicySerializer,
+    PartnerRoleSerializer,
+    PartnerRoleAssignmentSerializer,
+    PartnerAuditEventSerializer,
+    PartnerIntegrationSerializer,
+    PartnerWebhookSerializer,
+    PartnerWebhookDeliverySerializer,
+    PartnerAutomationRuleSerializer,
+    PartnerReportSnapshotSerializer,
+    PartnerExportJobSerializer,
+    PartnerAccessRequestSerializer,
+    PartnerAccessReviewSerializer,
+    PartnerExportScheduleSerializer,
+    PartnerSettingSerializer,
+    PartnerOrganizationProfileSerializer,
+    PartnerOrganizationAppSerializer,
+    PartnerProfileLinkSerializer,
+)
+from apps.moderation.models import UserBlock
+from apps.accounts.feature_gate import require_feature
+from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
+from apps.partners.services import (
+    ensure_partner_policy,
+    apply_partner_policy,
+    ensure_default_organization_app,
+    log_organization_app_access,
+    user_has_partner_permission,
+    log_partner_audit,
+    evaluate_partner_dlp,
+    dispatch_partner_webhooks,
+    run_partner_automation_rules,
+    build_partner_summary,
+    next_export_run_at,
+    retry_partner_webhook_delivery,
+    deactivate_partner_profile,
+    reactivate_partner_profile,
+    get_partner_organization_apps_for_user,
+)
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+LANDING_PAGE_BUILDER_KEY = "landing_page_builder"
+LANDING_BUILDER_KEYS = {
+    "sections",
+    "section_groups",
+    "sectionGroups",
+    "landingBackgroundImageUrl",
+    "landingBackgroundColorKey",
+    "landingLogoUrl",
+    "landing_style",
+    "landingStyle",
+}
+LANDING_BUILDER_CONTAINER_KEYS = (
+    "landing_page_builder",
+    "landingPageBuilder",
+    "profile_editor",
+    "profileEditor",
+    "landing_preview",
+    "landingPreview",
+)
+
+
+def _safe_json_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_safe_json_value(item) for item in value]
+    if isinstance(value, dict):
+        safe_obj = {}
+        for key, val in value.items():
+            if not isinstance(key, str):
+                continue
+            safe_obj[key] = _safe_json_value(val)
+        return safe_obj
+    return str(value)
+
+
+def _collect_landing_builder_candidate(source):
+    if not isinstance(source, dict):
+        return {}
+    candidate = {}
+    for key in LANDING_BUILDER_KEYS:
+        if key in source:
+            candidate[key] = source.get(key)
+    for container_key in LANDING_BUILDER_CONTAINER_KEYS:
+        nested = source.get(container_key)
+        if not isinstance(nested, dict):
+            continue
+        for key, value in nested.items():
+            if key not in candidate:
+                candidate[key] = value
+    return candidate
+
+
+def _normalize_landing_builder_config(raw_config):
+    candidate = _collect_landing_builder_candidate(raw_config)
+    if not candidate:
+        return {}
+
+    sections = candidate.get("sections")
+    if not isinstance(sections, list):
+        sections = []
+
+    section_groups = candidate.get("section_groups")
+    if not isinstance(section_groups, list):
+        section_groups = candidate.get("sectionGroups")
+    if not isinstance(section_groups, list):
+        section_groups = []
+
+    normalized = {"sections": _safe_json_value(sections)}
+    if section_groups:
+        normalized["section_groups"] = _safe_json_value(section_groups)
+        normalized["sectionGroups"] = normalized["section_groups"]
+
+    landing_background_image = str(candidate.get("landingBackgroundImageUrl") or "").strip()
+    landing_background_color = str(candidate.get("landingBackgroundColorKey") or "").strip()
+    landing_logo = str(candidate.get("landingLogoUrl") or "").strip()
+    if landing_background_image:
+        normalized["landingBackgroundImageUrl"] = landing_background_image
+    if landing_background_color:
+        normalized["landingBackgroundColorKey"] = landing_background_color
+    if landing_logo:
+        normalized["landingLogoUrl"] = landing_logo
+
+    if "landing_style" in candidate:
+        normalized["landing_style"] = _safe_json_value(candidate.get("landing_style"))
+    if "landingStyle" in candidate:
+        normalized["landingStyle"] = _safe_json_value(candidate.get("landingStyle"))
+    return normalized
+
+
+class PartnerViewSet(viewsets.ModelViewSet):
+    """
+    /api/v1/partners/partners/
+
+    - list:       GET     /api/v1/partners/partners/
+    - create:     POST    /api/v1/partners/partners/
+    - retrieve:   GET     /api/v1/partners/partners/{id}/
+    - update:     PUT/PATCH /api/v1/partners/partners/{id}/
+    - deactivate: POST    /api/v1/partners/partners/{id}/deactivate/
+    """
+    permission_classes = [IsAuthenticated]
+    queryset = Partner.objects.select_related("owner", "main_conversation")
+    http_method_names = ["get", "post", "put", "patch", "delete", "head", "options"]
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return PartnerListSerializer
+        if self.action == "create":
+            return PartnerCreateSerializer
+        if self.action == "discover":
+            return PartnerDiscoverSerializer
+        if self.action == "apply":
+            return PartnerApplicationSerializer
+        return PartnerDetailSerializer
+
+    def get_queryset(self):
+        """
+        For now:
+        - Return partners where the user is the owner, OR
+        - The user is a member of the partner's main conversation (if exists).
+        """
+        user = self.request.user
+
+        # Only used in the filter; import kept here if needed elsewhere
+        from apps.chat.models import ConversationMember  # noqa: F401
+
+        return (
+            Partner.objects
+            .select_related("owner", "main_conversation")
+            .filter(
+                models.Q(owner=user)
+                | models.Q(
+                    main_conversation__memberships__user=user,
+                    main_conversation__memberships__left_at__isnull=True,
+                )
+            )
+            .distinct()
+        )
+
+    def create(self, request, *args, **kwargs):
+        require_feature(request.user, "partner_accounts")
+        features = get_user_tier_features(request.user)
+        allowed = normalize_limit_value(features.get("partner_accounts"), default=0)
+        if allowed is not None and allowed > 0:
+            existing = Partner.objects.filter(owner=request.user).count()
+            if existing >= allowed:
+                raise ValidationError(
+                    {
+                        "detail": "You have reached your partner allocation for this tier. Upgrade to Partner Pro for unlimited partner accounts."
+                    }
+                )
+        return super().create(request, *args, **kwargs)
+
+    def _user_can_access_partner(self, partner: Partner, user) -> bool:
+        if partner.owner_id == user.id:
+            return True
+        if partner.main_conversation_id:
+            return partner.main_conversation.memberships.filter(
+                user=user,
+                left_at__isnull=True,
+            ).exists()
+        return False
+
+    def _member_role(self, partner: Partner, user):
+        if not partner.main_conversation_id:
+            return None
+        member = partner.main_conversation.memberships.filter(
+            user=user,
+            left_at__isnull=True,
+        ).first()
+        return member.base_role if member else None
+
+    def _ui_role(self, partner: Partner, user) -> str:
+        if partner.owner_id == user.id:
+            return "owner"
+        base_role = self._member_role(partner, user)
+        if base_role == BaseConversationRole.ADMIN:
+            return "admin"
+        if base_role == BaseConversationRole.OWNER:
+            return "owner"
+        return "member"
+
+    def _user_can_manage_partner(self, partner: Partner, user) -> bool:
+        if partner.owner_id == user.id:
+            return True
+        role = self._member_role(partner, user)
+        return role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN)
+
+    def _user_partner_roles(self, partner: Partner, user) -> set[str]:
+        roles = set()
+        if partner.owner_id == user.id:
+            roles.add("owner")
+        base_role = self._member_role(partner, user)
+        if base_role == BaseConversationRole.ADMIN:
+            roles.add("admin")
+        elif base_role == BaseConversationRole.OWNER:
+            roles.add("owner")
+        else:
+            roles.add("member")
+        membership = PartnerMembership.objects.filter(partner=partner, user=user).first()
+        if membership and membership.role:
+            roles.add(membership.role)
+        return roles
+
+    def _user_can_manage_organization_apps(self, partner: Partner, user) -> bool:
+        if partner.owner_id == user.id:
+            return True
+        role = self._member_role(partner, user)
+        if role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
+            return True
+        membership = PartnerMembership.objects.filter(partner=partner, user=user).first()
+        if membership and membership.role in ("owner", "admin", "manager"):
+            return True
+        return False
+
+    def _require_permission(self, partner: Partner, user, codename: str) -> None:
+        if self._user_can_manage_partner(partner, user):
+            return
+        if user_has_partner_permission(partner, user, codename):
+            return
+        raise PermissionDenied("You do not have permission to perform this action.")
+
+    def _require_partner_feature(self, user, key: str, message: str | None = None) -> None:
+        require_feature(user, key, message)
+
+    def _ensure_conversation_member(self, partner: Partner, user, base_role: str) -> None:
+        if not partner.main_conversation_id:
+            return
+        ConversationMember.objects.get_or_create(
+            conversation_id=partner.main_conversation_id,
+            user=user,
+            defaults={"base_role": base_role},
+        )
+
+    def _auto_assign_membership(self, partner: Partner, user, config: dict | None):
+        if not config:
+            return
+        communities = config.get("communities") or []
+        groups = config.get("groups") or []
+        channels = config.get("channels") or []
+        from apps.communities.models import CommunityMembership, CommunityRole
+        from apps.groups.models import GroupMembership, GroupRole
+        from apps.channels.models import Channel
+
+        for community_id in communities:
+            CommunityMembership.objects.update_or_create(
+                community_id=community_id,
+                user=user,
+                defaults={"role": CommunityRole.MEMBER, "left_at": None, "is_banned": False},
+            )
+
+        for group_id in groups:
+            GroupMembership.objects.update_or_create(
+                group_id=group_id,
+                user=user,
+                defaults={"role": GroupRole.MEMBER},
+            )
+
+        for channel_id in channels:
+            channel = Channel.objects.filter(id=channel_id).select_related("conversation").first()
+            if channel:
+                ConversationMember.objects.get_or_create(
+                    conversation=channel.conversation,
+                    user=user,
+                    defaults={"base_role": BaseConversationRole.MEMBER},
+                )
+
+    def _validate_profile_key(self, profile_key: str) -> str:
+        valid_keys = {choice[0] for choice in PartnerProfileLink.PROFILE_CHOICES}
+        if profile_key not in valid_keys:
+            raise ValidationError({"profile_key": "Invalid profile key."})
+        return profile_key
+
+    def _ensure_profile_links(self, partner: Partner):
+        existing = {link.profile_key: link for link in partner.profile_links.all()}
+        for profile_key, _label in PartnerProfileLink.PROFILE_CHOICES:
+            if profile_key not in existing:
+                existing[profile_key] = PartnerProfileLink.objects.create(
+                    partner=partner,
+                    profile_key=profile_key,
+                )
+        return [existing[key] for key, _ in PartnerProfileLink.PROFILE_CHOICES]
+
+    def _get_profile_link(self, partner: Partner, profile_key: str) -> PartnerProfileLink:
+        profile_key = self._validate_profile_key(profile_key)
+        link, _created = PartnerProfileLink.objects.get_or_create(
+            partner=partner,
+            profile_key=profile_key,
+        )
+        return link
+
+    @action(detail=False, methods=["get"], url_path="discover")
+    def discover(self, request):
+        """
+        Discover all partner accounts with join options.
+        """
+        qs = Partner.objects.select_related("owner", "main_conversation").filter(
+            is_active=True,
+        ).filter(
+            models.Q(join_config__allow_public_listing=True)
+            | models.Q(join_config__isnull=True)
+        )
+
+        q = (request.query_params.get("q") or "").strip()
+        if q:
+            qs = qs.filter(
+                models.Q(name__icontains=q)
+                | models.Q(description__icontains=q)
+                | models.Q(slug__icontains=q)
+            )
+
+        method = (request.query_params.get("method") or "").strip().lower()
+        if method:
+            qs = qs.filter(join_config__methods__contains=[method])
+
+        open_only = (request.query_params.get("open") or "").strip().lower()
+        if open_only in ("1", "true", "yes"):
+            qs = qs.filter(join_config__auto_approve=True)
+
+        return Response(
+            PartnerDiscoverSerializer(qs.order_by("name"), many=True, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def perform_create(self, serializer):
+        # Uses PartnerCreateSerializer.create(), which handles conversation creation
+        serializer.save()
+
+    @action(detail=True, methods=["post"], url_path="deactivate")
+    def deactivate(self, request, pk=None):
+        """
+        Soft-deactivate a partner.
+
+        Later you can add RBAC (e.g. only owner or global admin).
+        """
+        partner = self.get_object()
+        if partner.owner != request.user:
+            return Response(
+                {"detail": "Only the partner owner can deactivate this partner (for now)."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        deactivate_partner_profile(partner, by_user=request.user, source=Partner.DeactivationSource.USER)
+
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.deactivate",
+            target_type="partner",
+            target_id=str(partner.id),
+            request=request,
+        )
+
+        return Response(
+            {"detail": "Partner deactivated."},
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="reactivate")
+    def reactivate(self, request, pk=None):
+        partner = self.get_object()
+        if partner.owner != request.user:
+            return Response({"detail": "Only the owner can reactivate this partner."}, status=status.HTTP_403_FORBIDDEN)
+        if partner.is_active:
+            return Response({"detail": "Partner is already active."}, status=status.HTTP_400_BAD_REQUEST)
+        if partner.deactivation_source == Partner.DeactivationSource.SYSTEM:
+            return Response(
+                {"detail": "This profile cannot be reactivated manually."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        reactivate_partner_profile(partner)
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.reactivate",
+            target_type="partner",
+            target_id=str(partner.id),
+            request=request,
+        )
+        return Response({"detail": "Partner reactivated."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="delete")
+    def delete(self, request, pk=None):
+        partner = self.get_object()
+        if partner.owner != request.user:
+            return Response({"detail": "Only the owner can delete this partner."}, status=status.HTTP_403_FORBIDDEN)
+        partner.delete()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.delete",
+            target_type="partner",
+            target_id=str(partner.id),
+            request=request,
+        )
+        return Response({"detail": "Partner deleted."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "put"], url_path="policy")
+    def policy(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.policy.edit")
+        policy = ensure_partner_policy(partner)
+        if request.method == "GET":
+            return Response(
+                PartnerPolicySerializer(policy).data,
+                status=status.HTTP_200_OK,
+            )
+        serializer = PartnerPolicySerializer(policy, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        apply_partner_policy(partner)
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.policy.update",
+            target_type="partner_policy",
+            target_id=str(policy.id),
+            metadata={"keys": list((request.data or {}).keys())},
+            request=request,
+        )
+        dispatch_partner_webhooks(
+            partner=partner,
+            event="policy.updated",
+            payload={
+                "policy_id": str(policy.id),
+                "actor_id": str(request.user.id),
+            },
+        )
+        run_partner_automation_rules(
+            partner=partner,
+            event="policy.updated",
+            payload={"policy_id": str(policy.id), "actor_id": str(request.user.id)},
+            actor=request.user,
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="audit-events")
+    def audit_events(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.audit.view")
+        qs = PartnerAuditEvent.objects.filter(partner=partner).order_by("-created_at")
+        limit = int(request.query_params.get("limit") or 100)
+        qs = qs[: min(limit, 500)]
+        return Response(
+            PartnerAuditEventSerializer(qs, many=True).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get", "post"], url_path="roles")
+    def roles(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.roles.manage")
+            serializer = PartnerRoleSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save(partner=partner)
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.role.create",
+                target_type="partner_role",
+                target_id=str(serializer.instance.id),
+                metadata={"name": serializer.instance.name},
+                request=request,
+            )
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        self._require_permission(partner, request.user, "partner.roles.view")
+        qs = PartnerRole.objects.filter(partner=partner).order_by("name")
+        return Response(PartnerRoleSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="role-assignments")
+    def role_assignments(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.roles.manage")
+            serializer = PartnerRoleAssignmentSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save(partner=partner)
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.role.assign",
+                target_type="partner_role_assignment",
+                target_id=str(serializer.instance.id),
+                metadata={"user": str(serializer.instance.user_id)},
+                request=request,
+            )
+            dispatch_partner_webhooks(
+                partner=partner,
+                event="role.changed",
+                payload={
+                    "action": "assigned",
+                    "assignment_id": str(serializer.instance.id),
+                    "user_id": str(serializer.instance.user_id),
+                    "role_id": str(serializer.instance.role_id),
+                    "actor_id": str(request.user.id),
+                },
+            )
+            run_partner_automation_rules(
+                partner=partner,
+                event="role.changed",
+                payload={
+                    "action": "assigned",
+                    "assignment_id": str(serializer.instance.id),
+                    "user_id": str(serializer.instance.user_id),
+                    "role_id": str(serializer.instance.role_id),
+                    "actor_id": str(request.user.id),
+                },
+                actor=request.user,
+            )
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        self._require_permission(partner, request.user, "partner.roles.view")
+        qs = PartnerRoleAssignment.objects.filter(partner=partner).order_by("-created_at")
+        return Response(
+            PartnerRoleAssignmentSerializer(qs, many=True).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="role-assignments/remove")
+    def role_assignments_remove(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.roles.manage")
+        assignment_id = request.data.get("assignmentId") or request.data.get("assignment_id")
+        if not assignment_id:
+            raise ValidationError("assignmentId is required.")
+        assignment = PartnerRoleAssignment.objects.filter(id=assignment_id, partner=partner).first()
+        if not assignment:
+            return Response({"detail": "Assignment not found."}, status=status.HTTP_404_NOT_FOUND)
+        payload = {
+            "action": "removed",
+            "assignment_id": str(assignment.id),
+            "user_id": str(assignment.user_id),
+            "role_id": str(assignment.role_id),
+            "actor_id": str(request.user.id),
+        }
+        assignment.delete()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.role.remove",
+            target_type="partner_role_assignment",
+            target_id=str(assignment_id),
+            request=request,
+        )
+        dispatch_partner_webhooks(
+            partner=partner,
+            event="role.changed",
+            payload=payload,
+        )
+        run_partner_automation_rules(
+            partner=partner,
+            event="role.changed",
+            payload=payload,
+            actor=request.user,
+        )
+        return Response({"detail": "Role assignment removed."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="integrations")
+    def integrations(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_partner_feature(request.user, "partner_integrations")
+            self._require_permission(partner, request.user, "partner.integrations.manage")
+            serializer = PartnerIntegrationSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save(partner=partner)
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.integration.create",
+                target_type="partner_integration",
+                target_id=str(serializer.instance.id),
+                metadata={"kind": serializer.instance.kind},
+                request=request,
+            )
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        self._require_partner_feature(request.user, "partner_integrations")
+        self._require_permission(partner, request.user, "partner.integrations.view")
+        qs = PartnerIntegration.objects.filter(partner=partner).order_by("kind", "provider")
+        return Response(PartnerIntegrationSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["patch"],
+        url_path=r"integrations/(?P<integration_id>[^/.]+)",
+    )
+    def integrations_update(self, request, pk=None, integration_id=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "partner_integrations")
+        self._require_permission(partner, request.user, "partner.integrations.manage")
+        integration = PartnerIntegration.objects.filter(
+            id=integration_id,
+            partner=partner,
+        ).first()
+        if not integration:
+            return Response({"detail": "Integration not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = PartnerIntegrationSerializer(integration, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.integration.update",
+            target_type="partner_integration",
+            target_id=str(integration.id),
+            metadata={"fields": list((request.data or {}).keys())},
+            request=request,
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="webhooks")
+    def webhooks(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_partner_feature(request.user, "partner_webhooks")
+            self._require_permission(partner, request.user, "partner.integrations.manage")
+            serializer = PartnerWebhookSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save(partner=partner)
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.webhook.create",
+                target_type="partner_webhook",
+                target_id=str(serializer.instance.id),
+                request=request,
+            )
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_permission(partner, request.user, "partner.integrations.view")
+        qs = PartnerWebhook.objects.filter(partner=partner).order_by("-created_at")
+        return Response(PartnerWebhookSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["patch"],
+        url_path=r"webhooks/(?P<webhook_id>[^/.]+)",
+    )
+    def webhooks_update(self, request, pk=None, webhook_id=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_permission(partner, request.user, "partner.integrations.manage")
+        webhook = PartnerWebhook.objects.filter(id=webhook_id, partner=partner).first()
+        if not webhook:
+            return Response({"detail": "Webhook not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = PartnerWebhookSerializer(webhook, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.webhook.update",
+            target_type="partner_webhook",
+            target_id=str(webhook.id),
+            metadata={"fields": list((request.data or {}).keys())},
+            request=request,
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"webhooks/(?P<webhook_id>[^/.]+)/remove",
+    )
+    def webhooks_remove(self, request, pk=None, webhook_id=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_permission(partner, request.user, "partner.integrations.manage")
+        webhook = PartnerWebhook.objects.filter(id=webhook_id, partner=partner).first()
+        if not webhook:
+            return Response({"detail": "Webhook not found."}, status=status.HTTP_404_NOT_FOUND)
+        webhook.delete()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.webhook.delete",
+            target_type="partner_webhook",
+            target_id=str(webhook_id),
+            request=request,
+        )
+        return Response({"detail": "Webhook removed."}, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path=r"webhooks/(?P<webhook_id>[^/.]+)/deliveries",
+    )
+    def webhook_deliveries(self, request, pk=None, webhook_id=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_permission(partner, request.user, "partner.integrations.view")
+        webhook = PartnerWebhook.objects.filter(id=webhook_id, partner=partner).first()
+        if not webhook:
+            return Response({"detail": "Webhook not found."}, status=status.HTTP_404_NOT_FOUND)
+        qs = PartnerWebhookDelivery.objects.filter(webhook=webhook).order_by("-created_at")[:200]
+        return Response(PartnerWebhookDeliverySerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"webhooks/(?P<webhook_id>[^/.]+)/deliveries/(?P<delivery_id>[^/.]+)/retry",
+    )
+    def webhook_delivery_retry(self, request, pk=None, webhook_id=None, delivery_id=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_permission(partner, request.user, "partner.integrations.manage")
+        delivery = PartnerWebhookDelivery.objects.filter(
+            id=delivery_id,
+            webhook__id=webhook_id,
+            webhook__partner=partner,
+        ).select_related("webhook").first()
+        if not delivery:
+            return Response({"detail": "Delivery not found."}, status=status.HTTP_404_NOT_FOUND)
+        ok = retry_partner_webhook_delivery(delivery)
+        return Response({"delivered": ok}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="automation-rules")
+    def automation_rules(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_partner_feature(request.user, "partner_automation")
+            self._require_permission(partner, request.user, "partner.automation.manage")
+            serializer = PartnerAutomationRuleSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save(partner=partner, created_by=request.user)
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.automation.create",
+                target_type="partner_automation_rule",
+                target_id=str(serializer.instance.id),
+                request=request,
+            )
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        self._require_partner_feature(request.user, "partner_automation")
+        self._require_permission(partner, request.user, "partner.automation.view")
+        qs = PartnerAutomationRule.objects.filter(partner=partner).order_by("-created_at")
+        return Response(PartnerAutomationRuleSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["patch"],
+        url_path=r"automation-rules/(?P<rule_id>[^/.]+)",
+    )
+    def automation_rules_update(self, request, pk=None, rule_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.automation.manage")
+        rule = PartnerAutomationRule.objects.filter(id=rule_id, partner=partner).first()
+        if not rule:
+            return Response({"detail": "Automation rule not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = PartnerAutomationRuleSerializer(rule, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.automation.update",
+            target_type="partner_automation_rule",
+            target_id=str(rule.id),
+            metadata={"fields": list((request.data or {}).keys())},
+            request=request,
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"automation-rules/(?P<rule_id>[^/.]+)/remove",
+    )
+    def automation_rules_remove(self, request, pk=None, rule_id=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "partner_automation")
+        self._require_permission(partner, request.user, "partner.automation.manage")
+        rule = PartnerAutomationRule.objects.filter(id=rule_id, partner=partner).first()
+        if not rule:
+            return Response({"detail": "Automation rule not found."}, status=status.HTTP_404_NOT_FOUND)
+        rule.delete()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.automation.delete",
+            target_type="partner_automation_rule",
+            target_id=str(rule_id),
+            request=request,
+        )
+        return Response({"detail": "Automation rule removed."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="reports/summary")
+    def reports_summary(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.reports.view")
+        self._require_partner_feature(request.user, "partner_insight")
+        from apps.accounts.tiers import get_user_tier_features
+
+        features = get_user_tier_features(request.user)
+        can_basic = bool(features.get("analytics_basic") or features.get("analytics_advanced"))
+        can_advanced = bool(features.get("analytics_advanced"))
+        if not can_basic:
+            raise PermissionDenied("Your tier does not include analytics access.")
+        summary = build_partner_summary(partner)
+        if not can_advanced:
+            summary.pop("activity_series", None)
+            activity_summary = summary.get("activity_summary") or {}
+            if isinstance(activity_summary, dict):
+                summary["activity_summary"] = {
+                    "last_7_days": activity_summary.get("last_7_days", {}),
+                }
+        if str(request.query_params.get("snapshot", "")).lower() in ("1", "true", "yes"):
+            snapshot = PartnerReportSnapshot.objects.create(
+                partner=partner,
+                kind="summary",
+                data=summary,
+                created_by=request.user,
+            )
+            return Response(PartnerReportSnapshotSerializer(snapshot).data, status=status.HTTP_201_CREATED)
+        return Response(summary, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="exports")
+    def exports(self, request, pk=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "partner_insight")
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.exports.manage")
+            kind = request.data.get("kind") or "summary"
+            export_format = (request.data.get("export_format") or "csv").lower()
+            job = PartnerExportJob.objects.create(
+                partner=partner,
+                kind=kind,
+                export_format=export_format,
+                status=PartnerExportStatus.RUNNING,
+                created_by=request.user,
+            )
+            try:
+                rows = self._build_export_rows(partner, kind)
+                file_path = self._write_export_file(job, rows, export_format)
+                job.status = PartnerExportStatus.COMPLETED
+                job.file_path = file_path
+                job.finished_at = timezone.now()
+                job.save(update_fields=["status", "file_path", "finished_at", "updated_at"])
+            except Exception as exc:
+                job.status = PartnerExportStatus.FAILED
+                job.error_message = str(exc)[:500]
+                job.finished_at = timezone.now()
+                job.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+                return Response({"detail": "Export failed.", "error": job.error_message}, status=400)
+            return Response(PartnerExportJobSerializer(job, context={"request": request}).data, status=status.HTTP_201_CREATED)
+        self._require_permission(partner, request.user, "partner.exports.view")
+        qs = PartnerExportJob.objects.filter(partner=partner).order_by("-created_at")[:200]
+        return Response(
+            PartnerExportJobSerializer(qs, many=True, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get", "post"], url_path="export-schedules")
+    def export_schedules(self, request, pk=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "partner_insight")
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.exports.manage")
+            serializer = PartnerExportScheduleSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            schedule = serializer.save(
+                partner=partner,
+                created_by=request.user,
+                next_run_at=next_export_run_at(serializer.validated_data.get("frequency")),
+            )
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.export.schedule.create",
+                target_type="partner_export_schedule",
+                target_id=str(schedule.id),
+                request=request,
+            )
+            return Response(
+                PartnerExportScheduleSerializer(schedule).data,
+                status=status.HTTP_201_CREATED,
+            )
+        self._require_permission(partner, request.user, "partner.exports.view")
+        qs = PartnerExportSchedule.objects.filter(partner=partner).order_by("-created_at")
+        return Response(PartnerExportScheduleSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["patch"],
+        url_path=r"export-schedules/(?P<schedule_id>[^/.]+)",
+    )
+    def export_schedules_update(self, request, pk=None, schedule_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.exports.manage")
+        schedule = PartnerExportSchedule.objects.filter(id=schedule_id, partner=partner).first()
+        if not schedule:
+            return Response({"detail": "Export schedule not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = PartnerExportScheduleSerializer(schedule, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        if "frequency" in serializer.validated_data:
+            schedule.next_run_at = next_export_run_at(schedule.frequency)
+            schedule.save(update_fields=["next_run_at", "updated_at"])
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.export.schedule.update",
+            target_type="partner_export_schedule",
+            target_id=str(schedule.id),
+            metadata={"fields": list((request.data or {}).keys())},
+            request=request,
+        )
+        return Response(PartnerExportScheduleSerializer(schedule).data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"export-schedules/(?P<schedule_id>[^/.]+)/remove",
+    )
+    def export_schedules_remove(self, request, pk=None, schedule_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.exports.manage")
+        schedule = PartnerExportSchedule.objects.filter(id=schedule_id, partner=partner).first()
+        if not schedule:
+            return Response({"detail": "Export schedule not found."}, status=status.HTTP_404_NOT_FOUND)
+        schedule.delete()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.export.schedule.delete",
+            target_type="partner_export_schedule",
+            target_id=str(schedule_id),
+            request=request,
+        )
+        return Response({"detail": "Export schedule removed."}, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"export-schedules/(?P<schedule_id>[^/.]+)/run",
+    )
+    def export_schedules_run(self, request, pk=None, schedule_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.exports.manage")
+        schedule = PartnerExportSchedule.objects.filter(id=schedule_id, partner=partner).first()
+        if not schedule:
+            return Response({"detail": "Export schedule not found."}, status=status.HTTP_404_NOT_FOUND)
+        job = self._run_export_job(
+            partner=partner,
+            kind=schedule.kind,
+            export_format=schedule.export_format,
+            actor=request.user,
+        )
+        schedule.last_run_at = timezone.now()
+        schedule.next_run_at = next_export_run_at(schedule.frequency)
+        schedule.save(update_fields=["last_run_at", "next_run_at", "updated_at"])
+        return Response(PartnerExportJobSerializer(job, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get", "post"], url_path="access-requests")
+    def access_requests(self, request, pk=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "access_control")
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.access.view")
+            serializer = PartnerAccessRequestSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            access_request = serializer.save(partner=partner, requester=request.user)
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.access.request",
+                target_type="partner_access_request",
+                target_id=str(access_request.id),
+                request=request,
+            )
+            dispatch_partner_webhooks(
+                partner=partner,
+                event="access.requested",
+                payload={
+                    "request_id": str(access_request.id),
+                    "requester_id": str(request.user.id),
+                },
+            )
+            run_partner_automation_rules(
+                partner=partner,
+                event="access.requested",
+                payload={
+                    "request_id": str(access_request.id),
+                    "requester_id": str(request.user.id),
+                },
+                actor=request.user,
+            )
+            return Response(PartnerAccessRequestSerializer(access_request).data, status=status.HTTP_201_CREATED)
+        self._require_permission(partner, request.user, "partner.access.view")
+        qs = PartnerAccessRequest.objects.filter(partner=partner).order_by("-created_at")
+        return Response(PartnerAccessRequestSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"access-requests/(?P<request_id>[^/.]+)/approve",
+    )
+    def access_requests_approve(self, request, pk=None, request_id=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "access_control")
+        self._require_permission(partner, request.user, "partner.access.manage")
+        access_request = PartnerAccessRequest.objects.filter(id=request_id, partner=partner).first()
+        if not access_request:
+            return Response({"detail": "Access request not found."}, status=status.HTTP_404_NOT_FOUND)
+        if access_request.status != PartnerAccessRequestStatus.PENDING:
+            return Response({"detail": "Access request already resolved."}, status=status.HTTP_400_BAD_REQUEST)
+        access_request.status = PartnerAccessRequestStatus.APPROVED
+        access_request.decided_by = request.user
+        access_request.decided_at = timezone.now()
+        access_request.save(update_fields=["status", "decided_by", "decided_at"])
+        if access_request.requested_role_id and access_request.target_user_id:
+            PartnerRoleAssignment.objects.update_or_create(
+                partner=partner,
+                user_id=access_request.target_user_id,
+                role_id=access_request.requested_role_id,
+                defaults={
+                    "scope_type": access_request.scope_type,
+                    "scope_id": access_request.scope_id,
+                },
+            )
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.access.approve",
+            target_type="partner_access_request",
+            target_id=str(access_request.id),
+            request=request,
+        )
+        dispatch_partner_webhooks(
+            partner=partner,
+            event="access.approved",
+            payload={
+                "request_id": str(access_request.id),
+                "decided_by": str(request.user.id),
+            },
+        )
+        run_partner_automation_rules(
+            partner=partner,
+            event="access.approved",
+            payload={
+                "request_id": str(access_request.id),
+                "decided_by": str(request.user.id),
+            },
+            actor=request.user,
+        )
+        return Response(PartnerAccessRequestSerializer(access_request).data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"access-requests/(?P<request_id>[^/.]+)/reject",
+    )
+    def access_requests_reject(self, request, pk=None, request_id=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "access_control")
+        self._require_permission(partner, request.user, "partner.access.manage")
+        access_request = PartnerAccessRequest.objects.filter(id=request_id, partner=partner).first()
+        if not access_request:
+            return Response({"detail": "Access request not found."}, status=status.HTTP_404_NOT_FOUND)
+        if access_request.status != PartnerAccessRequestStatus.PENDING:
+            return Response({"detail": "Access request already resolved."}, status=status.HTTP_400_BAD_REQUEST)
+        access_request.status = PartnerAccessRequestStatus.REJECTED
+        access_request.decided_by = request.user
+        access_request.decided_at = timezone.now()
+        access_request.save(update_fields=["status", "decided_by", "decided_at"])
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.access.reject",
+            target_type="partner_access_request",
+            target_id=str(access_request.id),
+            request=request,
+        )
+        dispatch_partner_webhooks(
+            partner=partner,
+            event="access.rejected",
+            payload={
+                "request_id": str(access_request.id),
+                "decided_by": str(request.user.id),
+            },
+        )
+        run_partner_automation_rules(
+            partner=partner,
+            event="access.rejected",
+            payload={
+                "request_id": str(access_request.id),
+                "decided_by": str(request.user.id),
+            },
+            actor=request.user,
+        )
+        return Response(PartnerAccessRequestSerializer(access_request).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="access-reviews")
+    def access_reviews(self, request, pk=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "access_control")
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.access.manage")
+            serializer = PartnerAccessReviewSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            review = serializer.save(partner=partner, created_by=request.user)
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.access.review.create",
+                target_type="partner_access_review",
+                target_id=str(review.id),
+                request=request,
+            )
+            return Response(PartnerAccessReviewSerializer(review).data, status=status.HTTP_201_CREATED)
+        self._require_permission(partner, request.user, "partner.access.view")
+        qs = PartnerAccessReview.objects.filter(partner=partner).order_by("-created_at")
+        return Response(PartnerAccessReviewSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"access-reviews/(?P<review_id>[^/.]+)/close",
+    )
+    def access_reviews_close(self, request, pk=None, review_id=None):
+        partner = self.get_object()
+        self._require_partner_feature(request.user, "access_control")
+        self._require_permission(partner, request.user, "partner.access.manage")
+        review = PartnerAccessReview.objects.filter(id=review_id, partner=partner).first()
+        if not review:
+            return Response({"detail": "Access review not found."}, status=status.HTTP_404_NOT_FOUND)
+        review.status = PartnerAccessReviewStatus.CLOSED
+        review.closed_at = timezone.now()
+        review.findings = request.data.get("findings", review.findings)
+        review.save(update_fields=["status", "closed_at", "findings", "updated_at"])
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.access.review.close",
+            target_type="partner_access_review",
+            target_id=str(review.id),
+            request=request,
+        )
+        return Response(PartnerAccessReviewSerializer(review).data, status=status.HTTP_200_OK)
+
+    def _build_export_rows(self, partner: Partner, kind: str) -> list[dict]:
+        if kind == "members":
+            qs = PartnerMembership.objects.filter(partner=partner).select_related("user")
+            return [
+                {
+                    "user_id": str(item.user_id),
+                    "status": item.status,
+                    "role": item.role,
+                    "joined_at": item.created_at.isoformat(),
+                }
+                for item in qs
+            ]
+        if kind == "audit":
+            qs = PartnerAuditEvent.objects.filter(partner=partner).order_by("-created_at")[:5000]
+            return [
+                {
+                    "action": item.action,
+                    "target_type": item.target_type,
+                    "target_id": item.target_id,
+                    "actor_id": str(item.actor_id) if item.actor_id else None,
+                    "created_at": item.created_at.isoformat(),
+                }
+                for item in qs
+            ]
+        if kind == "roles":
+            qs = PartnerRoleAssignment.objects.filter(partner=partner)
+            return [
+                {
+                    "user_id": str(item.user_id),
+                    "role_id": str(item.role_id),
+                    "scope_type": item.scope_type,
+                    "scope_id": item.scope_id,
+                }
+                for item in qs
+            ]
+        if kind == "applications":
+            qs = PartnerApplication.objects.filter(partner=partner).select_related("user")
+            return [
+                {
+                    "user_id": str(item.user_id),
+                    "status": item.status,
+                    "method": item.method,
+                    "job_post_id": item.job_post_id,
+                    "created_at": item.created_at.isoformat(),
+                }
+                for item in qs
+            ]
+        if kind == "posts":
+            qs = PartnerPost.objects.filter(partner=partner, is_deleted=False).select_related("author")
+            return [
+                {
+                    "post_id": str(item.id),
+                    "author_id": str(item.author_id),
+                    "text": item.text,
+                    "created_at": item.created_at.isoformat(),
+                }
+                for item in qs
+            ]
+        summary = build_partner_summary(partner)
+        return [summary]
+
+    def _run_export_job(self, *, partner: Partner, kind: str, export_format: str, actor):
+        job = PartnerExportJob.objects.create(
+            partner=partner,
+            kind=kind,
+            export_format=export_format,
+            status=PartnerExportStatus.RUNNING,
+            created_by=actor,
+        )
+        rows = self._build_export_rows(partner, kind)
+        file_path = self._write_export_file(job, rows, export_format)
+        job.status = PartnerExportStatus.COMPLETED
+        job.file_path = file_path
+        job.finished_at = timezone.now()
+        job.save(update_fields=["status", "file_path", "finished_at", "updated_at"])
+        return job
+
+    def _write_export_file(self, job: PartnerExportJob, rows: list[dict], export_format: str) -> str:
+        export_root = getattr(settings, "MEDIA_ROOT", None) or "media"
+        export_dir = os.path.join(export_root, "exports", str(job.partner_id))
+        os.makedirs(export_dir, exist_ok=True)
+        filename = f"{job.kind}-{timezone.now().strftime('%Y%m%d%H%M%S')}.{export_format}"
+        full_path = os.path.join(export_dir, filename)
+        if export_format == "json":
+            with open(full_path, "w", encoding="utf-8") as handle:
+                json.dump(rows, handle, ensure_ascii=True, indent=2)
+        else:
+            fieldnames = sorted({key for row in rows for key in row.keys()})
+            with open(full_path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+        return os.path.join("exports", str(job.partner_id), filename)
+
+    @action(detail=True, methods=["post"], url_path="admins")
+    def add_admin(self, request, pk=None):
+        """
+        Add or promote a partner admin by user_id.
+        """
+        partner = self.get_object()
+        if partner.owner != request.user:
+            return Response(
+                {"detail": "Only the partner owner can manage admins (for now)."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not partner.main_conversation_id:
+            return Response(
+                {"detail": "Partner has no main conversation to manage admins."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_id = request.data.get("user_id")
+        if not user_id:
+            return Response({"detail": "user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from apps.accounts.models import User
+        from apps.chat.models import ConversationMember
+
+        user = User.objects.filter(id=user_id).first()
+        if not user:
+            return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        member, _ = ConversationMember.objects.get_or_create(
+            conversation_id=partner.main_conversation_id,
+            user=user,
+            defaults={"base_role": BaseConversationRole.ADMIN},
+        )
+        if member.base_role not in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
+            member.base_role = BaseConversationRole.ADMIN
+            member.save(update_fields=["base_role"])
+
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.admin.add",
+            target_type="user",
+            target_id=str(user.id),
+            request=request,
+        )
+        dispatch_partner_webhooks(
+            partner=partner,
+            event="role.changed",
+            payload={
+                "action": "admin.added",
+                "user_id": str(user.id),
+                "role": "admin",
+                "actor_id": str(request.user.id),
+            },
+        )
+        run_partner_automation_rules(
+            partner=partner,
+            event="role.changed",
+            payload={
+                "action": "admin.added",
+                "user_id": str(user.id),
+                "role": "admin",
+                "actor_id": str(request.user.id),
+            },
+            actor=request.user,
+        )
+
+        return Response({"detail": "Admin updated."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="admins/remove")
+    def remove_admin(self, request, pk=None):
+        """
+        Demote an admin to MEMBER.
+        """
+        partner = self.get_object()
+        if partner.owner != request.user:
+            return Response(
+                {"detail": "Only the partner owner can manage admins (for now)."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not partner.main_conversation_id:
+            return Response(
+                {"detail": "Partner has no main conversation to manage admins."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_id = request.data.get("user_id")
+        if not user_id:
+            return Response({"detail": "user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        member = ConversationMember.objects.filter(
+            conversation_id=partner.main_conversation_id,
+            user_id=user_id,
+            left_at__isnull=True,
+        ).first()
+
+        if not member:
+            return Response({"detail": "Member not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if member.base_role == BaseConversationRole.OWNER:
+            return Response(
+                {"detail": "Owner role cannot be removed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        member.base_role = BaseConversationRole.MEMBER
+        member.save(update_fields=["base_role"])
+
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.admin.remove",
+            target_type="user",
+            target_id=str(member.user_id),
+            request=request,
+        )
+        dispatch_partner_webhooks(
+            partner=partner,
+            event="role.changed",
+            payload={
+                "action": "admin.removed",
+                "user_id": str(member.user_id),
+                "role": "member",
+                "actor_id": str(request.user.id),
+            },
+        )
+        run_partner_automation_rules(
+            partner=partner,
+            event="role.changed",
+            payload={
+                "action": "admin.removed",
+                "user_id": str(member.user_id),
+                "role": "member",
+                "actor_id": str(request.user.id),
+            },
+            actor=request.user,
+        )
+
+        return Response({"detail": "Admin removed."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="settings-catalog")
+    def settings_catalog(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view settings.")
+
+        role = self._ui_role(partner, request.user)
+        keys = [
+            feature["key"]
+            for section in PARTNER_SETTINGS_SECTIONS
+            for feature in section.get("features", [])
+        ]
+        flags = PartnerFeatureFlag.objects.filter(
+            partner=partner,
+            key__in=keys,
+        )
+        flag_map = {flag.key: flag.is_enabled for flag in flags}
+
+        sections = []
+        for section in PARTNER_SETTINGS_SECTIONS:
+            features = []
+            for feature in section.get("features", []):
+                enabled = flag_map.get(feature["key"], True)
+                allowed = role in feature.get("access", [])
+                features.append(
+                    {
+                        **feature,
+                        "enabled": enabled,
+                        "allowed": allowed,
+                    }
+                )
+            sections.append({**section, "features": features})
+
+        return Response(
+            {"role": role, "sections": sections},
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get", "post"], url_path="organization-apps")
+    def organization_apps(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view organization apps.")
+
+        DEFAULT_ORGANIZATION_PARTNER_SLUG = "cc"
+        if partner.slug == DEFAULT_ORGANIZATION_PARTNER_SLUG:
+            ensure_default_organization_app(
+                partner,
+                app_type=PartnerOrganizationAppType.BIBLE,
+                defaults={
+                    "name": "Bible App",
+                    "description": "Bible experience maintained by CC.",
+                    "module": "partner.bible",
+                    "metadata": {"internal": True, "immutable": True},
+                    "is_active": True,
+                },
+            )
+
+        if request.method == "POST":
+            if not self._user_can_manage_organization_apps(partner, request.user):
+                raise PermissionDenied("Not allowed to manage organization apps.")
+            serializer = PartnerOrganizationAppSerializer(data=request.data)
+            if not serializer.is_valid():
+                logger.warning(
+                    "Organization app creation failed validation for partner %s: %s",
+                    partner.id,
+                    serializer.errors,
+                )
+                return Response(
+                    {"errors": serializer.errors},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            app = PartnerOrganizationApp.objects.create(partner=partner, **serializer.validated_data)
+            logger.info(
+                "Created organization app %s for partner %s",
+                app.id,
+                partner.id,
+            )
+            return Response(
+                {
+                    "app": PartnerOrganizationAppSerializer(app).data,
+                    "partner_id": str(partner.id),
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        apps = get_partner_organization_apps_for_user(partner, request.user)
+        serializer = PartnerOrganizationAppSerializer(apps, many=True)
+        return Response(
+            {
+                "apps": serializer.data,
+                "partner_id": str(partner.id),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="organization-apps/(?P<app_id>[^/.]+)/access-log",
+    )
+    def organization_app_access_log(self, request, pk=None, app_id=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to access organization app logs.")
+
+        try:
+            app = partner.organization_apps.get(id=app_id)
+        except PartnerOrganizationApp.DoesNotExist:
+            raise ValidationError({"app_id": "Invalid organization app ID."})
+
+        if request.method == "get":
+            logs = app.access_logs.select_related("user").order_by("-created_at")[:25]
+            serializer = PartnerOrganizationAppAccessLogSerializer(logs, many=True)
+            return Response({"logs": serializer.data}, status=status.HTTP_200_OK)
+
+        action_key = request.data.get("action", "view")
+        data_scope = request.data.get("data_scope", [])
+        consent = bool(request.data.get("consent", False))
+
+        if not request.data.get("action"):
+            raise ValidationError({"action": "Action is required to log access."})
+
+        log_entry = log_organization_app_access(
+            user=request.user,
+            app=app,
+            action=action_key,
+            data_scope=data_scope,
+            consent=consent,
+        )
+        serializer = PartnerOrganizationAppAccessLogSerializer(log_entry)
+        return Response({"log": serializer.data}, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path="organization-apps/(?P<app_id>[^/.]+)",
+    )
+    def organization_app_detail(self, request, pk=None, app_id=None):
+        partner = self.get_object()
+        if not self._user_can_manage_organization_apps(partner, request.user):
+            raise PermissionDenied("Not allowed to manage organization apps.")
+        try:
+            app = partner.organization_apps.get(id=app_id)
+        except PartnerOrganizationApp.DoesNotExist:
+            raise ValidationError({"app_id": "Invalid organization app ID."})
+
+        if request.method == "delete":
+            app.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = PartnerOrganizationAppSerializer(app, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response({"app": serializer.data}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch"], url_path="settings")
+    def update_settings(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to update settings.")
+
+        updates = request.data.get("updates", [])
+        if not isinstance(updates, list):
+            raise ValidationError({"updates": "Expected a list of updates."})
+
+        allowed_keys = {
+            feature["key"]
+            for section in PARTNER_SETTINGS_SECTIONS
+            for feature in section.get("features", [])
+        }
+
+        changed = 0
+        for update in updates:
+            key = update.get("key")
+            enabled = update.get("enabled")
+            if key not in allowed_keys or not isinstance(enabled, bool):
+                continue
+            PartnerFeatureFlag.objects.update_or_create(
+                partner=partner,
+                key=key,
+                defaults={"is_enabled": enabled},
+            )
+            changed += 1
+
+        return Response({"updated": changed}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="settings-config")
+    def settings_config_list(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.settings.view")
+        qs = PartnerSetting.objects.filter(partner=partner).order_by("key")
+        return Response(PartnerSettingSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "patch"], url_path=r"settings-config/(?P<key>[^/.]+)")
+    def settings_config_detail(self, request, pk=None, key=None):
+        partner = self.get_object()
+        allowed_keys = {
+            feature["key"]
+            for section in PARTNER_SETTINGS_SECTIONS
+            for feature in section.get("features", [])
+        }
+        if key not in allowed_keys:
+            raise ValidationError({"key": "Unknown settings key."})
+
+        if request.method == "GET":
+            self._require_permission(partner, request.user, "partner.settings.view")
+            setting = PartnerSetting.objects.filter(partner=partner, key=key).first()
+            if not setting:
+                default_config = {}
+                if key == LANDING_PAGE_BUILDER_KEY:
+                    default_config = _normalize_landing_builder_config({})
+                setting = PartnerSetting.objects.create(
+                    partner=partner,
+                    key=key,
+                    config=default_config,
+                    updated_by=request.user,
+                )
+            elif key == LANDING_PAGE_BUILDER_KEY:
+                normalized = _normalize_landing_builder_config(setting.config or {})
+                if normalized != (setting.config or {}):
+                    setting.config = normalized
+                    setting.updated_by = request.user
+                    setting.save(update_fields=["config", "updated_by", "updated_at"])
+            return Response(PartnerSettingSerializer(setting).data, status=status.HTTP_200_OK)
+
+        self._require_permission(partner, request.user, "partner.settings.manage")
+        setting, _ = PartnerSetting.objects.get_or_create(
+            partner=partner,
+            key=key,
+            defaults={"config": {}, "updated_by": request.user},
+        )
+        payload = request.data.copy() if hasattr(request.data, "copy") else dict(request.data or {})
+        if key == LANDING_PAGE_BUILDER_KEY:
+            payload["config"] = _normalize_landing_builder_config(payload.get("config"))
+        serializer = PartnerSettingSerializer(setting, data=payload, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(updated_by=request.user)
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.settings.update",
+            target_type="partner_setting",
+            target_id=key,
+            metadata={"fields": list((request.data or {}).keys())},
+            request=request,
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "patch"], url_path="organization-profile")
+    def organization_profile(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "GET":
+            self._require_permission(partner, request.user, "partner.settings.view")
+            profile, _ = PartnerOrganizationProfile.objects.get_or_create(
+                partner=partner,
+                defaults={
+                    "display_name": partner.name,
+                    "updated_by": request.user,
+                },
+            )
+            return Response(PartnerOrganizationProfileSerializer(profile).data, status=status.HTTP_200_OK)
+
+        self._require_permission(partner, request.user, "partner.settings.manage")
+        profile, _ = PartnerOrganizationProfile.objects.get_or_create(
+            partner=partner,
+            defaults={
+                "display_name": partner.name,
+                "updated_by": request.user,
+            },
+        )
+        serializer = PartnerOrganizationProfileSerializer(profile, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(updated_by=request.user)
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.organization_profile.update",
+            target_type="partner_organization_profile",
+            target_id=str(partner.id),
+            request=request,
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch"], url_path="join-config")
+    def update_join_config(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to update join criteria.")
+
+        config, _ = PartnerJoinConfig.objects.get_or_create(partner=partner)
+        fields = [
+            "allow_public_listing",
+            "allow_apply",
+            "allow_subscribe",
+            "auto_approve",
+            "require_profile",
+            "methods",
+            "criteria",
+        ]
+        updates = {}
+        for field in fields:
+            if field in request.data:
+                updates[field] = request.data.get(field)
+        for key, value in updates.items():
+            setattr(config, key, value)
+        config.save()
+
+        return Response({"detail": "Join config updated."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="apply")
+    def apply(self, request, pk=None):
+        partner = self.get_object()
+        config = getattr(partner, "join_config", None)
+        if config and not config.allow_apply:
+            raise PermissionDenied("Applications are disabled for this partner.")
+
+        job_post = None
+        job_post_id = request.data.get("job_post")
+        if job_post_id:
+            job_post = PartnerJobPost.objects.filter(
+                id=job_post_id,
+                partner=partner,
+                is_active=True,
+            ).first()
+
+        serializer = PartnerApplicationSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        steps = job_post.steps if job_post else []
+        method = serializer.validated_data.get("method") or "application"
+        if config and config.methods and method not in config.methods:
+            raise PermissionDenied("This join method is not available.")
+
+        application = PartnerApplication.objects.create(
+            partner=partner,
+            job_post=job_post,
+            user=request.user,
+            method=method,
+            message=serializer.validated_data.get("message", ""),
+            answers=serializer.validated_data.get("answers", {}),
+            profile_visible=serializer.validated_data.get("profile_visible", True),
+            status=PartnerApplicationStatus.PENDING,
+            stage_index=0,
+            stage_state={"steps": steps, "current": 0},
+        )
+
+        PartnerMembership.objects.update_or_create(
+            partner=partner,
+            user=request.user,
+            defaults={"status": PartnerMembershipStatus.PENDING, "role": "member"},
+        )
+
+        if config and config.auto_approve:
+            application.status = PartnerApplicationStatus.APPROVED
+            application.save(update_fields=["status", "updated_at"])
+            PartnerMembership.objects.update_or_create(
+                partner=partner,
+                user=request.user,
+                defaults={"status": PartnerMembershipStatus.MEMBER, "role": "member"},
+            )
+            self._ensure_conversation_member(partner, request.user, BaseConversationRole.MEMBER)
+            if job_post:
+                self._auto_assign_membership(partner, request.user, job_post.auto_assign)
+            dispatch_partner_webhooks(
+                partner=partner,
+                event="member.joined",
+                payload={
+                    "user_id": str(request.user.id),
+                    "status": PartnerMembershipStatus.MEMBER,
+                    "role": "member",
+                },
+            )
+            run_partner_automation_rules(
+                partner=partner,
+                event="member.joined",
+                payload={
+                    "user_id": str(request.user.id),
+                    "status": PartnerMembershipStatus.MEMBER,
+                    "role": "member",
+                },
+                actor=request.user,
+            )
+
+        return Response(PartnerApplicationSerializer(application).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get", "post"], url_path="jobs")
+    def jobs(self, request, pk=None):
+        partner = self.get_object()
+        if request.method.lower() == "get":
+            qs = PartnerJobPost.objects.filter(partner=partner).order_by("-created_at")
+            return Response(
+                PartnerJobPostSerializer(qs, many=True).data,
+                status=status.HTTP_200_OK,
+            )
+
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to manage job posts.")
+
+        serializer = PartnerJobPostSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        job = PartnerJobPost.objects.create(
+            partner=partner,
+            title=serializer.validated_data.get("title", ""),
+            description=serializer.validated_data.get("description", ""),
+            requirements=serializer.validated_data.get("requirements", ""),
+            steps=serializer.validated_data.get("steps", []),
+            auto_assign=serializer.validated_data.get("auto_assign", {}),
+            is_active=serializer.validated_data.get("is_active", True),
+        )
+        return Response(PartnerJobPostSerializer(job).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["patch"], url_path="jobs/(?P<job_id>[^/.]+)")
+    def update_job(self, request, pk=None, job_id=None):
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to manage job posts.")
+
+        job = PartnerJobPost.objects.filter(partner=partner, id=job_id).first()
+        if not job:
+            return Response({"detail": "Job post not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        fields = ["title", "description", "requirements", "steps", "auto_assign", "is_active"]
+        for field in fields:
+            if field in request.data:
+                setattr(job, field, request.data.get(field))
+        job.save()
+        return Response(PartnerJobPostSerializer(job).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="applications")
+    def list_applications(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view applications.")
+
+        qs = PartnerApplication.objects.filter(partner=partner).select_related("user", "user__profile").order_by("-created_at")
+        return Response(
+            PartnerApplicationDetailSerializer(qs, many=True).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="subscribe")
+    def subscribe(self, request, pk=None):
+        partner = self.get_object()
+        config = getattr(partner, "join_config", None)
+        if config and not config.allow_subscribe:
+            raise PermissionDenied("Subscriptions are disabled for this partner.")
+
+        PartnerMembership.objects.update_or_create(
+            partner=partner,
+            user=request.user,
+            defaults={"status": PartnerMembershipStatus.SUBSCRIBER, "role": "subscriber"},
+        )
+        self._ensure_conversation_member(partner, request.user, BaseConversationRole.READONLY)
+        dispatch_partner_webhooks(
+            partner=partner,
+            event="member.joined",
+            payload={
+                "user_id": str(request.user.id),
+                "status": PartnerMembershipStatus.SUBSCRIBER,
+                "role": "subscriber",
+            },
+        )
+        run_partner_automation_rules(
+            partner=partner,
+            event="member.joined",
+            payload={
+                "user_id": str(request.user.id),
+                "status": PartnerMembershipStatus.SUBSCRIBER,
+                "role": "subscriber",
+            },
+            actor=request.user,
+        )
+
+        return Response({"detail": "Subscribed."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="applications/(?P<app_id>[^/.]+)/approve")
+    def approve_application(self, request, pk=None, app_id=None):
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to approve applications.")
+
+        application = PartnerApplication.objects.filter(id=app_id, partner=partner).first()
+        if not application:
+            return Response({"detail": "Application not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        application.status = PartnerApplicationStatus.APPROVED
+        application.save(update_fields=["status", "updated_at"])
+
+        PartnerMembership.objects.update_or_create(
+            partner=partner,
+            user=application.user,
+            defaults={"status": PartnerMembershipStatus.MEMBER, "role": "member"},
+        )
+        self._ensure_conversation_member(partner, application.user, BaseConversationRole.MEMBER)
+        if application.job_post_id:
+            self._auto_assign_membership(partner, application.user, application.job_post.auto_assign)
+        dispatch_partner_webhooks(
+            partner=partner,
+            event="member.joined",
+            payload={
+                "user_id": str(application.user_id),
+                "status": PartnerMembershipStatus.MEMBER,
+                "role": "member",
+            },
+        )
+        run_partner_automation_rules(
+            partner=partner,
+            event="member.joined",
+            payload={
+                "user_id": str(application.user_id),
+                "status": PartnerMembershipStatus.MEMBER,
+                "role": "member",
+            },
+            actor=request.user,
+        )
+
+        return Response({"detail": "Application approved."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="links")
+    def profile_links(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.settings.view")
+        links = self._ensure_profile_links(partner)
+        serializer = PartnerProfileLinkSerializer(links, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="links/(?P<profile_key>[^/.]+)")
+    def link_profile(self, request, pk=None, profile_key=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.settings.manage")
+        link = self._get_profile_link(partner, profile_key)
+        if not link.linked:
+            link.linked = True
+            link.save(update_fields=["linked", "updated_at"])
+        serializer = PartnerProfileLinkSerializer(link, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["delete"], url_path="links/(?P<profile_key>[^/.]+)")
+    def unlink_profile(self, request, pk=None, profile_key=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.settings.manage")
+        link = self._get_profile_link(partner, profile_key)
+        if link.linked:
+            link.linked = False
+            link.save(update_fields=["linked", "updated_at"])
+        serializer = PartnerProfileLinkSerializer(link, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch"], url_path="links/(?P<profile_key>[^/.]+)")
+    def update_profile_link(self, request, pk=None, profile_key=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.settings.manage")
+        link = self._get_profile_link(partner, profile_key)
+        role = request.data.get("role")
+        valid_roles = {choice[0] for choice in PartnerProfileLink.ROLE_CHOICES}
+        if role is None or role not in valid_roles:
+            raise ValidationError({"role": "Invalid role."})
+        if link.role != role:
+            link.role = role
+            link.save(update_fields=["role", "updated_at"])
+        serializer = PartnerProfileLinkSerializer(link, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class PartnerPostViewSet(viewsets.ModelViewSet):
+    """
+    /api/v1/partners/posts/
+
+    - list:     GET  /api/v1/partners/posts/?partner=<partner_id>
+    - create:   POST /api/v1/partners/posts/
+    - retrieve: GET  /api/v1/partners/posts/{id}/
+    """
+    permission_classes = [IsAuthenticated]
+    queryset = PartnerPost.objects.select_related("partner", "author")
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return PartnerPostCreateSerializer
+        return PartnerPostSerializer
+
+    def _user_can_access_partner(self, partner: Partner, user) -> bool:
+        if partner.owner_id == user.id:
+            return True
+        if partner.main_conversation_id:
+            return partner.main_conversation.memberships.filter(
+                user=user,
+                left_at__isnull=True,
+            ).exists()
+        return False
+
+    def _member_role(self, partner: Partner, user):
+        if not partner.main_conversation_id:
+            return None
+        member = partner.main_conversation.memberships.filter(
+            user=user,
+            left_at__isnull=True,
+        ).first()
+        return member.base_role if member else None
+
+    def _ensure_can_engage(self, partner: Partner, user):
+        role = self._member_role(partner, user)
+        if role == BaseConversationRole.READONLY:
+            raise PermissionDenied("Subscribers cannot post or react.")
+
+    def get_queryset(self):
+        user = self.request.user
+        blocked_ids = UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
+        partner_id = self.request.query_params.get("partner")
+        if partner_id:
+            partner = Partner.objects.filter(id=partner_id).first()
+            if not partner or not self._user_can_access_partner(partner, user):
+                return PartnerPost.objects.none()
+            return (
+                PartnerPost.objects
+                .select_related("partner", "author")
+                .filter(partner=partner, is_deleted=False)
+                .exclude(author_id__in=blocked_ids)
+                .order_by("-created_at")
+            )
+
+        accessible_partners = Partner.objects.filter(
+            models.Q(owner=user)
+            | models.Q(
+                main_conversation__memberships__user=user,
+                main_conversation__memberships__left_at__isnull=True,
+            )
+        )
+        return (
+            PartnerPost.objects
+            .select_related("partner", "author")
+            .filter(partner__in=accessible_partners, is_deleted=False)
+            .exclude(author_id__in=blocked_ids)
+            .order_by("-created_at")
+        )
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        sample_limit = self._personalization_sample_limit(request)
+        candidates = list(queryset[:sample_limit])
+        metadata = self._build_partner_metadata(request.user, candidates)
+        profile = get_affinity_profile(request.user)
+        if profile:
+            for entry in metadata.values():
+                entry["profile"] = profile
+        ranked = rank_feed_items(candidates, request.user, feed_type="partner", metadata_map=metadata)
+        page = self.paginate_queryset(ranked)
+        serializer = self.get_serializer(page if page is not None else ranked, many=True)
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        log_feed_interaction(request.user, "partner", "feed_impression", weight=0.05)
+        return Response(serializer.data)
+
+    def _personalization_sample_limit(self, request):
+        return resolve_personalization_sample_limit(request.query_params.get("limit"))
+
+    def _build_partner_metadata(self, user, posts):
+        if not posts:
+            return {}
+        partner_ids = {post.partner_id for post in posts if post.partner_id}
+        memberships = PartnerMembership.objects.filter(
+            partner_id__in=partner_ids,
+            user=user,
+            status__in=(PartnerMembershipStatus.MEMBER, PartnerMembershipStatus.SUBSCRIBER),
+        ).values_list("partner_id", flat=True)
+        member_ids = {str(pid) for pid in memberships}
+        metadata = {}
+        for post in posts:
+            partner_id = str(post.partner_id) if post.partner_id else None
+            metadata[str(post.id)] = {
+                "source": {
+                    "type": "partner",
+                    "id": partner_id,
+                    "is_member": partner_id in member_ids if partner_id else False,
+                    "can_open": partner_id in member_ids if partner_id else False,
+                }
+            }
+        return metadata
+
+    def perform_create(self, serializer):
+        partner_id = self.request.data.get("partner")
+        if not partner_id:
+            raise ValidationError({"partner": "This field is required."})
+        partner = Partner.objects.filter(id=partner_id).first()
+        if not partner or not self._user_can_access_partner(partner, self.request.user):
+            raise PermissionDenied("Not allowed to post to this partner.")
+        self._ensure_can_engage(partner, self.request.user)
+        dlp = evaluate_partner_dlp(partner, self.request.data.get("text", "") or "")
+        if dlp["blocked"]:
+            raise ValidationError({"detail": "Message blocked by DLP policy."})
+        if dlp["warn"]:
+            log_partner_audit(
+                partner=partner,
+                actor=self.request.user,
+                action="partner.dlp.warn",
+                target_type="partner_post",
+                metadata={"matches": dlp["warn"]},
+                request=self.request,
+            )
+        post = serializer.save()
+        run_partner_automation_rules(
+            partner=partner,
+            event="partner.post.created",
+            payload={
+                "post_id": str(post.id),
+                "user_id": str(self.request.user.id),
+            },
+            actor=self.request.user,
+        )
+
+    @action(detail=True, methods=["post"], url_path="comment")
+    def comment(self, request, pk=None):
+        post = self.get_object()
+        if not self._user_can_access_partner(post.partner, request.user):
+            raise PermissionDenied("Not allowed to comment.")
+        self._ensure_can_engage(post.partner, request.user)
+        dlp = evaluate_partner_dlp(post.partner, request.data.get("text", "") or "")
+        if dlp["blocked"]:
+            raise ValidationError({"detail": "Message blocked by DLP policy."})
+        if dlp["warn"]:
+            log_partner_audit(
+                partner=post.partner,
+                actor=request.user,
+                action="partner.dlp.warn",
+                target_type="partner_post_comment",
+                metadata={"matches": dlp["warn"]},
+                request=request,
+            )
+        comment = PartnerPostComment.objects.create(
+            post=post,
+            author=request.user,
+            text=request.data.get("text", ""),
+        )
+        run_partner_automation_rules(
+            partner=post.partner,
+            event="partner.post.commented",
+            payload={
+                "post_id": str(post.id),
+                "comment_id": str(comment.id),
+                "user_id": str(request.user.id),
+            },
+            actor=request.user,
+        )
+        return Response(PartnerPostCommentSerializer(comment).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="comment-room")
+    def comment_room(self, request, pk=None):
+        post = self.get_object()
+        if not self._user_can_access_partner(post.partner, request.user):
+            raise PermissionDenied("Not allowed to comment.")
+        self._ensure_can_engage(post.partner, request.user)
+
+        conversation = post.comment_conversation
+        if not conversation:
+            created_by = post.author or request.user
+            conversation = Conversation.objects.create(
+                type=ConversationType.POST,
+                title=f"{post.partner.name} comments",
+                description=f"Comments for partner post {post.id}",
+                created_by=created_by,
+            )
+            ConversationSettings.objects.get_or_create(
+                conversation=conversation,
+                defaults={
+                    "send_policy": ConversationSendPolicy.ALL_MEMBERS,
+                    "join_policy": ChatConversationJoinPolicy.OPEN,
+                },
+            )
+            post.comment_conversation = conversation
+            post.save(update_fields=["comment_conversation"])
+
+        ConversationMember.objects.get_or_create(
+            conversation=conversation,
+            user=request.user,
+            defaults={"base_role": BaseConversationRole.MEMBER},
+        )
+
+        return Response(
+            {"conversation_id": str(conversation.id), "title": conversation.title},
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get"], url_path="comments")
+    def comments(self, request, pk=None):
+        post = self.get_object()
+        if not self._user_can_access_partner(post.partner, request.user):
+            raise PermissionDenied("Not allowed to view comments.")
+        comments = post.comments.filter(is_deleted=False).select_related("author").order_by("created_at")
+        return Response(PartnerPostCommentSerializer(comments, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="react")
+    def react(self, request, pk=None):
+        post = self.get_object()
+        if not self._user_can_access_partner(post.partner, request.user):
+            raise PermissionDenied("Not allowed to react.")
+        self._ensure_can_engage(post.partner, request.user)
+        emoji = request.data.get("emoji") or "👍"
+        action = request.data.get("action")
+        existing = PartnerPostReaction.objects.filter(post=post, user=request.user).first()
+        if action in ("remove", "unlike") or (action == "toggle" and existing):
+            if existing:
+                existing.delete()
+            run_partner_automation_rules(
+                partner=post.partner,
+                event="partner.post.reacted",
+                payload={
+                    "post_id": str(post.id),
+                    "user_id": str(request.user.id),
+                    "action": "remove",
+                },
+                actor=request.user,
+            )
+            return Response({"detail": "Reaction removed.", "has_reacted": False}, status=status.HTTP_200_OK)
+
+        reaction, created = PartnerPostReaction.objects.get_or_create(
+            post=post,
+            user=request.user,
+            defaults={"emoji": emoji},
+        )
+        if not created and reaction.emoji != emoji:
+            reaction.emoji = emoji
+            reaction.save(update_fields=["emoji"])
+        run_partner_automation_rules(
+            partner=post.partner,
+            event="partner.post.reacted",
+            payload={
+                "post_id": str(post.id),
+                "user_id": str(request.user.id),
+                "action": "add",
+                "emoji": emoji,
+            },
+            actor=request.user,
+        )
+        return Response({"detail": "Reaction saved.", "has_reacted": True}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="delete")
+    def delete_post(self, request, pk=None):
+        post = self.get_object()
+        role = self._member_role(post.partner, request.user)
+        is_owner = post.author_id == request.user.id
+        is_admin = role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN)
+        if not (is_owner or is_admin or post.partner.owner_id == request.user.id):
+            raise PermissionDenied("Not allowed to delete this post.")
+        policy = ensure_partner_policy(post.partner)
+        compliance = (policy.settings or {}).get("compliance", {})
+        if compliance.get("legal_hold_enabled"):
+            raise PermissionDenied("Legal hold is enabled for this partner.")
+        post.is_deleted = True
+        post.save(update_fields=["is_deleted"])
+        return Response({"detail": "Post deleted."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="broadcast")
+    def broadcast(self, request, pk=None):
+        post = self.get_object()
+        role = self._member_role(post.partner, request.user)
+        is_owner = post.author_id == request.user.id
+        is_admin = role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN)
+        if not (is_owner or is_admin or post.partner.owner_id == request.user.id):
+            raise PermissionDenied("Not allowed to broadcast this post.")
+        post.is_broadcast = True
+        post.save(update_fields=["is_broadcast"])
+        try:
+            from apps.broadcasts.models import BroadcastItem, BroadcastSourceType
+            from datetime import timedelta
+
+            BroadcastItem.objects.update_or_create(
+                source_type=BroadcastSourceType.PARTNER_POST,
+                source_id=str(post.id),
+                defaults={
+                    "broadcasted_by": request.user,
+                    "broadcasted_at": timezone.now(),
+                    "expires_at": timezone.now() + timedelta(days=10),
+                    "is_deleted": False,
+                },
+            )
+        except Exception:
+            pass
+        return Response({"detail": "Post broadcasted."}, status=status.HTTP_200_OK)

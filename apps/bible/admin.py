@@ -1,0 +1,61 @@
+from django.contrib import admin
+
+from .models import (
+    BibleTranslation,
+    BibleBook,
+    BibleChapter,
+    BibleVerse,
+    BibleAudio,
+    BibleAudioSegment,
+    DailyDevotional,
+    PrayerRequest,
+    MeditationTopic,
+    MeditationSchedule,
+    MeditationEntry,
+    BibleChatSession,
+    BibleChatMessage,
+    ReadingPlan,
+    ReadingPlanItem,
+    ReadingPlanEnrollment,
+    ReadingHistory,
+    BibleBookmark,
+    BibleNote,
+    BibleHighlight,
+    MemoryVerse,
+    BiblePreference,
+    BibleCrossReference,
+    BibleCourse,
+    BibleCourseModule,
+    BibleLesson,
+    BibleCourseEnrollment,
+    BibleLessonProgress,
+)
+
+admin.site.register(BibleTranslation)
+admin.site.register(BibleBook)
+admin.site.register(BibleChapter)
+admin.site.register(BibleVerse)
+admin.site.register(BibleAudio)
+admin.site.register(BibleAudioSegment)
+admin.site.register(DailyDevotional)
+admin.site.register(PrayerRequest)
+admin.site.register(MeditationTopic)
+admin.site.register(MeditationSchedule)
+admin.site.register(MeditationEntry)
+admin.site.register(BibleChatSession)
+admin.site.register(BibleChatMessage)
+admin.site.register(ReadingPlan)
+admin.site.register(ReadingPlanItem)
+admin.site.register(ReadingPlanEnrollment)
+admin.site.register(ReadingHistory)
+admin.site.register(BibleBookmark)
+admin.site.register(BibleNote)
+admin.site.register(BibleHighlight)
+admin.site.register(MemoryVerse)
+admin.site.register(BiblePreference)
+admin.site.register(BibleCrossReference)
+admin.site.register(BibleCourse)
+admin.site.register(BibleCourseModule)
+admin.site.register(BibleLesson)
+admin.site.register(BibleCourseEnrollment)
+admin.site.register(BibleLessonProgress)

@@ -1,0 +1,819 @@
+
+
+"""
+Commerce Django App (commerce)
+
+Purpose:
+- Full-featured marketplace & shop platform focusing on security, authenticity, and advanced commerce features.
+- Built to integrate with the AI & Automation app for verification, recommendations and fraud detection.
+
+Key capabilities implemented:
+- Shop creation + KYC-style verification workflow (ShopVerificationRequest)
+- Product catalog with authenticity checks (ProductAuthenticityCheck)
+- Orders, Payments (provider hooks), Promotions, Subscriptions, Loyalty
+- FraudSignal model and async fraud evaluation
+- Audit logs for compliance and traceability
+- Background tasks (Celery) for verification & fraud computation
+- Admin panels for manual review & audit
+- Stubs/adapters in services.py to connect to third-party verifiers, OCR, blockchain verification, or image-forensics providers
+
+Free-tier behavior / safety notes:
+- Verification & authenticity adapters are stubbed for free-tier testing. Replace adapters with paid providers when ready (examples: Jumio, Onfido, Trulioo for KYC; Chainpoint or OpenTimestamps for blockchain anchoring; Virustotal/ImageForensics APIs for image checks).
+- Use django-storages + S3/Backblaze for secure document storage.
+- Enable server-side scanning and virus checks for user uploads.
+
+Quick install:
+1. Add "commerce" to INSTALLED_APPS.
+2. Ensure DRF and Celery are installed and configured.
+3. Run migrations: python manage.py makemigrations commerce && python manage.py migrate
+4. Start Celery worker: celery -A your_project worker -l info
+5. Configure object storage and set secure upload buckets.
+
+Security & authenticity recommended next steps:
+- Integrate a KYC provider for automated identity verification.
+- Connect image-forensics models and brand catalogs for counterfeit detection.
+- Use blockchain anchoring for high-value goods (store certificate hash on-chain).
+- Add manual review queues with role-based access controls for reviewers.
+- Add rate-limits, merchant onboarding checks, scoring thresholds and escalation rules.
+
+"""
+
+from datetime import timedelta
+import uuid
+from django.db import models
+from django.db.models import JSONField
+from django.conf import settings
+from django.utils import timezone
+from django.utils.text import slugify
+from django.contrib.postgres.fields import ArrayField
+
+from .constants import KIS_COIN_CODE
+
+
+class BaseEntity(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_deleted = models.BooleanField(default=False)
+
+    class Meta:
+        abstract = True
+
+
+class Shop(BaseEntity):
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='shops')
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=255, unique=True)
+    description = models.TextField(blank=True)
+    employee_slots = models.PositiveIntegerField(default=1)
+    branding = JSONField(default=dict, blank=True)
+    image_file = models.ImageField(upload_to='commerce/shops/', null=True, blank=True)
+    is_verified = models.BooleanField(default=False)
+    verification_status = models.CharField(max_length=20, default='UNVERIFIED')  # PENDING | VERIFIED | REJECTED
+    rating_avg = models.FloatField(default=0.0)
+    rating_count = models.IntegerField(default=0)
+    followers_count = models.IntegerField(default=0)
+    membership_discount_pct = models.PositiveIntegerField(default=5)
+    social_links = JSONField(default=dict, blank=True)
+    analytics = JSONField(default=dict, blank=True)
+    trust_badges = JSONField(default=list, blank=True)  # e.g., ['kyc','authenticity','secure-pay']
+    membership_public = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [models.Index(fields=['slug'])]
+
+    def __str__(self):
+        return f"{self.name} ({self.owner})"
+
+    @property
+    def image_url(self):
+        try:
+            url = self.image_file.url if self.image_file else ''
+        except ValueError:
+            return ''
+        if not url:
+            return ''
+        if url.startswith('http://') or url.startswith('https://'):
+            return url
+        site_url = settings.SITE_URL.rstrip('/')
+        if site_url:
+            return f"{site_url}{url}"
+        return url
+
+
+class ShopLandingPage(BaseEntity):
+    shop = models.OneToOneField(Shop, on_delete=models.CASCADE, related_name='landing_page')
+    headline = models.CharField(max_length=255, blank=True)
+    subheadline = models.TextField(blank=True)
+    hero_image_url = models.URLField(max_length=512, blank=True)
+    hero_cta_text = models.CharField(max_length=128, blank=True)
+    hero_cta_url = models.URLField(max_length=512, blank=True)
+    is_public = models.BooleanField(default=False)
+    is_published = models.BooleanField(default=False)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='shop_landing_pages_created',
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='shop_landing_pages_updated',
+    )
+
+    class Meta:
+        verbose_name = 'Shop landing page'
+        verbose_name_plural = 'Shop landing pages'
+
+    def __str__(self):
+        return f"Landing page for {self.shop.name}"
+
+
+class ShopLandingTestimonial(BaseEntity):
+    landing_page = models.ForeignKey(
+        ShopLandingPage,
+        on_delete=models.CASCADE,
+        related_name='testimonials',
+    )
+    quote = models.TextField()
+    author = models.CharField(max_length=128, blank=True)
+    role = models.CharField(max_length=128, blank=True)
+    rating = models.PositiveSmallIntegerField(null=True, blank=True)
+    sort_order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['sort_order', 'created_at']
+
+    def __str__(self):
+        return f"Testimonial by {self.author or 'anonymous'} for {self.landing_page.shop.name}"
+
+
+class ShopCategory(BaseEntity):
+    CATEGORY_TYPES = [
+        ('product', 'Product'),
+        ('service', 'Service'),
+        ('both', 'Both'),
+    ]
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='categories')
+    name = models.CharField(max_length=128)
+    slug = models.SlugField(max_length=128)
+    description = models.TextField(blank=True)
+    category_type = models.CharField(max_length=16, choices=CATEGORY_TYPES, default='product')
+
+    class Meta:
+        unique_together = (('shop', 'slug'),)
+
+    def save(self, *args, **kwargs):
+        if not self.slug and self.name:
+            base = slugify(self.name) or 'category'
+            slug = base
+            suffix = 1
+            while ShopCategory.objects.filter(shop=self.shop, slug=slug).exclude(id=self.id).exists():
+                slug = f"{base}-{suffix}"
+                suffix += 1
+            self.slug = slug
+        super().save(*args, **kwargs)
+
+
+class ShopService(BaseEntity):
+    VISIBILITY_CHOICES = [('draft', 'Draft'), ('public', 'Public'), ('unlisted', 'Unlisted'), ('private', 'Private')]
+    STATUS_CHOICES = [('draft', 'Draft'), ('published', 'Published'), ('paused', 'Paused')]
+
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='services')
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=255)
+    short_summary = models.CharField(max_length=320, blank=True, default='')
+    tags = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    description = models.TextField(blank=True, default='')
+    pricing_model = models.CharField(max_length=32, blank=True, default='standard')
+    service_type = models.CharField(max_length=64, blank=True, default='Appointment')
+    delivery_modes = ArrayField(models.CharField(max_length=32), default=list, blank=True)
+    visibility = models.CharField(max_length=16, choices=VISIBILITY_CHOICES, default='draft')
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='draft')
+    featured = models.BooleanField(default=False)
+    price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    compare_at_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    deposit_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    deposit_percent = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    minimum_charge = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    negotiable = models.BooleanField(default=False)
+    tax_inclusive = models.BooleanField(default=True)
+    quote_required = models.BooleanField(default=False)
+    category = models.ForeignKey(ShopCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='services')
+    availability = JSONField(default=dict, blank=True)
+    availability_rules = JSONField(default=list, blank=True)
+    blackout_dates = ArrayField(models.DateField(), default=list, blank=True)
+    coverage = ArrayField(models.CharField(max_length=128), default=list, blank=True)
+    remote_regions = ArrayField(models.CharField(max_length=128), default=list, blank=True)
+    remote_meeting_link = models.CharField(max_length=512, blank=True, default='')
+    address_line1 = models.CharField(max_length=255, blank=True, default='')
+    address_line2 = models.CharField(max_length=255, blank=True, default='')
+    city = models.CharField(max_length=128, blank=True, default='')
+    state = models.CharField(max_length=128, blank=True, default='')
+    country = models.CharField(max_length=128, blank=True, default='')
+    postal_code = models.CharField(max_length=20, blank=True, default='')
+    travel_radius_km = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+    timezone = models.CharField(max_length=64, blank=True, default='UTC')
+    duration_minutes = models.PositiveIntegerField(default=60)
+    prep_buffer_minutes = models.PositiveIntegerField(default=0)
+    cleanup_buffer_minutes = models.PositiveIntegerField(default=0)
+    turnaround_hours = models.PositiveIntegerField(default=0)
+    max_bookings_per_slot = models.PositiveIntegerField(default=1)
+    group_booking_allowed = models.BooleanField(default=False)
+    allow_multiple_attendees_per_slot = models.BooleanField(default=False)
+    max_participants = models.PositiveIntegerField(default=1)
+    staff_required = models.PositiveIntegerField(default=1)
+    min_notice_hours = models.PositiveIntegerField(default=24)
+    max_advance_booking_days = models.PositiveIntegerField(default=90)
+    cancellation_window_hours = models.PositiveIntegerField(default=24)
+    reschedule_window_hours = models.PositiveIntegerField(default=24)
+    auto_confirm_booking = models.BooleanField(default=True)
+    approval_required = models.BooleanField(default=False)
+    packages = JSONField(default=list, blank=True)
+    addons = JSONField(default=list, blank=True)
+    requirements = JSONField(default=list, blank=True)
+    refund_policy = models.TextField(blank=True, default='')
+    warranty_policy = models.TextField(blank=True, default='')
+    service_terms = models.TextField(blank=True, default='')
+    seo_title = models.CharField(max_length=255, blank=True, default='')
+    seo_description = models.TextField(blank=True, default='')
+    published_at = models.DateTimeField(null=True, blank=True)
+    paused_at = models.DateTimeField(null=True, blank=True)
+    other_shops_discount = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    image_file = models.ImageField(upload_to='commerce/services/', null=True, blank=True)
+    image_url = models.URLField(max_length=512, blank=True)
+    rating_avg = models.FloatField(default=0.0)
+    rating_count = models.IntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    is_featured = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = (('shop', 'slug'),)
+        indexes = [
+            models.Index(fields=['shop', 'name']),
+            models.Index(fields=['status']),
+            models.Index(fields=['visibility']),
+            models.Index(fields=['shop']),
+            models.Index(fields=['category']),
+            models.Index(fields=['price']),
+            models.Index(fields=['published_at']),
+        ]
+
+    def __str__(self):
+        return f"Service {self.name} ({self.shop.name})"
+
+
+class ServiceBooking(BaseEntity):
+    STATUS_PENDING = 'pending'
+    STATUS_CONFIRMED = 'confirmed'
+    STATUS_CANCELLED = 'cancelled'
+    STATUS_COMPLETED = 'completed'
+    STATUS_AWAITING_SATISFACTION = 'awaiting_satisfaction'
+    STATUS_DISPUTE = 'dispute'
+    STATUS_REFUNDED = 'refunded'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_CONFIRMED, 'Confirmed'),
+        (STATUS_CANCELLED, 'Cancelled'),
+        (STATUS_COMPLETED, 'Completed'),
+        (STATUS_AWAITING_SATISFACTION, 'Awaiting satisfaction'),
+        (STATUS_DISPUTE, 'Dispute'),
+        (STATUS_REFUNDED, 'Refunded'),
+    ]
+
+    service = models.ForeignKey(ShopService, on_delete=models.CASCADE, related_name='bookings')
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='bookings')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='service_bookings')
+    scheduled_at = models.DateTimeField()
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    price_cents = models.BigIntegerField(default=0)
+    deposit_cents = models.BigIntegerField(default=0)
+    balance_cents = models.BigIntegerField(default=0)
+    instructions = models.TextField(blank=True, default='')
+    payment_tx_ref = models.CharField(max_length=128, blank=True, default='')
+    remote_meeting_link = models.CharField(max_length=512, blank=True, default='')
+    reminder_sent_at = models.DateTimeField(null=True, blank=True)
+    provider_completed_at = models.DateTimeField(null=True, blank=True)
+    payer_satisfied_at = models.DateTimeField(null=True, blank=True)
+    satisfaction_deadline = models.DateTimeField(null=True, blank=True)
+
+    @property
+    def provider_user(self):
+        return getattr(self.shop, "owner", None)
+
+    @property
+    def is_remote_session(self):
+        return bool(self.remote_meeting_link)
+
+    @property
+    def awaiting_satisfaction(self):
+        return self.status == self.STATUS_AWAITING_SATISFACTION
+
+    def mark_provider_completed(self):
+        now = timezone.now()
+        self.provider_completed_at = now
+        self.satisfaction_deadline = now + timedelta(days=3)
+
+    class Meta:
+        ordering = ['-scheduled_at']
+        indexes = [
+            models.Index(fields=['service', 'scheduled_at']),
+            models.Index(fields=['user', 'status']),
+        ]
+        constraints = []
+
+    def __str__(self):
+        return f"Booking {self.service.name} for {self.user} on {self.scheduled_at}"
+
+    @property
+    def complaint_window_expires(self):
+        if not self.provider_completed_at:
+            return None
+        return self.provider_completed_at + timedelta(days=3)
+
+
+class ServiceBookingPayment(BaseEntity):
+    STATUS_PENDING = 'pending'
+    STATUS_PAID = 'paid'
+    STATUS_FAILED = 'failed'
+    STATUS_REFUNDED = 'refunded'
+    STATUS_SATISFIED = 'satisfied'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_PAID, 'Paid'),
+        (STATUS_FAILED, 'Failed'),
+        (STATUS_REFUNDED, 'Refunded'),
+        (STATUS_SATISFIED, 'Satisfied'),
+    ]
+
+    booking = models.OneToOneField(
+        ServiceBooking,
+        on_delete=models.CASCADE,
+        related_name='payment',
+    )
+    amount_cents = models.BigIntegerField(default=0)
+    currency = models.CharField(max_length=12, default=KIS_COIN_CODE)
+    payment_method = models.CharField(max_length=64, blank=True, default='wallet')
+    payment_status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    transaction_reference = models.CharField(max_length=128, blank=True, default='')
+    notes = models.TextField(blank=True, default='')
+    satisfied_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['payment_status']),
+            models.Index(fields=['paid_at']),
+            models.Index(fields=['satisfied_at']),
+        ]
+
+    def __str__(self):
+        return f"Payment {self.transaction_reference or self.id} for booking {self.booking_id}"
+
+
+class ServiceBookingEscrow(BaseEntity):
+    STATUS_PENDING = 'pending'
+    STATUS_AWAITING_SATISFACTION = 'awaiting_satisfaction'
+    STATUS_RELEASED = 'released'
+    STATUS_REFUNDED = 'refunded'
+    STATUS_DISPUTE = 'dispute'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_AWAITING_SATISFACTION, 'Awaiting satisfaction'),
+        (STATUS_RELEASED, 'Released'),
+        (STATUS_REFUNDED, 'Refunded'),
+        (STATUS_DISPUTE, 'Dispute'),
+    ]
+
+    booking = models.OneToOneField(ServiceBooking, on_delete=models.CASCADE, related_name='escrow')
+    payer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='service_escrows',
+    )
+    provider = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='service_payouts',
+    )
+    amount_cents = models.BigIntegerField(default=0)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    payment_reference = models.CharField(max_length=128, blank=True, default='')
+    locked_at = models.DateTimeField(auto_now_add=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+    refunded_at = models.DateTimeField(null=True, blank=True)
+    released_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='+',
+    )
+    refunded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='+',
+    )
+    metadata = JSONField(default=dict, blank=True)
+    note = models.TextField(blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['locked_at']),
+            models.Index(fields=['released_at']),
+            models.Index(fields=['refunded_at']),
+        ]
+
+    def __str__(self):
+        return f"Escrow for {self.booking_id} ({self.amount_cents} cents)"
+
+    @property
+    def is_pending(self):
+        return self.status == self.STATUS_PENDING
+
+
+class ServiceBookingComplaint(BaseEntity):
+    STATUS_SUBMITTED = 'submitted'
+    STATUS_UNDER_REVIEW = 'under_review'
+    STATUS_RESOLVED_RELEASE = 'resolved_release_provider'
+    STATUS_RESOLVED_REFUND = 'resolved_refund_customer'
+    STATUS_REJECTED = 'rejected'
+    STATUS_CHOICES = [
+        (STATUS_SUBMITTED, 'Submitted'),
+        (STATUS_UNDER_REVIEW, 'Under review'),
+        (STATUS_RESOLVED_RELEASE, 'Resolved • Release payment'),
+        (STATUS_RESOLVED_REFUND, 'Resolved • Refund customer'),
+        (STATUS_REJECTED, 'Rejected'),
+    ]
+    ACTION_NONE = 'none'
+    ACTION_RELEASE = 'release'
+    ACTION_REFUND = 'refund'
+    ACTION_CHOICES = [
+        (ACTION_NONE, 'None'),
+        (ACTION_RELEASE, 'Release payment'),
+        (ACTION_REFUND, 'Refund payment'),
+    ]
+
+    booking = models.ForeignKey(
+        ServiceBooking,
+        on_delete=models.CASCADE,
+        related_name='complaints',
+    )
+    payment = models.ForeignKey(
+        ServiceBookingPayment,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='complaints',
+    )
+    escrow = models.ForeignKey(
+        ServiceBookingEscrow,
+        on_delete=models.CASCADE,
+        related_name='complaints',
+    )
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='service_booking_complaints',
+    )
+    provider = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='service_provider_complaints',
+    )
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_SUBMITTED)
+    action = models.CharField(max_length=32, choices=ACTION_CHOICES, default=ACTION_NONE)
+    transaction_reference = models.CharField(max_length=128, blank=True)
+    receipt_url = models.URLField(max_length=512, blank=True)
+    personal_statement = models.TextField(blank=True)
+    reason = models.TextField(blank=True)
+    service_name = models.CharField(max_length=255, blank=True)
+    shop_name = models.CharField(max_length=255, blank=True)
+    provider_info = JSONField(default=dict, blank=True)
+    metadata = JSONField(default=dict, blank=True)
+    resolution_note = models.TextField(blank=True)
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='resolved_service_booking_complaints',
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['action']),
+            models.Index(fields=['created_at']),
+        ]
+
+    def __str__(self):
+        return f"Complaint {self.id} · booking {self.booking_id}"
+    @property
+    def effective_image_url(self):
+        try:
+            if self.image_file:
+                return self.image_file.url
+        except ValueError:
+            pass
+        if self.image_url:
+            return self.image_url
+        return ''
+
+
+class ShopServiceImage(BaseEntity):
+    service = models.ForeignKey(ShopService, on_delete=models.CASCADE, related_name='images')
+    image_file = models.ImageField(upload_to='commerce/service-images/', null=True, blank=True)
+    order = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['order']
+
+    def __str__(self):
+        return f"Image {self.order} for {self.service.name}"
+
+
+class ServiceRating(BaseEntity):
+    service = models.ForeignKey(ShopService, on_delete=models.CASCADE, related_name='ratings')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='service_ratings')
+    score = models.PositiveSmallIntegerField()
+
+    class Meta:
+        unique_together = ('service', 'user')
+
+    def __str__(self):
+        return f"Rating {self.score} for {self.service.name} by {self.user}"
+
+
+class ShopVerificationRequest(BaseEntity):
+    SHOP_DOC_TYPES = [('ID', 'ID Document'), ('BUSINESS_REG', 'Business Registration'), ('INVOICE', 'Proof of Sales')]
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='verification_requests')
+    requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    status = models.CharField(max_length=20, default='PENDING')  # PENDING | IN_REVIEW | APPROVED | REJECTED
+    documents = JSONField(default=list, blank=True)  # list of {type, url, meta}
+    reviewer_notes = models.TextField(blank=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    risk_score = models.FloatField(null=True, blank=True)
+
+
+class Product(BaseEntity):
+    INVENTORY_TYPES = [('PHYSICAL', 'Physical'), ('DIGITAL', 'Digital'), ('SERVICE', 'Service')]
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='products')
+    sku = models.CharField(max_length=128, unique=True)
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=255)
+    image_url = models.URLField(max_length=512, blank=True)
+    image_file = models.ImageField(upload_to='commerce/products/', null=True, blank=True)
+    description = models.TextField(blank=True)
+    price = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(
+        max_length=8,
+        choices=[(KIS_COIN_CODE, KIS_COIN_CODE)],
+        default=KIS_COIN_CODE,
+    )
+    inventory_type = models.CharField(max_length=20, choices=INVENTORY_TYPES, default='PHYSICAL')
+    stock_qty = models.IntegerField(default=0)
+    variants = JSONField(default=list, blank=True)
+    categories = JSONField(default=list, blank=True)
+    attributes = JSONField(default=dict, blank=True)
+    is_active = models.BooleanField(default=True)
+    is_featured = models.BooleanField(default=False)
+    rating_avg = models.FloatField(default=0.0)
+    rating_count = models.IntegerField(default=0)
+    ai_score = models.FloatField(default=0.0)
+    ar_preview_url = models.URLField(blank=True)
+    authenticity_status = models.CharField(max_length=20, default='UNKNOWN')  # UNKNOWN | VERIFIED | FLAGGED
+    authenticity_proof = JSONField(default=dict, blank=True)  # e.g., blockchain anchor, certificate
+    category = models.ForeignKey(ShopCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
+    availability = models.CharField(max_length=128, blank=True, default='')
+    coverage = models.TextField(blank=True, default='')
+    location = models.CharField(max_length=255, blank=True, default='')
+    service_type = models.CharField(max_length=64, blank=True, default='')
+    other_shops_discount = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    availability_rules = JSONField(default=list, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['sku']), models.Index(fields=['slug'])]
+
+    def __str__(self):
+        return f"{self.name} [{self.sku}]"
+
+    @property
+    def effective_image_url(self):
+        try:
+            if self.image_file:
+                return self.image_file.url
+        except ValueError:
+            pass
+        return self.image_url
+
+
+class ProductImage(BaseEntity):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='images')
+    image_file = models.ImageField(upload_to='commerce/product-images/')
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['order', 'created_at']
+
+
+class ProductRating(BaseEntity):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='ratings')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='product_ratings')
+    score = models.PositiveSmallIntegerField()
+
+    class Meta:
+        unique_together = ('product', 'user')
+
+
+class ProductAuthenticityCheck(BaseEntity):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='auth_checks')
+    requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    provider = models.CharField(max_length=100, default='local_ai')
+    status = models.CharField(max_length=20, default='PENDING')  # PENDING | PROCESSING | VERIFIED | FLAGGED | ERROR
+    result = JSONField(default=dict, blank=True)
+    confidence = models.FloatField(null=True, blank=True)
+    checked_at = models.DateTimeField(null=True, blank=True)
+
+
+class Order(BaseEntity):
+    ORDER_STATUS = [('PENDING','Pending'),('PAID','Paid'),('SHIPPED','Shipped'),('DELIVERED','Delivered'),('CANCELLED','Cancelled'),('REFUNDED','Refunded')]
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='orders')
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='orders')
+    status = models.CharField(max_length=20, choices=ORDER_STATUS, default='PENDING')
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2)
+    tax = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    shipping = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    total = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(
+        max_length=8,
+        choices=[(KIS_COIN_CODE, KIS_COIN_CODE)],
+        default=KIS_COIN_CODE,
+    )
+    paid_at = models.DateTimeField(null=True, blank=True)
+    shipped_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    discount_code = models.CharField(max_length=64, blank=True)
+    referral_code = models.CharField(max_length=64, blank=True)
+
+
+class OrderItem(BaseEntity):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey(Product, on_delete=models.SET_NULL, null=True, blank=True)
+    name = models.CharField(max_length=255)
+    quantity = models.IntegerField(default=1)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(
+        max_length=8,
+        choices=[(KIS_COIN_CODE, KIS_COIN_CODE)],
+        default=KIS_COIN_CODE,
+    )
+    variant = JSONField(default=dict, blank=True)
+    applied_discount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+
+class Payment(BaseEntity):
+    PAYMENT_STATUS = [('PENDING','Pending'),('SUCCESS','Success'),('FAILED','Failed'),('REFUNDED','Refunded')]
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='payments')
+    provider = models.CharField(max_length=100)
+    method = models.CharField(max_length=50)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(
+        max_length=8,
+        choices=[(KIS_COIN_CODE, KIS_COIN_CODE)],
+        default=KIS_COIN_CODE,
+    )
+    status = models.CharField(max_length=20, choices=PAYMENT_STATUS, default='PENDING')
+    provider_ref = models.CharField(max_length=255, blank=True)
+    captured_at = models.DateTimeField(null=True, blank=True)
+    refunded_at = models.DateTimeField(null=True, blank=True)
+    fraud_score = models.FloatField(null=True, blank=True)
+
+
+class Promotion(BaseEntity):
+    DISCOUNT_TYPES = [('PERCENT','Percent'),('FIXED','Fixed')]
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='promotions')
+    code = models.CharField(max_length=64, unique=True)
+    description = models.TextField(blank=True)
+    discount_type = models.CharField(max_length=20, choices=DISCOUNT_TYPES)
+    discount_value = models.DecimalField(max_digits=8, decimal_places=2)
+    start_date = models.DateTimeField()
+    end_date = models.DateTimeField()
+    usage_limit = models.IntegerField(null=True, blank=True)
+    used_count = models.IntegerField(default=0)
+    applicable_products = JSONField(default=list, blank=True)
+    social_boost = models.BooleanField(default=False)
+
+
+class Subscription(BaseEntity):
+    STATUS = [('ACTIVE','Active'),('PAUSED','Paused'),('CANCELLED','Cancelled')]
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='shop_subscriptions')
+    shop = models.ForeignKey(Shop, on_delete=models.SET_NULL, null=True, blank=True, related_name='shop_subscriptions')
+    plan_name = models.CharField(max_length=128)
+    status = models.CharField(max_length=20, choices=STATUS, default='ACTIVE')
+    start_date = models.DateTimeField()
+    end_date = models.DateTimeField(null=True, blank=True)
+    next_billing_date = models.DateTimeField(null=True, blank=True)
+    price = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(
+        max_length=8,
+        choices=[(KIS_COIN_CODE, KIS_COIN_CODE)],
+        default=KIS_COIN_CODE,
+    )
+    perks = JSONField(default=dict, blank=True)
+
+
+class LoyaltyPoint(BaseEntity):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='loyalty_points')
+    shop = models.ForeignKey(Shop, on_delete=models.SET_NULL, null=True, blank=True)
+    points = models.IntegerField()
+    earned_at = models.DateTimeField()
+    expires_at = models.DateTimeField(null=True, blank=True)
+    reason = models.CharField(max_length=255, blank=True)
+
+
+class ShopFollow(BaseEntity):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='follows')
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='followers')
+    followed_at = models.DateTimeField(auto_now_add=True)
+
+
+class ShopRole(models.TextChoices):
+    OWNER = 'owner', 'Owner'
+    MANAGER = 'manager', 'Manager'
+    ADMIN = 'admin', 'Admin'
+    MEMBER = 'member', 'Member'
+
+
+class ShopTeamMember(BaseEntity):
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='team_members')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='shop_memberships')
+    role = models.CharField(max_length=16, choices=ShopRole.choices, default=ShopRole.MEMBER)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        unique_together = (('shop', 'user'),)
+        indexes = [
+            models.Index(fields=['shop', 'role']),
+            models.Index(fields=['user']),
+        ]
+
+    def __str__(self):
+        return f"{self.user} as {self.role} in {self.shop}"
+
+
+class ProductShare(BaseEntity):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    shared_at = models.DateTimeField(auto_now_add=True)
+
+
+class ProductSubscription(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='product_subscriptions')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='subscriptions')
+    subscribed_at = models.DateTimeField(default=timezone.now)
+    platform = models.CharField(max_length=64, default='kis-platform')
+
+    class Meta:
+        unique_together = ('user', 'product')
+
+    def __str__(self):
+        return f'{self.user} subscribes to {self.product}'
+
+
+class AIRecommendation(BaseEntity):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    target_type = models.CharField(max_length=50)  # Product | Shop
+    target_id = models.UUIDField()
+    score = models.FloatField()
+    reason = models.TextField(blank=True)
+
+
+class AuditLog(BaseEntity):
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    action = models.CharField(max_length=255)
+    target_type = models.CharField(max_length=255)
+    target_id = models.UUIDField(null=True, blank=True)
+    metadata = JSONField(default=dict, blank=True)
+
+
+class FraudSignal(BaseEntity):
+    source = models.CharField(max_length=100)
+    entity_type = models.CharField(max_length=100)  # order, payment, shop, product
+    entity_id = models.UUIDField()
+    score = models.FloatField()
+    details = JSONField(default=dict, blank=True)
+    processed = models.BooleanField(default=False)

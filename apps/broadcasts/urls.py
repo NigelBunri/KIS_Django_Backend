@@ -1,0 +1,155 @@
+from django.urls import path
+
+from .views import (
+    BroadcastFeedView,
+    BroadcastChannelMessageView,
+    BroadcastReactView,
+    BroadcastCommentRoomView,
+    BroadcastShareView,
+    BroadcastFeatureListView,
+    ChannelFeatureView,
+    BroadcastVideoListView,
+    BroadcastVideoUploadView,
+    BroadcastVideoStreamView,
+    BroadcastLessonListView,
+    LessonEnrollmentActionView,
+    LessonEnrollmentListView,
+    ProfileCreationView,
+    BroadcastFeedEntriesView,
+    BroadcastFeedEntryDetailView,
+    BroadcastFeedEntryBroadcastView,
+    BroadcastFeedEntryAttachmentDeleteView,
+    ProfileAttachmentUploadView,
+    ProfileManagementView,
+    BroadcastSubscribeView,
+    EducationCourseBroadcastView,
+    EducationProfileListView,
+    EducationProfileDetailView,
+    EducationProfileBroadcastView,
+    EducationProfilePermissionsView,
+    HealthInstitutionCardsView,
+    HealthMediumListView,
+    HealthMediumDetailView,
+    HealthServiceListView,
+    HealthServiceDetailView,
+)
+
+app_name = "broadcasts"
+
+urlpatterns = [
+    path("broadcasts/", BroadcastFeedView.as_view(), name="broadcast-feed"),
+    path("broadcasts/channel-messages/", BroadcastChannelMessageView.as_view(), name="broadcast-channel-messages"),
+    path("broadcasts/<uuid:pk>/react/", BroadcastReactView.as_view(), name="broadcast-react"),
+    path("broadcasts/<uuid:pk>/comment-room/", BroadcastCommentRoomView.as_view(), name="broadcast-comment-room"),
+    path("broadcasts/<uuid:pk>/share/", BroadcastShareView.as_view(), name="broadcast-share"),
+    path("broadcasts/features/", BroadcastFeatureListView.as_view(), name="broadcast-features"),
+    path(
+        "broadcasts/channels/<uuid:channel_id>/features/",
+        ChannelFeatureView.as_view(),
+        name="channel-features",
+    ),
+    path("broadcasts/videos/", BroadcastVideoListView.as_view(), name="broadcast-videos"),
+    path("broadcasts/videos/upload/", BroadcastVideoUploadView.as_view(), name="broadcast-video-upload"),
+    path("broadcasts/videos/<uuid:video_id>/stream/", BroadcastVideoStreamView.as_view(), name="video-stream"),
+    path("broadcasts/lessons/", BroadcastLessonListView.as_view(), name="broadcast-lessons"),
+    path(
+        "broadcasts/lessons/enrollments/",
+        LessonEnrollmentListView.as_view(),
+        name="lesson-enrollments",
+    ),
+    path(
+        "broadcasts/lessons/<uuid:lesson_id>/enroll/",
+        LessonEnrollmentActionView.as_view(),
+        name="lesson-enroll",
+    ),
+    path(
+        "broadcasts/profiles/create/",
+        ProfileCreationView.as_view(),
+        name="profile-create",
+    ),
+    path(
+        "broadcasts/profiles/feeds/",
+        BroadcastFeedEntriesView.as_view(),
+        name="profile-feed-entries",
+    ),
+    path(
+        "broadcasts/profiles/feeds/<uuid:entry_id>/",
+        BroadcastFeedEntryDetailView.as_view(),
+        name="profile-feed-entry",
+    ),
+    path(
+        "broadcasts/profiles/feeds/<uuid:entry_id>/broadcast/",
+        BroadcastFeedEntryBroadcastView.as_view(),
+        name="profile-feed-entry-broadcast",
+    ),
+    path(
+        "broadcasts/profiles/feeds/<uuid:entry_id>/attachments/",
+        BroadcastFeedEntryAttachmentDeleteView.as_view(),
+        name="profile-feed-entry-attachment",
+    ),
+    path(
+        "broadcasts/profiles/attachment/",
+        ProfileAttachmentUploadView.as_view(),
+        name="profile-attachment",
+    ),
+    path(
+        "broadcasts/profiles/manage/",
+        ProfileManagementView.as_view(),
+        name="profile-manage",
+    ),
+    path(
+        "broadcasts/subscribe/",
+        BroadcastSubscribeView.as_view(),
+        name="broadcast-subscribe",
+    ),
+    path(
+        "broadcasts/education/courses/broadcast/",
+        EducationCourseBroadcastView.as_view(),
+        name="education-course-broadcast",
+    ),
+    path(
+        "broadcasts/education/profiles/",
+        EducationProfileListView.as_view(),
+        name="education-profile-list",
+    ),
+    path(
+        "broadcasts/education/profiles/<uuid:profile_id>/",
+        EducationProfileDetailView.as_view(),
+        name="education-profile-detail",
+    ),
+    path(
+        "broadcasts/education/profiles/<uuid:profile_id>/broadcast/",
+        EducationProfileBroadcastView.as_view(),
+        name="education-profile-broadcast",
+    ),
+    path(
+        "broadcasts/education/profiles/permissions/",
+        EducationProfilePermissionsView.as_view(),
+        name="education-profile-permissions",
+    ),
+    path(
+        "broadcasts/health/cards/<str:institution_id>/",
+        HealthInstitutionCardsView.as_view(),
+        name="health-institution-cards",
+    ),
+    path(
+        "broadcasts/health/mediums/",
+        HealthMediumListView.as_view(),
+        name="health-medium-list",
+    ),
+    path(
+        "broadcasts/health/mediums/<uuid:medium_id>/",
+        HealthMediumDetailView.as_view(),
+        name="health-medium-detail",
+    ),
+    path(
+        "broadcasts/health/services/",
+        HealthServiceListView.as_view(),
+        name="health-service-list",
+    ),
+    path(
+        "broadcasts/health/services/<uuid:service_id>/",
+        HealthServiceDetailView.as_view(),
+        name="health-service-detail",
+    ),
+]
