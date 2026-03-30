@@ -8,7 +8,7 @@ from typing import Tuple, Optional
 
 from django.utils import timezone
 
-from apps.commerce.models import ServiceBooking
+from apps.commerce.models import ServiceBooking, ServiceBookingReceipt
 
 from django.conf import settings
 
@@ -400,7 +400,7 @@ def render_receipt_pdf(tx, path: str) -> None:
     c.save()
 
 
-def render_booking_receipt_pdf(booking: ServiceBooking, path: str) -> None:
+def render_booking_receipt_pdf(booking: ServiceBooking, receipt: Optional[ServiceBookingReceipt], path: str) -> None:
     """
     Styled PDF tailored for a commerce service booking.
     """
@@ -418,13 +418,15 @@ def render_booking_receipt_pdf(booking: ServiceBooking, path: str) -> None:
     _draw_wave_gold(c, page_w, page_h)
     _draw_bokeh(c, page_w, page_h, seed=hash(str(booking.id)) % 1000)
 
+    phase_label = _receipt_phase_label(receipt)
+
     c.saveState()
     c.setFillColor(gold)
     c.setFont("Times-Bold", 46)
     c.drawCentredString(page_w / 2, page_h * 0.87, "KIS")
     c.setFillColor(colors.Color(1, 1, 1, alpha=0.92))
     c.setFont("Helvetica-Oblique", 26)
-    c.drawCentredString(page_w / 2, page_h * 0.835, "Booking receipt")
+    c.drawCentredString(page_w / 2, page_h * 0.835, phase_label)
     c.restoreState()
 
     card_w = page_w * 0.78
@@ -468,11 +470,24 @@ def render_booking_receipt_pdf(booking: ServiceBooking, path: str) -> None:
     )
     status_label = str(booking.status or "pending").replace("_", " ").capitalize()
     payment = getattr(booking, "payment", None)
-    amount_cents = booking.price_cents or getattr(payment, "amount_cents", 0)
-    currency = (getattr(payment, "currency", "KISC") or "KISC").upper()
-    payment_ref = (
-        getattr(payment, "transaction_reference", "") or booking.payment_tx_ref or "—"
+    amount_cents = (
+        (receipt.amount_cents if receipt and receipt.amount_cents else 0)
+        or booking.price_cents
+        or getattr(payment, "amount_cents", 0)
+        or 0
     )
+    currency = (
+        (receipt.currency if receipt and receipt.currency else None)
+        or (getattr(payment, "currency", "KISC") or "KISC")
+    ).upper()
+    receipt_ref = getattr(receipt, "transaction_reference", "") if receipt else ""
+    payment_ref = (
+        (receipt_ref.strip() if receipt_ref and receipt_ref.strip() else None)
+        or getattr(payment, "transaction_reference", "")
+        or booking.payment_tx_ref
+        or "—"
+    )
+    phase_label = _receipt_phase_label(receipt)
 
     rows = [
         ("Booking reference", str(booking.id)),
@@ -854,7 +869,17 @@ def _render_receipt_html(tx) -> str:
     return html
 
 
-def _render_booking_receipt_html(booking) -> str:
+def _receipt_phase_label(receipt: Optional[ServiceBookingReceipt]) -> str:
+    if not receipt:
+        return "Booking receipt"
+    labels = {
+        ServiceBookingReceipt.PHASE_DEPOSIT: "Deposit receipt",
+        ServiceBookingReceipt.PHASE_REMAINING: "Final payment receipt",
+    }
+    return labels.get(receipt.phase, receipt.phase.replace("_", " ").title())
+
+
+def _render_booking_receipt_html(booking, receipt: Optional[ServiceBookingReceipt]) -> str:
     def _safe(value):
         return html_module.escape(str(value)) if value is not None else "—"
 
@@ -883,11 +908,24 @@ def _render_booking_receipt_html(booking) -> str:
     payer_name = _safe(_display_name(booking.user))
     instructions = _safe(booking.instructions or "—")
     payment = getattr(booking, "payment", None)
-    amount = booking.price_cents or getattr(payment, "amount_cents", 0) or 0
-    currency = (getattr(payment, "currency", "KISC") or "KISC").upper()
-    payment_ref = (
-        getattr(payment, "transaction_reference", "") or booking.payment_tx_ref or "—"
+    amount = (
+        (receipt.amount_cents if receipt and receipt.amount_cents else 0)
+        or booking.price_cents
+        or getattr(payment, "amount_cents", 0)
+        or 0
     )
+    currency = (
+        (receipt.currency if receipt and receipt.currency else None)
+        or (getattr(payment, "currency", "KISC") or "KISC")
+    ).upper()
+    receipt_ref = str(getattr(receipt, "transaction_reference", "") or "").strip() if receipt else ""
+    payment_ref = (
+        receipt_ref
+        or getattr(payment, "transaction_reference", "")
+        or booking.payment_tx_ref
+        or "—"
+    )
+    phase_label = _receipt_phase_label(receipt)
     rows = [
         ("Booking reference", _safe(booking.id)),
         ("Service", service_name),
@@ -944,6 +982,13 @@ def _render_booking_receipt_html(booking) -> str:
         font-size: 14px;
         color: #555;
       }}
+      .phase-label {{
+        margin-top: 4px;
+        font-size: 12px;
+        letter-spacing: 0.6px;
+        color: #d89f34;
+        text-transform: uppercase;
+      }}
       .grid {{
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -971,6 +1016,7 @@ def _render_booking_receipt_html(booking) -> str:
       <div class="card">
         <div class="header">
           <h1>KIS Booking receipt</h1>
+          <p class="phase-label">{phase_label}</p>
           <p>Generated on {created_str}</p>
         </div>
         <div class="grid">
@@ -1013,19 +1059,29 @@ def ensure_receipt_documents(tx) -> Tuple[str, str]:
     return _relative_path(html_name), _relative_path(pdf_name)
 
 
-def ensure_booking_receipt_documents(booking: ServiceBooking) -> Tuple[str, str]:
+def ensure_booking_receipt_documents(
+    booking: ServiceBooking,
+    receipt: Optional[ServiceBookingReceipt] = None,
+    force: bool = False,
+) -> Tuple[str, str]:
     storage_root = _booking_receipt_storage_root()
-    base_name = f"booking-{booking.id}"
+    suffix = f"-{receipt.phase}-{receipt.id}" if receipt else ""
+    base_name = f"booking-{booking.id}{suffix}"
     html_name = f"{base_name}.html"
     pdf_name = f"{base_name}.pdf"
     html_path = os.path.join(storage_root, html_name)
     pdf_path = os.path.join(storage_root, pdf_name)
 
+    if force:
+        for target in (html_path, pdf_path):
+            if os.path.exists(target):
+                os.remove(target)
+
     if not os.path.exists(html_path):
         with open(html_path, "w", encoding="utf-8") as handle:
-            handle.write(_render_booking_receipt_html(booking))
+            handle.write(_render_booking_receipt_html(booking, receipt))
     if not os.path.exists(pdf_path):
-        render_booking_receipt_pdf(booking, pdf_path)
+        render_booking_receipt_pdf(booking, receipt, pdf_path)
 
     return _booking_relative_path(html_name), _booking_relative_path(pdf_name)
 
@@ -1058,6 +1114,11 @@ def build_invoice_urls(request, sub) -> Tuple[str, str]:
     return _build_media_url(request, html_rel), _build_media_url(request, pdf_rel)
 
 
-def build_booking_receipt_urls(request, booking: ServiceBooking) -> Tuple[str, str]:
-    html_rel, pdf_rel = ensure_booking_receipt_documents(booking)
+def build_booking_receipt_urls(
+    request,
+    booking: ServiceBooking,
+    receipt: Optional[ServiceBookingReceipt] = None,
+    force: bool = False,
+) -> Tuple[str, str]:
+    html_rel, pdf_rel = ensure_booking_receipt_documents(booking, receipt, force=force)
     return _build_media_url(request, html_rel), _build_media_url(request, pdf_rel)

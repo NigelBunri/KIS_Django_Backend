@@ -296,6 +296,7 @@ class ServiceBooking(BaseEntity):
     instructions = models.TextField(blank=True, default='')
     payment_tx_ref = models.CharField(max_length=128, blank=True, default='')
     remote_meeting_link = models.CharField(max_length=512, blank=True, default='')
+    metadata = JSONField(default=dict, blank=True)
     reminder_sent_at = models.DateTimeField(null=True, blank=True)
     provider_completed_at = models.DateTimeField(null=True, blank=True)
     payer_satisfied_at = models.DateTimeField(null=True, blank=True)
@@ -334,6 +335,36 @@ class ServiceBooking(BaseEntity):
         if not self.provider_completed_at:
             return None
         return self.provider_completed_at + timedelta(days=3)
+
+
+class ServiceBookingReceipt(BaseEntity):
+    PHASE_DEPOSIT = 'deposit'
+    PHASE_REMAINING = 'remaining'
+    PHASE_CHOICES = [
+        (PHASE_DEPOSIT, 'Deposit payment'),
+        (PHASE_REMAINING, 'Remaining payment'),
+    ]
+
+    booking = models.ForeignKey(
+        ServiceBooking,
+        on_delete=models.CASCADE,
+        related_name='receipts',
+    )
+    amount_cents = models.BigIntegerField(default=0)
+    currency = models.CharField(max_length=12, default=KIS_COIN_CODE)
+    transaction_reference = models.CharField(max_length=128, blank=True, default='')
+    phase = models.CharField(max_length=32, choices=PHASE_CHOICES, default=PHASE_DEPOSIT)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['booking', 'phase']),
+            models.Index(fields=['transaction_reference']),
+        ]
+
+    def __str__(self):
+        return f"Receipt {self.phase} for booking {self.booking_id}"
 
 
 class ServiceBookingPayment(BaseEntity):
@@ -521,16 +552,6 @@ class ServiceBookingComplaint(BaseEntity):
 
     def __str__(self):
         return f"Complaint {self.id} · booking {self.booking_id}"
-    @property
-    def effective_image_url(self):
-        try:
-            if self.image_file:
-                return self.image_file.url
-        except ValueError:
-            pass
-        if self.image_url:
-            return self.image_url
-        return ''
 
 
 class ShopServiceImage(BaseEntity):
@@ -588,6 +609,23 @@ class Product(BaseEntity):
     variants = JSONField(default=list, blank=True)
     categories = JSONField(default=list, blank=True)
     attributes = JSONField(default=dict, blank=True)
+    brand = models.CharField(max_length=128, blank=True, default='')
+    condition = models.CharField(max_length=64, blank=True, default='')
+    sale_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    compare_at_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    material = models.CharField(max_length=128, blank=True, default='')
+    fit = models.CharField(max_length=64, blank=True, default='')
+    size_guide = models.TextField(blank=True, default='')
+    available_sizes = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    available_colors = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    weight = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    length = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    width = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    height = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    low_stock_threshold = models.PositiveIntegerField(null=True, blank=True)
+    requires_shipping = models.BooleanField(default=True)
+    pickup_available = models.BooleanField(default=False)
+    allow_backorder = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
     is_featured = models.BooleanField(default=False)
     rating_avg = models.FloatField(default=0.0)
@@ -617,7 +655,44 @@ class Product(BaseEntity):
                 return self.image_file.url
         except ValueError:
             pass
-        return self.image_url
+        if self.image_url:
+            return self.image_url
+        return ''
+
+
+class Cart(BaseEntity):
+    STATUS_CHOICES = [
+        ('active', 'Active'),
+        ('checked_out', 'Checked out'),
+        ('abandoned', 'Abandoned'),
+    ]
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='carts')
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='carts')
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='active')
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    class Meta:
+        indexes = [models.Index(fields=['user', 'shop', 'status'])]
+
+    def __str__(self):
+        return f"Cart {self.id} ({self.user}) of {self.shop.name}"
+
+
+class CartItem(BaseEntity):
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='cart_items')
+    variant = models.CharField(max_length=128, blank=True, default='')
+    variant_snapshot = JSONField(default=dict, blank=True)
+    quantity = models.PositiveIntegerField(default=1)
+    price_snapshot = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    stock_snapshot = models.IntegerField(default=0)
+
+    class Meta:
+        indexes = [models.Index(fields=['cart'])]
+
+    def __str__(self):
+        return f"{self.quantity}x {self.product.name} in cart {self.cart.id}"
 
 
 class ProductImage(BaseEntity):

@@ -165,3 +165,38 @@ def get_allowed_times(availability: dict, entry: dict) -> set[str]:
     if entry.get('all_day'):
         return set(generate_time_slots(availability.get('slot_duration_minutes', DEFAULT_SLOT_DURATION_MINUTES)))
     return set(entry.get('times', []))
+
+
+def derive_availability_rules_from_payload(availability: dict | None) -> list[dict]:
+    if not availability or not isinstance(availability, dict):
+        return []
+    derived: list[dict] = []
+    days = availability.get('days') or {}
+    for day_key, entry in days.items():
+        if not entry or not isinstance(entry, dict):
+            continue
+        if not entry.get('enabled'):
+            continue
+        times = [time for time in entry.get('times', []) if isinstance(time, str) and time]
+        if not times:
+            continue
+        derived.append({
+            'scope': 'week',
+            'targets': [str(day_key)],
+            'times': times,
+        })
+    specific = availability.get('specific_dates') or {}
+    for date_key, entry in specific.items():
+        if not entry or not isinstance(entry, dict):
+            continue
+        if not entry.get('enabled'):
+            continue
+        times = [time for time in entry.get('times', []) if isinstance(time, str) and time]
+        if not times:
+            continue
+        derived.append({
+            'scope': 'day',
+            'targets': [str(date_key)],
+            'times': times,
+        })
+    return derived

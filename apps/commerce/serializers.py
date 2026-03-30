@@ -8,7 +8,7 @@ from django.db import IntegrityError
 import json
 from django.http import QueryDict
 from rest_framework import serializers
-from .availability import normalize_availability_payload
+from .availability import normalize_availability_payload, derive_availability_rules_from_payload
 from .constants import KIS_COIN_CODE
 from .models import (
     Shop,
@@ -39,10 +39,29 @@ from .models import (
     ShopServiceImage,
     ServiceRating,
     ServiceBookingPayment,
+    Cart,
+    CartItem,
 )
 
 AVAILABILITY_RULE_SCOPES = {'year', 'month', 'week', 'day'}
 TIME_PATTERN = re.compile(r'^([01]?\d|2[0-3]):([0-5]\d)$')
+
+
+def normalize_availability_rules_value(value):
+    normalized = []
+    if not isinstance(value, list):
+        return normalized
+    for rule in value:
+        if not rule or not isinstance(rule, dict):
+            continue
+        scope_candidate = str(rule.get("scope", "day")).lower()
+        scope = scope_candidate if scope_candidate in AVAILABILITY_RULE_SCOPES else "day"
+        targets = _normalize_string_list(rule.get("targets"))
+        times = _normalize_time_list(rule.get("times"))
+        if not times:
+            continue
+        normalized.append({"scope": scope, "targets": targets, "times": times})
+    return normalized
 
 def _parse_list_field(value):
     if value is None:
@@ -421,6 +440,31 @@ class ProductSerializer(serializers.ModelSerializer):
     sku = serializers.CharField(required=False, allow_blank=True)
     is_broadcasted = serializers.SerializerMethodField()
     broadcast_item_id = serializers.SerializerMethodField()
+    brand = serializers.CharField(required=False, allow_blank=True)
+    condition = serializers.CharField(required=False, allow_blank=True)
+    sale_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    compare_at_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    material = serializers.CharField(required=False, allow_blank=True)
+    fit = serializers.CharField(required=False, allow_blank=True)
+    size_guide = serializers.CharField(required=False, allow_blank=True)
+    available_sizes = serializers.ListField(
+        child=serializers.CharField(max_length=64),
+        required=False,
+        allow_empty=True,
+    )
+    available_colors = serializers.ListField(
+        child=serializers.CharField(max_length=64),
+        required=False,
+        allow_empty=True,
+    )
+    weight = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    length = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    width = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    height = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    low_stock_threshold = serializers.IntegerField(required=False, min_value=0, allow_null=True)
+    requires_shipping = serializers.BooleanField(required=False)
+    pickup_available = serializers.BooleanField(required=False)
+    allow_backorder = serializers.BooleanField(required=False)
 
     class Meta:
         model = Product
@@ -435,11 +479,34 @@ class ProductSerializer(serializers.ModelSerializer):
        )
 
     def get_image_url(self, obj):
-        url = obj.effective_image_url
         request = self.context.get('request')
-        if request is not None and url:
-            return request.build_absolute_uri(url)
-        return url
+        url_candidate = ''
+
+        image_file = getattr(obj, 'image_file', None)
+        if image_file:
+            try:
+                url_candidate = image_file.url or ''
+            except (ValueError, AttributeError):
+                url_candidate = ''
+
+        if not url_candidate:
+            url_candidate = getattr(obj, 'image_url', '') or ''
+
+        if not url_candidate and hasattr(obj, 'images'):
+            try:
+                first_image = obj.images.order_by('order').first()
+            except AttributeError:
+                first_image = getattr(obj.images, 'first', lambda: None)()
+            if first_image:
+                try:
+                    url_candidate = first_image.image_file.url or ''
+                except (ValueError, AttributeError):
+                    url_candidate = first_image.image_url or ''
+
+        if url_candidate and request:
+            return request.build_absolute_uri(url_candidate)
+
+        return url_candidate
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -453,6 +520,7 @@ class ProductSerializer(serializers.ModelSerializer):
             if category.shop_id != shop.id:
                 raise serializers.ValidationError({"category_id": "Category must belong to the same shop."})
             attrs["_category_obj"] = category
+        attrs = self._hydrate_extended_attributes(attrs)
         attrs["currency"] = KIS_COIN_CODE
         attrs["attributes"] = self._sanitize_attributes(attrs.get("attributes"))
         return attrs
@@ -465,6 +533,32 @@ class ProductSerializer(serializers.ModelSerializer):
             "serviceType": "service_type",
             "otherShopsDiscount": "other_shops_discount",
             "availabilityRules": "availability_rules",
+            "brand": "brand",
+            "condition": "condition",
+            "material": "material",
+            "fit": "fit",
+            "sizeGuide": "size_guide",
+            "size_guide": "size_guide",
+            "salePrice": "sale_price",
+            "sale_price": "sale_price",
+            "compareAtPrice": "compare_at_price",
+            "compare_at_price": "compare_at_price",
+            "availableSizes": "available_sizes",
+            "available_sizes": "available_sizes",
+            "availableColors": "available_colors",
+            "available_colors": "available_colors",
+            "weight": "weight",
+            "length": "length",
+            "width": "width",
+            "height": "height",
+            "lowStockThreshold": "low_stock_threshold",
+            "low_stock_threshold": "low_stock_threshold",
+            "requiresShipping": "requires_shipping",
+            "requires_shipping": "requires_shipping",
+            "pickupAvailable": "pickup_available",
+            "pickup_available": "pickup_available",
+            "allowBackorder": "allow_backorder",
+            "allow_backorder": "allow_backorder",
         }
         sanitized = {}
         for key, val in value.items():
@@ -481,6 +575,45 @@ class ProductSerializer(serializers.ModelSerializer):
                 continue
             sanitized[target_key] = candidate
         return sanitized
+
+    def _hydrate_extended_attributes(self, attrs):
+        attributes = _parse_json_field(attrs.pop("attributes", None), default=dict)
+        def patch_value(field, caster=lambda v: v):
+            attr_value = attributes.get(field)
+            current = attrs.get(field)
+            if current in (None, '', []):
+                if attr_value not in (None, '', []):
+                    attrs[field] = caster(attr_value)
+            else:
+                attributes[field] = attrs[field]
+        patch_value("brand", str)
+        patch_value("condition", str)
+        patch_value("material", str)
+        patch_value("fit", str)
+        patch_value("size_guide", str)
+        patch_value("sale_price", lambda v: v)
+        patch_value("compare_at_price", lambda v: v)
+        patch_value("weight", lambda v: v)
+        patch_value("length", lambda v: v)
+        patch_value("width", lambda v: v)
+        patch_value("height", lambda v: v)
+        patch_value("low_stock_threshold", lambda v: v)
+        patch_value("requires_shipping", lambda v: v)
+        patch_value("pickup_available", lambda v: v)
+        patch_value("allow_backorder", lambda v: v)
+        for list_field in ("available_sizes", "available_colors"):
+            list_value = attrs.get(list_field)
+            if list_value in (None, '', []):
+                attr_value = attributes.get(list_field)
+                if attr_value not in (None, '', []):
+                    if isinstance(attr_value, list):
+                        attrs[list_field] = attr_value
+                    else:
+                        attrs[list_field] = _parse_list_field(attr_value)
+            else:
+                attributes[list_field] = list_value
+        attrs["attributes"] = attributes
+        return attrs
 
     def _normalize_string_list(self, value):
         items = []
@@ -503,20 +636,7 @@ class ProductSerializer(serializers.ModelSerializer):
         return normalized
 
     def _normalize_availability_rules(self, value):
-        if not isinstance(value, list):
-            return []
-        normalized = []
-        for rule in value:
-            if not rule or not isinstance(rule, dict):
-                continue
-            scope_candidate = str(rule.get("scope", "day")).lower()
-            scope = scope_candidate if scope_candidate in AVAILABILITY_RULE_SCOPES else "day"
-            targets = self._normalize_string_list(rule.get("targets"))
-            times = self._normalize_time_list(rule.get("times"))
-            if not times:
-                continue
-            normalized.append({"scope": scope, "targets": targets, "times": times})
-        return normalized
+        return normalize_availability_rules_value(value)
 
     def _get_market_broadcast_item(self, obj: Product):
         existing = getattr(obj, '_market_broadcast_item', None)
@@ -699,17 +819,20 @@ class ShopServiceSerializer(serializers.ModelSerializer):
         for camel, snake in mapper.items():
             if camel in mutable_data and snake not in mutable_data:
                 mutable_data[snake] = mutable_data.pop(camel)
-        availability_raw = mutable_data.get('availability_rules')
-        if isinstance(availability_raw, str):
-            try:
-                mutable_data['availability_rules'] = json.loads(availability_raw or '[]')
-            except json.JSONDecodeError:
-                mutable_data['availability_rules'] = []
+        print("ShopServiceSerializer payload:", mutable_data)
         mutable_data['packages'] = _parse_json_field(mutable_data.get('packages'), default=list)
         mutable_data['addons'] = _parse_json_field(mutable_data.get('addons'), default=list)
         mutable_data['requirements'] = _parse_json_field(mutable_data.get('requirements'), default=list)
         availability_raw = _parse_json_field(mutable_data.get('availability'), default=dict)
-        mutable_data['availability'] = normalize_availability_payload(availability_raw)
+        normalized_availability = normalize_availability_payload(availability_raw)
+        mutable_data['availability'] = normalized_availability
+        rules_raw = _parse_json_field(mutable_data.get('availability_rules'), default=list)
+        normalized_rules = normalize_availability_rules_value(rules_raw)
+        if not normalized_rules:
+            normalized_rules = normalize_availability_rules_value(
+                derive_availability_rules_from_payload(normalized_availability)
+            )
+        mutable_data['availability_rules'] = normalized_rules
         mutable_data['delivery_modes'] = _parse_list_field(mutable_data.get('delivery_modes'))
         mutable_data['coverage'] = _parse_list_field(mutable_data.get('coverage'))
         mutable_data['remote_regions'] = _parse_list_field(mutable_data.get('remote_regions'))
@@ -901,6 +1024,7 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
     latest_complaint = serializers.SerializerMethodField()
     remote_meeting_link = serializers.CharField(read_only=True)
     payment = serializers.SerializerMethodField()
+    metadata = serializers.JSONField(read_only=True)
 
     class Meta:
         model = ServiceBooking
@@ -921,6 +1045,7 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'deposit_cents',
             'balance_cents',
             'instructions',
+            'metadata',
             'payment_tx_ref',
             'remote_meeting_link',
             'remote_available',
@@ -1122,6 +1247,23 @@ class ServiceBookingCreateSerializer(serializers.Serializer):
     service_id = serializers.UUIDField()
     scheduled_at = serializers.DateTimeField()
     instructions = serializers.CharField(required=False, allow_blank=True)
+    requirements_acknowledged = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
+    terms_accepted = serializers.BooleanField(required=False, default=False)
+    selected_package = serializers.CharField(required=False, allow_blank=True)
+    selected_addons = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    requested_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, min_value=0)
+    location = serializers.DictField(required=False)
+    distance_km = serializers.DecimalField(max_digits=8, decimal_places=2, required=False)
+    is_remote = serializers.BooleanField(required=False, default=False)
+    remote_region = serializers.CharField(required=False, allow_blank=True)
+    participant_count = serializers.IntegerField(required=False, min_value=1)
+    staff_on_site = serializers.IntegerField(required=False, min_value=0)
+
+
+class ServiceBookingRescheduleSerializer(serializers.Serializer):
+    scheduled_at = serializers.DateTimeField()
 
 
 class ServiceBookingComplaintSerializer(serializers.ModelSerializer):
@@ -1240,3 +1382,76 @@ class FraudSignalSerializer(serializers.ModelSerializer):
     class Meta:
         model = FraudSignal
         fields = '__all__'
+
+
+class CartItemSerializer(serializers.ModelSerializer):
+    quantity = serializers.IntegerField(min_value=1)
+    product_name = serializers.SerializerMethodField()
+    product_image = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CartItem
+        fields = (
+            'id',
+            'cart',
+            'product',
+            'variant',
+            'variant_snapshot',
+            'quantity',
+            'product_name',
+            'product_image',
+            'price_snapshot',
+            'stock_snapshot',
+            'created_at',
+            'updated_at',
+        )
+        read_only_fields = ('id', 'created_at', 'updated_at')
+
+    def _build_image_url(self, product):
+        if not product:
+            return ''
+        try:
+            url = product.effective_image_url or ''
+        except AttributeError:
+            url = getattr(product, 'image_url', '') or ''
+        request = self.context.get('request')
+        if url and request:
+            return request.build_absolute_uri(url)
+        return url
+
+    def get_product_name(self, obj):
+        return obj.product.name if obj.product else None
+
+    def get_product_image(self, obj):
+        return self._build_image_url(obj.product)
+
+
+class CartSerializer(serializers.ModelSerializer):
+    items = CartItemSerializer(many=True, read_only=True)
+    shop_info = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Cart
+        fields = (
+            'id',
+            'user',
+            'shop',
+            'shop_info',
+            'status',
+            'subtotal',
+            'items',
+            'created_at',
+            'updated_at',
+        )
+        read_only_fields = ('id', 'user', 'created_at', 'updated_at')
+
+    def get_shop_info(self, obj):
+        shop = getattr(obj, 'shop', None)
+        if not shop:
+            return None
+        return {
+            'id': str(shop.id),
+            'name': shop.name,
+            'slug': shop.slug,
+            'image_url': shop.image_url,
+        }

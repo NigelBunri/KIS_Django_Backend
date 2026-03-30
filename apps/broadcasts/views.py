@@ -148,6 +148,50 @@ def _to_cents(cents_value: object | None) -> int:
     return max(0, cents)
 
 
+SERVICE_BROADCAST_FEATURED_RANKING = getattr(settings, "SERVICE_BROADCAST_FEATURED_RANKING", False)
+SERVICE_BROADCAST_TAG_FILTERS = getattr(settings, "SERVICE_BROADCAST_TAG_FILTERS", False)
+
+
+def _normalize_tag_filters(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [token.strip().lower() for token in raw.split(",") if token.strip()]
+
+
+def _service_matches_tag_filters(payload: dict[str, Any], filters: list[str]) -> bool:
+    if not filters:
+        return True
+    tags = [
+        str(tag).strip().lower()
+        for tag in (payload.get("service", {}).get("tags", []) or [])
+        if str(tag).strip()
+    ]
+    if not tags:
+        return False
+    return bool(set(tags) & set(filters))
+
+
+def _market_sort_key_featured(entry: dict[str, Any]) -> tuple[int, float]:
+    featured = bool(entry.get("service", {}).get("is_featured"))
+    return (0 if featured else 1, -entry.get("_broadcast_ts", 0))
+
+
+def _market_sort_key_simple(entry: dict[str, Any]) -> float:
+    return -entry.get("_broadcast_ts", 0)
+
+
+def _broadcast_timestamp(value: datetime | None) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = _parse_dt(value)
+    if dt == datetime.min:
+        return 0.0
+    return dt.timestamp()
+
+
 def _fetch_channel_messages(
     conversation_ids: list[str],
     since: datetime,
@@ -2987,22 +3031,16 @@ class BroadcastFeedView(APIView):
                 resolved_sources.extend(value)
             elif value:
                 resolved_sources.append(value)
-        print("Source filter tokens:", raw_tokens)
-        print("Resolved source filters:", resolved_sources)
-
         broadcast_items_qs = (
             BroadcastItem.objects
             .select_related("broadcasted_by", "broadcasted_by__profile")
             .filter(is_deleted=False, expires_at__gt=now)
         )
-        print("Initial broadcast items:", broadcast_items_qs)
-
         if resolved_sources:
             broadcast_items_qs = broadcast_items_qs.filter(source_type__in=resolved_sources)
         else:
             broadcast_items_qs = broadcast_items_qs.exclude(source_type=BroadcastSourceType.MARKET_PRODUCT)
 
-        print("Filtered broadcast items:", broadcast_items_qs)
 
         broadcast_items = broadcast_items_qs.order_by("-broadcasted_at")[:limit * 3]
 
@@ -3532,6 +3570,7 @@ class BroadcastFeedView(APIView):
                     "currency": KIS_COIN_CODE,
                     "delivery_modes": service.delivery_modes,
                     "duration_minutes": service.duration_minutes,
+                    "compare_at_price": str(service.compare_at_price) if service.compare_at_price is not None else None,
                     "coverage": service.coverage,
                     "availability_rules": service.availability_rules,
                     "status": service.status,

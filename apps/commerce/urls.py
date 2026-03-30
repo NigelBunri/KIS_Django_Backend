@@ -23,6 +23,8 @@ router.register(r'shares', views.ProductShareViewSet)
 router.register(r'recommendations', views.AIRecommendationViewSet)
 router.register(r'audit-logs', views.AuditLogViewSet)
 router.register(r'fraud-signals', views.FraudSignalViewSet)
+router.register(r'carts', views.CartViewSet)
+router.register(r'cart-items', views.CartItemViewSet)
 
 urlpatterns = [
     *router.urls,
