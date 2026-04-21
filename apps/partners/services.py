@@ -4,7 +4,7 @@ from datetime import timedelta
 
 from django.utils import timezone
 
-from django.db import transaction
+from django.db import DatabaseError, models, transaction
 from django.db.models import Count
 from django.db.models.functions import TruncDate
 
@@ -34,8 +34,8 @@ from apps.partners.models import (
     PartnerOrganizationApp,
     PartnerOrganizationAppType,
     PartnerOrganizationAppAccessLog,
+    PartnerChannelPermissionOverwrite,
 )
-from apps.chat.models import ConversationSettings
 import json
 import hmac
 import hashlib
@@ -66,9 +66,9 @@ def create_partner_with_main_conversation(
 
     if create_main_conversation:
         main_conversation = Conversation.objects.create(
-            type=ConversationType.GROUP,  # or SYSTEM
+            type=ConversationType.POST,
             title=name,
-            description=f"Main conversation for partner {name}",
+            description=f"Post space for partner {name}",
             created_by=owner,
         )
 
@@ -109,28 +109,40 @@ def apply_partner_policy(partner: Partner) -> None:
         from apps.communities.models import Community
         from apps.groups.models import Group
         from apps.channels.models import Channel
+    except ImportError:
+        Community = Group = Channel = None
 
-        community_ids = Community.objects.filter(partner=partner).values_list(
-            "main_conversation_id",
-            "posts_conversation_id",
-        )
-        for main_id, posts_id in community_ids:
-            if main_id:
-                conversation_ids.add(str(main_id))
-            if posts_id:
-                conversation_ids.add(str(posts_id))
+    if Community is not None:
+        try:
+            community_ids = Community.objects.filter(partner=partner).order_by().values_list(
+                "main_conversation_id",
+                "posts_conversation_id",
+            )
+            for main_id, posts_id in community_ids:
+                if main_id:
+                    conversation_ids.add(str(main_id))
+                if posts_id:
+                    conversation_ids.add(str(posts_id))
+        except DatabaseError:
+            pass
 
-        group_ids = Group.objects.filter(partner=partner).values_list("conversation_id", flat=True)
-        for gid in group_ids:
-            if gid:
-                conversation_ids.add(str(gid))
+    if Group is not None:
+        try:
+            group_ids = Group.objects.filter(partner=partner).order_by().values_list("conversation_id", flat=True)
+            for gid in group_ids:
+                if gid:
+                    conversation_ids.add(str(gid))
+        except DatabaseError:
+            pass
 
-        channel_ids = Channel.objects.filter(partner=partner).values_list("conversation_id", flat=True)
-        for cid in channel_ids:
-            if cid:
-                conversation_ids.add(str(cid))
-    except Exception:
-        conversation_ids = conversation_ids
+    if Channel is not None:
+        try:
+            channel_ids = Channel.objects.filter(partner=partner).order_by().values_list("conversation_id", flat=True)
+            for cid in channel_ids:
+                if cid:
+                    conversation_ids.add(str(cid))
+        except DatabaseError:
+            pass
 
     for conv_id in conversation_ids:
         ConversationSettings.objects.update_or_create(
@@ -255,6 +267,42 @@ def _get_member_conversation_role(partner: Partner, user: Optional[User]) -> str
     return member.base_role if member else None
 
 
+def _get_active_partner_membership(partner: Partner, user: Optional[User]) -> Optional[PartnerMembership]:
+    if not user or user.is_anonymous:
+        return None
+    return PartnerMembership.objects.filter(
+        partner=partner,
+        user=user,
+        status__in=(PartnerMembershipStatus.MEMBER, PartnerMembershipStatus.SUBSCRIBER),
+        is_banned=False,
+    ).first()
+
+
+def partner_user_can_access(partner: Partner, user: Optional[User]) -> bool:
+    if not user or user.is_anonymous:
+        return False
+    if partner.owner_id == user.id:
+        return True
+    if _get_active_partner_membership(partner, user):
+        return True
+    # Legacy fallback while older partner records are migrated to PartnerMembership.
+    return _get_member_conversation_role(partner, user) is not None
+
+
+def partner_user_can_manage(partner: Partner, user: Optional[User]) -> bool:
+    if not user or user.is_anonymous:
+        return False
+    if partner.owner_id == user.id:
+        return True
+    base_role = _get_member_conversation_role(partner, user)
+    if base_role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
+        return True
+    membership = _get_active_partner_membership(partner, user)
+    if membership and membership.role in ("owner", "admin", "manager"):
+        return True
+    return False
+
+
 def get_partner_user_roles(partner: Partner, user: Optional[User]) -> Set[str]:
     roles: Set[str] = set()
     if not user or user.is_anonymous:
@@ -266,26 +314,178 @@ def get_partner_user_roles(partner: Partner, user: Optional[User]) -> Set[str]:
         roles.add("admin")
     elif base_role == BaseConversationRole.OWNER:
         roles.add("owner")
-    else:
-        roles.add("member")
-    membership = PartnerMembership.objects.filter(partner=partner, user=user).first()
+    membership = _get_active_partner_membership(partner, user)
     if membership and membership.role:
         roles.add(membership.role)
+    if not roles:
+        roles.add("member")
+    elif "owner" not in roles and "admin" not in roles and "manager" not in roles:
+        roles.add("member")
     return roles
 
 
-def user_can_manage_organization_apps(partner: Partner, user: Optional[User]) -> bool:
+PARTNER_CHANNEL_PERMISSION_VIEW = PartnerChannelPermissionOverwrite.PermissionCode.VIEW_CHANNEL
+PARTNER_CHANNEL_PERMISSION_SEND = PartnerChannelPermissionOverwrite.PermissionCode.SEND_MESSAGES
+PARTNER_CHANNEL_PERMISSION_MANAGE = PartnerChannelPermissionOverwrite.PermissionCode.MANAGE_CHANNEL
+PARTNER_CHANNEL_PERMISSION_CODES = {
+    PARTNER_CHANNEL_PERMISSION_VIEW,
+    PARTNER_CHANNEL_PERMISSION_SEND,
+    PARTNER_CHANNEL_PERMISSION_MANAGE,
+}
+
+
+def _normalized_role_names(partner: Partner, user: Optional[User], channel=None) -> Set[str]:
+    role_names = {role_name.strip().lower() for role_name in get_partner_user_roles(partner, user) if role_name}
     if not user or user.is_anonymous:
-        return False
+        return role_names
+    assignments = PartnerRoleAssignment.objects.select_related("role").filter(
+        partner=partner,
+        user=user,
+    )
+    if channel is not None:
+        assignments = assignments.filter(
+            models.Q(scope_type=PartnerRoleAssignment.SCOPE_GLOBAL)
+            | models.Q(
+                scope_type=PartnerRoleAssignment.SCOPE_CHANNEL,
+                scope_id=str(channel.id),
+            )
+        )
+    for assignment in assignments:
+        if assignment.role_id:
+            role_names.add(assignment.role.name.strip().lower())
+    return role_names
+
+
+def get_partner_user_channel_base_permissions(partner: Partner, user: Optional[User], channel=None) -> set[str]:
+    permissions: set[str] = set()
+    if not user or user.is_anonymous:
+        return permissions
     if partner.owner_id == user.id:
+        return set(PARTNER_CHANNEL_PERMISSION_CODES)
+    if not partner_user_can_access(partner, user):
+        return permissions
+
+    permissions.add(PARTNER_CHANNEL_PERMISSION_VIEW)
+
+    membership = _get_active_partner_membership(partner, user)
+    if membership and membership.status == PartnerMembershipStatus.MEMBER:
+        muted_until = membership.muted_until
+        timed_out_until = membership.timed_out_until
+        is_temporarily_blocked = bool(
+            (muted_until and muted_until > timezone.now())
+            or (timed_out_until and timed_out_until > timezone.now())
+            or membership.is_muted
+        )
+        if not is_temporarily_blocked:
+            permissions.add(PARTNER_CHANNEL_PERMISSION_SEND)
+
+    if partner_user_can_manage(partner, user):
+        permissions.update(PARTNER_CHANNEL_PERMISSION_CODES)
+
+    assignments = PartnerRoleAssignment.objects.select_related("role").filter(
+        partner=partner,
+        user=user,
+    )
+    if channel is not None:
+        assignments = assignments.filter(
+            models.Q(scope_type=PartnerRoleAssignment.SCOPE_GLOBAL)
+            | models.Q(
+                scope_type=PartnerRoleAssignment.SCOPE_CHANNEL,
+                scope_id=str(channel.id),
+            )
+        )
+    for assignment in assignments:
+        for permission_codename in _role_permission_set(assignment.role):
+            if permission_codename in PARTNER_CHANNEL_PERMISSION_CODES:
+                permissions.add(permission_codename)
+
+    if channel is not None and channel.category_id and getattr(channel.category, "is_private", False):
+        permissions.discard(PARTNER_CHANNEL_PERMISSION_VIEW)
+        permissions.discard(PARTNER_CHANNEL_PERMISSION_SEND)
+        permissions.discard(PARTNER_CHANNEL_PERMISSION_MANAGE)
+
+    return permissions
+
+
+def resolve_partner_channel_permissions(channel, user: Optional[User]) -> set[str]:
+    partner = getattr(channel, "partner", None)
+    if partner is None:
+        return set()
+    if not user or user.is_anonymous:
+        return set()
+    if partner.owner_id == user.id:
+        return set(PARTNER_CHANNEL_PERMISSION_CODES)
+
+    permissions = get_partner_user_channel_base_permissions(partner, user, channel=channel)
+    role_names = _normalized_role_names(partner, user, channel=channel)
+
+    overwrites = channel.permission_overwrites.select_related("role", "user").all()
+    role_allows: set[str] = set()
+    role_denies: set[str] = set()
+    member_allows: set[str] = set()
+    member_denies: set[str] = set()
+
+    for overwrite in overwrites:
+        allow_permissions = {
+            code for code in (overwrite.allow_permissions or []) if code in PARTNER_CHANNEL_PERMISSION_CODES
+        }
+        deny_permissions = {
+            code for code in (overwrite.deny_permissions or []) if code in PARTNER_CHANNEL_PERMISSION_CODES
+        }
+        if overwrite.subject_type == PartnerChannelPermissionOverwrite.SubjectType.ROLE:
+            role = getattr(overwrite, "role", None)
+            if role and role.name.strip().lower() in role_names:
+                role_allows.update(allow_permissions)
+                role_denies.update(deny_permissions)
+        elif overwrite.subject_type == PartnerChannelPermissionOverwrite.SubjectType.MEMBER:
+            if overwrite.user_id == user.id:
+                member_allows.update(allow_permissions)
+                member_denies.update(deny_permissions)
+
+    permissions.update(role_allows)
+    permissions.difference_update(role_denies)
+    permissions.update(member_allows)
+    permissions.difference_update(member_denies)
+
+    if PARTNER_CHANNEL_PERMISSION_VIEW not in permissions:
+        permissions.discard(PARTNER_CHANNEL_PERMISSION_SEND)
+        permissions.discard(PARTNER_CHANNEL_PERMISSION_MANAGE)
+    if PARTNER_CHANNEL_PERMISSION_MANAGE in permissions:
+        permissions.update({PARTNER_CHANNEL_PERMISSION_VIEW, PARTNER_CHANNEL_PERMISSION_SEND})
+
+    return permissions
+
+
+def partner_user_can_view_channel(channel, user: Optional[User]) -> bool:
+    if not getattr(channel, "partner_id", None):
         return True
-    base_role = _get_member_conversation_role(partner, user)
-    if base_role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
+    return PARTNER_CHANNEL_PERMISSION_VIEW in resolve_partner_channel_permissions(channel, user)
+
+
+def partner_user_can_send_channel(channel, user: Optional[User]) -> bool:
+    if not getattr(channel, "partner_id", None):
         return True
-    membership = PartnerMembership.objects.filter(partner=partner, user=user).first()
-    if membership and membership.role in ("owner", "admin", "manager"):
+    return PARTNER_CHANNEL_PERMISSION_SEND in resolve_partner_channel_permissions(channel, user)
+
+
+def partner_user_can_manage_channel(channel, user: Optional[User]) -> bool:
+    if not getattr(channel, "partner_id", None):
+        return getattr(channel, "owner_id", None) == getattr(user, "id", None)
+    if getattr(channel, "owner_id", None) == getattr(user, "id", None):
         return True
-    return False
+    return PARTNER_CHANNEL_PERMISSION_MANAGE in resolve_partner_channel_permissions(channel, user)
+
+
+def filter_partner_channels_for_user(channels, user: Optional[User]) -> list:
+    visible_channels = []
+    for channel in channels:
+        if not getattr(channel, "partner_id", None) or partner_user_can_view_channel(channel, user):
+            visible_channels.append(channel)
+    return visible_channels
+
+
+def user_can_manage_organization_apps(partner: Partner, user: Optional[User]) -> bool:
+    return partner_user_can_manage(partner, user)
 
 
 def get_partner_organization_apps_for_user(partner: Partner, user: Optional[User]) -> list[PartnerOrganizationApp]:
@@ -511,7 +711,7 @@ def dispatch_partner_webhooks(
             delivery.status = PartnerWebhookDeliveryStatus.FAILED
             delivery.error_message = hook.last_error
         if delivery.status == PartnerWebhookDeliveryStatus.FAILED and delivery.attempt_count <= hook.retry_limit:
-            delivery.next_retry_at = timezone.now() + datetime.timedelta(
+            delivery.next_retry_at = timezone.now() + timedelta(
                 seconds=hook.retry_backoff_seconds,
             )
         hook.save(update_fields=["last_sent_at", "last_error", "updated_at"])
@@ -579,7 +779,7 @@ def retry_partner_webhook_delivery(delivery: PartnerWebhookDelivery) -> bool:
         hook.last_error = delivery.error_message
 
     if delivery.status == PartnerWebhookDeliveryStatus.FAILED and delivery.attempt_count <= hook.retry_limit:
-        delivery.next_retry_at = timezone.now() + datetime.timedelta(
+        delivery.next_retry_at = timezone.now() + timedelta(
             seconds=hook.retry_backoff_seconds,
         )
     else:
@@ -750,7 +950,7 @@ def build_partner_summary(partner: Partner) -> dict:
 
     def _build_series(days: int):
         today = timezone.now().date()
-        start_date = today - datetime.timedelta(days=days - 1)
+        start_date = today - timedelta(days=days - 1)
         posts = _series_counts(
             PartnerPost.objects.filter(partner=partner, is_deleted=False),
             "created_at",
@@ -783,7 +983,7 @@ def build_partner_summary(partner: Partner) -> dict:
         )
         series = []
         for idx in range(days):
-            day = start_date + datetime.timedelta(days=idx)
+            day = start_date + timedelta(days=idx)
             series.append(
                 {
                     "date": day.isoformat(),
@@ -865,10 +1065,10 @@ def build_partner_summary(partner: Partner) -> dict:
 def next_export_run_at(frequency: str) -> timezone.datetime:
     now = timezone.now()
     if frequency == PartnerExportScheduleFrequency.DAILY:
-        return now + datetime.timedelta(days=1)
+        return now + timedelta(days=1)
     if frequency == PartnerExportScheduleFrequency.MONTHLY:
-        return now + datetime.timedelta(days=30)
-    return now + datetime.timedelta(days=7)
+        return now + timedelta(days=30)
+    return now + timedelta(days=7)
 
 
 def _role_permission_set(role: PartnerRole) -> set[str]:

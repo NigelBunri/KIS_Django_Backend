@@ -1,7 +1,8 @@
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from rest_framework import serializers
+from apps.core.money import KISC_MICRO_PER_KISC, frontend_kisc_major_to_micro
 
 from .models import (
     AdmissionBedSession,
@@ -50,9 +51,6 @@ from .services import (
     resolve_engine_access_window_days,
 )
 
-KISC_MICRO_PER_KISC = 100000
-
-
 def _micro_to_kisc_text(micro_value) -> str:
     try:
         micro = int(micro_value or 0)
@@ -67,13 +65,12 @@ def _micro_to_kisc_text(micro_value) -> str:
 def _kisc_to_micro_or_none(value) -> int | None:
     if value in (None, ""):
         return None
-    try:
-        parsed = Decimal(str(value).strip())
-    except (InvalidOperation, TypeError, ValueError):
+    result = frontend_kisc_major_to_micro(value, allow_none=True)
+    if result is None:
         raise serializers.ValidationError("Invalid KISC amount.")
-    if parsed < 0:
+    if result < 0:
         raise serializers.ValidationError("KISC amount cannot be negative.")
-    return int((parsed * Decimal(KISC_MICRO_PER_KISC)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return int(result)
 
 
 class EngineRegistrySerializer(serializers.ModelSerializer):

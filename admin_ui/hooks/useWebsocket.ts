@@ -17,7 +17,7 @@ export function useWebsocket(onMessage: (payload: any) => void) {
       return;
     }
 
-    const url = (process.env.NEXT_PUBLIC_ADMIN_WS_BASE || "ws://localhost:8000/control/admin/ws") + "/live";
+    const url = (process.env.NEXT_PUBLIC_ADMIN_WS_BASE || "ws://10.14.20.99:8000/control/admin/ws") + "/live";
     const socket = new WebSocket(url);
     socketRef.current = socket;
 

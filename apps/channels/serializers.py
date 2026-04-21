@@ -2,6 +2,7 @@
 from rest_framework import serializers
 
 from apps.channels.models import Channel
+from apps.partners.services import partner_user_can_send_channel
 from apps.chat.models import (
     BaseConversationRole,
     ConversationMember,
@@ -21,7 +22,9 @@ def _member_for(channel: Channel, user):
     ).first()
 
 
-def _can_send(channel: Channel, member: ConversationMember | None) -> bool:
+def _can_send(channel: Channel, member: ConversationMember | None, user=None) -> bool:
+    if channel.partner_id:
+        return partner_user_can_send_channel(channel, user)
     if not member or member.base_role == BaseConversationRole.READONLY:
         return False
     settings = ConversationSettings.objects.filter(conversation=channel.conversation).first()
@@ -35,6 +38,8 @@ class ChannelListSerializer(serializers.ModelSerializer):
     is_subscribed = serializers.SerializerMethodField()
     member_role = serializers.SerializerMethodField()
     can_post = serializers.SerializerMethodField()
+    category_id = serializers.UUIDField(source="category.id", read_only=True)
+    category_name = serializers.CharField(source="category.name", read_only=True)
 
     class Meta:
         model = Channel
@@ -43,11 +48,16 @@ class ChannelListSerializer(serializers.ModelSerializer):
             "name",
             "slug",
             "description",
+            "channel_type",
+            "order",
             "avatar_url",
             "invite_messages",
             "is_archived",
             "partner",
             "community",
+            "category",
+            "category_id",
+            "category_name",
             "is_subscribed",
             "member_role",
             "can_post",
@@ -66,7 +76,7 @@ class ChannelListSerializer(serializers.ModelSerializer):
 
     def get_can_post(self, obj):
         member = _member_for(obj, self.context["request"].user)
-        return _can_send(obj, member)
+        return _can_send(obj, member, self.context["request"].user)
 
 
 class ChannelDetailSerializer(serializers.ModelSerializer):
@@ -74,6 +84,8 @@ class ChannelDetailSerializer(serializers.ModelSerializer):
     is_subscribed = serializers.SerializerMethodField()
     member_role = serializers.SerializerMethodField()
     can_post = serializers.SerializerMethodField()
+    category_id = serializers.UUIDField(source="category.id", read_only=True)
+    category_name = serializers.CharField(source="category.name", read_only=True)
 
     class Meta:
         model = Channel
@@ -82,10 +94,15 @@ class ChannelDetailSerializer(serializers.ModelSerializer):
             "name",
             "slug",
             "description",
+            "channel_type",
+            "order",
             "avatar_url",
             "invite_messages",
             "partner",
             "community",
+            "category",
+            "category_id",
+            "category_name",
             "owner",
             "is_archived",
             "is_subscribed",
@@ -112,7 +129,7 @@ class ChannelDetailSerializer(serializers.ModelSerializer):
 
     def get_can_post(self, obj):
         member = _member_for(obj, self.context["request"].user)
-        return _can_send(obj, member)
+        return _can_send(obj, member, self.context["request"].user)
 
 
 class ChannelCreateSerializer(serializers.ModelSerializer):
@@ -131,14 +148,30 @@ class ChannelCreateSerializer(serializers.ModelSerializer):
             "name",
             "slug",
             "description",
+            "channel_type",
+            "order",
             "avatar_url",
             "invite_messages",
             "partner",
             "community",
+            "category",
         ]
 
     def validate(self, attrs):
-        # Add any custom validation (e.g., require partner OR community) later.
+        instance = getattr(self, "instance", None)
+        partner = attrs.get("partner", getattr(instance, "partner", None))
+        community = attrs.get("community", getattr(instance, "community", None))
+        category = attrs.get("category", getattr(instance, "category", None))
+
+        if category:
+            if not partner:
+                raise serializers.ValidationError({"category": "A categorized channel must belong to a partner."})
+            if category.partner_id != partner.id:
+                raise serializers.ValidationError({"category": "Category does not belong to the selected partner."})
+
+        if partner and community and community.partner_id and community.partner_id != partner.id:
+            raise serializers.ValidationError({"community": "Community does not belong to the selected partner."})
+
         return attrs
 
     def create(self, validated_data):

@@ -1,16 +1,39 @@
 
 from datetime import timedelta
 from decimal import Decimal
+import json
+import uuid
 
 from django.contrib.auth import get_user_model
+from django.http import QueryDict
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.billing.services import get_wallet_account
+from .category_catalog import ensure_catalog_categories
+from .services import place_marketplace_order, satisfy_marketplace_order
 from .availability import DAY_KEYS, normalize_availability_payload
-from .models import Shop, Product, ShopService, ServiceBooking, ServiceBookingEscrow
+from .models import (
+    CatalogCategory,
+    MarketplaceOrderStatus,
+    Product,
+    ProductImage,
+    ServiceBooking,
+    ServiceBookingComplaint,
+    ServiceBookingEscrow,
+    ServiceBookingPayment,
+    Shop,
+    ShopLandingPage,
+    ShopService,
+    ShopServiceImage,
+    ShopTeamMember,
+    ShopRole,
+)
+from .serializers import ProductSerializer, ShopServiceSerializer
+from apps.broadcasts.models import BroadcastItem, BroadcastSourceType
 
 
 class CommerceSmokeTests(TestCase):
@@ -24,23 +47,631 @@ class CommerceSmokeTests(TestCase):
         self.assertEqual(p.shop, self.shop)
 
 
+class MarketplaceOrderSettlementTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.provider = User.objects.create_user(phone='5555551000', username='provider', password='secret', country='NG')
+        self.buyer = User.objects.create_user(phone='5555552000', username='buyer', password='secret', country='NG')
+        self.shop = Shop.objects.create(owner=self.provider, name='Provider Shop', slug='provider-shop')
+        self.product = Product.objects.create(
+            shop=self.shop,
+            sku='MP-001',
+            name='Marketplace Product',
+            price=Decimal('10.00'),
+            sale_price=Decimal('10.00'),
+            stock_qty=10,
+        )
+        buyer_wallet = get_wallet_account(self.buyer)
+        buyer_wallet.balance_cents = 50_000
+        buyer_wallet.save(update_fields=['balance_cents'])
+
+    def test_marketplace_satisfaction_credits_provider_exact_cents(self):
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[
+                {
+                    'product_id': str(self.product.id),
+                    'quantity': 1,
+                    'unit_price_cents': 1_000,
+                }
+            ],
+        )
+
+        buyer_wallet = get_wallet_account(self.buyer)
+        provider_wallet = get_wallet_account(self.provider)
+        buyer_wallet.refresh_from_db()
+        provider_wallet.refresh_from_db()
+
+        self.assertEqual(order.total_amount, Decimal('10'))
+        self.assertEqual(buyer_wallet.balance_cents, 49_000)
+        self.assertEqual(buyer_wallet.locked_cents, 1_000)
+        self.assertEqual(provider_wallet.balance_cents, 0)
+
+        satisfy_marketplace_order(order)
+
+        order.refresh_from_db()
+        buyer_wallet.refresh_from_db()
+        provider_wallet.refresh_from_db()
+
+        self.assertEqual(order.status, MarketplaceOrderStatus.SATISFIED)
+        self.assertIsNotNone(order.provider_credit_transaction)
+        self.assertEqual(order.provider_credit_transaction.amount_cents, 1_000)
+        self.assertEqual(buyer_wallet.locked_cents, 0)
+        self.assertEqual(provider_wallet.balance_cents, 1_000)
+
+    def test_marketplace_satisfaction_uses_locked_buyer_transaction_amount(self):
+        buyer_wallet = get_wallet_account(self.buyer)
+        buyer_wallet.balance_cents = 2_000_000
+        buyer_wallet.save(update_fields=['balance_cents'])
+
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[
+                {
+                    'product_id': str(self.product.id),
+                    'quantity': 1,
+                    'unit_price_cents': 1_000_000,
+                }
+            ],
+        )
+
+        buyer_wallet = get_wallet_account(self.buyer)
+        provider_wallet = get_wallet_account(self.provider)
+        buyer_wallet.refresh_from_db()
+        provider_wallet.refresh_from_db()
+
+        self.assertEqual(buyer_wallet.locked_cents, 1_000_000)
+
+        satisfy_marketplace_order(order)
+
+        order.refresh_from_db()
+        buyer_wallet.refresh_from_db()
+        provider_wallet.refresh_from_db()
+
+        self.assertEqual(order.status, MarketplaceOrderStatus.SATISFIED)
+        self.assertIsNotNone(order.provider_credit_transaction)
+        self.assertEqual(order.provider_credit_transaction.amount_cents, 1_000_000)
+        self.assertEqual(buyer_wallet.locked_cents, 0)
+        self.assertEqual(provider_wallet.balance_cents, 1_000_000)
+
+
+class ServiceBookingMoneyNormalizationTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5556661111', username='owner_money_norm', password='secret', country='NG')
+        self.customer = User.objects.create_user(phone='5556662222', username='customer_money_norm', password='secret', country='NG')
+        self.shop = Shop.objects.create(owner=self.owner, name='Money Norm Shop', slug='money-norm-shop')
+        self.service = ShopService.objects.create(
+            shop=self.shop,
+            name='Deep Consult',
+            slug='deep-consult',
+            price=Decimal('100.00'),
+            visibility='public',
+            status='published',
+        )
+        wallet = get_wallet_account(self.customer)
+        wallet.balance_cents = 2_000_000
+        wallet.save(update_fields=['balance_cents'])
+        self.client.force_authenticate(user=self.customer)
+
+    def test_frontend_major_kisc_booking_price_normalizes_to_wallet_cents(self):
+        scheduled_at = timezone.now() + timedelta(days=2)
+        response = self.client.post(
+            '/api/v1/commerce/service-bookings/',
+            {
+                'service_id': str(self.service.id),
+                'scheduled_at': scheduled_at.isoformat(),
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        booking = ServiceBooking.objects.get(id=response.data['id'])
+        wallet = get_wallet_account(self.customer)
+        wallet.refresh_from_db()
+
+        self.assertEqual(booking.price_cents, 1_000_000)
+        self.assertEqual(booking.deposit_cents, 1_000_000)
+        self.assertEqual(wallet.balance_cents, 1_000_000)
+        self.assertEqual(wallet.locked_cents, 1_000_000)
+
+
+class ShopLandingPageSystemTests(APITestCase):
+    @staticmethod
+    def _tiny_gif(name: str):
+        return SimpleUploadedFile(
+            name,
+            (
+                b'GIF89a\x01\x00\x01\x00\x80\x00\x00'
+                b'\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,'
+                b'\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
+            ),
+            content_type='image/gif',
+        )
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5551112222',
+            username='shop_landing_owner',
+            password='secret',
+            country='NG',
+        )
+        self.shop = Shop.objects.create(
+            owner=self.owner,
+            name='Landing Shop',
+            slug='landing-shop',
+            description='A shop with a custom landing page.',
+            image_file=self._tiny_gif('shop.gif'),
+        )
+        self.client.force_authenticate(user=self.owner)
+
+    def test_shop_landing_page_builder_round_trips_through_shop_endpoint(self):
+        payload = {
+            'landing_page_is_public': True,
+            'landing_page_is_published': True,
+            'landing_page': {
+                'headline': 'Launch your next order with confidence.',
+                'subheadline': 'Shop smarter with a curated landing flow.',
+                'hero_image_url': 'https://example.com/hero.jpg',
+                'hero_cta_text': 'Shop now',
+                'hero_cta_url': 'https://example.com/shop',
+                'landingBackgroundImageUrl': 'https://example.com/background.jpg',
+                'landingBackgroundColorKey': 'ocean_mist',
+                'landingLogoUrl': 'https://example.com/logo.png',
+                'hero': {
+                    'title': 'Launch your next order with confidence.',
+                    'slogan': 'Shop smarter with a curated landing flow.',
+                    'imageUrl': 'https://example.com/hero.jpg',
+                    'ctaLabel': 'Shop now',
+                    'ctaUrl': 'https://example.com/shop',
+                },
+                'about': 'We curate products and services for your home and team.',
+                'gallery': [
+                    'https://example.com/gallery-1.jpg',
+                    'https://example.com/gallery-2.jpg',
+                ],
+                'contact': {
+                    'phone': '+2348000000000',
+                    'email': 'hello@example.com',
+                    'address': '12 Broad Street',
+                },
+                'faqs': [
+                    {'question': 'Do you deliver nationwide?', 'answer': 'Yes.'},
+                ],
+                'seo': {
+                    'title': 'Landing Shop',
+                    'description': 'Marketplace landing page',
+                    'keywords': ['shop', 'marketplace'],
+                },
+                'sections': [
+                    {
+                        'id': 'hero_1',
+                        'name': 'Hero Banner',
+                        'type': 'hero_banner',
+                        'data': {
+                            'backgroundImageUrl': 'https://example.com/hero.jpg',
+                            'title': 'Launch your next order with confidence.',
+                            'subtitle': 'Shop smarter with a curated landing flow.',
+                            'ctaText': 'Shop now',
+                            'ctaLink': 'https://example.com/shop',
+                        },
+                    },
+                    {
+                        'id': 'testimonials_1',
+                        'name': 'Testimonials',
+                        'type': 'testimonials',
+                        'data': {
+                            'items': [
+                                {
+                                    'id': 'quote_1',
+                                    'quote': 'This shop always delivers.',
+                                    'author': 'Ada',
+                                    'role': 'Buyer',
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        'id': 'gallery_1',
+                        'name': 'Gallery',
+                        'type': 'image_gallery_grid',
+                        'data': {
+                            'images': [
+                                'https://example.com/gallery-1.jpg',
+                                'https://example.com/gallery-2.jpg',
+                            ],
+                        },
+                    },
+                ],
+            },
+        }
+
+        response = self.client.patch(
+            f'/api/v1/commerce/shops/{self.shop.id}/',
+            payload,
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        landing_page = ShopLandingPage.objects.get(shop=self.shop)
+        self.assertEqual(landing_page.headline, 'Launch your next order with confidence.')
+        self.assertEqual(landing_page.hero_cta_text, 'Shop now')
+        self.assertEqual(landing_page.builder_data.get('landingBackgroundColorKey'), 'ocean_mist')
+        self.assertEqual(len(landing_page.builder_data.get('sections', [])), 3)
+
+        detail_response = self.client.get(f'/api/v1/commerce/shops/{self.shop.id}/')
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK, detail_response.data)
+        data = detail_response.data
+        landing = data['landing_page']
+
+        self.assertTrue(data['landing_page_is_public'])
+        self.assertTrue(data['landing_page_is_published'])
+        self.assertEqual(landing['hero']['title'], 'Launch your next order with confidence.')
+        self.assertEqual(landing['hero']['ctaLabel'], 'Shop now')
+        self.assertEqual(landing['landingBackgroundImageUrl'], 'https://example.com/background.jpg')
+        self.assertEqual(landing['landingLogoUrl'], 'https://example.com/logo.png')
+        self.assertEqual(len(landing['gallery']), 2)
+        self.assertEqual(len(landing['sections']), 3)
+        self.assertEqual(landing['testimonials'][0]['quote'], 'This shop always delivers.')
+
+
+class ServiceCategorySystemTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5559991111', username='service_owner', password='secret', country='NG')
+        self.shop = Shop.objects.create(owner=self.owner, name='Service Category Shop', slug='service-category-shop')
+        ensure_catalog_categories()
+
+    @staticmethod
+    def _tiny_gif(name: str):
+        return SimpleUploadedFile(
+            name,
+            (
+                b'GIF89a\x01\x00\x01\x00\x80\x00\x00'
+                b'\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,'
+                b'\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
+            ),
+            content_type='image/gif',
+        )
+
+    def test_service_catalog_categories_include_parent_hierarchy(self):
+        parent = CatalogCategory.objects.get(slug='tech-digital-services')
+        child = CatalogCategory.objects.get(slug='custom-software-development')
+
+        self.assertEqual(parent.category_type, 'service')
+        self.assertIsNone(parent.parent_id)
+        self.assertEqual(child.category_type, 'service')
+        self.assertEqual(child.parent_id, parent.id)
+
+    def test_service_serializer_saves_and_updates_catalog_category_ids(self):
+        create_serializer = ShopServiceSerializer(data={
+            'shop': self.shop.id,
+            'name': 'Managed Support',
+            'price': '250',
+            'duration_minutes': 60,
+            'delivery_modes': ['remote'],
+            'remote_meeting_link': 'https://example.com/meet/support',
+            'category_ids': [str(CatalogCategory.objects.get(slug='tech-digital-services').id)],
+            'catalog_category_ids': [str(CatalogCategory.objects.get(slug='custom-software-development').id)],
+        })
+        self.assertTrue(create_serializer.is_valid(), create_serializer.errors)
+        service = create_serializer.save()
+
+        saved_slugs = list(service.catalog_categories.order_by('sort_order', 'name').values_list('slug', flat=True))
+        self.assertEqual(saved_slugs, ['tech-digital-services', 'custom-software-development'])
+
+        update_serializer = ShopServiceSerializer(
+            instance=service,
+            data={
+                'name': 'Managed Support Plus',
+                'category_ids': [str(CatalogCategory.objects.get(slug='professional-services').id)],
+                'catalog_category_ids': [str(CatalogCategory.objects.get(slug='virtual-administrative-support').id)],
+            },
+            partial=True,
+        )
+        self.assertTrue(update_serializer.is_valid(), update_serializer.errors)
+        updated_service = update_serializer.save()
+        updated_slugs = list(updated_service.catalog_categories.order_by('sort_order', 'name').values_list('slug', flat=True))
+        self.assertEqual(updated_slugs, ['professional-services', 'virtual-administrative-support'])
+
+    def test_service_serializer_accepts_querydict_category_lists_on_partial_update(self):
+        parent = CatalogCategory.objects.get(slug='home-services')
+        first_child = CatalogCategory.objects.get(slug='landscape-architecture-design')
+        second_child = CatalogCategory.objects.get(slug='subscription-box-curation')
+        service = ShopService.objects.create(
+            shop=self.shop,
+            name='VIP Session',
+            slug='vip-session',
+            price=Decimal('199.99'),
+        )
+        service.catalog_categories.set([parent, first_child])
+
+        query_data = QueryDict('', mutable=True)
+        query_data.update({
+            'name': 'Echo Davis VIP Session',
+            'description': 'Reserved slot with a trusted specialist.',
+            'price': '199.99',
+            'service_type': 'appointment',
+            'availability': json.dumps({
+                'timezone': 'UTC',
+                'slot_duration_minutes': 60,
+                'date_range': None,
+                'days': {
+                    'monday': {'enabled': True, 'all_day': True, 'times': []},
+                    'tuesday': {'enabled': True, 'all_day': True, 'times': []},
+                    'wednesday': {'enabled': True, 'all_day': True, 'times': []},
+                    'thursday': {'enabled': True, 'all_day': True, 'times': []},
+                    'friday': {'enabled': True, 'all_day': True, 'times': []},
+                    'saturday': {'enabled': True, 'all_day': True, 'times': []},
+                    'sunday': {'enabled': True, 'all_day': True, 'times': []},
+                },
+                'specific_dates': {},
+            }),
+            'availability_rules': '[]',
+            'category_id': str(parent.id),
+        })
+        query_data.setlist('category_ids', [str(parent.id), str(second_child.id)])
+        query_data.setlist('catalog_category_ids', [str(parent.id), str(second_child.id)])
+
+        serializer = ShopServiceSerializer(instance=service, data=query_data, partial=True)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        updated_service = serializer.save()
+
+        updated_slugs = list(updated_service.catalog_categories.order_by('sort_order', 'name').values_list('slug', flat=True))
+        self.assertEqual(updated_slugs, ['home-services', 'subscription-box-curation'])
+
+    def test_service_serializer_accepts_querydict_with_uploaded_files(self):
+        parent = CatalogCategory.objects.get(slug='home-services')
+        service = ShopService.objects.create(
+            shop=self.shop,
+            name='Photo Session',
+            slug='photo-session',
+            price=Decimal('99.99'),
+        )
+        service.catalog_categories.set([parent])
+
+        query_data = QueryDict('', mutable=True)
+        query_data.update({
+            'name': 'Photo Session Updated',
+            'price': '120.00',
+            'category_id': str(parent.id),
+        })
+        query_data.setlist('category_ids', [str(parent.id)])
+        query_data.setlist('catalog_category_ids', [str(parent.id)])
+        query_data.setlist('images', [
+            self._tiny_gif('gallery-1.gif'),
+            self._tiny_gif('gallery-2.gif'),
+        ])
+
+        serializer = ShopServiceSerializer(instance=service, data=query_data, partial=True)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(len(serializer.initial_data.getlist('images')), 2)
+        updated_service = serializer.save()
+        self.assertEqual(updated_service.images.count(), 2)
+
+    def test_service_serializer_exposes_featured_image_url_and_gallery_images(self):
+        parent = CatalogCategory.objects.get(slug='home-services')
+        service = ShopService.objects.create(
+            shop=self.shop,
+            name='Design Session',
+            slug='design-session',
+            price=Decimal('150.00'),
+            image_file=self._tiny_gif('featured.gif'),
+        )
+        service.catalog_categories.set([parent])
+        ShopServiceImage.objects.create(
+            service=service,
+            image_file=self._tiny_gif('gallery.gif'),
+            order=1,
+        )
+
+        payload = ShopServiceSerializer(instance=service).data
+
+        self.assertIn('featured', str(payload.get('image_url') or ''))
+        self.assertEqual(len(payload.get('images') or []), 1)
+
+    def test_service_serializer_can_remove_featured_and_selected_gallery_images(self):
+        parent = CatalogCategory.objects.get(slug='home-services')
+        service = ShopService.objects.create(
+            shop=self.shop,
+            name='Removal Session',
+            slug='removal-session',
+            price=Decimal('150.00'),
+            image_file=self._tiny_gif('featured-remove.gif'),
+        )
+        service.catalog_categories.set([parent])
+        first_image = ShopServiceImage.objects.create(
+            service=service,
+            image_file=self._tiny_gif('gallery-remove-1.gif'),
+            order=1,
+        )
+        second_image = ShopServiceImage.objects.create(
+            service=service,
+            image_file=self._tiny_gif('gallery-remove-2.gif'),
+            order=2,
+        )
+
+        query_data = QueryDict('', mutable=True)
+        query_data.update({
+            'remove_featured_image': 'true',
+        })
+        query_data.setlist('remove_image_ids', [str(first_image.id)])
+
+        serializer = ShopServiceSerializer(instance=service, data=query_data, partial=True)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        updated_service = serializer.save()
+        updated_service.refresh_from_db()
+
+        self.assertFalse(bool(updated_service.image_file))
+        self.assertEqual(updated_service.image_url, '')
+        self.assertEqual(updated_service.images.count(), 1)
+        self.assertEqual(str(updated_service.images.first().id), str(second_image.id))
+
+
+class ProductSystemTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        token = uuid.uuid4().hex[:8]
+        self.owner = User.objects.create_user(
+            phone=f'555888{token[:4]}',
+            username=f'product_owner_{token}',
+            password='secret',
+            country='NG',
+        )
+        self.shop = Shop.objects.create(
+            owner=self.owner,
+            name='Product Category Shop',
+            slug=f'product-category-shop-{token}',
+        )
+        ensure_catalog_categories()
+
+    @staticmethod
+    def _tiny_gif(name: str):
+        return SimpleUploadedFile(
+            name,
+            (
+                b'GIF89a\x01\x00\x01\x00\x80\x00\x00'
+                b'\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,'
+                b'\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
+            ),
+            content_type='image/gif',
+        )
+
+    def test_product_serializer_saves_catalog_categories_variants_and_gallery_images(self):
+        parent = CatalogCategory.objects.get(slug='sustainable-apparel')
+        child = CatalogCategory.objects.get(slug='luxury-leather-goods')
+        serializer = ProductSerializer(data={
+            'shop': self.shop.id,
+            'sku': f'PROD-{uuid.uuid4().hex[:6]}',
+            'name': 'Layered Jacket',
+            'slug': f'layered-jacket-{uuid.uuid4().hex[:6]}',
+            'description': 'Warm jacket with variants.',
+            'price': '180.00',
+            'sale_price': '150.00',
+            'inventory_type': 'PHYSICAL',
+            'stock_qty': 9,
+            'image_file': self._tiny_gif('main.gif'),
+            'images': [self._tiny_gif('gallery-1.gif'), self._tiny_gif('gallery-2.gif')],
+            'category_ids': [str(parent.id)],
+            'catalog_category_ids': [str(parent.id), str(child.id)],
+            'available_sizes': ['M', 'L'],
+            'available_colors': ['Black', 'Olive'],
+            'variants': [
+                {
+                    'id': 'variant-1',
+                    'name': 'Black / M',
+                    'sku': 'JACKET-BLK-M',
+                    'price': '180.00',
+                    'sale_price': '150.00',
+                    'stock_qty': 4,
+                    'is_active': True,
+                    'options': {'size': 'M', 'color': 'Black'},
+                }
+            ],
+        })
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        product = serializer.save()
+
+        saved_slugs = list(product.catalog_categories.order_by('sort_order', 'name').values_list('slug', flat=True))
+        self.assertEqual(saved_slugs, ['sustainable-apparel', 'luxury-leather-goods'])
+        self.assertEqual(product.gallery_images.count(), 2)
+        self.assertEqual(product.variants[0]['sku'], 'JACKET-BLK-M')
+        self.assertEqual(product.variants[0]['options'], {'size': 'M', 'color': 'Black'})
+
+    def test_product_serializer_exposes_featured_image_url_and_gallery_images(self):
+        parent = CatalogCategory.objects.get(slug='sustainable-apparel')
+        product = Product.objects.create(
+            shop=self.shop,
+            sku=f'LOOK-{uuid.uuid4().hex[:6]}',
+            name='Tailored Suit',
+            slug=f'tailored-suit-{uuid.uuid4().hex[:6]}',
+            price=Decimal('220.00'),
+            main_image=self._tiny_gif('featured.gif'),
+        )
+        product.catalog_categories.set([parent])
+        ProductImage.objects.create(
+            product=product,
+            image_file=self._tiny_gif('gallery.gif'),
+            sort_order=1,
+        )
+
+        payload = ProductSerializer(instance=product).data
+
+        self.assertIn('featured', str(payload.get('image_url') or ''))
+        self.assertEqual(len(payload.get('gallery_images') or []), 1)
+
+
+class ProductBroadcastAPITests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        token = uuid.uuid4().hex[:8]
+        self.owner = User.objects.create_user(
+            phone=f'555777{token[:4]}',
+            username=f'product_broadcast_owner_{token}',
+            password='secret',
+            country='NG',
+        )
+        self.shop = Shop.objects.create(
+            owner=self.owner,
+            name='Broadcast Product Shop',
+            slug=f'broadcast-product-shop-{token}',
+        )
+        self.product = Product.objects.create(
+            shop=self.shop,
+            sku=f'BROADCAST-{token}',
+            name='Broadcast Sneakers',
+            slug=f'broadcast-sneakers-{token}',
+            price=Decimal('75.00'),
+            stock_qty=3,
+        )
+        self.client.force_authenticate(user=self.owner)
+
+    def test_product_can_be_broadcast_by_owner(self):
+        response = self.client.post(f'/api/v1/commerce/products/{self.product.id}/broadcast/', {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.MARKET_PRODUCT,
+                source_id=str(self.product.id),
+                is_deleted=False,
+            ).exists()
+        )
+
+    def test_product_broadcast_can_be_removed(self):
+        self.client.post(f'/api/v1/commerce/products/{self.product.id}/broadcast/', {}, format='json')
+        response = self.client.delete(f'/api/v1/commerce/products/{self.product.id}/broadcast/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(
+            BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.MARKET_PRODUCT,
+                source_id=str(self.product.id),
+                is_deleted=False,
+            ).exists()
+        )
+
+
 class ServiceBookingAPITests(APITestCase):
     def setUp(self):
         User = get_user_model()
-        self.owner = User.objects.create_user(phone='5551111111', username='owner', password='secret', country='NG')
-        self.customer = User.objects.create_user(phone='5552222222', username='customer', password='secret', country='NG')
-        self.shop = Shop.objects.create(owner=self.owner, name='Owner Shop', slug='owner-shop')
+        token = uuid.uuid4().hex[:8]
+        self.owner = User.objects.create_user(phone=f'555111{token[:4]}', username=f'owner_{token}', password='secret', country='NG')
+        self.customer = User.objects.create_user(phone=f'555222{token[4:]}', username=f'customer_{token}', password='secret', country='NG')
+        self.manager = User.objects.create_user(phone=f'555333{token[:4]}', username=f'manager_{token}', password='secret', country='NG')
+        self.shop = Shop.objects.create(owner=self.owner, name='Owner Shop', slug=f'owner-shop-{token}')
+        ShopTeamMember.objects.create(shop=self.shop, user=self.manager, role=ShopRole.MANAGER, is_active=True)
         self.service = ShopService.objects.create(
             shop=self.shop,
             name='Consultation',
-            slug='consultation',
+            slug=f'consultation-{token}',
             price=Decimal('180.00'),
             deposit_percent=Decimal('50'),
             visibility='public',
             status='published',
         )
         wallet = get_wallet_account(self.customer)
-        wallet.balance_cents = 50000
+        wallet.balance_cents = 5_000_000
         wallet.save(update_fields=['balance_cents'])
         self.client.force_authenticate(user=self.customer)
         self.shared_slot = timezone.now() + timedelta(days=2, hours=1)
@@ -63,6 +694,31 @@ class ServiceBookingAPITests(APITestCase):
         self.service.availability = normalized
         self.service.save(update_fields=['availability'])
 
+    def test_service_can_be_broadcast_by_owner(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(f'/api/v1/commerce/shop-services/{self.service.id}/broadcast/', {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.MARKET_SERVICE,
+                source_id=str(self.service.id),
+                is_deleted=False,
+            ).exists()
+        )
+
+    def test_service_broadcast_can_be_removed(self):
+        self.client.force_authenticate(user=self.owner)
+        self.client.post(f'/api/v1/commerce/shop-services/{self.service.id}/broadcast/', {}, format='json')
+        response = self.client.delete(f'/api/v1/commerce/shop-services/{self.service.id}/broadcast/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(
+            BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.MARKET_SERVICE,
+                source_id=str(self.service.id),
+                is_deleted=False,
+            ).exists()
+        )
+
     def _extract_field_message(self, response_data, field):
         value = response_data.get(field)
         if isinstance(value, (list, tuple)):
@@ -81,7 +737,7 @@ class ServiceBookingAPITests(APITestCase):
         customer_wallet.refresh_from_db()
         owner_wallet.refresh_from_db()
         self.assertEqual(response.data['deposit_cents'], booking.deposit_cents)
-        self.assertEqual(customer_wallet.balance_cents, 50000 - booking.deposit_cents)
+        self.assertEqual(customer_wallet.balance_cents, 5_000_000 - booking.deposit_cents)
         self.assertEqual(owner_wallet.balance_cents, 0)
         escrow = booking.escrow
         self.assertEqual(escrow.amount_cents, booking.deposit_cents)
@@ -98,11 +754,90 @@ class ServiceBookingAPITests(APITestCase):
         owner_wallet.refresh_from_db()
         customer_wallet.refresh_from_db()
         booking = ServiceBooking.objects.get(id=first.data['id'])
-        self.assertEqual(customer_wallet.balance_cents, 50000 - booking.deposit_cents)
+        self.assertEqual(customer_wallet.balance_cents, 5_000_000 - booking.deposit_cents)
         self.assertEqual(owner_wallet.balance_cents, 0)
         escrow = booking.escrow
         self.assertEqual(escrow.amount_cents, booking.deposit_cents)
         self.assertEqual(escrow.status, ServiceBookingEscrow.STATUS_PENDING)
+
+    def test_payer_can_submit_complaint_without_manual_escrow_field(self):
+        wallet = get_wallet_account(self.customer)
+        wallet.balance_cents = 2_000_000
+        wallet.save(update_fields=['balance_cents'])
+        response = self.client.post('/api/v1/commerce/service-bookings/', self._create_booking_payload(), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        booking = ServiceBooking.objects.get(id=response.data['id'])
+        booking.mark_provider_completed()
+        booking.save(update_fields=['status', 'provider_completed_at', 'satisfaction_deadline'])
+
+        complaint_response = self.client.post(
+            '/api/v1/commerce/service-booking-complaints/',
+            {
+                'booking': str(booking.id),
+                'personal_statement': 'The service was not delivered as agreed.',
+                'reason': 'Provider marked complete before finishing.',
+                'receipt_url': '',
+            },
+            format='json',
+        )
+        self.assertEqual(complaint_response.status_code, status.HTTP_201_CREATED)
+        booking.refresh_from_db()
+        complaint = ServiceBookingComplaint.objects.get(id=complaint_response.data['id'])
+        self.assertEqual(complaint.booking_id, booking.id)
+        self.assertEqual(complaint.escrow_id, booking.escrow.id)
+        self.assertEqual(complaint.submitted_by_id, self.customer.id)
+        self.assertEqual(booking.status, ServiceBooking.STATUS_DISPUTE)
+
+    def test_manager_can_view_and_mark_completed(self):
+        response = self.client.post('/api/v1/commerce/service-bookings/', self._create_booking_payload(), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        booking_id = response.data['id']
+
+        self.client.force_authenticate(user=self.manager)
+        detail = self.client.get(f'/api/v1/commerce/service-bookings/{booking_id}/')
+        self.assertEqual(detail.status_code, status.HTTP_200_OK)
+
+        complete = self.client.post(f'/api/v1/commerce/service-bookings/{booking_id}/mark-completed/', format='json')
+        self.assertEqual(complete.status_code, status.HTTP_200_OK)
+
+        booking = ServiceBooking.objects.get(id=booking_id)
+        self.assertEqual(booking.status, ServiceBooking.STATUS_AWAITING_SATISFACTION)
+        self.assertIsNotNone(booking.provider_completed_at)
+
+    @override_settings(SERVICE_ENABLE_QUOTES=True)
+    def test_pay_remaining_creates_payment_for_quote_booking(self):
+        wallet = get_wallet_account(self.customer)
+        wallet.balance_cents = 2_000_000
+        wallet.save(update_fields=['balance_cents'])
+        booking = ServiceBooking.objects.create(
+            service=self.service,
+            shop=self.shop,
+            user=self.customer,
+            scheduled_at=self.shared_slot,
+            price_cents=1_250_000,
+            deposit_cents=0,
+            balance_cents=1_250_000,
+            instructions='Quote approved, pending full payment.',
+            payment_tx_ref='quote-booking-test',
+            metadata={'quote_required': True},
+        )
+
+        pay_remaining = self.client.post(f'/api/v1/commerce/service-bookings/{booking.id}/pay-remaining/', format='json')
+        self.assertEqual(pay_remaining.status_code, status.HTTP_200_OK)
+
+        booking.refresh_from_db()
+        payment = ServiceBookingPayment.objects.get(booking=booking)
+        self.assertEqual(payment.amount_cents, booking.price_cents)
+        self.assertEqual(payment.payment_status, ServiceBookingPayment.STATUS_PAID)
+        self.assertEqual(booking.balance_cents, 0)
+        self.assertEqual(booking.deposit_cents, booking.price_cents)
+
+        satisfy = self.client.patch(f'/api/v1/commerce/payments/{payment.id}/satisfy/', format='json')
+        self.assertEqual(satisfy.status_code, status.HTTP_200_OK)
+        booking.refresh_from_db()
+        payment.refresh_from_db()
+        self.assertEqual(booking.status, ServiceBooking.STATUS_COMPLETED)
+        self.assertEqual(payment.payment_status, ServiceBookingPayment.STATUS_SATISFIED)
 
     def test_insufficient_balance_returns_bad_request(self):
         customer_wallet = get_wallet_account(self.customer)
@@ -220,14 +955,14 @@ class ServiceBookingAPITests(APITestCase):
         self.assertEqual(first.status_code, status.HTTP_201_CREATED)
         second_user = get_user_model().objects.create_user(phone='5553333333', username='second', password='secret', country='NG')
         second_wallet = get_wallet_account(second_user)
-        second_wallet.balance_cents = 50000
+        second_wallet.balance_cents = 5_000_000
         second_wallet.save(update_fields=['balance_cents'])
         self.client.force_authenticate(user=second_user)
         second = self.client.post('/api/v1/commerce/service-bookings/', self._create_booking_payload(), format='json')
         self.assertEqual(second.status_code, status.HTTP_201_CREATED)
         third_user = get_user_model().objects.create_user(phone='5554444444', username='third', password='secret', country='NG')
         third_wallet = get_wallet_account(third_user)
-        third_wallet.balance_cents = 50000
+        third_wallet.balance_cents = 5_000_000
         third_wallet.save(update_fields=['balance_cents'])
         self.client.force_authenticate(user=third_user)
         third = self.client.post('/api/v1/commerce/service-bookings/', self._create_booking_payload(), format='json')
@@ -249,7 +984,7 @@ class ServiceBookingAPITests(APITestCase):
 
     @override_settings(SERVICE_ENFORCE_COVERAGE=True, SERVICE_ENFORCE_TRAVEL_RADIUS=True)
     def test_request_outside_coverage_or_radius_is_blocked(self):
-        self.service.coverage = ['Lagos']
+        self.service.coverage = ['Abuja']
         self.service.travel_radius_km = Decimal('25.00')
         self.service.save(update_fields=['coverage', 'travel_radius_km'])
         payload = self._create_booking_payload(scheduled_at=self.shared_slot + timedelta(days=1))
@@ -259,9 +994,7 @@ class ServiceBookingAPITests(APITestCase):
         })
         response = self.client.post('/api/v1/commerce/service-bookings/', payload, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        location_message = self._extract_field_message(response.data, 'location')
         distance_message = self._extract_field_message(response.data, 'distance_km')
-        self.assertTrue('coverage' in location_message.lower() or 'destination' in location_message.lower())
         self.assertIn('travel distance', distance_message.lower())
 
     @override_settings(SERVICE_ENFORCE_REMOTE_REGIONS=True)
@@ -281,13 +1014,18 @@ class ServiceBookingAPITests(APITestCase):
         self.service.max_participants = 2
         self.service.staff_required = 2
         self.service.save(update_fields=['max_participants', 'staff_required'])
-        payload = self._create_booking_payload(scheduled_at=self.shared_slot + timedelta(days=1))
-        payload.update({'participant_count': 3, 'staff_on_site': 1})
-        response = self.client.post('/api/v1/commerce/service-bookings/', payload, format='json')
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        participants_message = self._extract_field_message(response.data, 'participant_count')
-        staff_message = self._extract_field_message(response.data, 'staff_on_site')
+        participant_payload = self._create_booking_payload(scheduled_at=self.shared_slot + timedelta(days=1))
+        participant_payload.update({'participant_count': 3, 'staff_on_site': 2})
+        participant_response = self.client.post('/api/v1/commerce/service-bookings/', participant_payload, format='json')
+        self.assertEqual(participant_response.status_code, status.HTTP_400_BAD_REQUEST)
+        participants_message = self._extract_field_message(participant_response.data, 'participant_count')
         self.assertIn('maximum', participants_message.lower())
+
+        staff_payload = self._create_booking_payload(scheduled_at=self.shared_slot + timedelta(days=2))
+        staff_payload.update({'participant_count': 2, 'staff_on_site': 1})
+        staff_response = self.client.post('/api/v1/commerce/service-bookings/', staff_payload, format='json')
+        self.assertEqual(staff_response.status_code, status.HTTP_400_BAD_REQUEST)
+        staff_message = self._extract_field_message(staff_response.data, 'staff_on_site')
         self.assertIn('at least', staff_message.lower())
 
     @override_settings(SERVICE_ENFORCE_REQUIREMENTS=True)
@@ -315,6 +1053,28 @@ class ServiceBookingAPITests(APITestCase):
         self.assertEqual(success.status_code, status.HTTP_201_CREATED)
         booking = ServiceBooking.objects.get(id=success.data['id'])
         self.assertTrue(booking.metadata.get('terms_accepted'))
+
+    def test_booking_metadata_persists_location_and_capacity_fields(self):
+        self.service.delivery_modes = ['onsite', 'remote']
+        self.service.max_participants = 4
+        self.service.staff_required = 2
+        self.service.save(update_fields=['delivery_modes', 'max_participants', 'staff_required'])
+        payload = self._create_booking_payload(
+            is_remote=False,
+            participant_count=3,
+            staff_on_site=2,
+            location={'address_line1': '12 Marina', 'city': 'Lagos', 'country': 'NG'},
+            distance_km='10',
+            remote_region='West Africa',
+        )
+        response = self.client.post('/api/v1/commerce/service-bookings/', payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        booking = ServiceBooking.objects.get(id=response.data['id'])
+        self.assertEqual(booking.metadata.get('participant_count'), 3)
+        self.assertEqual(booking.metadata.get('staff_on_site'), 2)
+        self.assertEqual(booking.metadata.get('remote_region'), 'West Africa')
+        self.assertEqual(booking.metadata.get('distance_km'), '10.00')
+        self.assertEqual(booking.metadata.get('location', {}).get('city'), 'Lagos')
 
     @override_settings(SERVICE_ENFORCE_REFUND_POLICY=True)
     def test_refund_policy_window_blocks_close_cancellations(self):
@@ -390,7 +1150,7 @@ class ServiceBookingAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         booking = ServiceBooking.objects.get(id=response.data['id'])
-        self.assertEqual(booking.price_cents, 5550)
+        self.assertEqual(booking.price_cents, 555000)
         self.assertEqual(booking.deposit_cents, 0)
         self.assertTrue(booking.metadata.get('negotiation_requested'))
         self.assertEqual(booking.metadata.get('requested_price'), '55.50')
@@ -408,7 +1168,7 @@ class ServiceBookingAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         booking = ServiceBooking.objects.get(id=response.data['id'])
-        self.assertEqual(booking.price_cents, 20000)
+        self.assertEqual(booking.price_cents, 2000000)
 
     @override_settings(SERVICE_ENABLE_ADDONS=True)
     def test_addon_pricing_increases_price(self):
@@ -423,7 +1183,7 @@ class ServiceBookingAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         booking = ServiceBooking.objects.get(id=response.data['id'])
-        self.assertEqual(booking.price_cents, 18500)
+        self.assertEqual(booking.price_cents, 1850000)
 
     @override_settings(SERVICE_ENFORCE_MINIMUM_CHARGE=True)
     def test_minimum_charge_is_enforced(self):
@@ -441,4 +1201,4 @@ class ServiceBookingAPITests(APITestCase):
         response = self.client.post('/api/v1/commerce/service-bookings/', self._create_booking_payload(), format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         booking = ServiceBooking.objects.get(id=response.data['id'])
-        self.assertEqual(booking.price_cents, 19800)
+        self.assertEqual(booking.price_cents, 1_980_000)

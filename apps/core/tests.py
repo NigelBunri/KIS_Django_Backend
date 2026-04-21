@@ -3,6 +3,11 @@ from django.contrib.contenttypes.models import ContentType
 
 from apps.accounts.models import User
 from apps.core import models
+from apps.core.money import (
+    frontend_kisc_major_to_micro,
+    frontend_kisc_major_to_usd_cents,
+    parse_frontend_money_to_cents,
+)
 
 
 class CommunityPermissionHelperTests(TestCase):
@@ -59,3 +64,17 @@ class CommunityPermissionHelperTests(TestCase):
             self.permission,
         )
         self.assertFalse(allowed)
+
+
+class FrontendMoneyNormalizationTests(TestCase):
+    def test_frontend_kisc_major_to_usd_cents_scales_by_ten_thousand(self):
+        self.assertEqual(frontend_kisc_major_to_usd_cents("100"), 1_000_000)
+
+    def test_frontend_kisc_major_to_micro_scales_by_one_hundred_thousand(self):
+        self.assertEqual(frontend_kisc_major_to_micro("100"), 10_000_000)
+
+    def test_parse_frontend_money_to_cents_keeps_cents_unchanged(self):
+        self.assertEqual(parse_frontend_money_to_cents({"amount_cents": 1250}), 1250)
+
+    def test_parse_frontend_money_to_cents_normalizes_major_unit_kisc(self):
+        self.assertEqual(parse_frontend_money_to_cents({"amount_kisc": "100"}), 1_000_000)

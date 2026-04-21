@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from decimal import Decimal, ROUND_HALF_UP
 from rest_framework import serializers
 
 from .documents import build_receipt_urls
@@ -23,14 +24,20 @@ from apps.accounts.models import AccountTier, User
 class WalletAccountSerializer(serializers.ModelSerializer):
     balance_usd = serializers.SerializerMethodField()
     balance_usd_compact = serializers.SerializerMethodField()
+    balance_micro = serializers.SerializerMethodField()
+    balance_kisc_label = serializers.SerializerMethodField()
+    balance_usd_label = serializers.SerializerMethodField()
 
     class Meta:
         model = WalletAccount
         fields = [
             "id",
             "balance_cents",
+            "balance_micro",
             "balance_usd",
             "balance_usd_compact",
+            "balance_kisc_label",
+            "balance_usd_label",
             "currency",
             "status",
             "metadata",
@@ -42,6 +49,22 @@ class WalletAccountSerializer(serializers.ModelSerializer):
 
     def get_balance_usd_compact(self, obj):
         return cents_to_usd_compact(int(obj.balance_cents or 0))
+
+    def get_balance_micro(self, obj):
+        return int((obj.balance_cents or 0) * 10)
+
+    def get_balance_kisc_label(self, obj):
+        cents = int(obj.balance_cents or 0)
+        kisc = Decimal(cents) / Decimal("10000")
+        quantized = kisc.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        text = format(quantized, "f")
+        return f"{text} KISC"
+
+    def get_balance_usd_label(self, obj):
+        usd = cents_to_usd(int(obj.balance_cents or 0))
+        quantized = usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        text = format(quantized, "f")
+        return f"${text}"
 
 
 class CreditAccountSerializer(serializers.ModelSerializer):

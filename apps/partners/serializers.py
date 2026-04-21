@@ -10,7 +10,9 @@ from apps.partners.models import (
     PartnerJoinConfig,
     PartnerMembership,
     PartnerApplication,
+    PartnerInvite,
     PartnerJobPost,
+    PartnerOnboardingProgress,
     PartnerPolicy,
     PartnerRole,
     PartnerRoleAssignment,
@@ -29,6 +31,9 @@ from apps.partners.models import (
     PartnerOrganizationApp,
     PartnerOrganizationAppAccessLog,
     PartnerProfileLink,
+    PartnerServerCategory,
+    PartnerChannelPermissionOverwrite,
+    PartnerModerationAction,
     PARTNER_ORG_APP_VISIBILITY_ROLES,
     default_app_visibility,
 )
@@ -523,6 +528,144 @@ class PartnerApplicationDetailSerializer(serializers.ModelSerializer):
         }
 
 
+class PartnerInviteSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+    is_expired = serializers.BooleanField(read_only=True)
+    has_uses_remaining = serializers.BooleanField(read_only=True)
+    is_redeemable = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PartnerInvite
+        fields = [
+            "id",
+            "partner",
+            "code",
+            "label",
+            "created_by",
+            "created_by_name",
+            "max_uses",
+            "use_count",
+            "expires_at",
+            "is_active",
+            "membership_role",
+            "auto_assign",
+            "metadata",
+            "is_expired",
+            "has_uses_remaining",
+            "is_redeemable",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "partner",
+            "code",
+            "created_by",
+            "created_by_name",
+            "use_count",
+            "is_expired",
+            "has_uses_remaining",
+            "is_redeemable",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_created_by_name(self, obj):
+        user = obj.created_by
+        if not user:
+            return None
+        return getattr(user, "display_name", None) or getattr(user, "username", None) or str(user.id)
+
+    def get_is_redeemable(self, obj):
+        return obj.is_redeemable()
+
+
+class PartnerOnboardingProgressSerializer(serializers.ModelSerializer):
+    invite_code = serializers.CharField(source="invite.code", read_only=True)
+
+    class Meta:
+        model = PartnerOnboardingProgress
+        fields = [
+            "id",
+            "partner",
+            "user",
+            "invite",
+            "invite_code",
+            "rules_accepted_at",
+            "selected_role_ids",
+            "selected_channel_ids",
+            "onboarding_snapshot",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "partner",
+            "user",
+            "invite_code",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class PartnerModerationActionSerializer(serializers.ModelSerializer):
+    actor_name = serializers.SerializerMethodField()
+    user_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PartnerModerationAction
+        fields = [
+            "id",
+            "partner",
+            "user",
+            "user_name",
+            "actor",
+            "actor_name",
+            "membership",
+            "action_type",
+            "reason",
+            "expires_at",
+            "metadata",
+            "revoked_at",
+            "created_at",
+        ]
+        read_only_fields = [
+            "id",
+            "partner",
+            "actor",
+            "actor_name",
+            "user_name",
+            "membership",
+            "revoked_at",
+            "created_at",
+        ]
+
+    def get_actor_name(self, obj):
+        actor = obj.actor
+        if not actor:
+            return None
+        return getattr(actor, "display_name", None) or getattr(actor, "username", None) or str(actor.id)
+
+    def get_user_name(self, obj):
+        user = obj.user
+        return getattr(user, "display_name", None) or getattr(user, "username", None) or str(user.id)
+
+
+class PartnerMemberDirectoryEntrySerializer(serializers.Serializer):
+    user_id = serializers.CharField()
+    display_name = serializers.CharField(allow_blank=True, allow_null=True)
+    username = serializers.CharField(allow_blank=True, allow_null=True)
+    avatar_url = serializers.CharField(allow_blank=True, allow_null=True)
+    membership_status = serializers.CharField()
+    membership_role = serializers.CharField()
+    role_names = serializers.ListField(child=serializers.CharField(), default=list)
+    is_muted = serializers.BooleanField()
+    is_banned = serializers.BooleanField()
+    timed_out_until = serializers.DateTimeField(allow_null=True)
+    joined_at = serializers.DateTimeField(allow_null=True)
+
+
 class PartnerJobPostSerializer(serializers.ModelSerializer):
     class Meta:
         model = PartnerJobPost
@@ -945,3 +1088,77 @@ class PartnerProfileLinkSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "partner", "created_at", "updated_at"]
+
+
+class PartnerServerCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PartnerServerCategory
+        fields = [
+            "id",
+            "partner",
+            "name",
+            "slug",
+            "order",
+            "is_private",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "partner", "created_at", "updated_at"]
+
+
+class PartnerChannelPermissionOverwriteSerializer(serializers.ModelSerializer):
+    role_name = serializers.CharField(source="role.name", read_only=True)
+    user_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PartnerChannelPermissionOverwrite
+        fields = [
+            "id",
+            "partner",
+            "channel",
+            "subject_type",
+            "role",
+            "role_name",
+            "user",
+            "user_name",
+            "allow_permissions",
+            "deny_permissions",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "partner", "channel", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        instance = getattr(self, "instance", None)
+        subject_type = attrs.get("subject_type", getattr(instance, "subject_type", None))
+        role = attrs.get("role", getattr(instance, "role", None))
+        user = attrs.get("user", getattr(instance, "user", None))
+        partner = self.context.get("partner") or getattr(instance, "partner", None)
+
+        if subject_type == PartnerChannelPermissionOverwrite.SubjectType.ROLE:
+            if not role or user:
+                raise serializers.ValidationError("Role overwrites must target exactly one role.")
+            if partner and role.partner_id != partner.id:
+                raise serializers.ValidationError({"role": "Role does not belong to the same partner."})
+        elif subject_type == PartnerChannelPermissionOverwrite.SubjectType.MEMBER:
+            if not user or role:
+                raise serializers.ValidationError("Member overwrites must target exactly one user.")
+        else:
+            raise serializers.ValidationError({"subject_type": "Invalid overwrite subject type."})
+
+        for field_name in ("allow_permissions", "deny_permissions"):
+            values = attrs.get(field_name, getattr(instance, field_name, []))
+            invalid = [
+                value for value in values
+                if value not in PartnerChannelPermissionOverwrite.PermissionCode.values
+            ]
+            if invalid:
+                raise serializers.ValidationError({field_name: f"Unsupported permission codes: {invalid}"})
+
+        return attrs
+
+    def get_user_name(self, obj):
+        user = obj.user
+        if not user:
+            return None
+        return getattr(user, "display_name", None) or getattr(user, "username", None) or str(user.id)

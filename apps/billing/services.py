@@ -147,6 +147,30 @@ def record_ledger(
     )
 
 
+def debit_wallet_balance(
+    *,
+    user: User,
+    amount_cents: int,
+    reference: str,
+    kind: str = "purchase",
+    meta: Optional[dict] = None,
+) -> WalletLedgerEntry:
+    if amount_cents <= 0:
+        raise ValueError("Debit amount must be greater than zero.")
+
+    wallet = get_wallet_account(user)
+    if wallet.balance_cents < amount_cents:
+        raise ValueError("Insufficient wallet balance.")
+
+    return record_ledger(
+        user=user,
+        kind=kind,
+        amount_cents=-amount_cents,
+        reference=reference,
+        meta=meta,
+    )
+
+
 def lock_wallet_funds_for_booking(
     *,
     user: User,

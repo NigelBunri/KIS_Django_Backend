@@ -13,6 +13,7 @@ from rest_framework.test import APIClient
 from apps.accounts.models import AccountTier, Subscription
 from apps.billing.models import WalletLedgerEntry, WalletTransaction
 from apps.billing.services import get_credit_account, get_wallet_account, transfer_balance, upgrade_with_credits
+from apps.billing.views import _parse_frontend_money_to_cents
 
 
 User = get_user_model()
@@ -95,6 +96,12 @@ class BillingWalletFlowTests(TestCase):
         self.assertEqual(res.data["outbound"]["counterparty_phone"], self.recipient.phone)
         self.assertEqual(res.data["inbound"]["counterparty_name"], self.sender.display_name)
         self.assertEqual(res.data["inbound"]["counterparty_phone"], self.sender.phone)
+
+    def test_frontend_kisc_major_amount_is_normalized_to_cents(self):
+        self.assertEqual(_parse_frontend_money_to_cents({"amount_kisc": "100"}), 1_000_000)
+
+    def test_amount_cents_passthrough_stays_unchanged(self):
+        self.assertEqual(_parse_frontend_money_to_cents({"amount_cents": 1250}), 1250)
 
     def test_transfer_endpoint_rejects_self_transfer(self):
         self.client.force_authenticate(self.sender)

@@ -2,6 +2,7 @@ import uuid
 from datetime import timedelta
 
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.accounts.models import Profile, User
@@ -9,6 +10,8 @@ from apps.chat.models import Conversation
 from apps.channels.models import Channel
 from apps.communities.models import Community
 from apps.partners.models import Partner
+from apps.billing.models import WalletTransaction
+from apps.commerce.constants import KIS_COIN_CODE
 
 
 class BroadcastSourceType(models.TextChoices):
@@ -20,6 +23,7 @@ class BroadcastSourceType(models.TextChoices):
     MARKET_SERVICE = "market_service", "Market Service"
     EDUCATION_COURSE = "education_course", "Education Course"
     EDUCATION_PROFILE = "education_profile", "Education Profile"
+    EDUCATION_BROADCAST = "education_broadcast", "Education Broadcast"
 
 
 def _default_expires_at():
@@ -341,6 +345,1299 @@ class EducationProfileRoleAssignment(models.Model):
     class Meta:
         db_table = "education_profile_role_assignment"
         unique_together = [("role", "user")]
+
+
+class EducationInstitutionType(models.TextChoices):
+    SCHOOL = "school", "School"
+    COLLEGE = "college", "College"
+    UNIVERSITY = "university", "University"
+    ACADEMY = "academy", "Academy"
+    TRAINING_CENTER = "training_center", "Training Center"
+    BOOTCAMP = "bootcamp", "Bootcamp"
+    COMMUNITY = "community", "Community"
+    OTHER = "other", "Other"
+
+
+class EducationInstitutionMembershipPolicy(models.TextChoices):
+    OPEN = "open", "Open Membership"
+    APPLICATION = "application", "Application Required"
+    CLOSED = "closed", "Closed Membership"
+
+
+class EducationInstitutionMembershipRole(models.TextChoices):
+    OWNER = "owner", "Owner"
+    MANAGER = "manager", "Manager"
+    ADMINISTRATOR = "administrator", "Administrator"
+    LECTURER = "lecturer", "Lecturer"
+    ACADEMIC_STAFF = "academic_staff", "Academic Staff"
+    STUDENT = "student", "Student"
+
+
+class EducationInstitutionMembershipStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    PENDING = "pending", "Pending"
+    REJECTED = "rejected", "Rejected"
+    INVITED = "invited", "Invited"
+    REMOVED = "removed", "Removed"
+
+
+class EducationInstitution(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="owned_education_institutions",
+    )
+    profile = models.ForeignKey(
+        Profile,
+        on_delete=models.CASCADE,
+        related_name="education_institutions",
+        null=True,
+        blank=True,
+    )
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True, default="")
+    institution_type = models.CharField(
+        max_length=32,
+        choices=EducationInstitutionType.choices,
+        default=EducationInstitutionType.ACADEMY,
+    )
+    membership_policy = models.CharField(
+        max_length=16,
+        choices=EducationInstitutionMembershipPolicy.choices,
+        default=EducationInstitutionMembershipPolicy.APPLICATION,
+    )
+    contact_email = models.EmailField(blank=True, default="")
+    contact_phone = models.CharField(max_length=64, blank=True, default="")
+    branding = models.JSONField(default=dict, blank=True)
+    settings = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution"
+        ordering = ["-updated_at"]
+        indexes = [
+            models.Index(fields=["owner", "is_active"]),
+            models.Index(fields=["institution_type", "is_active"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class EducationInstitutionMembership(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="memberships",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="education_institution_memberships",
+    )
+    role = models.CharField(
+        max_length=32,
+        choices=EducationInstitutionMembershipRole.choices,
+        default=EducationInstitutionMembershipRole.STUDENT,
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=EducationInstitutionMembershipStatus.choices,
+        default=EducationInstitutionMembershipStatus.PENDING,
+    )
+    title = models.CharField(max_length=255, blank=True, default="")
+    permissions = models.JSONField(default=list, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="created_education_institution_memberships",
+        null=True,
+        blank=True,
+    )
+    decided_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="decided_education_institution_memberships",
+        null=True,
+        blank=True,
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_membership"
+        unique_together = [("institution", "user")]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["institution", "role"]),
+            models.Index(fields=["user", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.institution_id}:{self.user_id}:{self.role}"
+
+
+class EducationAcademicRecordStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    PUBLISHED = "published", "Published"
+    ARCHIVED = "archived", "Archived"
+
+
+class EducationClassSessionStatus(models.TextChoices):
+    SCHEDULED = "scheduled", "Scheduled"
+    LIVE = "live", "Live"
+    COMPLETED = "completed", "Completed"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class EducationClassSessionMode(models.TextChoices):
+    ONLINE = "online", "Online"
+    ONSITE = "onsite", "Onsite"
+    HYBRID = "hybrid", "Hybrid"
+
+
+class EducationMaterialKind(models.TextChoices):
+    DOCUMENT = "document", "Document"
+    VIDEO = "video", "Video"
+    LINK = "link", "Link"
+    SLIDES = "slides", "Slides"
+    ASSIGNMENT = "assignment", "Assignment"
+    REFERENCE = "reference", "Reference"
+
+
+class EducationAssessmentType(models.TextChoices):
+    MCQ = "mcq", "MCQ"
+    THEORY = "theory", "Theory"
+    MIXED = "mixed", "Mixed"
+
+
+class EducationAssessmentQuestionType(models.TextChoices):
+    MCQ = "mcq", "MCQ"
+    TRUE_FALSE = "true_false", "True / False"
+    SHORT_ANSWER = "short_answer", "Short Answer"
+    ESSAY = "essay", "Essay"
+
+
+class EducationAssessmentSubmissionStatus(models.TextChoices):
+    STARTED = "started", "Started"
+    SUBMITTED = "submitted", "Submitted"
+    GRADED = "graded", "Graded"
+    RETURNED = "returned", "Returned"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class EducationInstitutionEventType(models.TextChoices):
+    EVENT = "event", "Event"
+    TRAINING_SESSION = "training_session", "Training Session"
+
+
+class EducationBroadcastKind(models.TextChoices):
+    PROGRAM = "program", "Program"
+    COURSE = "course", "Course"
+    LESSON = "lesson", "Lesson"
+    CLASS_SESSION = "class_session", "Class Session"
+    TRAINING_SESSION = "training_session", "Training Session"
+    EVENT = "event", "Event"
+    INSTITUTION_NOTICE = "institution_notice", "Institution Notice"
+
+
+class EducationBroadcastStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    PUBLISHED = "published", "Published"
+    ARCHIVED = "archived", "Archived"
+
+
+class EducationEnrollmentStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    ENROLLED = "enrolled", "Enrolled"
+    WAITLISTED = "waitlisted", "Waitlisted"
+    CANCELLED = "cancelled", "Cancelled"
+    COMPLETED = "completed", "Completed"
+
+
+class EducationBookingStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    PAYMENT_PENDING = "payment_pending", "Payment Pending"
+    CONFIRMED = "confirmed", "Confirmed"
+    WAITLISTED = "waitlisted", "Waitlisted"
+    AWAITING_SATISFACTION = "awaiting_satisfaction", "Awaiting Satisfaction"
+    COMPLETED = "completed", "Completed"
+    CANCELLED = "cancelled", "Cancelled"
+    EXPIRED = "expired", "Expired"
+    REFUNDED = "refunded", "Refunded"
+
+
+class EducationInstitutionStaffAssignmentRole(models.TextChoices):
+    INSTRUCTOR = "instructor", "Instructor"
+    COORDINATOR = "coordinator", "Coordinator"
+    EXAMINER = "examiner", "Examiner"
+    ADVISOR = "advisor", "Advisor"
+    MODERATOR = "moderator", "Moderator"
+    EVENT_HOST = "event_host", "Event Host"
+
+
+class EducationInstitutionStaffAssignmentStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    INACTIVE = "inactive", "Inactive"
+
+
+class EducationCourseModuleItemType(models.TextChoices):
+    LESSON = "lesson", "Lesson"
+    MATERIAL = "material", "Material"
+    CLASS_SESSION = "class_session", "Class Session"
+    ASSESSMENT = "assessment", "Assessment"
+    EVENT = "event", "Event"
+    BROADCAST = "broadcast", "Broadcast"
+
+
+class EducationInstitutionProgram(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="programs",
+    )
+    title = models.CharField(max_length=255)
+    code = models.CharField(max_length=64, blank=True, default="")
+    summary = models.TextField(blank=True, default="")
+    description = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=16,
+        choices=EducationAcademicRecordStatus.choices,
+        default=EducationAcademicRecordStatus.DRAFT,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_program"
+        ordering = ["title", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["institution", "code"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class EducationInstitutionStaffAssignment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="staff_assignments",
+    )
+    membership = models.ForeignKey(
+        EducationInstitutionMembership,
+        on_delete=models.CASCADE,
+        related_name="staff_assignments",
+    )
+    program = models.ForeignKey(
+        "EducationInstitutionProgram",
+        on_delete=models.SET_NULL,
+        related_name="staff_assignments",
+        null=True,
+        blank=True,
+    )
+    course = models.ForeignKey(
+        "EducationInstitutionCourse",
+        on_delete=models.SET_NULL,
+        related_name="staff_assignments",
+        null=True,
+        blank=True,
+    )
+    class_session = models.ForeignKey(
+        "EducationInstitutionClassSession",
+        on_delete=models.SET_NULL,
+        related_name="staff_assignments",
+        null=True,
+        blank=True,
+    )
+    event = models.ForeignKey(
+        "EducationInstitutionEvent",
+        on_delete=models.SET_NULL,
+        related_name="staff_assignments",
+        null=True,
+        blank=True,
+    )
+    assessment = models.ForeignKey(
+        "EducationInstitutionAssessment",
+        on_delete=models.SET_NULL,
+        related_name="staff_assignments",
+        null=True,
+        blank=True,
+    )
+    role = models.CharField(
+        max_length=24,
+        choices=EducationInstitutionStaffAssignmentRole.choices,
+        default=EducationInstitutionStaffAssignmentRole.INSTRUCTOR,
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=EducationInstitutionStaffAssignmentStatus.choices,
+        default=EducationInstitutionStaffAssignmentStatus.ACTIVE,
+    )
+    notes = models.TextField(blank=True, default="")
+    metadata = models.JSONField(default=dict, blank=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="created_education_staff_assignments",
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_staff_assignment"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["membership", "status"]),
+            models.Index(fields=["course", "status"]),
+            models.Index(fields=["class_session", "status"]),
+            models.Index(fields=["event", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.institution_id}:{self.membership_id}:{self.role}"
+
+
+class EducationInstitutionCourse(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="courses_v2",
+    )
+    program = models.ForeignKey(
+        EducationInstitutionProgram,
+        on_delete=models.SET_NULL,
+        related_name="courses",
+        null=True,
+        blank=True,
+    )
+    title = models.CharField(max_length=255)
+    code = models.CharField(max_length=64, blank=True, default="")
+    summary = models.TextField(blank=True, default="")
+    description = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=16,
+        choices=EducationAcademicRecordStatus.choices,
+        default=EducationAcademicRecordStatus.DRAFT,
+    )
+    duration_minutes = models.PositiveIntegerField(default=0)
+    seat_limit = models.PositiveIntegerField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    settings = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_course"
+        ordering = ["title", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["institution", "code"]),
+            models.Index(fields=["program", "status"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class EducationInstitutionCourseModule(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="course_modules",
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.CASCADE,
+        related_name="modules_v2",
+    )
+    title = models.CharField(max_length=255)
+    summary = models.TextField(blank=True, default="")
+    module_order = models.PositiveIntegerField(default=0)
+    is_preview = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=16,
+        choices=EducationAcademicRecordStatus.choices,
+        default=EducationAcademicRecordStatus.DRAFT,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_course_module"
+        ordering = ["module_order", "title", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["course", "module_order"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class EducationInstitutionLesson(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="lessons_v2",
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.CASCADE,
+        related_name="lessons",
+    )
+    title = models.CharField(max_length=255)
+    summary = models.TextField(blank=True, default="")
+    content = models.TextField(blank=True, default="")
+    lesson_order = models.PositiveIntegerField(default=0)
+    duration_minutes = models.PositiveIntegerField(default=0)
+    is_preview = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=16,
+        choices=EducationAcademicRecordStatus.choices,
+        default=EducationAcademicRecordStatus.DRAFT,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_lesson"
+        ordering = ["lesson_order", "title", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["course", "lesson_order"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class EducationInstitutionCourseModuleItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="course_module_items",
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.CASCADE,
+        related_name="module_items",
+    )
+    module = models.ForeignKey(
+        EducationInstitutionCourseModule,
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+    item_type = models.CharField(
+        max_length=24,
+        choices=EducationCourseModuleItemType.choices,
+        default=EducationCourseModuleItemType.LESSON,
+    )
+    item_order = models.PositiveIntegerField(default=0)
+    title_override = models.CharField(max_length=255, blank=True, default="")
+    summary_override = models.TextField(blank=True, default="")
+    estimated_minutes = models.PositiveIntegerField(default=0)
+    lesson = models.ForeignKey(
+        "EducationInstitutionLesson",
+        on_delete=models.CASCADE,
+        related_name="module_items",
+        null=True,
+        blank=True,
+    )
+    material = models.ForeignKey(
+        "EducationInstitutionMaterial",
+        on_delete=models.CASCADE,
+        related_name="module_items",
+        null=True,
+        blank=True,
+    )
+    class_session = models.ForeignKey(
+        "EducationInstitutionClassSession",
+        on_delete=models.CASCADE,
+        related_name="module_items",
+        null=True,
+        blank=True,
+    )
+    assessment = models.ForeignKey(
+        "EducationInstitutionAssessment",
+        on_delete=models.CASCADE,
+        related_name="module_items",
+        null=True,
+        blank=True,
+    )
+    event = models.ForeignKey(
+        "EducationInstitutionEvent",
+        on_delete=models.CASCADE,
+        related_name="module_items",
+        null=True,
+        blank=True,
+    )
+    broadcast = models.ForeignKey(
+        "EducationInstitutionBroadcast",
+        on_delete=models.CASCADE,
+        related_name="module_items",
+        null=True,
+        blank=True,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_course_module_item"
+        ordering = ["item_order", "created_at"]
+        indexes = [
+            models.Index(fields=["institution", "item_type"]),
+            models.Index(fields=["course", "item_order"]),
+            models.Index(fields=["module", "item_order"]),
+        ]
+
+    def __str__(self):
+        return f"{self.module_id}:{self.item_type}:{self.item_order}"
+
+
+class EducationInstitutionClassSession(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="class_sessions",
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.CASCADE,
+        related_name="class_sessions",
+        null=True,
+        blank=True,
+    )
+    lesson = models.ForeignKey(
+        EducationInstitutionLesson,
+        on_delete=models.SET_NULL,
+        related_name="class_sessions",
+        null=True,
+        blank=True,
+    )
+    title = models.CharField(max_length=255)
+    summary = models.TextField(blank=True, default="")
+    starts_at = models.DateTimeField()
+    ends_at = models.DateTimeField()
+    timezone_name = models.CharField(max_length=64, blank=True, default="UTC")
+    delivery_mode = models.CharField(
+        max_length=16,
+        choices=EducationClassSessionMode.choices,
+        default=EducationClassSessionMode.ONLINE,
+    )
+    location_text = models.CharField(max_length=255, blank=True, default="")
+    meeting_url = models.URLField(blank=True, default="")
+    seat_limit = models.PositiveIntegerField(null=True, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=EducationClassSessionStatus.choices,
+        default=EducationClassSessionStatus.SCHEDULED,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_class_session"
+        ordering = ["starts_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["institution", "starts_at"]),
+            models.Index(fields=["course", "starts_at"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class EducationInstitutionMaterial(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="materials",
+    )
+    program = models.ForeignKey(
+        EducationInstitutionProgram,
+        on_delete=models.SET_NULL,
+        related_name="materials",
+        null=True,
+        blank=True,
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.CASCADE,
+        related_name="materials",
+        null=True,
+        blank=True,
+    )
+    lesson = models.ForeignKey(
+        EducationInstitutionLesson,
+        on_delete=models.CASCADE,
+        related_name="materials",
+        null=True,
+        blank=True,
+    )
+    class_session = models.ForeignKey(
+        EducationInstitutionClassSession,
+        on_delete=models.SET_NULL,
+        related_name="materials",
+        null=True,
+        blank=True,
+    )
+    assessment = models.ForeignKey(
+        "EducationInstitutionAssessment",
+        on_delete=models.SET_NULL,
+        related_name="materials",
+        null=True,
+        blank=True,
+    )
+    program_links = models.ManyToManyField(
+        EducationInstitutionProgram,
+        related_name="linked_materials",
+        blank=True,
+    )
+    course_links = models.ManyToManyField(
+        "EducationInstitutionCourse",
+        related_name="linked_materials",
+        blank=True,
+    )
+    lesson_links = models.ManyToManyField(
+        "EducationInstitutionLesson",
+        related_name="linked_materials",
+        blank=True,
+    )
+    class_session_links = models.ManyToManyField(
+        "EducationInstitutionClassSession",
+        related_name="linked_materials",
+        blank=True,
+    )
+    assessment_links = models.ManyToManyField(
+        "EducationInstitutionAssessment",
+        related_name="linked_materials",
+        blank=True,
+    )
+    title = models.CharField(max_length=255)
+    summary = models.TextField(blank=True, default="")
+    kind = models.CharField(
+        max_length=16,
+        choices=EducationMaterialKind.choices,
+        default=EducationMaterialKind.DOCUMENT,
+    )
+    resource_url = models.URLField(blank=True, default="")
+    resource_name = models.CharField(max_length=255, blank=True, default="")
+    resource_mime_type = models.CharField(max_length=128, blank=True, default="")
+    storage_path = models.CharField(max_length=512, blank=True, default="")
+    is_downloadable = models.BooleanField(default=True)
+    status = models.CharField(
+        max_length=16,
+        choices=EducationAcademicRecordStatus.choices,
+        default=EducationAcademicRecordStatus.DRAFT,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_material"
+        ordering = ["title", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["program", "status"]),
+            models.Index(fields=["course", "status"]),
+            models.Index(fields=["lesson", "status"]),
+            models.Index(fields=["class_session", "status"]),
+            models.Index(fields=["assessment", "status"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class EducationInstitutionAssessment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="assessments",
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.CASCADE,
+        related_name="assessments",
+        null=True,
+        blank=True,
+    )
+    lesson = models.ForeignKey(
+        EducationInstitutionLesson,
+        on_delete=models.CASCADE,
+        related_name="assessments",
+        null=True,
+        blank=True,
+    )
+    class_session = models.ForeignKey(
+        EducationInstitutionClassSession,
+        on_delete=models.CASCADE,
+        related_name="assessments",
+        null=True,
+        blank=True,
+    )
+    title = models.CharField(max_length=255)
+    summary = models.TextField(blank=True, default="")
+    instructions = models.TextField(blank=True, default="")
+    assessment_type = models.CharField(
+        max_length=16,
+        choices=EducationAssessmentType.choices,
+        default=EducationAssessmentType.MCQ,
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=EducationAcademicRecordStatus.choices,
+        default=EducationAcademicRecordStatus.DRAFT,
+    )
+    starts_at = models.DateTimeField(null=True, blank=True)
+    ends_at = models.DateTimeField(null=True, blank=True)
+    duration_minutes = models.PositiveIntegerField(default=0)
+    max_attempts = models.PositiveIntegerField(default=1)
+    passing_score_percent = models.PositiveIntegerField(default=0)
+    total_points = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+    settings = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_assessment"
+        ordering = ["title", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["course", "status"]),
+            models.Index(fields=["lesson", "status"]),
+            models.Index(fields=["class_session", "status"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class EducationInstitutionAssessmentQuestion(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    assessment = models.ForeignKey(
+        EducationInstitutionAssessment,
+        on_delete=models.CASCADE,
+        related_name="questions",
+    )
+    prompt = models.TextField()
+    question_type = models.CharField(
+        max_length=16,
+        choices=EducationAssessmentQuestionType.choices,
+        default=EducationAssessmentQuestionType.MCQ,
+    )
+    question_order = models.PositiveIntegerField(default=0)
+    points = models.DecimalField(max_digits=8, decimal_places=2, default=1)
+    is_required = models.BooleanField(default=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_assessment_question"
+        ordering = ["question_order", "created_at"]
+        indexes = [
+            models.Index(fields=["assessment", "question_order"]),
+            models.Index(fields=["assessment", "question_type"]),
+        ]
+
+    def __str__(self):
+        return self.prompt[:80]
+
+
+class EducationInstitutionAssessmentOption(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    question = models.ForeignKey(
+        EducationInstitutionAssessmentQuestion,
+        on_delete=models.CASCADE,
+        related_name="options",
+    )
+    option_text = models.TextField()
+    option_order = models.PositiveIntegerField(default=0)
+    is_correct = models.BooleanField(default=False)
+    explanation = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_assessment_option"
+        ordering = ["option_order", "created_at"]
+        indexes = [
+            models.Index(fields=["question", "option_order"]),
+        ]
+
+    def __str__(self):
+        return self.option_text[:80]
+
+
+class EducationInstitutionAssessmentSubmission(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    assessment = models.ForeignKey(
+        EducationInstitutionAssessment,
+        on_delete=models.CASCADE,
+        related_name="submissions",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="education_assessment_submissions",
+    )
+    attempt_number = models.PositiveIntegerField(default=1)
+    status = models.CharField(
+        max_length=16,
+        choices=EducationAssessmentSubmissionStatus.choices,
+        default=EducationAssessmentSubmissionStatus.STARTED,
+    )
+    earned_points = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    score_percent = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+    grader = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="graded_education_assessment_submissions",
+        null=True,
+        blank=True,
+    )
+    grader_feedback = models.TextField(blank=True, default="")
+    metadata = models.JSONField(default=dict, blank=True)
+    started_at = models.DateTimeField(default=timezone.now)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    graded_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_assessment_submission"
+        ordering = ["-created_at"]
+        unique_together = [("assessment", "user", "attempt_number")]
+        indexes = [
+            models.Index(fields=["assessment", "status"]),
+            models.Index(fields=["user", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.assessment_id}:{self.user_id}:#{self.attempt_number}"
+
+
+class EducationInstitutionAssessmentResponse(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    submission = models.ForeignKey(
+        EducationInstitutionAssessmentSubmission,
+        on_delete=models.CASCADE,
+        related_name="responses",
+    )
+    question = models.ForeignKey(
+        EducationInstitutionAssessmentQuestion,
+        on_delete=models.CASCADE,
+        related_name="responses",
+    )
+    answer_text = models.TextField(blank=True, default="")
+    is_correct = models.BooleanField(null=True, blank=True)
+    earned_points = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    grader_feedback = models.TextField(blank=True, default="")
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_assessment_response"
+        unique_together = [("submission", "question")]
+        indexes = [
+            models.Index(fields=["submission", "question"]),
+        ]
+
+    def __str__(self):
+        return f"{self.submission_id}:{self.question_id}"
+
+
+class EducationInstitutionAssessmentResponseOption(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    response = models.ForeignKey(
+        EducationInstitutionAssessmentResponse,
+        on_delete=models.CASCADE,
+        related_name="selected_options",
+    )
+    option = models.ForeignKey(
+        EducationInstitutionAssessmentOption,
+        on_delete=models.CASCADE,
+        related_name="response_links",
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "education_institution_assessment_response_option"
+        unique_together = [("response", "option")]
+        indexes = [
+            models.Index(fields=["response", "option"]),
+        ]
+
+
+class EducationInstitutionEvent(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="events",
+    )
+    program = models.ForeignKey(
+        EducationInstitutionProgram,
+        on_delete=models.SET_NULL,
+        related_name="events",
+        null=True,
+        blank=True,
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.SET_NULL,
+        related_name="events",
+        null=True,
+        blank=True,
+    )
+    class_session = models.ForeignKey(
+        EducationInstitutionClassSession,
+        on_delete=models.SET_NULL,
+        related_name="events",
+        null=True,
+        blank=True,
+    )
+    event_type = models.CharField(
+        max_length=24,
+        choices=EducationInstitutionEventType.choices,
+        default=EducationInstitutionEventType.EVENT,
+    )
+    title = models.CharField(max_length=255)
+    summary = models.TextField(blank=True, default="")
+    description = models.TextField(blank=True, default="")
+    starts_at = models.DateTimeField()
+    ends_at = models.DateTimeField()
+    timezone_name = models.CharField(max_length=64, blank=True, default="UTC")
+    delivery_mode = models.CharField(
+        max_length=16,
+        choices=EducationClassSessionMode.choices,
+        default=EducationClassSessionMode.ONLINE,
+    )
+    location_text = models.CharField(max_length=255, blank=True, default="")
+    meeting_url = models.URLField(blank=True, default="")
+    seat_limit = models.PositiveIntegerField(null=True, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=EducationAcademicRecordStatus.choices,
+        default=EducationAcademicRecordStatus.DRAFT,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_event"
+        ordering = ["starts_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["program", "status"]),
+            models.Index(fields=["course", "status"]),
+            models.Index(fields=["class_session", "status"]),
+            models.Index(fields=["institution", "event_type"]),
+            models.Index(fields=["institution", "starts_at"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class EducationInstitutionBroadcast(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="education_broadcasts",
+    )
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="education_broadcasts_created",
+    )
+    broadcast_item = models.OneToOneField(
+        BroadcastItem,
+        on_delete=models.SET_NULL,
+        related_name="education_broadcast_row",
+        null=True,
+        blank=True,
+    )
+    broadcast_kind = models.CharField(
+        max_length=24,
+        choices=EducationBroadcastKind.choices,
+    )
+    program = models.ForeignKey(
+        EducationInstitutionProgram,
+        on_delete=models.SET_NULL,
+        related_name="broadcasts",
+        null=True,
+        blank=True,
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.CASCADE,
+        related_name="broadcasts",
+        null=True,
+        blank=True,
+    )
+    lesson = models.ForeignKey(
+        EducationInstitutionLesson,
+        on_delete=models.CASCADE,
+        related_name="broadcasts",
+        null=True,
+        blank=True,
+    )
+    class_session = models.ForeignKey(
+        EducationInstitutionClassSession,
+        on_delete=models.CASCADE,
+        related_name="broadcasts",
+        null=True,
+        blank=True,
+    )
+    event = models.ForeignKey(
+        EducationInstitutionEvent,
+        on_delete=models.CASCADE,
+        related_name="broadcasts",
+        null=True,
+        blank=True,
+    )
+    title = models.CharField(max_length=255)
+    summary = models.TextField(blank=True, default="")
+    description = models.TextField(blank=True, default="")
+    cover_image_url = models.URLField(blank=True, default="")
+    starts_at = models.DateTimeField(null=True, blank=True)
+    ends_at = models.DateTimeField(null=True, blank=True)
+    timezone_name = models.CharField(max_length=64, blank=True, default="UTC")
+    seat_limit = models.PositiveIntegerField(null=True, blank=True)
+    booking_enabled = models.BooleanField(default=False)
+    price_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    price_currency = models.CharField(max_length=8, blank=True, default=KIS_COIN_CODE)
+    status = models.CharField(
+        max_length=16,
+        choices=EducationBroadcastStatus.choices,
+        default=EducationBroadcastStatus.PUBLISHED,
+    )
+    published_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField(default=_default_expires_at)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_broadcast"
+        ordering = ["-published_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["institution", "broadcast_kind"]),
+            models.Index(fields=["program", "status"]),
+            models.Index(fields=["published_at"]),
+            models.Index(fields=["expires_at"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class EducationInstitutionEnrollment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="enrollments",
+    )
+    broadcast = models.ForeignKey(
+        EducationInstitutionBroadcast,
+        on_delete=models.CASCADE,
+        related_name="enrollments",
+    )
+    program = models.ForeignKey(
+        EducationInstitutionProgram,
+        on_delete=models.SET_NULL,
+        related_name="enrollments",
+        null=True,
+        blank=True,
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="education_enrollments",
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.CASCADE,
+        related_name="enrollments",
+        null=True,
+        blank=True,
+    )
+    lesson = models.ForeignKey(
+        EducationInstitutionLesson,
+        on_delete=models.CASCADE,
+        related_name="enrollments",
+        null=True,
+        blank=True,
+    )
+    class_session = models.ForeignKey(
+        EducationInstitutionClassSession,
+        on_delete=models.CASCADE,
+        related_name="enrollments",
+        null=True,
+        blank=True,
+    )
+    event = models.ForeignKey(
+        EducationInstitutionEvent,
+        on_delete=models.CASCADE,
+        related_name="enrollments",
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=EducationEnrollmentStatus.choices,
+        default=EducationEnrollmentStatus.PENDING,
+    )
+    enrolled_at = models.DateTimeField(default=timezone.now)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_enrollment"
+        unique_together = [("broadcast", "user")]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["broadcast", "status"]),
+            models.Index(fields=["program", "status"]),
+            models.Index(fields=["user", "status"]),
+        ]
+
+
+class EducationInstitutionBooking(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="bookings",
+    )
+    broadcast = models.ForeignKey(
+        EducationInstitutionBroadcast,
+        on_delete=models.CASCADE,
+        related_name="bookings",
+    )
+    program = models.ForeignKey(
+        EducationInstitutionProgram,
+        on_delete=models.SET_NULL,
+        related_name="bookings",
+        null=True,
+        blank=True,
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.SET_NULL,
+        related_name="bookings",
+        null=True,
+        blank=True,
+    )
+    class_session = models.ForeignKey(
+        EducationInstitutionClassSession,
+        on_delete=models.SET_NULL,
+        related_name="bookings",
+        null=True,
+        blank=True,
+    )
+    event = models.ForeignKey(
+        EducationInstitutionEvent,
+        on_delete=models.SET_NULL,
+        related_name="bookings",
+        null=True,
+        blank=True,
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="education_bookings",
+    )
+    status = models.CharField(
+        max_length=24,
+        choices=EducationBookingStatus.choices,
+        default=EducationBookingStatus.PENDING,
+    )
+    seat_count = models.PositiveIntegerField(default=1)
+    amount_cents = models.BigIntegerField(default=0)
+    currency = models.CharField(max_length=8, default=KIS_COIN_CODE)
+    payment_method = models.CharField(max_length=32, blank=True, default="")
+    wallet_transaction = models.ForeignKey(
+        WalletTransaction,
+        on_delete=models.SET_NULL,
+        related_name="education_bookings",
+        null=True,
+        blank=True,
+    )
+    provider_credit_transaction = models.ForeignKey(
+        WalletTransaction,
+        on_delete=models.SET_NULL,
+        related_name="education_booking_provider_payouts",
+        null=True,
+        blank=True,
+    )
+    reserved_at = models.DateTimeField(default=timezone.now)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    provider_completed_at = models.DateTimeField(null=True, blank=True)
+    payer_satisfied_at = models.DateTimeField(null=True, blank=True)
+    satisfaction_deadline = models.DateTimeField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_booking"
+        unique_together = [("broadcast", "user")]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["broadcast", "status"]),
+            models.Index(fields=["program", "status"]),
+            models.Index(fields=["course", "status"]),
+            models.Index(fields=["class_session", "status"]),
+            models.Index(fields=["event", "status"]),
+            models.Index(fields=["user", "status"]),
+            models.Index(fields=["satisfaction_deadline"]),
+        ]
+
+    @property
+    def complaint_window_expires(self):
+        if not self.provider_completed_at:
+            return None
+        return self.provider_completed_at + timedelta(days=3)
 
 
 FEATURE_DEFINITIONS = [

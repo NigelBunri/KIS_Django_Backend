@@ -4,8 +4,6 @@ import logging
 import uuid
 import os
 from datetime import timedelta
-from typing import Any
-
 import requests
 from django.conf import settings
 from django.utils import timezone
@@ -23,6 +21,7 @@ from rest_framework.views import APIView
 
 from django.core.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
+from apps.core.money import parse_frontend_money_to_cents
 
 from apps.accounts.models import User, AccountTier, Subscription, AuditLog
 from apps.partners.services import ensure_partner_profiles_for_user
@@ -106,13 +105,16 @@ def _tier_rank(name: str) -> int:
     return 0
 
 
-def _parse_int_field(value: Any, field_name: str) -> int:
+def _parse_int_field(value, field_name: str) -> int:
     if value in (None, ""):
         return 0
     try:
         return int(value)
     except (TypeError, ValueError):
         raise ValueError(f"Invalid {field_name}")
+
+
+_parse_frontend_money_to_cents = parse_frontend_money_to_cents
 
 
 def _normalized_phone_variants(phone: str, country_hint: str | None = None) -> list[str]:
@@ -646,8 +648,10 @@ class WalletViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["post"], url_path="deposit")
     def deposit(self, request):
         print("deposit data: ", request.data)
-        amount = int(request.data.get("amount_cents", 0))
-        amount_usd = request.data.get("amount_usd")
+        try:
+            amount = _parse_frontend_money_to_cents(request.data)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         provider = request.data.get("provider", "flutterwave")
         method = request.data.get("method")
         payment_meta: dict[str, Any] = {}
@@ -657,12 +661,6 @@ class WalletViewSet(viewsets.ViewSet):
             logger = logging.getLogger(__name__)
             logger.warning("Flutterwave secret missing; falling back to direct deposit.")
             force_direct = True
-
-        if amount_usd is not None:
-            try:
-                amount = int(float(amount_usd) * 100)
-            except (ValueError, TypeError):
-                return Response({"detail": "Invalid amount_usd"}, status=status.HTTP_400_BAD_REQUEST)
 
         if amount <= 0:
             return Response({"detail": "Amount must be greater than 0"}, status=status.HTTP_400_BAD_REQUEST)
@@ -776,9 +774,7 @@ class WalletViewSet(viewsets.ViewSet):
         direction = request.data.get("direction")
         try:
             if direction == "cash_to_credits":
-                amount_cents = int(request.data.get("amount_cents", 0))
-                if amount_cents == 0 and request.data.get("amount_usd"):
-                    amount_cents = int(float(request.data.get("amount_usd")) * 100)
+                amount_cents = _parse_frontend_money_to_cents(request.data)
                 result = convert_cash_to_credits(request.user, amount_cents)
                 return Response(
                     {
@@ -812,10 +808,9 @@ class WalletViewSet(viewsets.ViewSet):
         recipient_id = request.data.get("recipient_id")
         recipient_phone = request.data.get("recipient_phone")
         country_hint = request.data.get("country") or getattr(request.user, "country", None)
-        amount_usd = request.data.get("amount_usd")
 
         try:
-            amount_cents = _parse_int_field(request.data.get("amount_cents"), "amount_cents")
+            amount_cents = _parse_frontend_money_to_cents(request.data)
             credits = _parse_int_field(request.data.get("credits"), "credits")
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -825,12 +820,6 @@ class WalletViewSet(viewsets.ViewSet):
                 {"detail": "Provide either amount_cents or credits, not both."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        if amount_usd is not None and amount_cents == 0:
-            try:
-                amount_cents = int(float(amount_usd) * 100)
-            except (ValueError, TypeError):
-                return Response({"detail": "Invalid amount_usd"}, status=status.HTTP_400_BAD_REQUEST)
 
         if amount_cents <= 0 and credits <= 0:
             return Response(
@@ -926,6 +915,42 @@ class WalletViewSet(viewsets.ViewSet):
             except ValueError as exc:
                 return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
             return Response(result, status=status.HTTP_200_OK)
+
+        if payment_method in ("kisc", "wallet", "wallet_balance"):
+            tx_ref = f"kis_upgrade_{uuid.uuid4().hex}"
+            wallet_account = get_wallet_account(request.user)
+            if wallet_account.balance_cents < tier.price_cents:
+                return Response(
+                    {"detail": "Insufficient wallet balance for upgrade."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            transaction_obj = WalletTransaction.objects.create(
+                user=request.user,
+                provider="internal",
+                method="wallet",
+                amount_cents=tier.price_cents,
+                currency="USD",
+                status="pending",
+                tx_ref=tx_ref,
+                meta={"intent": "tier_upgrade", "tier_id": str(tier.id), "payment_method": payment_method},
+            )
+            apply_tier_upgrade(
+                user=request.user,
+                tier=tier,
+                source="wallet",
+                amount_cents=-tier.price_cents,
+                reference=tx_ref,
+                meta={"payment_method": payment_method},
+            )
+            transaction_obj.status = "success"
+            transaction_obj.provider = "wallet"
+            transaction_obj.payment_url = ""
+            transaction_obj.processed_at = timezone.now()
+            transaction_obj.save(update_fields=["status", "payment_url", "updated_at", "processed_at"])
+            return Response(
+                {"tier": tier.name, "status": "success", "payment_method": payment_method},
+                status=status.HTTP_200_OK,
+            )
 
         tx_ref = f"kis_upgrade_{uuid.uuid4().hex}"
         transaction_obj = WalletTransaction.objects.create(

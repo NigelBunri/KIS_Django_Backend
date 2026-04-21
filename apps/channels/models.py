@@ -9,6 +9,11 @@ from apps.chat.models import Conversation
 
 
 class Channel(models.Model):
+    class ChannelType(models.TextChoices):
+        TEXT = "text", "Text"
+        ANNOUNCEMENT = "announcement", "Announcement"
+        PRIVATE = "private", "Private"
+
     """
     Channel entity (broadcast-like or topic-based stream).
 
@@ -35,9 +40,25 @@ class Channel(models.Model):
         help_text="Owning community (optional).",
     )
 
+    category = models.ForeignKey(
+        "partners.PartnerServerCategory",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="channels",
+        help_text="Optional partner server category used to group channels in the sidebar.",
+    )
+
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=255)
     description = models.TextField(blank=True)
+    channel_type = models.CharField(
+        max_length=24,
+        choices=ChannelType.choices,
+        default=ChannelType.ANNOUNCEMENT,
+        db_index=True,
+    )
+    order = models.PositiveIntegerField(default=0)
 
     avatar_url = models.URLField(
         blank=True,
@@ -74,6 +95,12 @@ class Channel(models.Model):
         db_table = "channel_channel"
         unique_together = [
             ("community", "slug"),
+            ("partner", "slug"),
+        ]
+        ordering = ["order", "name"]
+        indexes = [
+            models.Index(fields=["partner", "category", "order"]),
+            models.Index(fields=["partner", "channel_type"]),
         ]
 
     def __str__(self) -> str:

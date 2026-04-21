@@ -13,6 +13,7 @@ from django.conf import settings
 from django.shortcuts import get_object_or_404
 from django.db import transaction
 from django.db.models import Q
+from django.http import FileResponse
 from django.utils import timezone
 
 import logging
@@ -21,8 +22,11 @@ from apps.accounts.tiers import get_user_tier, get_feature_limit, normalize_limi
 from apps.notifications import services as notification_services
 from apps.billing.documents import build_booking_receipt_urls
 from apps.billing.services import lock_wallet_funds_for_booking, release_locked_booking_funds, refund_locked_booking_funds
+from apps.core.money import frontend_kisc_major_to_usd_cents, parse_decimal_amount
 
 from .availability import format_date_key, get_day_key, normalize_availability_payload
+from .category_catalog import ensure_catalog_categories
+from .documents import render_marketplace_receipt_pdf
 from .constants import KIS_COIN_CODE
 from .models import (
     Shop,
@@ -40,7 +44,6 @@ from .models import (
     AIRecommendation,
     AuditLog,
     FraudSignal,
-    ShopCategory,
     ProductRating,
     ShopService,
     ShopRole,
@@ -52,6 +55,18 @@ from .models import (
     ServiceBookingComplaint,
     Cart,
     CartItem,
+    MarketplaceOrder,
+    MarketplaceOrderStatus,
+    MarketplaceComplaint,
+    CatalogCategory,
+)
+from .services import (
+    place_marketplace_order,
+    cancel_marketplace_order_by_id,
+    satisfy_marketplace_order_by_id,
+    provider_complete_marketplace_order_by_id,
+    create_marketplace_complaint_from_data,
+    _provider_can_manage_shop,
 )
 from .serializers import (
     ShopSerializer,
@@ -69,7 +84,7 @@ from .serializers import (
     AuditLogSerializer,
     FraudSignalSerializer,
     ProductRatingSerializer,
-    ProductCategorySerializer,
+    CatalogCategorySerializer,
     ShopServiceSerializer,
     ShopTeamMemberSerializer,
     ServiceBookingSerializer,
@@ -79,29 +94,27 @@ from .serializers import (
     ServiceBookingComplaintSerializer,
     CartSerializer,
     CartItemSerializer,
+    MarketplaceOrderSerializer,
+    MarketplaceOrderCreateSerializer,
+    MarketplaceComplaintSerializer,
+    MarketplaceComplaintCreateSerializer,
 )
 
 logger = logging.getLogger(__name__)
 
-WALLET_CENT_SCALE = 100
-
-
 def _wallet_amount(value: int | None) -> int:
-    return max(0, int(value or 0) * WALLET_CENT_SCALE)
+    return max(0, int(value or 0))
 
 
 def _decimal_from_value(value):
-    if value is None:
+    parsed = parse_decimal_amount(value)
+    if parsed is None:
         return Decimal("0")
-    try:
-        return Decimal(str(value))
-    except Exception:
-        return Decimal("0")
+    return parsed
 
 
 def _to_cents(amount: Decimal) -> int:
-    quantized = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return int((quantized * Decimal("100")).to_integral_value())
+    return int(frontend_kisc_major_to_usd_cents(amount) or 0)
 
 
 def _resolve_service_package_option(service, package_name):
@@ -141,13 +154,14 @@ def _resolve_service_addon_options(service, addon_names):
 
 
 def _apply_tax_if_needed(service, price):
-    if not SERVICE_HANDLE_TAX_INCLUSIVE or getattr(service, 'tax_inclusive', True):
+    if not _service_flag("SERVICE_HANDLE_TAX_INCLUSIVE", False) or getattr(service, 'tax_inclusive', True):
         return price
-    if COMMERCE_DEFAULT_TAX_RATE_PCT <= 0:
+    tax_rate_pct = _commerce_default_tax_rate_pct()
+    if tax_rate_pct <= 0:
         return price
-    multiplier = Decimal('1') + (COMMERCE_DEFAULT_TAX_RATE_PCT / Decimal('100'))
+    multiplier = Decimal('1') + (tax_rate_pct / Decimal('100'))
     taxed = (price * multiplier).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-    logger.info("SERVICE_HANDLE_TAX_INCLUSIVE applied for service %s rate=%s", service.id, COMMERCE_DEFAULT_TAX_RATE_PCT)
+    logger.info("SERVICE_HANDLE_TAX_INCLUSIVE applied for service %s rate=%s", service.id, tax_rate_pct)
     return taxed
 
 
@@ -155,7 +169,7 @@ def _enforce_minimum_charge(service, price, negotiation_flow):
     min_charge = _decimal_from_value(getattr(service, 'minimum_charge', None))
     if min_charge <= 0:
         return price
-    if SERVICE_ENFORCE_MINIMUM_CHARGE and not negotiation_flow:
+    if _service_flag("SERVICE_ENFORCE_MINIMUM_CHARGE", False) and not negotiation_flow:
         if price < min_charge:
             raise ValidationError({
                 'detail': f"Minimum charge for this service is {min_charge}.",
@@ -167,13 +181,21 @@ def _enforce_minimum_charge(service, price, negotiation_flow):
 
 
 def _normalize_requirement_tokens(items):
-    return [str(item).strip() for item in (items or []) if str(item).strip()]
+    normalized = []
+    for item in (items or []):
+        if isinstance(item, dict):
+            candidate = str(item.get('label') or item.get('name') or '').strip()
+        else:
+            candidate = str(item).strip()
+        if candidate:
+            normalized.append(candidate)
+    return normalized
 
 
 def _validate_requirements_acknowledgement(service, provided):
     requirements = _normalize_requirement_tokens(getattr(service, 'requirements', []) or [])
     acknowledgements = _normalize_requirement_tokens(provided)
-    if not SERVICE_ENFORCE_REQUIREMENTS or not requirements:
+    if not _service_flag("SERVICE_ENFORCE_REQUIREMENTS", False) or not requirements:
         return acknowledgements
     normalized_ack = {item.lower() for item in acknowledgements}
     missing = [req for req in requirements if req.lower() not in normalized_ack]
@@ -196,7 +218,7 @@ def _validate_requirements_acknowledgement(service, provided):
 
 def _ensure_terms_accepted(service, accepted):
     terms_text = str(getattr(service, 'service_terms', '') or '').strip()
-    if not SERVICE_REQUIRE_TERMS_ACCEPTANCE or not terms_text:
+    if not _service_flag("SERVICE_REQUIRE_TERMS_ACCEPTANCE", False) or not terms_text:
         return bool(accepted)
     if not accepted:
         logger.warning(
@@ -231,6 +253,13 @@ def _build_booking_metadata(
     requested_price,
     requirements_ack,
     terms_accepted,
+    *,
+    location=None,
+    distance_km=None,
+    is_remote=False,
+    remote_region="",
+    participant_count=None,
+    staff_on_site=None,
 ):
     metadata = {
         'pricing_model': str(getattr(service, 'pricing_model', '') or 'standard'),
@@ -258,6 +287,19 @@ def _build_booking_metadata(
     if negotiation_flow:
         metadata['negotiation_requested'] = True
         metadata['requested_price'] = str(requested_price)
+    normalized_location = _normalize_location_payload(location)
+    if normalized_location:
+        metadata['location'] = normalized_location
+    if distance_km is not None:
+        metadata['distance_km'] = str(distance_km)
+    if is_remote:
+        metadata['is_remote'] = True
+    if remote_region:
+        metadata['remote_region'] = str(remote_region)
+    if participant_count is not None:
+        metadata['participant_count'] = int(participant_count)
+    if staff_on_site is not None:
+        metadata['staff_on_site'] = int(staff_on_site)
     return metadata
 
 
@@ -371,26 +413,16 @@ ACTIVE_BOOKING_STATUSES = {
     ServiceBooking.STATUS_COMPLETED,
     ServiceBooking.STATUS_DISPUTE,
 }
-SERVICE_ENFORCE_BUFFERS = getattr(settings, "SERVICE_ENFORCE_BUFFERS", False)
-SERVICE_ENFORCE_COVERAGE = getattr(settings, "SERVICE_ENFORCE_COVERAGE", False)
-SERVICE_ENFORCE_TRAVEL_RADIUS = getattr(settings, "SERVICE_ENFORCE_TRAVEL_RADIUS", False)
-SERVICE_ENFORCE_REMOTE_REGIONS = getattr(settings, "SERVICE_ENFORCE_REMOTE_REGIONS", False)
-SERVICE_ENFORCE_GROUP_CAPACITY = getattr(settings, "SERVICE_ENFORCE_GROUP_CAPACITY", False)
-SERVICE_ENABLE_QUOTES = getattr(settings, "SERVICE_ENABLE_QUOTES", False)
-SERVICE_ENABLE_NEGOTIATION = getattr(settings, "SERVICE_ENABLE_NEGOTIATION", False)
-SERVICE_ENABLE_PACKAGE_PRICING = getattr(settings, "SERVICE_ENABLE_PACKAGE_PRICING", False)
-SERVICE_ENABLE_ADDONS = getattr(settings, "SERVICE_ENABLE_ADDONS", False)
-SERVICE_ENFORCE_MINIMUM_CHARGE = getattr(settings, "SERVICE_ENFORCE_MINIMUM_CHARGE", False)
-SERVICE_HANDLE_TAX_INCLUSIVE = getattr(settings, "SERVICE_HANDLE_TAX_INCLUSIVE", False)
-_COMMERCE_DEFAULT_TAX_RATE_PCT = getattr(settings, "COMMERCE_DEFAULT_TAX_RATE_PCT", "0")
-try:
-    COMMERCE_DEFAULT_TAX_RATE_PCT = Decimal(str(_COMMERCE_DEFAULT_TAX_RATE_PCT) or "0")
-except InvalidOperation:
-    COMMERCE_DEFAULT_TAX_RATE_PCT = Decimal("0")
-SERVICE_REQUIRE_TERMS_ACCEPTANCE = getattr(settings, "SERVICE_REQUIRE_TERMS_ACCEPTANCE", False)
-SERVICE_ENFORCE_REQUIREMENTS = getattr(settings, "SERVICE_ENFORCE_REQUIREMENTS", False)
-SERVICE_ENFORCE_REFUND_POLICY = getattr(settings, "SERVICE_ENFORCE_REFUND_POLICY", False)
-SERVICE_ENFORCE_RESCHEDULE_POLICY = getattr(settings, "SERVICE_ENFORCE_RESCHEDULE_POLICY", False)
+def _service_flag(name, default=False):
+    return getattr(settings, name, default)
+
+
+def _commerce_default_tax_rate_pct():
+    raw_value = getattr(settings, "COMMERCE_DEFAULT_TAX_RATE_PCT", "0")
+    try:
+        return Decimal(str(raw_value) or "0")
+    except InvalidOperation:
+        return Decimal("0")
 
 
 def _get_service_timezone(service):
@@ -433,8 +465,7 @@ def _validate_service_schedule(service, scheduled_at):
     if scheduled <= now:
         raise ValidationError({"scheduled_at": "Scheduled time must be in the future."})
 
-    min_hours = min(getattr(service, "min_notice_hours", 0) or 0, CANCELLATION_WINDOW_HOURS)
-    min_hours = max(min_hours, CANCELLATION_WINDOW_HOURS)
+    min_hours = max(int(getattr(service, "min_notice_hours", 0) or 0), 0)
     if min_hours:
         cutoff = now + timedelta(hours=min_hours)
         if scheduled < cutoff:
@@ -490,7 +521,7 @@ def _get_service_busy_range(service, scheduled_at):
 
 
 def _ensure_no_buffer_conflict(service, scheduled_at):
-    if not SERVICE_ENFORCE_BUFFERS or service.group_booking_allowed:
+    if not _service_flag("SERVICE_ENFORCE_BUFFERS", False) or service.group_booking_allowed:
         return
     logger.info("SERVICE_ENFORCE_BUFFERS active for service %s", service.id)
     start, end = _get_service_busy_range(service, scheduled_at)
@@ -517,13 +548,16 @@ def _normalize_location_payload(payload):
 
 
 def _validate_service_location(service, location_payload, distance_km, is_remote, remote_region):
-    if not any((SERVICE_ENFORCE_COVERAGE, SERVICE_ENFORCE_TRAVEL_RADIUS, SERVICE_ENFORCE_REMOTE_REGIONS)):
+    enforce_coverage = _service_flag("SERVICE_ENFORCE_COVERAGE", False)
+    enforce_travel_radius = _service_flag("SERVICE_ENFORCE_TRAVEL_RADIUS", False)
+    enforce_remote_regions = _service_flag("SERVICE_ENFORCE_REMOTE_REGIONS", False)
+    if not any((enforce_coverage, enforce_travel_radius, enforce_remote_regions)):
         return
     location = _normalize_location_payload(location_payload)
     coverage = [str(item).strip().lower() for item in (getattr(service, "coverage", []) or []) if str(item).strip()]
 
     if is_remote:
-        if SERVICE_ENFORCE_REMOTE_REGIONS and getattr(service, "remote_regions", None):
+        if enforce_remote_regions and getattr(service, "remote_regions", None):
             logger.info("SERVICE_ENFORCE_REMOTE_REGIONS active for service %s", service.id)
             remote_hint = str(remote_region or location.get("region") or location.get("state") or location.get("country") or "").strip()
             if remote_hint:
@@ -539,7 +573,7 @@ def _validate_service_location(service, location_payload, distance_km, is_remote
                     raise ValidationError({"remote_region": "Remote region is not covered by this service."})
         return
 
-    if SERVICE_ENFORCE_COVERAGE and coverage and location:
+    if enforce_coverage and coverage and location:
         logger.info("SERVICE_ENFORCE_COVERAGE active for service %s", service.id)
         tokens = [value for value in [location.get("region"), location.get("city"), location.get("state"), location.get("country")] if value]
         normalized_tokens = [str(token).strip().lower() for token in tokens]
@@ -552,7 +586,7 @@ def _validate_service_location(service, location_payload, distance_km, is_remote
             )
             raise ValidationError({"location": "Your location is not within the configured coverage area."})
 
-    if SERVICE_ENFORCE_TRAVEL_RADIUS and distance_km is not None:
+    if enforce_travel_radius and distance_km is not None:
         logger.info("SERVICE_ENFORCE_TRAVEL_RADIUS active for service %s", service.id)
         try:
             distance_value = Decimal(distance_km)
@@ -570,7 +604,7 @@ def _validate_service_location(service, location_payload, distance_km, is_remote
 
 
 def _validate_group_capacity(validated_data, service):
-    if not SERVICE_ENFORCE_GROUP_CAPACITY:
+    if not _service_flag("SERVICE_ENFORCE_GROUP_CAPACITY", False):
         return
     logger.info("SERVICE_ENFORCE_GROUP_CAPACITY active for service %s", service.id)
     participant_count = validated_data.get("participant_count")
@@ -612,8 +646,9 @@ class ShopViewSet(viewsets.ModelViewSet):
 
     def get_object(self):
         obj = super().get_object()
-        if obj.owner_id != self.request.user.id and not self.request.user.is_staff:
-            raise PermissionDenied("Only shop owners or staff can modify shops.")
+        if self.request.method not in permissions.SAFE_METHODS:
+            if obj.owner_id != self.request.user.id and not self.request.user.is_staff:
+                raise PermissionDenied("Only shop owners or staff can modify shops.")
         return obj
 
     def perform_create(self, serializer):
@@ -711,19 +746,15 @@ class ProductViewSet(viewsets.ModelViewSet):
 
     def get_object(self):
         obj = super().get_object()
-        if obj.shop.owner_id != self.request.user.id and not self.request.user.is_staff:
-            raise PermissionDenied("Only product owners or staff can modify listings.")
+        if self.request.method not in permissions.SAFE_METHODS:
+            if obj.shop.owner_id != self.request.user.id and not self.request.user.is_staff:
+                raise PermissionDenied("Only product owners or staff can modify listings.")
         return obj
 
     def perform_create(self, serializer):
         shop = serializer.validated_data.get("shop")
         if not shop or shop.owner_id != self.request.user.id:
             raise PermissionDenied("You can only add products to your own shop.")
-
-        image_file = serializer.validated_data.get("image_file")
-        if not image_file:
-            raise ValidationError({"image_file": "Product image is required."})
-        _enforce_media_size_limit(self.request.user, image_file, field_name="image_file")
 
         product_limit_raw = get_feature_limit(self.request.user, "products_per_shop_limit", 0)
         product_limit = _normalize_limit(product_limit_raw)
@@ -737,11 +768,10 @@ class ProductViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def perform_update(self, serializer):
-        image_file = serializer.validated_data.get("image_file")
-        if not image_file and not serializer.instance.image_file:
-            raise ValidationError({"image_file": "Product image is required."})
-        _enforce_media_size_limit(self.request.user, image_file, field_name="image_file")
         super().perform_update(serializer)
+
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
 
     @doc_decorator(
         summary="Request product authenticity check",
@@ -756,13 +786,22 @@ class ProductViewSet(viewsets.ModelViewSet):
         enqueue_product_auth_check.delay(str(pac.id))
         return Response({'status': 'auth_check_requested', 'id': pac.id})
 
-    @action(detail=True, methods=['post'], url_path='broadcast')
+    @action(detail=True, methods=['post', 'delete'], url_path='broadcast')
     def broadcast(self, request, pk=None):
         product = self.get_object()
         if product.shop.owner_id != request.user.id:
             raise PermissionDenied("Only the shop owner can broadcast this product.")
 
         from apps.broadcasts.models import BroadcastItem, BroadcastSourceType
+        if request.method == 'DELETE':
+            updated = BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.MARKET_PRODUCT,
+                source_id=str(product.id),
+                is_deleted=False,
+            ).update(is_deleted=True)
+            if updated:
+                return Response({"detail": "Product broadcast removed."}, status=200)
+            raise NotFound("Product is not currently broadcasted.")
         from datetime import timedelta
 
         item, _ = BroadcastItem.objects.update_or_create(
@@ -912,7 +951,9 @@ class CartViewSet(viewsets.ModelViewSet):
             raise ValidationError({'shop_id': 'shop_id query parameter is required.'})
         cart = Cart.objects.filter(user=request.user, shop_id=shop_id, status='active').first()
         if not cart:
-            raise NotFound('No active cart found for this shop.')
+            cart = Cart.objects.filter(user=request.user, shop_id=shop_id).order_by('-updated_at').first()
+            if not cart:
+                raise NotFound('No cart found for this shop.')
         serializer = self.get_serializer(cart)
         return Response(serializer.data)
 
@@ -969,17 +1010,18 @@ class ProductRatingViewSet(viewsets.ModelViewSet):
 
 
 @class_doc_decorator('Product Categories')
-class ProductCategoryViewSet(viewsets.ModelViewSet):
-    queryset = ShopCategory.objects.all().order_by('-created_at')
-    serializer_class = ProductCategorySerializer
+class ProductCategoryViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = CatalogCategory.objects.select_related('parent').all().order_by('category_type', 'sort_order', 'name')
+    serializer_class = CatalogCategorySerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    http_method_names = ['get', 'head']
 
     def get_queryset(self):
+        ensure_catalog_categories()
         qs = super().get_queryset()
-        qs = qs.filter(category_type__in=['product', 'both'])
-        shop_id = self.request.query_params.get('shop')
-        if shop_id:
-            qs = qs.filter(shop_id=shop_id)
+        category_type = self.request.query_params.get('category_type')
+        if category_type in {'product', 'service'}:
+            qs = qs.filter(category_type=category_type)
         return qs
 
 
@@ -1138,6 +1180,36 @@ class ShopServiceViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied("Only shop owners or staff can modify services.")
         return obj
 
+    @action(detail=True, methods=['post', 'delete'], url_path='broadcast')
+    def broadcast(self, request, pk=None):
+        service = self.get_object()
+        if service.shop.owner_id != request.user.id:
+            raise PermissionDenied("Only the shop owner can broadcast this service.")
+
+        from apps.broadcasts.models import BroadcastItem, BroadcastSourceType
+        if request.method == 'DELETE':
+            updated = BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.MARKET_SERVICE,
+                source_id=str(service.id),
+                is_deleted=False,
+            ).update(is_deleted=True)
+            if updated:
+                return Response({"detail": "Service broadcast removed."}, status=200)
+            raise NotFound("Service is not currently broadcasted.")
+        from datetime import timedelta
+
+        item, _ = BroadcastItem.objects.update_or_create(
+            source_type=BroadcastSourceType.MARKET_SERVICE,
+            source_id=str(service.id),
+            defaults={
+                "broadcasted_by": request.user,
+                "broadcasted_at": timezone.now(),
+                "expires_at": timezone.now() + timedelta(days=10),
+                "is_deleted": False,
+            },
+        )
+        return Response({"detail": "Service broadcasted.", "broadcast_id": str(item.id)}, status=200)
+
 
 @class_doc_decorator('Service Bookings')
 class ServiceBookingViewSet(
@@ -1159,7 +1231,15 @@ class ServiceBookingViewSet(
         qs = super().get_queryset()
         if self.request.user.is_staff:
             return qs
-        return qs.filter(Q(user=self.request.user) | Q(shop__owner=self.request.user))
+        return qs.filter(
+            Q(user=self.request.user)
+            | Q(shop__owner=self.request.user)
+            | Q(
+                shop__team_members__user=self.request.user,
+                shop__team_members__role__in={ShopRole.MANAGER, ShopRole.ADMIN},
+                shop__team_members__is_active=True,
+            )
+        ).distinct()
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -1241,20 +1321,24 @@ class ServiceBookingViewSet(
         requested_price = serializer.validated_data.get("requested_price")
         package_option = _resolve_service_package_option(service, selected_package)
         addon_options = _resolve_service_addon_options(service, selected_addons)
-        package_price = package_option["price"] if SERVICE_ENABLE_PACKAGE_PRICING and package_option else Decimal("0")
-        addon_price = sum(item["price"] for item in addon_options) if SERVICE_ENABLE_ADDONS and addon_options else Decimal("0")
-        if SERVICE_ENABLE_PACKAGE_PRICING and package_option:
+        package_pricing_enabled = _service_flag("SERVICE_ENABLE_PACKAGE_PRICING", False)
+        addons_enabled = _service_flag("SERVICE_ENABLE_ADDONS", False)
+        quotes_enabled = _service_flag("SERVICE_ENABLE_QUOTES", False)
+        negotiation_enabled = _service_flag("SERVICE_ENABLE_NEGOTIATION", False)
+        package_price = package_option["price"] if package_pricing_enabled and package_option else Decimal("0")
+        addon_price = sum(item["price"] for item in addon_options) if addons_enabled and addon_options else Decimal("0")
+        if package_pricing_enabled and package_option:
             logger.info("SERVICE_ENABLE_PACKAGE_PRICING applied for service %s package=%s", service.id, package_option["name"])
-        if SERVICE_ENABLE_ADDONS and addon_options:
+        if addons_enabled and addon_options:
             logger.info(
                 "SERVICE_ENABLE_ADDONS applied for service %s addons=%s",
                 service.id,
                 [item["name"] for item in addon_options],
             )
-        quote_flow = SERVICE_ENABLE_QUOTES and bool(getattr(service, "quote_required", False))
+        quote_flow = quotes_enabled and bool(getattr(service, "quote_required", False))
         negotiation_flow = False
         requested_price_value = None
-        if SERVICE_ENABLE_NEGOTIATION and getattr(service, "negotiable", False) and requested_price is not None:
+        if negotiation_enabled and getattr(service, "negotiable", False) and requested_price is not None:
             requested_price_value = _decimal_from_value(requested_price)
             negotiation_flow = True
             logger.info(
@@ -1282,13 +1366,19 @@ class ServiceBookingViewSet(
             balance_cents = max(price_cents - deposit_cents, 0)
         booking_metadata = _build_booking_metadata(
             service,
-            package_option if SERVICE_ENABLE_PACKAGE_PRICING else None,
-            addon_options if SERVICE_ENABLE_ADDONS else [],
+            package_option if package_pricing_enabled else None,
+            addon_options if addons_enabled else [],
             quote_flow,
             negotiation_flow,
             requested_price_value,
             requirements_ack,
             terms_accepted,
+            location=serializer.validated_data.get("location"),
+            distance_km=serializer.validated_data.get("distance_km"),
+            is_remote=serializer.validated_data.get("is_remote"),
+            remote_region=serializer.validated_data.get("remote_region"),
+            participant_count=serializer.validated_data.get("participant_count"),
+            staff_on_site=serializer.validated_data.get("staff_on_site"),
         )
 
         tx_ref = str(uuid.uuid4())
@@ -1374,8 +1464,8 @@ class ServiceBookingViewSet(
     @action(detail=True, methods=["post"], url_path="mark-completed")
     def mark_completed(self, request, pk=None):
         booking = self.get_object()
-        if booking.shop.owner_id != request.user.id and not request.user.is_staff:
-            raise PermissionDenied("Only the provider can mark this booking as completed.")
+        if not self._can_user_manage_booking(request.user, booking):
+            raise PermissionDenied("Only the provider, managers, or staff can mark this booking as completed.")
         booking.status = ServiceBooking.STATUS_AWAITING_SATISFACTION
         booking.mark_provider_completed()
         booking.save(update_fields=["status", "provider_completed_at", "satisfaction_deadline"])
@@ -1399,6 +1489,21 @@ class ServiceBookingViewSet(
             return False
         if booking.user_id == user.id:
             return True
+        if user.is_staff:
+            return True
+        shop = getattr(booking, "shop", None)
+        if shop and shop.owner_id == user.id:
+            return True
+        return ShopTeamMember.objects.filter(
+            shop=shop,
+            user=user,
+            role__in={ShopRole.MANAGER, ShopRole.ADMIN},
+            is_active=True,
+        ).exists()
+
+    def _can_user_manage_booking(self, user, booking):
+        if not user or not user.is_authenticated:
+            return False
         if user.is_staff:
             return True
         shop = getattr(booking, "shop", None)
@@ -1443,7 +1548,7 @@ class ServiceBookingViewSet(
             return Response({"message": "The service date/time has already passed."}, status=status.HTTP_400_BAD_REQUEST)
         service = booking.service
         window_hours = CANCELLATION_WINDOW_HOURS
-        if SERVICE_ENFORCE_REFUND_POLICY:
+        if _service_flag("SERVICE_ENFORCE_REFUND_POLICY", False):
             service_window = getattr(service, 'cancellation_window_hours', None)
             if service_window:
                 window_hours = max(int(service_window), CANCELLATION_WINDOW_HOURS)
@@ -1492,7 +1597,7 @@ class ServiceBookingViewSet(
             return Response({"message": "Scheduled time must be in the future."}, status=status.HTTP_400_BAD_REQUEST)
 
         service = booking.service
-        if SERVICE_ENFORCE_RESCHEDULE_POLICY:
+        if _service_flag("SERVICE_ENFORCE_RESCHEDULE_POLICY", False):
             window_hours = max(int(getattr(service, 'reschedule_window_hours', 0) or 0), 0)
             if window_hours:
                 cutoff = booking.scheduled_at - timedelta(hours=window_hours)
@@ -1636,7 +1741,18 @@ class ServiceBookingViewSet(
                     payment.transaction_reference = (
                         f"{transaction_ref},{tx_ref}" if transaction_ref else tx_ref
                     )
-                    payment.save(update_fields=["amount_cents", "transaction_reference"])
+                    payment.payment_status = ServiceBookingPayment.STATUS_PAID
+                    payment.paid_at = timezone.now()
+                    payment.save(update_fields=["amount_cents", "transaction_reference", "payment_status", "paid_at"])
+                else:
+                    ServiceBookingPayment.objects.create(
+                        booking=booking,
+                        amount_cents=remaining,
+                        payment_method="wallet",
+                        payment_status=ServiceBookingPayment.STATUS_PAID,
+                        paid_at=timezone.now(),
+                        transaction_reference=tx_ref,
+                    )
                 booking.deposit_cents = (booking.deposit_cents or 0) + remaining
                 booking.balance_cents = 0
                 booking.payment_tx_ref = tx_ref
@@ -1671,6 +1787,22 @@ class ServiceBookingComplaintViewSet(viewsets.ModelViewSet):
     queryset = ServiceBookingComplaint.objects.all().order_by('-created_at')
     serializer_class = ServiceBookingComplaintSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_staff:
+            return qs
+        return qs.filter(
+            Q(submitted_by=user)
+            | Q(booking__user=user)
+            | Q(booking__shop__owner=user)
+            | Q(
+                booking__shop__team_members__user=user,
+                booking__shop__team_members__role__in={ShopRole.MANAGER, ShopRole.ADMIN},
+                booking__shop__team_members__is_active=True,
+            )
+        ).distinct()
 
 
 class ServiceBookingPaymentSatisfyView(APIView):
@@ -1709,3 +1841,177 @@ class ServiceBookingPaymentSatisfyView(APIView):
         booking.payer_satisfied_at = now
         booking.save(update_fields=["status", "payer_satisfied_at"])
         return Response({"status": "satisfied"}, status=status.HTTP_200_OK)
+
+
+class MarketplaceOrderViewSet(
+    viewsets.GenericViewSet,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+):
+    queryset = MarketplaceOrder.objects.all().order_by('-created_at')
+    serializer_class = MarketplaceOrderSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _provider_filter(self, user):
+        provider_roles = [ShopRole.ADMIN, ShopRole.MANAGER]
+        return (
+            Q(shop__owner=user) |
+            Q(
+                shop__team_members__user=user,
+                shop__team_members__is_active=True,
+                shop__team_members__role__in=provider_roles,
+            )
+        )
+
+    def get_queryset(self):
+        user = self.request.user
+        provider_filter = self._provider_filter(user)
+        return (
+            MarketplaceOrder.objects.filter(Q(buyer=user) | provider_filter)
+            .order_by('-created_at')
+            .select_related('buyer', 'shop')
+            .prefetch_related('items__product')
+            .distinct()
+        )
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return MarketplaceOrderCreateSerializer
+        return MarketplaceOrderSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validated = serializer.validated_data
+        metadata = dict(validated.get('metadata') or {})
+        metadata.setdefault('source', 'product_details')
+        try:
+            order = place_marketplace_order(
+                buyer=request.user,
+                shop_id=validated['shop_id'],
+                items=validated['items'],
+                metadata=metadata,
+            )
+        except ValidationError as exc:
+            return Response({'detail': exc.detail}, status=status.HTTP_400_BAD_REQUEST)
+        output = MarketplaceOrderSerializer(order, context={'request': request})
+        headers = self.get_success_headers(output.data)
+        return Response(output.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        order = self.get_object()
+        if order.buyer_id != request.user.id:
+            raise PermissionDenied('Only the buyer may cancel this order.')
+        try:
+            order = cancel_marketplace_order_by_id(order_id=order.id, buyer=request.user)
+        except ValidationError as exc:
+            return Response({'detail': exc.detail}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(order).data)
+
+    @action(detail=True, methods=['post'])
+    def satisfy(self, request, pk=None):
+        order = self.get_object()
+        if order.buyer_id != request.user.id:
+            raise PermissionDenied('Only the buyer may satisfy this order.')
+        try:
+            order = satisfy_marketplace_order_by_id(order_id=order.id, buyer=request.user)
+        except (ValidationError, ValueError) as exc:
+            detail = exc.detail if hasattr(exc, 'detail') else str(exc)
+            return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(order).data)
+
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        order = self.get_object()
+        user = request.user
+        if not _provider_can_manage_shop(user, order.shop):
+            raise PermissionDenied('Only the provider or managers may complete this order.')
+        try:
+            order = provider_complete_marketplace_order_by_id(order_id=order.id, provider=user)
+        except ValidationError as exc:
+            return Response({'detail': exc.detail}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(order).data)
+
+    @action(detail=True, methods=['get'])
+    def receipt(self, request, pk=None):
+        order = self.get_object()
+        buffer = render_marketplace_receipt_pdf(order)
+        return FileResponse(buffer, as_attachment=True, filename=f'marketplace_receipt_{order.id}.pdf')
+
+    def destroy(self, request, *args, **kwargs):
+        order = self.get_object()
+        if order.buyer_id != request.user.id:
+            raise PermissionDenied('Only the buyer may delete this order.')
+        allowed = {MarketplaceOrderStatus.CANCELLED, MarketplaceOrderStatus.SATISFIED}
+        if order.status not in allowed:
+            return Response(
+                {'detail': 'Only canceled or satisfied orders can be deleted.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class MarketplaceProviderOrderViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.RetrieveModelMixin):
+    serializer_class = MarketplaceOrderSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _provider_filter(self, user):
+        provider_roles = [ShopRole.ADMIN, ShopRole.MANAGER]
+        return Q(
+            shop__owner=user
+        ) | Q(
+            shop__team_members__user=user,
+            shop__team_members__is_active=True,
+            shop__team_members__role__in=provider_roles,
+        )
+
+    def get_queryset(self):
+        user = self.request.user
+        return (
+            MarketplaceOrder.objects.filter(self._provider_filter(user))
+            .distinct()
+            .order_by('-created_at')
+            .select_related('shop')
+            .prefetch_related('items__product')
+        )
+
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        order = provider_complete_marketplace_order_by_id(order_id=pk, provider=request.user)
+        serializer = self.get_serializer(order)
+        return Response(serializer.data)
+
+
+class MarketplaceComplaintViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateModelMixin):
+    queryset = MarketplaceComplaint.objects.all().order_by('-created_at')
+    serializer_class = MarketplaceComplaintSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        return (
+            MarketplaceComplaint.objects.filter(Q(user=user) | Q(order__shop__owner=user))
+            .distinct()
+            .select_related('order', 'user')
+            .order_by('-created_at')
+        )
+
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.get_queryset(), many=True)
+        return Response(serializer.data)
+
+    def create(self, request, *args, **kwargs):
+        serializer = MarketplaceComplaintCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        complaint = create_marketplace_complaint_from_data(
+            order_id=serializer.validated_data['order_id'],
+            user=request.user,
+            text=serializer.validated_data['text'],
+            attachment=serializer.validated_data.get('attachment'),
+        )
+        output = MarketplaceComplaintSerializer(complaint, context=self.get_serializer_context())
+        return Response(output.data, status=status.HTTP_201_CREATED)

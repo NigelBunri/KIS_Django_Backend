@@ -6,6 +6,7 @@ import { motion } from "framer-motion";
 import {
   ArchiveBoxIcon,
   ChartPieIcon,
+  ChatBubbleLeftRightIcon,
   ShieldCheckIcon,
   SparklesIcon,
   Squares2X2Icon,
@@ -15,6 +16,7 @@ import { ThemeSelector } from "@/components/ui/ThemeToggle";
 
 const navItems = [
   { label: "Dashboard", href: "/", icon: ChartPieIcon },
+  { label: "Partner Servers", href: "/partners", icon: ChatBubbleLeftRightIcon },
   { label: "App Analytics", href: "/analytics", icon: SparklesIcon },
   { label: "Services", href: "/services", icon: Squares2X2Icon },
   { label: "CRUD Engine", href: "/crud", icon: ArchiveBoxIcon },
@@ -37,7 +39,7 @@ export function Sidebar() {
       </div>
       <nav className="flex-1 space-y-1">
         {navItems.map((item) => {
-          const isActive = pathname === item.href;
+          const isActive = item.href === "/" ? pathname === item.href : pathname.startsWith(item.href);
           return (
             <Link key={item.label} href={item.href}>
               <motion.div

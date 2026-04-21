@@ -1,6 +1,7 @@
 import os
 import subprocess
 import uuid
+from urllib.parse import urljoin, urlparse
 
 from django.conf import settings
 
@@ -8,12 +9,55 @@ from apps.broadcasts.models import BroadcastVideo
 
 
 THUMBNAIL_SUBDIRECTORY = "broadcast_thumbnails"
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
+
+
+def _host_is_loopback(value: str | None) -> bool:
+    if not value:
+        return False
+    return value.strip().lower() in LOOPBACK_HOSTS
+
+
+def _get_preferred_public_base_url(request) -> str | None:
+    configured_base = (
+        str(getattr(settings, "API_BASE_URL", "") or "").strip()
+        or str(getattr(settings, "SITE_URL", "") or "").strip()
+    ).rstrip("/")
+    request_base = None
+    request_host = None
+    if request is not None:
+        request_base = request.build_absolute_uri("/").rstrip("/")
+        request_host = urlparse(request_base).hostname
+
+    configured_host = urlparse(configured_base).hostname if configured_base else None
+
+    if request_base and not _host_is_loopback(request_host):
+        return request_base
+    if configured_base and not _host_is_loopback(configured_host):
+        return configured_base
+    return request_base or configured_base or None
+
+
+def build_absolute_url(request, value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return text
+    if text.startswith(("http://", "https://")):
+        return text
+    if text.startswith("//"):
+        return f"https:{text}"
+    base = _get_preferred_public_base_url(request)
+    if base:
+        return urljoin(f"{base.rstrip('/')}/", text.lstrip("/"))
+    if request is not None:
+        return request.build_absolute_uri(text)
+    return text
 
 
 def build_media_url(request, relative_path: str) -> str:
     media_url = getattr(settings, "MEDIA_URL", "/media/").rstrip("/")
     path = relative_path.replace(os.sep, "/")
-    return request.build_absolute_uri(f"{media_url}/{path}")
+    return build_absolute_url(request, f"{media_url}/{path}")
 
 
 def _absolute_media_path(relative_path: str) -> str:

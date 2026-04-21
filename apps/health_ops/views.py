@@ -19,7 +19,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.broadcasts.models import BroadcastHealthProfile
-from apps.billing.services import get_wallet_account, record_ledger
+from apps.billing.services import debit_wallet_balance, get_wallet_account
+from apps.core.money import (
+    KISC_MICRO_PER_KISC,
+    KISC_MICRO_PER_USD_CENT,
+    frontend_kisc_major_to_micro,
+)
 
 from .models import (
     AdmissionBedSession,
@@ -254,8 +259,6 @@ def _sync_workflow_progress(workflow_session: ServiceWorkflowSession):
 USD_PER_KISC = Decimal("100")
 USD_CENTS_PER_USD = 100
 USD_CENTS_PER_KISC = int((USD_PER_KISC * Decimal(USD_CENTS_PER_USD)))
-KISC_MICRO_PER_USD_CENT = 10
-KISC_MICRO_PER_KISC = USD_CENTS_PER_KISC * KISC_MICRO_PER_USD_CENT
 KIS_WALLET_PROVIDER = "kis_wallet"
 VIDEO_CONSULTATION_STEP_ORDER = (
     "confirm_identity",
@@ -945,13 +948,12 @@ def _kisc_to_micro(value: Any, *, allow_empty: bool = False) -> int | None:
         if allow_empty:
             return None
         raise ValidationError("KISC amount is required.")
-    try:
-        parsed = Decimal(raw)
-    except (InvalidOperation, ValueError, TypeError):
+    result = frontend_kisc_major_to_micro(raw, allow_none=True)
+    if result is None:
         raise ValidationError("Invalid KISC amount.")
-    if parsed < 0:
+    if result < 0:
         raise ValidationError("KISC amount cannot be negative.")
-    return int((parsed * Decimal(KISC_MICRO_PER_KISC)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return int(result)
 
 
 def _accessible_services_for_user(user, institution_hint: str = ""):
@@ -4829,11 +4831,11 @@ class PaymentBillingSessionStepUpdateView(APIView):
                         },
                         status=status.HTTP_402_PAYMENT_REQUIRED,
                     )
-                record_ledger(
+                debit_wallet_balance(
                     user=workflow.user,
-                    kind="purchase",
-                    amount_cents=-charge_cents,
+                    amount_cents=charge_cents,
                     reference=f"health_ops_billing:{billing_session.id}",
+                    kind="purchase",
                     meta={
                         "workflow_session_id": str(workflow.id),
                         "engine_session_id": str(engine_session.id),

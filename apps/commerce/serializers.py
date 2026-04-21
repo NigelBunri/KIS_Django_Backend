@@ -1,12 +1,18 @@
+import json
+import logging
 import re
 import uuid
-
-from django.utils import timezone
-from django.utils.text import slugify
+from copy import deepcopy
+from decimal import Decimal, InvalidOperation
+from typing import Any
+from django.core.files.uploadedfile import UploadedFile
 
 from django.db import IntegrityError
-import json
+from django.db.utils import ProgrammingError
+from django.db.models import Max
 from django.http import QueryDict
+from django.utils import timezone
+from django.utils.text import slugify
 from rest_framework import serializers
 from .availability import normalize_availability_payload, derive_availability_rules_from_payload
 from .constants import KIS_COIN_CODE
@@ -30,7 +36,6 @@ from .models import (
     FraudSignal,
     ProductImage,
     ProductRating,
-    ShopCategory,
     ShopTeamMember,
     ShopService,
     ServiceBooking,
@@ -41,10 +46,15 @@ from .models import (
     ServiceBookingPayment,
     Cart,
     CartItem,
+    MarketplaceOrder,
+    MarketplaceOrderItem,
+    MarketplaceComplaint,
+    CatalogCategory,
 )
 
 AVAILABILITY_RULE_SCOPES = {'year', 'month', 'week', 'day'}
 TIME_PATTERN = re.compile(r'^([01]?\d|2[0-3]):([0-5]\d)$')
+logger = logging.getLogger(__name__)
 
 
 def normalize_availability_rules_value(value):
@@ -83,9 +93,221 @@ def _parse_json_field(value, default=None):
             return json.loads(value)
         except json.JSONDecodeError:
             return fallback
+    if isinstance(value, list):
+        return value
     if isinstance(value, dict):
         return value
     return fallback
+
+
+def _querydict_to_serializer_data(data: QueryDict, list_keys: set[str] | None = None):
+    serialized = {}
+    configured_list_keys = set(list_keys or set())
+    for key in data.keys():
+        values = data.getlist(key)
+        if key in configured_list_keys:
+            serialized[key] = [item for item in values if str(item or '').strip()]
+            continue
+        serialized[key] = values[-1] if values else None
+    return serialized
+
+
+CATEGORY_SELECTION_LIMIT = 5
+
+
+def _normalize_landing_string(value, default=''):
+    if value is None:
+        return default
+    return str(value)
+
+
+def _normalize_landing_list(value):
+    return value if isinstance(value, list) else []
+
+
+def _normalize_landing_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _extract_landing_section_data(sections, section_type):
+    for section in sections or []:
+        if not isinstance(section, dict):
+            continue
+        if section.get('type') != section_type:
+            continue
+        return _normalize_landing_dict(section.get('data'))
+    return {}
+
+
+def _normalize_landing_testimonials(items):
+    normalized = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        quote = str(item.get('quote') or '').strip()
+        author = str(item.get('author') or '').strip()
+        role = str(item.get('role') or '').strip()
+        rating_raw = item.get('rating')
+        rating = None
+        if rating_raw not in (None, ''):
+            try:
+                rating = max(1, min(5, int(rating_raw)))
+            except (TypeError, ValueError):
+                rating = None
+        if not quote and not author and not role:
+            continue
+        normalized.append({
+            'id': str(item.get('id') or uuid.uuid4()),
+            'quote': quote,
+            'author': author,
+            'role': role,
+            'rating': rating,
+            'sort_order': int(item.get('sort_order') or len(normalized)),
+        })
+    return normalized
+
+
+def _build_landing_builder_payload(landing_page):
+    raw_builder = deepcopy(getattr(landing_page, 'builder_data', {}) or {})
+    builder = raw_builder if isinstance(raw_builder, dict) else {}
+    sections = _normalize_landing_list(builder.get('sections'))
+    hero = _normalize_landing_dict(builder.get('hero'))
+    about_section = _extract_landing_section_data(sections, 'about')
+    gallery_section = _extract_landing_section_data(sections, 'image_gallery_grid')
+    contact_section = _extract_landing_section_data(sections, 'contact_information')
+    testimonials_section = _extract_landing_section_data(sections, 'testimonials')
+
+    normalized_testimonials = _normalize_landing_testimonials(
+        builder.get('testimonials') or testimonials_section.get('items')
+    )
+    if not normalized_testimonials:
+        normalized_testimonials = ShopLandingTestimonialSerializer(
+            landing_page.testimonials.all(),
+            many=True,
+        ).data
+
+    hero_image = _normalize_landing_string(
+        hero.get('imageUrl')
+        or hero.get('image_url')
+        or hero.get('image')
+        or builder.get('hero_image_url')
+        or landing_page.hero_image_url
+    )
+    hero_cta_text = _normalize_landing_string(
+        hero.get('ctaLabel')
+        or hero.get('ctaText')
+        or hero.get('cta_label')
+        or builder.get('hero_cta_text')
+        or builder.get('hero_cta_label')
+        or landing_page.hero_cta_text
+        or 'View shop'
+    )
+    hero_cta_url = _normalize_landing_string(
+        hero.get('ctaUrl')
+        or hero.get('ctaLink')
+        or hero.get('cta_url')
+        or builder.get('hero_cta_url')
+        or builder.get('hero_cta_link')
+        or landing_page.hero_cta_url
+    )
+    hero_title = _normalize_landing_string(
+        hero.get('title')
+        or builder.get('headline')
+        or landing_page.headline
+        or getattr(landing_page.shop, 'name', 'Shop')
+    )
+    hero_slogan = _normalize_landing_string(
+        hero.get('slogan')
+        or hero.get('subtitle')
+        or builder.get('subheadline')
+        or landing_page.subheadline
+        or getattr(landing_page.shop, 'description', '')
+    )
+
+    gallery = _normalize_landing_list(builder.get('gallery'))
+    if not gallery:
+        gallery = _normalize_landing_list(gallery_section.get('images'))
+
+    about = _normalize_landing_string(
+        builder.get('about')
+        or about_section.get('description')
+    )
+    contact = _normalize_landing_dict(builder.get('contact'))
+    if not contact:
+        contact = {
+            'phone': _normalize_landing_string(contact_section.get('phone')),
+            'email': _normalize_landing_string(contact_section.get('email')),
+            'address': _normalize_landing_string(contact_section.get('address')),
+        }
+
+    return {
+        **builder,
+        'id': str(landing_page.id),
+        'headline': _normalize_landing_string(landing_page.headline or hero_title),
+        'subheadline': _normalize_landing_string(landing_page.subheadline or hero_slogan),
+        'hero_image_url': hero_image,
+        'hero_cta_text': _normalize_landing_string(landing_page.hero_cta_text or hero_cta_text),
+        'hero_cta_url': _normalize_landing_string(landing_page.hero_cta_url or hero_cta_url),
+        'is_public': bool(landing_page.is_public),
+        'is_published': bool(landing_page.is_published),
+        'hero': {
+            **hero,
+            'title': hero_title,
+            'slogan': hero_slogan,
+            'imageUrl': hero_image,
+            'ctaLabel': hero_cta_text,
+            'ctaText': hero_cta_text,
+            'ctaUrl': hero_cta_url,
+            'ctaLink': hero_cta_url,
+        },
+        'about': about,
+        'gallery': gallery,
+        'contact': {
+            'phone': _normalize_landing_string(contact.get('phone')),
+            'email': _normalize_landing_string(contact.get('email')),
+            'address': _normalize_landing_string(contact.get('address')),
+        },
+        'sections': sections,
+        'testimonials': normalized_testimonials,
+        'servicesVisibility': _normalize_landing_dict(builder.get('servicesVisibility')),
+        'staffDisplayEnabled': bool(builder.get('staffDisplayEnabled', True)),
+        'certifications': _normalize_landing_list(builder.get('certifications')),
+        'faqs': _normalize_landing_list(builder.get('faqs')),
+        'seo': _normalize_landing_dict(builder.get('seo')),
+        'socialLinks': _normalize_landing_list(builder.get('socialLinks')),
+        'emergencyBanner': _normalize_landing_dict(builder.get('emergencyBanner')),
+        'operatingHours': _normalize_landing_list(builder.get('operatingHours')),
+        'pricingVisibilityEnabled': bool(builder.get('pricingVisibilityEnabled', True)),
+        'landingBackgroundImageUrl': _normalize_landing_string(builder.get('landingBackgroundImageUrl')),
+        'landingBackgroundColorKey': _normalize_landing_string(builder.get('landingBackgroundColorKey')),
+        'landingLogoUrl': _normalize_landing_string(builder.get('landingLogoUrl')),
+    }
+
+
+def _normalize_category_id_list(value):
+    if value is None:
+        return []
+    iterable = value if isinstance(value, (list, tuple)) else [value]
+    normalized = []
+    seen = set()
+    for token in iterable:
+        candidate = str(token or '').strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    return normalized
+
+
+def _resolve_catalog_categories(category_ids, category_type):
+    if not category_ids:
+        return []
+    categories = list(CatalogCategory.objects.filter(id__in=category_ids, category_type=category_type))
+    if len(categories) != len(set(category_ids)):
+        return None
+    lookup = {str(cat.id): cat for cat in categories}
+    ordered = [lookup[cid] for cid in category_ids if cid in lookup]
+    return ordered
 
 
 def _generate_shop_slug(name: str | None) -> str:
@@ -115,53 +337,43 @@ def _generate_product_sku() -> str:
             return sku
 
 
-class ShopCategorySerializer(serializers.ModelSerializer):
+def _decimal_from_value(value):
+    if value in (None, ''):
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+class CatalogCategorySerializer(serializers.ModelSerializer):
+    parent_id = serializers.UUIDField(read_only=True)
+    parent_slug = serializers.SerializerMethodField()
+    parent_name = serializers.SerializerMethodField()
+
     class Meta:
-        model = ShopCategory
-        fields = ('id', 'shop', 'name', 'slug', 'description', 'category_type')
-        extra_kwargs = {
-            'slug': {'required': False, 'allow_blank': True},
-        }
+        model = CatalogCategory
+        fields = (
+            'id',
+            'slug',
+            'name',
+            'description',
+            'category_type',
+            'parent_id',
+            'parent_slug',
+            'parent_name',
+            'sort_order',
+        )
 
+    def get_parent_slug(self, obj):
+        parent = getattr(obj, 'parent', None)
+        return getattr(parent, 'slug', None)
 
-class ProductCategorySerializer(serializers.ModelSerializer):
-    slug = serializers.SlugField(required=False, allow_blank=True)
-
-    class Meta:
-        model = ShopCategory
-        fields = ('id', 'shop', 'name', 'slug', 'description', 'category_type')
-        extra_kwargs = {
-            'slug': {'required': False, 'allow_blank': True},
-        }
-
-    @staticmethod
-    def _generate_slug(name: str, shop: Shop) -> str:
-        base = slugify((name or '').strip()) or 'category'
-        candidate = base
-        suffix = 1
-        while ShopCategory.objects.filter(shop=shop, slug=candidate).exists():
-            candidate = f"{base}-{suffix}"
-            suffix += 1
-        return candidate
-
-    def to_internal_value(self, data):
-        payload = data.copy() if isinstance(data, dict) else dict(data)
-        if not payload.get('slug'):
-            shop_id = payload.get('shop')
-            name = payload.get('name') or ''
-            if shop_id and name:
-                shop = Shop.objects.filter(pk=shop_id).first()
-                if shop:
-                    payload['slug'] = self._generate_slug(name, shop)
-        return super().to_internal_value(payload)
-
-    def create(self, validated_data):
-        if not validated_data.get('slug'):
-            shop = validated_data.get('shop')
-            name = validated_data.get('name') or ''
-            if shop:
-                validated_data['slug'] = self._generate_slug(name, shop)
-        return super().create(validated_data)
+    def get_parent_name(self, obj):
+        parent = getattr(obj, 'parent', None)
+        return getattr(parent, 'name', None)
 
 
 class ProductImageSerializer(serializers.ModelSerializer):
@@ -169,7 +381,7 @@ class ProductImageSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductImage
-        fields = ('id', 'image_url', 'order')
+        fields = ('id', 'image_url', 'sort_order')
 
     def get_image_url(self, obj):
         try:
@@ -258,22 +470,9 @@ class ShopLandingTestimonialSerializer(serializers.ModelSerializer):
         fields = ('id', 'quote', 'author', 'role', 'rating', 'sort_order')
 
 
-class ShopLandingPageSerializer(serializers.ModelSerializer):
-    testimonials = ShopLandingTestimonialSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = ShopLandingPage
-        fields = (
-            'id',
-            'headline',
-            'subheadline',
-            'hero_image_url',
-            'hero_cta_text',
-            'hero_cta_url',
-            'is_public',
-            'is_published',
-            'testimonials',
-        )
+class ShopLandingPageSerializer(serializers.Serializer):
+    def to_representation(self, instance):
+        return _build_landing_builder_payload(instance)
 
 
 class LandingPageField(serializers.Field):
@@ -310,7 +509,6 @@ class ShopSerializer(serializers.ModelSerializer):
     image_file = serializers.ImageField(required=False, allow_null=True)
     image_url = serializers.SerializerMethodField()
     employee_slots = serializers.IntegerField(min_value=1, default=1)
-    categories = ShopCategorySerializer(many=True, read_only=True)
     team_members = serializers.SerializerMethodField()
     landing_page = LandingPageField(required=False, allow_null=True)
     landing_is_public = LandingVisibilityField(attr_name='is_public')
@@ -363,13 +561,76 @@ class ShopSerializer(serializers.ModelSerializer):
 
     def _apply_landing_payload(self, landing_page, payload, updated_fields):
         changed = False
-        for field in ('headline', 'subheadline', 'hero_image_url', 'hero_cta_text', 'hero_cta_url'):
-            if field in payload:
-                value = payload[field] or ''
-                if getattr(landing_page, field, '') != value:
-                    setattr(landing_page, field, value)
-                    updated_fields.add(field)
-                    changed = True
+        existing_builder = deepcopy(getattr(landing_page, 'builder_data', {}) or {})
+        next_builder = existing_builder if isinstance(existing_builder, dict) else {}
+
+        for key, value in payload.items():
+            if key in {'is_public', 'is_published'}:
+                continue
+            next_builder[key] = value
+
+        hero_payload = _normalize_landing_dict(next_builder.get('hero'))
+        hero_title = payload.get('headline')
+        if hero_title is None:
+            hero_title = hero_payload.get('title')
+        if hero_title is None:
+            hero_title = landing_page.headline
+
+        hero_slogan = payload.get('subheadline')
+        if hero_slogan is None:
+            hero_slogan = hero_payload.get('slogan') or hero_payload.get('subtitle')
+        if hero_slogan is None:
+            hero_slogan = landing_page.subheadline
+
+        hero_image_url = payload.get('hero_image_url')
+        if hero_image_url is None:
+            hero_image_url = (
+                hero_payload.get('imageUrl')
+                or hero_payload.get('image_url')
+                or hero_payload.get('image')
+            )
+        if hero_image_url is None:
+            hero_image_url = landing_page.hero_image_url
+
+        hero_cta_text = payload.get('hero_cta_text')
+        if hero_cta_text is None:
+            hero_cta_text = (
+                hero_payload.get('ctaLabel')
+                or hero_payload.get('ctaText')
+                or hero_payload.get('cta_label')
+            )
+        if hero_cta_text is None:
+            hero_cta_text = landing_page.hero_cta_text
+
+        hero_cta_url = payload.get('hero_cta_url')
+        if hero_cta_url is None:
+            hero_cta_url = (
+                hero_payload.get('ctaUrl')
+                or hero_payload.get('ctaLink')
+                or hero_payload.get('cta_url')
+            )
+        if hero_cta_url is None:
+            hero_cta_url = landing_page.hero_cta_url
+
+        normalized_core_fields = {
+            'headline': _normalize_landing_string(hero_title),
+            'subheadline': _normalize_landing_string(hero_slogan),
+            'hero_image_url': _normalize_landing_string(hero_image_url),
+            'hero_cta_text': _normalize_landing_string(hero_cta_text),
+            'hero_cta_url': _normalize_landing_string(hero_cta_url),
+        }
+
+        for field, value in normalized_core_fields.items():
+            if getattr(landing_page, field, '') != value:
+                setattr(landing_page, field, value)
+                updated_fields.add(field)
+                changed = True
+
+        if next_builder != getattr(landing_page, 'builder_data', {}):
+            landing_page.builder_data = next_builder
+            updated_fields.add('builder_data')
+            changed = True
+
         for flag in ('is_public', 'is_published'):
             if flag in payload:
                 value = bool(payload[flag])
@@ -431,15 +692,55 @@ class ShopVerificationRequestSerializer(serializers.ModelSerializer):
 
 
 class ProductSerializer(serializers.ModelSerializer):
-    image_file = serializers.ImageField(required=False, allow_null=True)
+    ATTRIBUTE_BACKED_FIELDS = (
+        "brand",
+        "condition",
+        "material",
+        "fit",
+        "size_guide",
+        "compare_at_price",
+        "available_sizes",
+        "available_colors",
+        "weight",
+        "length",
+        "width",
+        "height",
+        "pickup_available",
+        "allow_backorder",
+    )
+
+    main_image = serializers.ImageField(required=False, allow_null=True)
     image_url = serializers.SerializerMethodField()
-    category = ShopCategorySerializer(read_only=True)
+    category = serializers.SerializerMethodField()
+    catalog_categories = CatalogCategorySerializer(many=True, read_only=True)
+
     category_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
-    images = ProductImageSerializer(many=True, read_only=True)
+    category_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        write_only=True,
+        required=False,
+        allow_empty=True,
+    )
+    catalog_category_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        write_only=True,
+        required=False,
+        allow_empty=True,
+    )
+
+    gallery_images = ProductImageSerializer(many=True, read_only=True)
+    images = serializers.ListField(
+        child=serializers.ImageField(),
+        write_only=True,
+        required=False,
+    )
+
     slug = serializers.CharField(required=False, allow_blank=True)
     sku = serializers.CharField(required=False, allow_blank=True)
+
     is_broadcasted = serializers.SerializerMethodField()
     broadcast_item_id = serializers.SerializerMethodField()
+
     brand = serializers.CharField(required=False, allow_blank=True)
     condition = serializers.CharField(required=False, allow_blank=True)
     sale_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
@@ -447,6 +748,7 @@ class ProductSerializer(serializers.ModelSerializer):
     material = serializers.CharField(required=False, allow_blank=True)
     fit = serializers.CharField(required=False, allow_blank=True)
     size_guide = serializers.CharField(required=False, allow_blank=True)
+
     available_sizes = serializers.ListField(
         child=serializers.CharField(max_length=64),
         required=False,
@@ -457,14 +759,38 @@ class ProductSerializer(serializers.ModelSerializer):
         required=False,
         allow_empty=True,
     )
+
     weight = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
     length = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
     width = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
     height = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+
     low_stock_threshold = serializers.IntegerField(required=False, min_value=0, allow_null=True)
     requires_shipping = serializers.BooleanField(required=False)
     pickup_available = serializers.BooleanField(required=False)
     allow_backorder = serializers.BooleanField(required=False)
+
+    def to_internal_value(self, data):
+        mutable = data
+        if isinstance(data, QueryDict):
+            normalized: dict[str, Any] = {}
+            for key in data.keys():
+                values = data.getlist(key)
+                if not values:
+                    continue
+                if len(values) == 1:
+                    normalized[key] = values[0]
+                else:
+                    normalized[key] = values
+            mutable = normalized
+        elif isinstance(data, dict):
+            mutable = data.copy()
+        if isinstance(mutable, dict) and 'image_file' in mutable and 'main_image' not in mutable:
+            mutable['main_image'] = mutable.pop('image_file')
+        return super().to_internal_value(mutable)
+
+    attributes = serializers.JSONField(required=False)
+    variants = serializers.JSONField(required=False)
 
     class Meta:
         model = Product
@@ -476,58 +802,161 @@ class ProductSerializer(serializers.ModelSerializer):
             'image_url',
             'is_broadcasted',
             'broadcast_item_id',
-       )
+        )
 
     def get_image_url(self, obj):
         request = self.context.get('request')
         url_candidate = ''
 
-        image_file = getattr(obj, 'image_file', None)
-        if image_file:
+        main_image = getattr(obj, 'main_image', None)
+        if main_image:
             try:
-                url_candidate = image_file.url or ''
+                url_candidate = main_image.url or ''
             except (ValueError, AttributeError):
                 url_candidate = ''
 
         if not url_candidate:
-            url_candidate = getattr(obj, 'image_url', '') or ''
-
-        if not url_candidate and hasattr(obj, 'images'):
-            try:
-                first_image = obj.images.order_by('order').first()
-            except AttributeError:
-                first_image = getattr(obj.images, 'first', lambda: None)()
+            first_image = self._get_first_gallery_image(obj)
             if first_image:
                 try:
                     url_candidate = first_image.image_file.url or ''
                 except (ValueError, AttributeError):
-                    url_candidate = first_image.image_url or ''
+                    url_candidate = ''
 
         if url_candidate and request:
             return request.build_absolute_uri(url_candidate)
 
         return url_candidate
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        attributes = getattr(instance, "attributes", None)
+        if not isinstance(attributes, dict):
+            return data
+
+        for field in self.ATTRIBUTE_BACKED_FIELDS:
+            current = data.get(field)
+            fallback = attributes.get(field)
+            if field in {"available_sizes", "available_colors"}:
+                if not current and fallback not in (None, "", []):
+                    data[field] = fallback if isinstance(fallback, list) else _parse_list_field(fallback)
+                continue
+            if current in (None, "", []):
+                data[field] = fallback
+
+        return data
+
+    def _get_first_gallery_image(self, obj):
+        if not hasattr(obj, 'gallery_images'):
+            return None
+        try:
+            return obj.gallery_images.filter(is_active=True).order_by('sort_order', 'id').first()
+        except ProgrammingError as exc:
+            logger.warning(
+                "Unable to fetch gallery images for product %s (missing column?): %s",
+                getattr(obj, 'id', None),
+                exc,
+            )
+            return None
+
+    def get_category(self, obj):
+        first_category = (
+            obj.catalog_categories.order_by('name').first()
+            if hasattr(obj, 'catalog_categories') else None
+        )
+        if not first_category:
+            return None
+        serializer = CatalogCategorySerializer(first_category, context=self.context)
+        return serializer.data
+
     def validate(self, attrs):
-        attrs = super().validate(attrs)
-        category_id = attrs.get("category_id")
-        shop = attrs.get("shop") or getattr(self.instance, "shop", None)
-        if category_id and shop is not None:
-            try:
-                category = ShopCategory.objects.get(id=category_id)
-            except ShopCategory.DoesNotExist:
-                raise serializers.ValidationError({"category_id": "Category does not exist."})
-            if category.shop_id != shop.id:
-                raise serializers.ValidationError({"category_id": "Category must belong to the same shop."})
-            attrs["_category_obj"] = category
-        attrs = self._hydrate_extended_attributes(attrs)
-        attrs["currency"] = KIS_COIN_CODE
-        attrs["attributes"] = self._sanitize_attributes(attrs.get("attributes"))
-        return attrs
+        try:
+            attrs = super().validate(attrs)
+
+            category_id = attrs.pop("category_id", None)
+            raw_category_ids = attrs.pop("category_ids", None)
+            raw_catalog_category_ids = attrs.pop("catalog_category_ids", None)
+
+            normalized_ids = _normalize_category_id_list(raw_catalog_category_ids)
+            legacy_ids = _normalize_category_id_list(raw_category_ids)
+
+            for item in legacy_ids:
+                if item not in normalized_ids:
+                    normalized_ids.append(item)
+
+            if category_id:
+                primary = str(category_id or '').strip()
+                if primary and primary not in normalized_ids:
+                    normalized_ids.insert(0, primary)
+
+            initial_keys = []
+            if hasattr(self.initial_data, "keys"):
+                initial_keys = list(self.initial_data.keys())
+            elif isinstance(self.initial_data, dict):
+                initial_keys = list(self.initial_data.keys())
+
+            category_ids_provided = any(
+                key in {'category_ids', 'categoryIds', 'catalog_category_ids', 'catalogCategoryIds'}
+                for key in initial_keys
+            )
+
+            catalog_categories = None
+            if normalized_ids:
+                if len(normalized_ids) > CATEGORY_SELECTION_LIMIT:
+                    raise serializers.ValidationError({
+                        "catalog_category_ids": f"Select up to {CATEGORY_SELECTION_LIMIT} categories."
+                    })
+                resolved = _resolve_catalog_categories(normalized_ids, 'product')
+                if resolved is None:
+                    raise serializers.ValidationError({
+                        "catalog_category_ids": "One or more selected categories are invalid."
+                    })
+                catalog_categories = resolved
+            elif category_ids_provided:
+                catalog_categories = []
+
+            attrs["_catalog_categories"] = catalog_categories
+            attrs = self._hydrate_extended_attributes(attrs)
+
+            attrs["currency"] = KIS_COIN_CODE
+
+            sanitized_attributes = self._sanitize_attributes(attrs.get("attributes"))
+            attrs["attributes"] = self._serialize_json_value(sanitized_attributes)
+
+            sanitized_variants = self._sanitize_variants(attrs.get("variants"))
+            attrs["variants"] = sanitized_variants
+
+            inventory_type = attrs.get("inventory_type") or getattr(self.instance, "inventory_type", None)
+            requires_shipping = attrs.get("requires_shipping")
+            if requires_shipping is None and self.instance is not None:
+                requires_shipping = getattr(self.instance, "requires_shipping", None)
+
+            if inventory_type in ["DIGITAL", "SERVICE"]:
+                attrs["requires_shipping"] = False
+            elif requires_shipping is not None:
+                attrs["requires_shipping"] = bool(requires_shipping)
+
+            price = attrs.get("price", getattr(self.instance, "price", None))
+            sale_price = attrs.get("sale_price", getattr(self.instance, "sale_price", None))
+            if price is not None and sale_price is not None and Decimal(str(sale_price)) > Decimal(str(price)):
+                raise serializers.ValidationError({
+                    "sale_price": "Sale price cannot be greater than price."
+                })
+
+            return attrs
+        except serializers.ValidationError as exc:
+            logger.warning(
+                "Product validation failed user=%s keys=%s errors=%s",
+                getattr(self.context.get("request"), "user", None),
+                list(self.initial_data.keys()) if hasattr(self.initial_data, "keys") else [],
+                exc.detail,
+            )
+            raise
 
     def _sanitize_attributes(self, value):
         if not isinstance(value, dict):
             return value
+
         mapping = {
             "bookingWindow": "booking_window",
             "serviceType": "service_type",
@@ -560,24 +989,71 @@ class ProductSerializer(serializers.ModelSerializer):
             "allowBackorder": "allow_backorder",
             "allow_backorder": "allow_backorder",
         }
+
         sanitized = {}
         for key, val in value.items():
             if key == "duration":
                 continue
+
             target_key = mapping.get(key, key)
+
             if target_key == "availability_rules":
                 normalized_rules = self._normalize_availability_rules(val)
                 if normalized_rules:
                     sanitized[target_key] = normalized_rules
                 continue
+
             candidate = val.strip() if isinstance(val, str) else val
             if candidate is None or candidate == '':
                 continue
+
             sanitized[target_key] = candidate
+
+        return sanitized
+
+    def _sanitize_variants(self, value):
+        value = _parse_json_field(value, default=list)
+        if not isinstance(value, list):
+            return []
+
+        sanitized = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+
+            variant_id = str(item.get("id") or "").strip() or _generate_product_sku()
+            name = str(item.get("name") or "").strip()
+            sku = str(item.get("sku") or "").strip()
+            options = item.get("options") if isinstance(item.get("options"), dict) else {}
+
+            cleaned_options = {}
+            for key, val in options.items():
+                option_key = str(key or "").strip()
+                option_val = str(val or "").strip()
+                if option_key:
+                    cleaned_options[option_key] = option_val
+
+            price = _decimal_from_value(item.get("price"))
+            sale_price = _decimal_from_value(item.get("sale_price"))
+            stock_qty = self._normalize_variant_stock(item.get("stock_qty"))
+            is_active = bool(item.get("is_active", True))
+
+            sanitized.append({
+                "id": variant_id,
+                "name": name,
+                "sku": sku,
+                "price": str(price.quantize(Decimal('0.01'))) if price is not None else "0.00",
+                "sale_price": str(sale_price.quantize(Decimal('0.01'))) if sale_price is not None else None,
+                "stock_qty": stock_qty,
+                "is_active": is_active,
+                "options": cleaned_options,
+            })
+
         return sanitized
 
     def _hydrate_extended_attributes(self, attrs):
         attributes = _parse_json_field(attrs.pop("attributes", None), default=dict)
+
         def patch_value(field, caster=lambda v: v):
             attr_value = attributes.get(field)
             current = attrs.get(field)
@@ -586,6 +1062,7 @@ class ProductSerializer(serializers.ModelSerializer):
                     attrs[field] = caster(attr_value)
             else:
                 attributes[field] = attrs[field]
+
         patch_value("brand", str)
         patch_value("condition", str)
         patch_value("material", str)
@@ -601,6 +1078,7 @@ class ProductSerializer(serializers.ModelSerializer):
         patch_value("requires_shipping", lambda v: v)
         patch_value("pickup_available", lambda v: v)
         patch_value("allow_backorder", lambda v: v)
+
         for list_field in ("available_sizes", "available_colors"):
             list_value = attrs.get(list_field)
             if list_value in (None, '', []):
@@ -612,6 +1090,7 @@ class ProductSerializer(serializers.ModelSerializer):
                         attrs[list_field] = _parse_list_field(attr_value)
             else:
                 attributes[list_field] = list_value
+
         attrs["attributes"] = attributes
         return attrs
 
@@ -638,10 +1117,36 @@ class ProductSerializer(serializers.ModelSerializer):
     def _normalize_availability_rules(self, value):
         return normalize_availability_rules_value(value)
 
+    def _normalize_variant_stock(self, value):
+        try:
+            numeric = int(Decimal(str(value)))
+            return max(0, numeric)
+        except (ValueError, TypeError, ArithmeticError):
+            return 0
+
+    def _serialize_json_value(self, value):
+        if value is None or isinstance(value, (str, bool, int, float)):
+            return value
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, list):
+            return [self._serialize_json_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._serialize_json_value(item) for key, item in value.items()}
+        return str(value)
+
     def _get_market_broadcast_item(self, obj: Product):
         existing = getattr(obj, '_market_broadcast_item', None)
         if existing is not None:
-            return existing
+            if existing.is_deleted or (
+                getattr(existing, "expires_at", None) is not None
+                and existing.expires_at <= timezone.now()
+            ):
+                existing = None
+                setattr(obj, "_market_broadcast_item", None)
+            else:
+                return existing
+
         from apps.broadcasts.models import BroadcastItem, BroadcastSourceType
 
         item = (
@@ -670,26 +1175,58 @@ class ProductSerializer(serializers.ModelSerializer):
         return KIS_COIN_CODE
 
     def create(self, validated_data):
-        category = validated_data.pop("_category_obj", None)
+        gallery_images = validated_data.pop("images", None)
+        catalog_categories = validated_data.pop("_catalog_categories", None)
         validated_data.pop("category_id", None)
+        validated_data.pop("category_ids", None)
+        validated_data.pop("catalog_category_ids", None)
+        for field in self.ATTRIBUTE_BACKED_FIELDS:
+            validated_data.pop(field, None)
+
         if not validated_data.get("slug"):
             validated_data["slug"] = _generate_product_slug(validated_data.get("name"))
         if not validated_data.get("sku"):
             validated_data["sku"] = _generate_product_sku()
+
         product = super().create(validated_data)
-        if category:
-            product.category = category
-            product.save(update_fields=["category"])
+
+        if catalog_categories is not None:
+            product.catalog_categories.set(catalog_categories)
+
+        self._save_gallery_images(product, gallery_images)
+
         return product
 
     def update(self, instance, validated_data):
-        category = validated_data.pop("_category_obj", None)
+        gallery_images = validated_data.pop("images", None)
+        catalog_categories = validated_data.pop("_catalog_categories", None)
         validated_data.pop("category_id", None)
+        validated_data.pop("category_ids", None)
+        validated_data.pop("catalog_category_ids", None)
+        for field in self.ATTRIBUTE_BACKED_FIELDS:
+            validated_data.pop(field, None)
+
         product = super().update(instance, validated_data)
-        if category is not None:
-            product.category = category
-            product.save(update_fields=["category"])
+
+        if catalog_categories is not None:
+            product.catalog_categories.set(catalog_categories)
+
+        self._save_gallery_images(product, gallery_images)
+
         return product
+
+    def _save_gallery_images(self, product, images):
+        if not images:
+            return
+        max_sort = product.gallery_images.aggregate(max_sort=Max("sort_order")).get("max_sort")
+        next_sort = (max_sort or 0) + 1
+        for image_file in images:
+            ProductImage.objects.create(
+                product=product,
+                image_file=image_file,
+                sort_order=next_sort,
+            )
+            next_sort += 1
 
 
 class ProductAuthenticityCheckSerializer(serializers.ModelSerializer):
@@ -771,9 +1308,36 @@ class ShopFollowSerializer(serializers.ModelSerializer):
 
 
 class ShopServiceSerializer(serializers.ModelSerializer):
-    category = ShopCategorySerializer(read_only=True)
+    category = serializers.SerializerMethodField()
+    catalog_categories = CatalogCategorySerializer(many=True, read_only=True)
+    image_url = serializers.SerializerMethodField()
     category_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    category_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        write_only=True,
+        required=False,
+        allow_empty=True,
+    )
+    catalog_category_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        write_only=True,
+        required=False,
+        allow_empty=True,
+    )
     images = ServiceImageSerializer(many=True, read_only=True)
+    uploaded_images = serializers.ListField(
+        child=serializers.ImageField(),
+        write_only=True,
+        required=False,
+        allow_empty=True,
+    )
+    remove_featured_image = serializers.BooleanField(write_only=True, required=False, default=False)
+    remove_image_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        write_only=True,
+        required=False,
+        allow_empty=True,
+    )
     currency = serializers.CharField(write_only=True, required=False, allow_blank=True)
     is_broadcasted = serializers.SerializerMethodField()
     broadcast_item_id = serializers.SerializerMethodField()
@@ -797,7 +1361,20 @@ class ShopServiceSerializer(serializers.ModelSerializer):
         if slug_candidate:
             normalized_slug = slugify(slug_candidate) or 'service'
         mutable_data = (
-            data.dict() if isinstance(data, QueryDict)
+            _querydict_to_serializer_data(
+                data,
+                {
+                    'category_ids',
+                    'catalog_category_ids',
+                    'delivery_modes',
+                    'coverage',
+                    'remote_regions',
+                    'tags',
+                    'blackout_dates',
+                    'images',
+                    'remove_image_ids',
+                },
+            ) if isinstance(data, QueryDict)
             else data.copy() if isinstance(data, dict)
             else dict(data)
         )
@@ -813,13 +1390,21 @@ class ShopServiceSerializer(serializers.ModelSerializer):
             'serviceType': 'service_type',
             'otherShopsDiscount': 'other_shops_discount',
             'categoryId': 'category_id',
+            'categoryIds': 'category_ids',
+            'catalogCategoryIds': 'catalog_category_ids',
             'remoteMeetingLink': 'remote_meeting_link',
             'allowMultipleAttendeesPerSlot': 'allow_multiple_attendees_per_slot',
+            'removeFeaturedImage': 'remove_featured_image',
+            'removeImageIds': 'remove_image_ids',
         }
         for camel, snake in mapper.items():
             if camel in mutable_data and snake not in mutable_data:
                 mutable_data[snake] = mutable_data.pop(camel)
-        print("ShopServiceSerializer payload:", mutable_data)
+        raw_images = mutable_data.get('images')
+        if isinstance(raw_images, list) and any(isinstance(item, UploadedFile) for item in raw_images):
+            mutable_data['uploaded_images'] = raw_images
+            mutable_data.pop('images', None)
+        logger.debug("ShopServiceSerializer payload: %s", mutable_data)
         mutable_data['packages'] = _parse_json_field(mutable_data.get('packages'), default=list)
         mutable_data['addons'] = _parse_json_field(mutable_data.get('addons'), default=list)
         mutable_data['requirements'] = _parse_json_field(mutable_data.get('requirements'), default=list)
@@ -836,7 +1421,48 @@ class ShopServiceSerializer(serializers.ModelSerializer):
         mutable_data['delivery_modes'] = _parse_list_field(mutable_data.get('delivery_modes'))
         mutable_data['coverage'] = _parse_list_field(mutable_data.get('coverage'))
         mutable_data['remote_regions'] = _parse_list_field(mutable_data.get('remote_regions'))
+        mutable_data['tags'] = _parse_list_field(mutable_data.get('tags'))
+        blackout_dates_raw = mutable_data.get('blackout_dates')
+        if isinstance(blackout_dates_raw, str):
+            mutable_data['blackout_dates'] = _parse_list_field(blackout_dates_raw)
         return super().to_internal_value(mutable_data)
+
+    def get_category(self, obj):
+        first_category = (
+            obj.catalog_categories.order_by('name').first()
+            if hasattr(obj, 'catalog_categories') else None
+        )
+        if not first_category:
+            return None
+        serializer = CatalogCategorySerializer(first_category, context=self.context)
+        return serializer.data
+
+    def get_image_url(self, obj):
+        image_file = getattr(obj, 'image_file', None)
+        if image_file:
+            try:
+                url = image_file.url or ''
+            except ValueError:
+                url = ''
+            if url:
+                request = self.context.get('request')
+                return request.build_absolute_uri(url) if request is not None else url
+        stored_url = str(getattr(obj, 'image_url', '') or '').strip()
+        if stored_url:
+            return stored_url
+        first_image = getattr(obj, 'images', None)
+        if first_image is None:
+            return ''
+        gallery_item = obj.images.order_by('order', 'id').first()
+        if gallery_item and getattr(gallery_item, 'image_file', None):
+            try:
+                url = gallery_item.image_file.url or ''
+            except ValueError:
+                return ''
+            if url:
+                request = self.context.get('request')
+                return request.build_absolute_uri(url) if request is not None else url
+        return ''
 
     def _generate_unique_slug(self, value: str, shop: Shop | None) -> str:
         base = slugify(value) or 'service'
@@ -859,24 +1485,40 @@ class ShopServiceSerializer(serializers.ModelSerializer):
             else:
                 attrs['slug'] = normalized
         attrs = super().validate(attrs)
-        category_id = attrs.get('category_id')
-        if category_id and shop is not None:
-            try:
-                category = ShopCategory.objects.get(id=category_id)
-            except ShopCategory.DoesNotExist:
-                raise serializers.ValidationError({'category_id': 'Category does not exist.'})
-            if category.shop_id != shop.id:
-                raise serializers.ValidationError({'category_id': 'Category must belong to the same shop.'})
-            attrs['_category_obj'] = category
-        name_value = str(attrs.get('name') or getattr(self.instance, 'name', '')).strip()
-        slug_value = str(attrs.get('slug') or getattr(self.instance, 'slug', '')).strip()
-        slug_source = slug_value or name_value or ''
-        if slug_source:
-            normalized = slugify(slug_source) or 'service'
-            if shop:
-                attrs['slug'] = self._generate_unique_slug(normalized, shop)
-            else:
-                attrs['slug'] = normalized
+        category_id_value = attrs.pop('category_id', None)
+        raw_category_ids = attrs.pop('category_ids', None)
+        raw_catalog_category_ids = attrs.pop('catalog_category_ids', None)
+        normalized_ids = _normalize_category_id_list(raw_catalog_category_ids)
+        legacy_ids = _normalize_category_id_list(raw_category_ids)
+        if legacy_ids:
+            normalized_ids.extend([cid for cid in legacy_ids if cid not in normalized_ids])
+        if category_id_value:
+            primary = str(category_id_value or '').strip()
+            if primary and primary not in normalized_ids:
+                normalized_ids.insert(0, primary)
+        initial_keys = []
+        if hasattr(self.initial_data, 'keys'):
+            initial_keys = list(self.initial_data.keys())
+        elif isinstance(self.initial_data, dict):
+            initial_keys = list(self.initial_data.keys())
+        has_category_ids = any(
+            key in {'category_ids', 'categoryIds', 'catalog_category_ids', 'catalogCategoryIds'}
+            for key in initial_keys
+        )
+        has_category_id = any(key in {'category_id', 'categoryId'} for key in initial_keys)
+        catalog_categories = None
+        if normalized_ids:
+            if len(normalized_ids) > CATEGORY_SELECTION_LIMIT:
+                raise serializers.ValidationError({
+                    'category_ids': f'Select up to {CATEGORY_SELECTION_LIMIT} categories.'
+                })
+            resolved = _resolve_catalog_categories(normalized_ids, 'service')
+            if not resolved:
+                raise serializers.ValidationError({'category_ids': 'One or more selected categories are invalid.'})
+            catalog_categories = resolved
+        elif has_category_ids or has_category_id or self.instance is None:
+            raise serializers.ValidationError({'category_ids': 'Please select at least one category.'})
+        attrs['_catalog_categories'] = catalog_categories
         if 'price' in attrs:
             if attrs['price'] is None or attrs['price'] < 0:
                 raise serializers.ValidationError({'price': 'Price must be greater than or equal to zero.'})
@@ -908,7 +1550,10 @@ class ShopServiceSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
-        category = validated_data.pop('_category_obj', None)
+        gallery_images = validated_data.pop('uploaded_images', None)
+        catalog_categories = validated_data.pop('_catalog_categories', None)
+        validated_data.pop('remove_featured_image', None)
+        validated_data.pop('remove_image_ids', None)
         shop = validated_data.get('shop')
         slug_source = validated_data.get('slug') or validated_data.get('name') or ''
         attempts = 0
@@ -922,9 +1567,9 @@ class ShopServiceSerializer(serializers.ModelSerializer):
                 attempts += 1
                 fallback_base = f"{slug_source}-{attempts}"
                 validated_data['slug'] = self._generate_unique_slug(fallback_base, shop)
-        if category:
-            service.category = category
-            service.save(update_fields=['category'])
+        if catalog_categories is not None:
+            service.catalog_categories.set(catalog_categories)
+        self._save_gallery_images(service, gallery_images)
         return service
 
     def _get_market_broadcast_item(self, obj: ShopService):
@@ -953,12 +1598,33 @@ class ShopServiceSerializer(serializers.ModelSerializer):
         return str(item.id) if item else None
 
     def update(self, instance, validated_data):
-        category = validated_data.pop('_category_obj', None)
+        gallery_images = validated_data.pop('uploaded_images', None)
+        catalog_categories = validated_data.pop('_catalog_categories', None)
+        remove_featured_image = bool(validated_data.pop('remove_featured_image', False))
+        remove_image_ids = [str(image_id) for image_id in validated_data.pop('remove_image_ids', [])]
+        if remove_featured_image and 'image_file' not in validated_data:
+            validated_data['image_file'] = None
+            validated_data['image_url'] = ''
         service = super().update(instance, validated_data)
-        if category:
-            service.category = category
-            service.save(update_fields=['category'])
+        if catalog_categories is not None:
+            service.catalog_categories.set(catalog_categories)
+        if remove_image_ids:
+            service.images.filter(id__in=remove_image_ids).delete()
+        self._save_gallery_images(service, gallery_images)
         return service
+
+    def _save_gallery_images(self, service, images):
+        if not images:
+            return
+        max_order = service.images.aggregate(max_order=Max('order')).get('max_order')
+        next_order = (max_order or 0) + 1
+        for image_file in images:
+            ShopServiceImage.objects.create(
+                service=service,
+                image_file=image_file,
+                order=next_order,
+            )
+            next_order += 1
 
     def _user_can_view_remote_link(self, instance: ShopService) -> bool:
         request = self.context.get('request')
@@ -1121,14 +1787,42 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
         deposit_cents = int((deposit_value or 0) * 100)
         return {
             'id': str(service.id),
+            'shop_id': str(service.shop_id) if service.shop_id else None,
+            'name': service.name,
             'short_summary': service.short_summary,
             'description': service.description,
             'service_type': service.service_type,
+            'pricing_model': service.pricing_model,
+            'quote_required': service.quote_required,
+            'negotiable': service.negotiable,
             'delivery_modes': service.delivery_modes or [],
             'duration_minutes': service.duration_minutes,
+            'prep_buffer_minutes': service.prep_buffer_minutes,
+            'cleanup_buffer_minutes': service.cleanup_buffer_minutes,
+            'turnaround_hours': service.turnaround_hours,
+            'staff_required': service.staff_required,
+            'max_participants': service.max_participants,
+            'group_booking_allowed': service.group_booking_allowed,
+            'max_bookings_per_slot': service.max_bookings_per_slot,
             'price_cents': price_cents,
             'deposit_cents': deposit_cents,
+            'deposit_percent': service.deposit_percent,
+            'minimum_charge': service.minimum_charge,
+            'coverage': service.coverage or [],
+            'remote_regions': service.remote_regions or [],
             'remote_meeting_link': service.remote_meeting_link,
+            'availability': service.availability or {},
+            'availability_rules': service.availability_rules or [],
+            'blackout_dates': service.blackout_dates or [],
+            'cancellation_window_hours': service.cancellation_window_hours,
+            'reschedule_window_hours': service.reschedule_window_hours,
+            'refund_policy': service.refund_policy,
+            'service_terms': service.service_terms,
+            'requirements': service.requirements or [],
+            'packages': service.packages or [],
+            'addons': service.addons or [],
+            'min_notice_hours': service.min_notice_hours,
+            'max_advance_booking_days': service.max_advance_booking_days,
             'tags': service.tags or [],
         }
 
@@ -1305,14 +1999,32 @@ class ServiceBookingComplaintSerializer(serializers.ModelSerializer):
         read_only_fields = (
             'id',
             'booking_reference',
-        'status_display',
-        'action_display',
-        'booking_status',
-        'escrow_status',
-        'created_at',
-        'updated_at',
-        'resolved_at',
-    )
+            'submitted_by',
+            'provider',
+            'status',
+            'status_display',
+            'action',
+            'action_display',
+            'service_name',
+            'shop_name',
+            'provider_info',
+            'booking_status',
+            'escrow_status',
+            'metadata',
+            'resolution_note',
+            'resolved_by',
+            'resolved_at',
+            'created_at',
+            'updated_at',
+        )
+        extra_kwargs = {
+            'escrow': {'required': False, 'allow_null': True},
+            'payment': {'required': False, 'allow_null': True},
+            'transaction_reference': {'required': False, 'allow_blank': True},
+            'receipt_url': {'required': False, 'allow_blank': True},
+            'personal_statement': {'required': False, 'allow_blank': True},
+            'reason': {'required': False, 'allow_blank': True},
+        }
 
     def create(self, validated_data):
         request = self.context.get('request')
@@ -1321,6 +2033,7 @@ class ServiceBookingComplaintSerializer(serializers.ModelSerializer):
             validated_data['submitted_by'] = user
         booking = validated_data.get('booking')
         if booking:
+            validated_data.setdefault('escrow', getattr(booking, 'escrow', None))
             validated_data.setdefault('provider', booking.provider_user)
             validated_data.setdefault('service_name', booking.service.name if booking.service else '')
             validated_data.setdefault('shop_name', booking.shop.name if booking.shop else '')
@@ -1351,6 +2064,16 @@ class ServiceBookingComplaintSerializer(serializers.ModelSerializer):
                 escrow.status = ServiceBookingEscrow.STATUS_DISPUTE
                 escrow.save(update_fields=['status'])
         return complaint
+
+    def validate(self, attrs):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        booking = attrs.get('booking')
+        if booking and user and booking.user_id != user.id and not getattr(user, 'is_staff', False):
+            raise serializers.ValidationError({'booking': 'Only the payer can submit a complaint for this booking.'})
+        if booking and not attrs.get('escrow') and not getattr(booking, 'escrow', None):
+            raise serializers.ValidationError({'escrow': 'This booking has no escrow record for complaint processing.'})
+        return attrs
 
     def get_booking_status(self, obj):
         booking = getattr(obj, 'booking', None)
@@ -1388,6 +2111,7 @@ class CartItemSerializer(serializers.ModelSerializer):
     quantity = serializers.IntegerField(min_value=1)
     product_name = serializers.SerializerMethodField()
     product_image = serializers.SerializerMethodField()
+    attribute_labels = serializers.DictField(child=serializers.CharField(), required=False)
 
     class Meta:
         model = CartItem
@@ -1396,12 +2120,17 @@ class CartItemSerializer(serializers.ModelSerializer):
             'cart',
             'product',
             'variant',
+            'size',
+            'color',
             'variant_snapshot',
             'quantity',
             'product_name',
             'product_image',
             'price_snapshot',
             'stock_snapshot',
+            'selected_attributes',
+            'attribute_labels',
+            'custom_description',
             'created_at',
             'updated_at',
         )
@@ -1424,6 +2153,20 @@ class CartItemSerializer(serializers.ModelSerializer):
 
     def get_product_image(self, obj):
         return self._build_image_url(obj.product)
+
+
+class CartItemAddOrUpdateSerializer(serializers.Serializer):
+    shop_id = serializers.UUIDField()
+    product_id = serializers.UUIDField()
+    variant_id = serializers.CharField(required=False, allow_blank=True)
+    size = serializers.CharField(required=False, allow_blank=True)
+    color = serializers.CharField(required=False, allow_blank=True)
+    quantity = serializers.IntegerField(min_value=1, default=1)
+    selected_options = serializers.DictField(
+        child=serializers.ListField(child=serializers.CharField()),
+        required=False,
+    )
+    custom_description = serializers.CharField(required=False, allow_blank=True)
 
 
 class CartSerializer(serializers.ModelSerializer):
@@ -1449,9 +2192,104 @@ class CartSerializer(serializers.ModelSerializer):
         shop = getattr(obj, 'shop', None)
         if not shop:
             return None
+        image_url = getattr(shop, 'image_url', '') or ''
         return {
             'id': str(shop.id),
             'name': shop.name,
             'slug': shop.slug,
-            'image_url': shop.image_url,
+            'description': getattr(shop, 'description', '') or '',
+            'image_url': image_url,
+            'image': image_url,
+            'logo': image_url,
         }
+
+
+class MarketplaceOrderItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MarketplaceOrderItem
+        fields = (
+            'id',
+            'product',
+            'product_name',
+            'variant_id',
+            'quantity',
+            'unit_price_cents',
+            'selected_attributes',
+            'custom_description',
+        )
+
+    def get_product_name(self, obj):
+        return obj.product.name if obj.product else ''
+
+
+class MarketplaceOrderSerializer(serializers.ModelSerializer):
+    items = MarketplaceOrderItemSerializer(many=True, read_only=True)
+    buyer_info = serializers.SerializerMethodField()
+    shop_info = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MarketplaceOrder
+        fields = (
+            'id',
+            'buyer',
+            'buyer_info',
+            'shop',
+            'shop_info',
+            'total_amount',
+            'currency',
+            'status',
+            'metadata',
+            'items',
+            'created_at',
+            'updated_at',
+        )
+        read_only_fields = ('id', 'created_at', 'updated_at')
+
+    def get_buyer_info(self, obj):
+        user = getattr(obj, 'buyer', None)
+        if not user:
+            return None
+        return {
+            'id': str(user.id),
+            'username': getattr(user, 'username', ''),
+        }
+
+    def get_shop_info(self, obj):
+        shop = getattr(obj, 'shop', None)
+        if not shop:
+            return None
+        return {
+            'id': str(shop.id),
+            'name': shop.name,
+            'slug': shop.slug,
+        }
+
+
+class MarketplaceOrderItemCreateSerializer(serializers.Serializer):
+    product_id = serializers.UUIDField()
+    variant_id = serializers.CharField(required=False, allow_blank=True)
+    quantity = serializers.IntegerField(min_value=1, default=1)
+    unit_price_cents = serializers.IntegerField(min_value=1)
+    selected_attributes = serializers.JSONField(required=False)
+    custom_description = serializers.CharField(required=False, allow_blank=True)
+
+
+class MarketplaceOrderCreateSerializer(serializers.Serializer):
+    shop_id = serializers.UUIDField()
+    items = MarketplaceOrderItemCreateSerializer(many=True)
+    metadata = serializers.JSONField(required=False)
+
+
+class MarketplaceComplaintSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MarketplaceComplaint
+        fields = ('id', 'order', 'user', 'text', 'attachment', 'status', 'created_at')
+        read_only_fields = ('id', 'status', 'created_at')
+
+
+class MarketplaceComplaintCreateSerializer(serializers.Serializer):
+    order_id = serializers.UUIDField()
+    text = serializers.CharField()
+    attachment = serializers.FileField(required=False, allow_null=True)

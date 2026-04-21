@@ -39,7 +39,7 @@ urlpatterns = [
     path("api/v1/partners/", include("apps.partners.urls", namespace="partners")),
     path("api/v1/", include("apps.communities.urls", namespace="communities")),
     path("api/v1/", include("apps.groups.urls", namespace="groups")),
-    path("api/v1/", include("apps.channels.urls", namespace="channels")),
+    path("api/v1/partner-channels/", include("apps.channels.urls", namespace="channels")),
     path("api/v1/", include("apps.broadcasts.urls", namespace="broadcasts")),
     path("api/v1/", include("apps.health_ops.urls")),
     path("api/v1/", include("apps.health_dashboard.urls")),

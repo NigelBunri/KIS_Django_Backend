@@ -72,7 +72,7 @@
 ## 8. Infrastructure
 - Database: default `sqlite3` (`BASE_DIR / db.sqlite3`); environment-specific overrides expected in `config/settings/local.py` or production.
 - Caching: `LocMemCache` (non-shared; keyed by `unique-snowflake`).
-- Celery: broker/res result backend default to Redis on localhost (env overrides via `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND`). Auto-loads tasks from `apps/*/tasks.py`.
+- Celery: broker/res result backend default to Redis on 10.14.20.99 (env overrides via `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND`). Auto-loads tasks from `apps/*/tasks.py`.
 - Static/media roots configured for `staticfiles` and `media` directories.
 
 ## 9. Additional notes

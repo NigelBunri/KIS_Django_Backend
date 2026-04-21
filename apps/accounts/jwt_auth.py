@@ -50,7 +50,9 @@ class DeviceBoundJWTAuthenticationAllowPhoneLookup(DeviceBoundJWTAuthentication)
         try:
             return super().authenticate(request)
         except AuthenticationFailed as exc:
-            # Allow anonymous phone lookups when the only failure is the missing device header.
-            if phone_lookup and str(exc.detail) == "Missing X-Device-Id":
+            # Allow anonymous phone lookups to proceed even when a stale/invalid
+            # token is still attached during bootstrap. The endpoint already has
+            # AllowAny permission and only returns the phone-matched public user payload.
+            if phone_lookup:
                 return None
             raise

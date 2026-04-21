@@ -57,7 +57,7 @@ export type ShopServiceRecord = {
   category?: { name?: string };
 };
 
-const APP_API_BASE = process.env.NEXT_PUBLIC_APP_API_BASE || "http://localhost:8000/api/v1";
+const APP_API_BASE = process.env.NEXT_PUBLIC_APP_API_BASE || "http://10.14.20.99:8000/api/v1";
 
 export async function fetchShopServices(perPage = 12) {
   const response = await fetch(

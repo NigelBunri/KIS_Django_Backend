@@ -19,6 +19,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(BASE_DIR / ".env")  # reads .env at project root
 
 ENV = os.environ.get("DJANGO_ENV", "local")
+DEV_SERVER_HOST = os.environ.get("DEV_SERVER_HOST", "10.14.20.99").strip() or "10.14.20.99"
+DEV_SERVER_PORT = os.environ.get("DEV_SERVER_PORT", "8000").strip() or "8000"
+DEV_CHAT_PORT = os.environ.get("DEV_CHAT_PORT", "4000").strip() or "4000"
+DEV_REDIS_PORT = os.environ.get("DEV_REDIS_PORT", "6379").strip() or "6379"
+DEV_BG_REMOVAL_PORT = os.environ.get("DEV_BG_REMOVAL_PORT", "9000").strip() or "9000"
+
+
+def _dev_host_url(*, port: str, path: str = "", scheme: str = "http") -> str:
+    suffix = path if path.startswith("/") or not path else f"/{path}"
+    return f"{scheme}://{DEV_SERVER_HOST}:{port}{suffix}"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -59,7 +69,7 @@ if _is_weak_secret(SECRET_KEY):
 
 DEBUG = _env_bool("DEBUG", False)
 
-ALLOWED_HOSTS = _env_csv("ALLOWED_HOSTS", "localhost,127.0.0.1")
+ALLOWED_HOSTS = _env_csv("ALLOWED_HOSTS", f"{DEV_SERVER_HOST},10.0.2.2")
 CSRF_TRUSTED_ORIGINS = _env_csv("CSRF_TRUSTED_ORIGINS", "")
 
 # Security defaults (override with env if needed)
@@ -208,7 +218,7 @@ STATIC_URL = "/static/"
 MEDIA_URL = "/media/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_ROOT = BASE_DIR / "media"
-SITE_URL = os.environ.get("SITE_URL", "http://10.0.2.2:8000").rstrip("/")
+SITE_URL = os.environ.get("SITE_URL", _dev_host_url(port=DEV_SERVER_PORT)).rstrip("/")
 API_BASE_URL = os.environ.get("API_BASE_URL", SITE_URL)
 
 
@@ -300,7 +310,7 @@ SIMPLE_JWT = {
 
     # Optional but recommended for strict validation
     # Set these in .env to have them embedded in tokens and enforced by verifiers
-    "ISSUER": os.environ.get("JWT_ISSUER", None),          # e.g., "http://localhost:8000"
+    "ISSUER": os.environ.get("JWT_ISSUER", SITE_URL),      # e.g., "http://10.14.20.99:8000"
     "AUDIENCE": os.environ.get("JWT_AUDIENCE", None),      # e.g., "messaging-platform"
 
     "AUTH_HEADER_TYPES": ("Bearer",),
@@ -322,8 +332,8 @@ CACHES = {
 }
 
 # Celery settings
-CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
-CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", f"redis://{DEV_SERVER_HOST}:{DEV_REDIS_PORT}/0")
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", f"redis://{DEV_SERVER_HOST}:{DEV_REDIS_PORT}/1")
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
@@ -332,13 +342,13 @@ CELERY_RESULT_SERIALIZER = "json"
 # This is what your Celery task uses to call the external service.
 MEDIA_SERVICE_URL = os.environ.get(
     "MEDIA_SERVICE_URL",
-    "http://localhost:9000/process/background-removal",
+    _dev_host_url(port=DEV_BG_REMOVAL_PORT, path="/process/background-removal"),
 )
 
 # NestJS internal webhook base + token for realtime event fanout
 NEST_INTERNAL_URL = os.environ.get(
     "NEST_INTERNAL_URL",
-    "http://127.0.0.1:4000/internal",
+    _dev_host_url(port=DEV_CHAT_PORT, path="/internal"),
 )
 NEST_INTERNAL_TOKEN = os.environ.get(
     "NEST_INTERNAL_TOKEN",

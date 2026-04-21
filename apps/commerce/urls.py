@@ -25,6 +25,9 @@ router.register(r'audit-logs', views.AuditLogViewSet)
 router.register(r'fraud-signals', views.FraudSignalViewSet)
 router.register(r'carts', views.CartViewSet)
 router.register(r'cart-items', views.CartItemViewSet)
+router.register(r'marketplace-orders', views.MarketplaceOrderViewSet)
+router.register(r'marketplace-complaints', views.MarketplaceComplaintViewSet)
+router.register(r'marketplace-provider-orders', views.MarketplaceProviderOrderViewSet, basename='marketplace-provider-orders')
 
 urlpatterns = [
     *router.urls,

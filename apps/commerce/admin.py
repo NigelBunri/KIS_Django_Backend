@@ -5,16 +5,21 @@ from .models import (
     AuditLog,
     Cart,
     CartItem,
+    Complaint,
+    FraudSignal,
     LoyaltyPoint,
+    MarketplaceComplaint,
+    MarketplaceOrder,
+    MarketplaceOrderItem,
     Order,
     OrderItem,
-    Payment,
     Product,
     ProductAuthenticityCheck,
     ProductImage,
     ProductRating,
     ProductShare,
     ProductSubscription,
+    ProductVariant,
     Promotion,
     Shop,
     ShopCategory,
@@ -28,6 +33,7 @@ from .models import (
     ServiceBookingEscrow,
     ServiceBookingPayment,
     ServiceBookingReceipt,
+    Subscription,
 )
 
 
@@ -133,29 +139,44 @@ class ServiceBookingEscrowAdmin(admin.ModelAdmin):
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    readonly_fields = (
-        'id', 'created_at', 'updated_at', 'rating_avg', 'rating_count', 'ai_score',
-    )
+    readonly_fields = ('id', 'created_at', 'updated_at', 'is_deleted')
     list_display = (
-        'id', 'name', 'sku', 'shop', 'inventory_type', 'price', 'currency', 'stock_qty',
-        'is_active', 'is_featured', 'authenticity_status', 'service_type', 'availability', 'other_shops_discount',
+        'id', 'name', 'sku', 'shop', 'inventory_type', 'price', 'sale_price', 'currency',
+        'stock_qty', 'low_stock_threshold', 'is_active', 'is_featured', 'requires_shipping',
+        'catalog_categories_summary',
     )
-    list_filter = ('inventory_type', 'is_active', 'is_featured', 'authenticity_status', 'shop')
+    list_filter = ('inventory_type', 'is_active', 'is_featured', 'shop')
     search_fields = ('name', 'sku', 'description', 'slug')
     fieldsets = (
-        ('Identification', {'fields': ('id', 'shop', 'name', 'sku', 'slug', 'category')}),
-        ('Description & Media', {'fields': ('description', 'image_url', 'image_file', 'ar_preview_url')}),
-        ('Pricing & Inventory', {'fields': ('price', 'currency', 'inventory_type', 'stock_qty', 'variants', 'categories')}),
-        ('Service metadata', {'fields': ('service_type', 'availability', 'coverage', 'location', 'other_shops_discount', 'availability_rules')}),
-        ('Attributes & Flags', {'fields': ('attributes', 'is_active', 'is_featured')}),
-        ('Ratings & Signals', {'fields': ('rating_avg', 'rating_count', 'ai_score', 'authenticity_status', 'authenticity_proof')}),
+        ('Identification', {'fields': ('id', 'shop', 'name', 'sku', 'slug')}),
+        ('Media & Description', {'fields': ('description', 'main_image')}),
+        ('Pricing & Inventory', {'fields': (
+            'price', 'sale_price', 'currency', 'inventory_type', 'stock_qty',
+            'low_stock_threshold', 'catalog_categories',
+        )}),
+        ('Flexible Data', {'fields': ('attributes', 'variants')}),
+        ('Status & Flags', {'fields': ('is_active', 'is_featured', 'requires_shipping')}),
         ('Audit', {'fields': ('created_at', 'updated_at', 'is_deleted')}),
     )
+
+    def catalog_categories_summary(self, obj):
+        if not obj.pk:
+            return '—'
+        names = obj.catalog_categories.order_by('name').values_list('name', flat=True)
+        return ', '.join(names) if names else '—'
+    catalog_categories_summary.short_description = 'Catalog categories'
+
+
+@admin.register(ProductVariant)
+class ProductVariantAdmin(admin.ModelAdmin):
+    list_display = ('id', 'product', 'sku', 'size', 'color', 'price', 'stock_qty', 'is_active')
+    list_filter = ('is_active', 'product__shop')
+    search_fields = ('sku', 'size', 'color')
 
 
 @admin.register(ProductImage)
 class ProductImageAdmin(admin.ModelAdmin):
-    list_display = ('id', 'product', 'order')
+    list_display = ('id', 'product', 'sort_order')
 
 
 @admin.register(ProductRating)
@@ -187,25 +208,61 @@ class CartAdmin(admin.ModelAdmin):
 
 @admin.register(CartItem)
 class CartItemAdmin(admin.ModelAdmin):
-    list_display = ('id', 'cart', 'product', 'variant', 'quantity', 'price_snapshot')
-    list_filter = ('cart__shop',)
+    list_display = (
+        'id',
+        'cart',
+        'product',
+        'variant',
+        'size',
+        'color',
+        'quantity',
+        'price_snapshot',
+        'selected_attributes',
+        'custom_description',
+    )
+    list_filter = ('cart__shop', 'variant')
+    search_fields = (
+        'product__name',
+        'cart__id',
+        'variant',
+        'size',
+        'color',
+        'custom_description',
+    )
 
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ('id', 'user', 'shop', 'status', 'total')
+    list_display = ('id', 'user', 'shop', 'status', 'total_cents')
     list_filter = ('status', 'shop')
 
 
 @admin.register(OrderItem)
 class OrderItemAdmin(admin.ModelAdmin):
-    list_display = ('id', 'order', 'product', 'name', 'quantity')
+    list_display = ('id', 'order', 'product', 'variant_id', 'quantity')
 
 
-@admin.register(Payment)
-class PaymentAdmin(admin.ModelAdmin):
-    list_display = ('id', 'order', 'provider', 'amount', 'status')
-    list_filter = ('status',)
+@admin.register(MarketplaceOrder)
+class MarketplaceOrderAdmin(admin.ModelAdmin):
+    list_display = ('id', 'buyer', 'shop', 'status', 'total_amount', 'currency', 'created_at')
+    list_filter = ('status', 'shop')
+    search_fields = ('buyer__email', 'shop__name', 'id')
+    readonly_fields = ('buyer', 'shop')
+
+
+@admin.register(MarketplaceOrderItem)
+class MarketplaceOrderItemAdmin(admin.ModelAdmin):
+    list_display = ('id', 'order', 'product', 'variant_id', 'quantity', 'unit_price_cents')
+    list_filter = ('order__shop',)
+    search_fields = ('order__id', 'product__name')
+
+
+@admin.register(MarketplaceComplaint)
+class MarketplaceComplaintAdmin(admin.ModelAdmin):
+    list_display = ('id', 'order', 'user', 'status', 'created_at')
+    list_filter = ('status', 'order__shop')
+    search_fields = ('order__id', 'user__email')
+
 
 
 @admin.register(Promotion)

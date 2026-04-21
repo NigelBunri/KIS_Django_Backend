@@ -88,7 +88,7 @@ from .serializers import (
     ApiTokenListSerializer,
 )
 from .feature_gate import require_feature
-from .tiers import get_user_tier_features
+from .tiers import ensure_default_account_tiers, get_user_tier_features, public_account_tiers_qs
 from apps.partners.models import Partner
 from apps.partners.serializers import PartnerListSerializer
 from apps.commerce.models import LoyaltyPoint
@@ -1194,12 +1194,13 @@ class ProfileViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], permission_classes=[IsAuthenticated], authentication_classes=JWT_AUTH)
     def me(self, request):
+        ensure_default_account_tiers()
         profile = Profile.objects.select_related("user").get(user=request.user)
         payload = _build_profile_payload(profile, request.user, request=request)
         payload["privacy"] = ProfileFieldVisibilitySerializer(
             ProfileFieldVisibility.objects.filter(user=request.user), many=True
         ).data
-        payload["tiers"] = AccountTierSerializer(AccountTier.objects.all(), many=True).data
+        payload["tiers"] = AccountTierSerializer(public_account_tiers_qs(), many=True).data
         payload.update(_partner_profile_summary(request.user, request))
         return Response(payload)
 
@@ -1425,12 +1426,15 @@ class ApiTokenViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Des
     retrieve=extend_schema(summary="Retrieve account tier"),
 )
 class AccountTierViewSet(viewsets.ModelViewSet):
-    queryset = AccountTier.objects.all()
     serializer_class = AccountTierSerializer
     authentication_classes = JWT_AUTH
     permission_classes = IS_AUTH_OR_RO
     filter_backends = [filters.SearchFilter]
     search_fields = ["name"]
+
+    def get_queryset(self):
+        ensure_default_account_tiers()
+        return public_account_tiers_qs()
 
 @extend_schema_view(
     list=extend_schema(summary="List subscriptions"),

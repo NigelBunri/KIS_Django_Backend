@@ -2,10 +2,10 @@
 import uuid
 
 from django.db import models
+from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from apps.accounts.models import User
-from apps.chat.models import Conversation
 from apps.chat.models import Conversation
 
 
@@ -151,6 +151,12 @@ class PartnerMembership(models.Model):
         default=False,
         help_text="True when membership exists solely because of a lesson enrollment.",
     )
+    is_muted = models.BooleanField(default=False)
+    muted_until = models.DateTimeField(null=True, blank=True)
+    timed_out_until = models.DateTimeField(null=True, blank=True)
+    is_banned = models.BooleanField(default=False)
+    banned_at = models.DateTimeField(null=True, blank=True)
+    removed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -159,6 +165,7 @@ class PartnerMembership(models.Model):
         unique_together = [("partner", "user")]
         indexes = [
             models.Index(fields=["partner", "status"]),
+            models.Index(fields=["partner", "is_banned"]),
         ]
 
 
@@ -230,6 +237,142 @@ class PartnerApplication(models.Model):
         db_table = "partner_application"
         indexes = [
             models.Index(fields=["partner", "status"]),
+        ]
+
+
+def generate_partner_invite_code() -> str:
+    return uuid.uuid4().hex[:12].upper()
+
+
+class PartnerInvite(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    partner = models.ForeignKey(
+        Partner,
+        on_delete=models.CASCADE,
+        related_name="invites",
+    )
+    code = models.CharField(max_length=32, unique=True, default=generate_partner_invite_code)
+    label = models.CharField(max_length=255, blank=True)
+    created_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="partner_invites_created",
+    )
+    max_uses = models.PositiveIntegerField(null=True, blank=True)
+    use_count = models.PositiveIntegerField(default=0)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    membership_role = models.CharField(max_length=16, default="member")
+    auto_assign = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_invite"
+        indexes = [
+            models.Index(fields=["partner", "is_active"]),
+            models.Index(fields=["partner", "code"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.partner.name} / {self.code}"
+
+    @property
+    def is_expired(self) -> bool:
+        return bool(self.expires_at and self.expires_at <= timezone.now())
+
+    @property
+    def has_uses_remaining(self) -> bool:
+        return self.max_uses is None or self.use_count < self.max_uses
+
+    def is_redeemable(self) -> bool:
+        return self.is_active and not self.is_expired and self.has_uses_remaining
+
+
+class PartnerOnboardingProgress(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(
+        Partner,
+        on_delete=models.CASCADE,
+        related_name="onboarding_progress",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="partner_onboarding_progress",
+    )
+    invite = models.ForeignKey(
+        PartnerInvite,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="onboarding_progress",
+    )
+    rules_accepted_at = models.DateTimeField(null=True, blank=True)
+    selected_role_ids = models.JSONField(default=list, blank=True)
+    selected_channel_ids = models.JSONField(default=list, blank=True)
+    onboarding_snapshot = models.JSONField(default=dict, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_onboarding_progress"
+        unique_together = [("partner", "user")]
+        indexes = [
+            models.Index(fields=["partner", "user"]),
+        ]
+
+
+class PartnerModerationAction(models.Model):
+    class ActionType(models.TextChoices):
+        MUTE = "mute", "Mute"
+        UNMUTE = "unmute", "Unmute"
+        TIMEOUT = "timeout", "Timeout"
+        KICK = "kick", "Kick"
+        BAN = "ban", "Ban"
+        UNBAN = "unban", "Unban"
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(
+        Partner,
+        on_delete=models.CASCADE,
+        related_name="moderation_actions",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="partner_moderation_actions",
+    )
+    actor = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="partner_moderation_actions_made",
+    )
+    membership = models.ForeignKey(
+        PartnerMembership,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="moderation_actions",
+    )
+    action_type = models.CharField(max_length=16, choices=ActionType.choices)
+    reason = models.CharField(max_length=500, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "partner_moderation_action"
+        indexes = [
+            models.Index(fields=["partner", "user", "action_type"]),
+            models.Index(fields=["partner", "created_at"]),
         ]
 
 
@@ -909,6 +1052,109 @@ class PartnerOrganizationProfile(models.Model):
 
     class Meta:
         db_table = "partner_organization_profile"
+
+
+class PartnerServerCategory(models.Model):
+    partner = models.ForeignKey(
+        Partner,
+        on_delete=models.CASCADE,
+        related_name="server_categories",
+    )
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=255)
+    order = models.PositiveIntegerField(default=0)
+    is_private = models.BooleanField(default=False)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_server_category"
+        ordering = ["order", "name"]
+        unique_together = [("partner", "slug")]
+        indexes = [
+            models.Index(fields=["partner", "order"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.partner.name} / {self.name}"
+
+
+class PartnerChannelPermissionOverwrite(models.Model):
+    class SubjectType(models.TextChoices):
+        ROLE = "role", "Role"
+        MEMBER = "member", "Member"
+
+    class PermissionCode(models.TextChoices):
+        VIEW_CHANNEL = "view_channel", "View channel"
+        SEND_MESSAGES = "send_messages", "Send messages"
+        MANAGE_CHANNEL = "manage_channel", "Manage channel"
+
+    partner = models.ForeignKey(
+        Partner,
+        on_delete=models.CASCADE,
+        related_name="channel_permission_overwrites",
+    )
+    channel = models.ForeignKey(
+        "channels.Channel",
+        on_delete=models.CASCADE,
+        related_name="permission_overwrites",
+    )
+    subject_type = models.CharField(max_length=16, choices=SubjectType.choices)
+    role = models.ForeignKey(
+        PartnerRole,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="channel_permission_overwrites",
+    )
+    user = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="partner_channel_permission_overwrites",
+    )
+    allow_permissions = models.JSONField(default=list, blank=True)
+    deny_permissions = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_channel_permission_overwrite"
+        indexes = [
+            models.Index(fields=["partner", "channel", "subject_type"]),
+            models.Index(fields=["channel", "role"]),
+            models.Index(fields=["channel", "user"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["channel", "role"],
+                condition=models.Q(subject_type="role", role__isnull=False),
+                name="partner_channel_overwrite_unique_role",
+            ),
+            models.UniqueConstraint(
+                fields=["channel", "user"],
+                condition=models.Q(subject_type="member", user__isnull=False),
+                name="partner_channel_overwrite_unique_user",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.subject_type == self.SubjectType.ROLE:
+            if not self.role_id or self.user_id:
+                raise ValidationError("Role overwrites must target exactly one role.")
+        if self.subject_type == self.SubjectType.MEMBER:
+            if not self.user_id or self.role_id:
+                raise ValidationError("Member overwrites must target exactly one user.")
+        if self.channel_id and self.partner_id and self.channel.partner_id != self.partner_id:
+            raise ValidationError("Overwrite partner must match the channel partner.")
+        if self.role_id and self.role.partner_id != self.partner_id:
+            raise ValidationError("Overwrite role must belong to the same partner.")
+
+    def __str__(self) -> str:
+        target = self.role.name if self.role_id else getattr(self.user, "username", self.user_id)
+        return f"{self.channel_id} / {self.subject_type} / {target}"
 
 
 PARTNER_ORG_APP_VISIBILITY_ROLES = ["owner", "admin", "manager", "member", "analyst", "viewer"]

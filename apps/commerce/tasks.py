@@ -2,6 +2,7 @@ import logging
 
 from celery import shared_task
 from django.utils import timezone
+from rest_framework.exceptions import ValidationError
 
 from .models import (
     ShopVerificationRequest,
@@ -18,6 +19,7 @@ from .services import (
     run_product_auth_check,
     compute_fraud_for_order,
     build_recommendations,
+    satisfy_marketplace_order,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,35 @@ def compute_recommendations(user_id):
         )
         created.append(str(ai.id))
     return created
+
+
+@shared_task
+def delete_cancelled_marketplace_order(order_id: str):
+    from .models import MarketplaceOrder, MarketplaceOrderStatus
+
+    try:
+        order = MarketplaceOrder.objects.get(id=order_id, status=MarketplaceOrderStatus.CANCELLED)
+        order.delete()
+    except MarketplaceOrder.DoesNotExist:
+        pass
+
+
+@shared_task
+def auto_satisfy_marketplace_order(order_id: str):
+    from .models import MarketplaceOrder, MarketplaceOrderStatus
+
+    try:
+        order = MarketplaceOrder.objects.get(id=order_id)
+    except MarketplaceOrder.DoesNotExist:
+        return {'status': 'missing'}
+    if order.status != MarketplaceOrderStatus.AWAITING_SATISFACTION:
+        return {'status': 'skipped', 'current_status': order.status}
+    try:
+        satisfy_marketplace_order(order)
+        return {'status': 'satisfied'}
+    except ValidationError as exc:
+        logger.warning('Auto satisfaction failed for order %s: %s', order_id, exc)
+        return {'status': 'failed', 'error': str(exc)}
 
 
 @shared_task(bind=True)

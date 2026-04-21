@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import datetime
+from functools import reduce
+from operator import or_
+
+from django.db.models import Q, QuerySet
 from django.utils import timezone
 
 from apps.accounts.models import AccountTier, Subscription, UsageQuota
+from .tier_presets import TIER_PRESETS
 
 
 TIER_HIERARCHY = [
@@ -118,3 +123,46 @@ def consume_quota(user, key: str, amount: int = 1) -> bool:
     quota.quotas_json[key] = remaining - amount
     quota.save(update_fields=["quotas_json", "updated_at"])
     return True
+
+
+PUBLIC_TIER_NAMES = tuple(
+    preset["name"].strip()
+    for preset in TIER_PRESETS
+    if preset.get("name")
+)
+
+PUBLIC_TIER_NAMES_LOWER = {name.lower() for name in PUBLIC_TIER_NAMES}
+
+
+def public_account_tiers_qs() -> QuerySet[AccountTier]:
+    if not PUBLIC_TIER_NAMES:
+        return AccountTier.objects.none()
+    predicate = reduce(
+        or_,
+        (Q(name__iexact=name) for name in PUBLIC_TIER_NAMES),
+        Q(),
+    )
+    return AccountTier.objects.filter(predicate)
+
+
+def is_public_tier_name(name: str | None) -> bool:
+    return (str(name or "").strip().lower()) in PUBLIC_TIER_NAMES_LOWER
+
+
+def ensure_default_account_tiers() -> None:
+    existing_names = {
+        (name or "").strip().lower()
+        for name in AccountTier.objects.values_list("name", flat=True)
+    }
+    required_names = {(preset["name"] or "").strip().lower() for preset in TIER_PRESETS}
+    if required_names and required_names.issubset(existing_names) and len(existing_names) >= len(required_names):
+        return
+
+    for preset in TIER_PRESETS:
+        AccountTier.objects.update_or_create(
+            name=preset["name"],
+            defaults={
+                "price_cents": preset["price_cents"],
+                "features_json": preset["features_json"],
+            },
+        )

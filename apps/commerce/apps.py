@@ -1,4 +1,5 @@
 from django.apps import AppConfig
+from django.db.utils import OperationalError, ProgrammingError
 
 
 class CommerceConfig(AppConfig):
@@ -9,3 +10,9 @@ class CommerceConfig(AppConfig):
     def ready(self):
         # import signals to ensure they are registered
         from . import signals  # noqa
+        from .category_catalog import ensure_catalog_categories
+
+        try:
+            ensure_catalog_categories()
+        except (OperationalError, ProgrammingError):
+            pass

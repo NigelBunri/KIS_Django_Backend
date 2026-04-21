@@ -24,10 +24,6 @@ class Migration(migrations.Migration):
         ),
         migrations.AddIndex(
             model_name='shopservice',
-            index=models.Index(fields=['category'], name='commerce_sh_categor_8518c5_idx'),
-        ),
-        migrations.AddIndex(
-            model_name='shopservice',
             index=models.Index(fields=['price'], name='commerce_sh_price_ffd12c_idx'),
         ),
         migrations.AddIndex(

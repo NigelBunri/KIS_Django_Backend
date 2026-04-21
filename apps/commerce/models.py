@@ -46,6 +46,8 @@ from django.conf import settings
 from django.utils import timezone
 from django.utils.text import slugify
 from django.contrib.postgres.fields import ArrayField
+from django.core.exceptions import ValidationError
+from apps.billing.models import WalletTransaction
 
 from .constants import KIS_COIN_CODE
 
@@ -108,6 +110,7 @@ class ShopLandingPage(BaseEntity):
     hero_image_url = models.URLField(max_length=512, blank=True)
     hero_cta_text = models.CharField(max_length=128, blank=True)
     hero_cta_url = models.URLField(max_length=512, blank=True)
+    builder_data = JSONField(default=dict, blank=True)
     is_public = models.BooleanField(default=False)
     is_published = models.BooleanField(default=False)
     created_by = models.ForeignKey(
@@ -179,6 +182,31 @@ class ShopCategory(BaseEntity):
         super().save(*args, **kwargs)
 
 
+class CatalogCategory(BaseEntity):
+    CATEGORY_TYPES = [
+        ('product', 'Product'),
+        ('service', 'Service'),
+    ]
+    name = models.CharField(max_length=128)
+    slug = models.SlugField(max_length=128, unique=True)
+    description = models.TextField(blank=True)
+    category_type = models.CharField(max_length=16, choices=CATEGORY_TYPES)
+    parent = models.ForeignKey(
+        'self',
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name='children',
+    )
+    sort_order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['category_type', 'sort_order', 'name']
+
+    def __str__(self):
+        return f"{self.name} ({self.category_type})"
+
+
 class ShopService(BaseEntity):
     VISIBILITY_CHOICES = [('draft', 'Draft'), ('public', 'Public'), ('unlisted', 'Unlisted'), ('private', 'Private')]
     STATUS_CHOICES = [('draft', 'Draft'), ('published', 'Published'), ('paused', 'Paused')]
@@ -203,7 +231,11 @@ class ShopService(BaseEntity):
     negotiable = models.BooleanField(default=False)
     tax_inclusive = models.BooleanField(default=True)
     quote_required = models.BooleanField(default=False)
-    category = models.ForeignKey(ShopCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='services')
+    catalog_categories = models.ManyToManyField(
+        'CatalogCategory',
+        blank=True,
+        related_name='services',
+    )
     availability = JSONField(default=dict, blank=True)
     availability_rules = JSONField(default=list, blank=True)
     blackout_dates = ArrayField(models.DateField(), default=list, blank=True)
@@ -258,7 +290,6 @@ class ShopService(BaseEntity):
             models.Index(fields=['status']),
             models.Index(fields=['visibility']),
             models.Index(fields=['shop']),
-            models.Index(fields=['category']),
             models.Index(fields=['price']),
             models.Index(fields=['published_at']),
         ]
@@ -589,61 +620,58 @@ class ShopVerificationRequest(BaseEntity):
     risk_score = models.FloatField(null=True, blank=True)
 
 
+
 class Product(BaseEntity):
-    INVENTORY_TYPES = [('PHYSICAL', 'Physical'), ('DIGITAL', 'Digital'), ('SERVICE', 'Service')]
+    INVENTORY_TYPES = [
+        ('PHYSICAL', 'Physical'),
+        ('DIGITAL', 'Digital'),
+        ('SERVICE', 'Service'),
+    ]
+
+    # Core Relations & Identity
     shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='products')
     sku = models.CharField(max_length=128, unique=True)
     name = models.CharField(max_length=255)
-    slug = models.SlugField(max_length=255)
-    image_url = models.URLField(max_length=512, blank=True)
-    image_file = models.ImageField(upload_to='commerce/products/', null=True, blank=True)
+    slug = models.SlugField(max_length=255, unique=True)
+
+    # Media
+    main_image = models.ImageField(upload_to='commerce/products/main/', null=True, blank=True)
     description = models.TextField(blank=True)
-    price = models.DecimalField(max_digits=12, decimal_places=2)
-    currency = models.CharField(
-        max_length=8,
-        choices=[(KIS_COIN_CODE, KIS_COIN_CODE)],
-        default=KIS_COIN_CODE,
+
+    # Pricing
+    price = models.DecimalField(max_digits=12, decimal_places=2, help_text="Original retail price")
+    sale_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Discounted selling price"
     )
+    currency = models.CharField(max_length=8, default=KIS_COIN_CODE)
+
+    # Inventory & Classification
     inventory_type = models.CharField(max_length=20, choices=INVENTORY_TYPES, default='PHYSICAL')
     stock_qty = models.IntegerField(default=0)
-    variants = JSONField(default=list, blank=True)
-    categories = JSONField(default=list, blank=True)
-    attributes = JSONField(default=dict, blank=True)
-    brand = models.CharField(max_length=128, blank=True, default='')
-    condition = models.CharField(max_length=64, blank=True, default='')
-    sale_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    compare_at_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    material = models.CharField(max_length=128, blank=True, default='')
-    fit = models.CharField(max_length=64, blank=True, default='')
-    size_guide = models.TextField(blank=True, default='')
-    available_sizes = ArrayField(models.CharField(max_length=64), default=list, blank=True)
-    available_colors = ArrayField(models.CharField(max_length=64), default=list, blank=True)
-    weight = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    length = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    width = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    height = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     low_stock_threshold = models.PositiveIntegerField(null=True, blank=True)
-    requires_shipping = models.BooleanField(default=True)
-    pickup_available = models.BooleanField(default=False)
-    allow_backorder = models.BooleanField(default=False)
+    catalog_categories = models.ManyToManyField('CatalogCategory', blank=True, related_name='products')
+
+    # Flexible Data
+    attributes = models.JSONField(default=dict, blank=True)
+    variants = models.JSONField(default=list, blank=True)
+
+    # Status & Visibility
     is_active = models.BooleanField(default=True)
     is_featured = models.BooleanField(default=False)
-    rating_avg = models.FloatField(default=0.0)
-    rating_count = models.IntegerField(default=0)
-    ai_score = models.FloatField(default=0.0)
-    ar_preview_url = models.URLField(blank=True)
-    authenticity_status = models.CharField(max_length=20, default='UNKNOWN')  # UNKNOWN | VERIFIED | FLAGGED
-    authenticity_proof = JSONField(default=dict, blank=True)  # e.g., blockchain anchor, certificate
-    category = models.ForeignKey(ShopCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
-    availability = models.CharField(max_length=128, blank=True, default='')
-    coverage = models.TextField(blank=True, default='')
-    location = models.CharField(max_length=255, blank=True, default='')
-    service_type = models.CharField(max_length=64, blank=True, default='')
-    other_shops_discount = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
-    availability_rules = JSONField(default=list, blank=True)
+    requires_shipping = models.BooleanField(default=True)
 
     class Meta:
-        indexes = [models.Index(fields=['sku']), models.Index(fields=['slug'])]
+        indexes = [
+            models.Index(fields=['sku']),
+            models.Index(fields=['slug']),
+            models.Index(fields=['shop', 'is_active']),
+            models.Index(fields=['inventory_type']),
+        ]
+        ordering = ['-created_at']
 
     def __str__(self):
         return f"{self.name} [{self.sku}]"
@@ -651,13 +679,79 @@ class Product(BaseEntity):
     @property
     def effective_image_url(self):
         try:
-            if self.image_file:
-                return self.image_file.url
+            if self.main_image:
+                return self.main_image.url
         except ValueError:
             pass
-        if self.image_url:
-            return self.image_url
+
+        first_gallery = self.gallery_images.filter(is_active=True).order_by('sort_order', 'id').first()
+        if first_gallery and first_gallery.image_file:
+            try:
+                return first_gallery.image_file.url
+            except ValueError:
+                pass
+
         return ''
+
+    @property
+    def gallery_image_urls(self):
+        urls = []
+        for item in self.gallery_images.filter(is_active=True).order_by('sort_order', 'id'):
+            try:
+                if item.image_file:
+                    urls.append(item.image_file.url)
+            except ValueError:
+                continue
+        return urls
+
+    def clean(self):
+        super().clean()
+
+        if self.sale_price is not None and self.sale_price > self.price:
+            raise ValidationError({'sale_price': 'Sale price cannot be greater than price.'})
+
+        if self.inventory_type in ['DIGITAL', 'SERVICE'] and self.requires_shipping:
+            raise ValidationError({
+                'requires_shipping': 'Digital or service products should not require shipping.'
+            })
+
+
+class ProductImage(BaseEntity):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='gallery_images')
+    image_file = models.ImageField(upload_to='commerce/products/gallery/')
+    alt_text = models.CharField(max_length=255, blank=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+        indexes = [
+            models.Index(fields=['product', 'sort_order']),
+            models.Index(fields=['product', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f"{self.product.name} - Gallery Image #{self.id}"
+
+
+class ProductVariant(BaseEntity):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='product_variants')
+    size = models.CharField(max_length=64, blank=True, default='')
+    color = models.CharField(max_length=64, blank=True, default='')
+    sku = models.CharField(max_length=128, blank=True, default='')
+    price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    stock_qty = models.IntegerField(default=0)
+    image_url = models.URLField(max_length=512, blank=True, default='')
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['product'], name='commerce_variant_product_idx'),
+            models.Index(fields=['sku'], name='commerce_variant_sku_idx'),
+        ]
+
+    def __str__(self):
+        return f"Variant {self.sku or self.id} of {self.product.name}"
 
 
 class Cart(BaseEntity):
@@ -683,25 +777,101 @@ class CartItem(BaseEntity):
     cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name='items')
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='cart_items')
     variant = models.CharField(max_length=128, blank=True, default='')
+    size = models.CharField(max_length=64, blank=True, default='')
+    color = models.CharField(max_length=64, blank=True, default='')
     variant_snapshot = JSONField(default=dict, blank=True)
     quantity = models.PositiveIntegerField(default=1)
     price_snapshot = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     stock_snapshot = models.IntegerField(default=0)
+    selected_attributes = JSONField(default=dict, blank=True)
+    attribute_labels = JSONField(default=dict, blank=True)
+    custom_description = models.TextField(blank=True)
 
     class Meta:
         indexes = [models.Index(fields=['cart'])]
+        unique_together = [('cart', 'product', 'variant')]
 
     def __str__(self):
         return f"{self.quantity}x {self.product.name} in cart {self.cart.id}"
 
 
-class ProductImage(BaseEntity):
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='images')
-    image_file = models.ImageField(upload_to='commerce/product-images/')
-    order = models.PositiveIntegerField(default=0)
+class MarketplaceOrderStatus(models.TextChoices):
+    TEMPORAL = 'temporal', 'Temporal'
+    CANCELLED = 'cancelled', 'Cancelled'
+    AWAITING_SATISFACTION = 'awaiting_satisfaction', 'Awaiting satisfaction'
+    SATISFIED = 'satisfied', 'Satisfied'
+    COMPLETED = 'completed', 'Completed'
+    COMPLAINT = 'complaint', 'Complaint'
+
+
+class MarketplaceOrder(BaseEntity):
+    buyer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='marketplace_orders')
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='marketplace_orders')
+    total_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=16, default=KIS_COIN_CODE)
+    status = models.CharField(max_length=32, choices=MarketplaceOrderStatus.choices, default=MarketplaceOrderStatus.TEMPORAL)
+    metadata = JSONField(default=dict, blank=True)
+    buyer_debit_transaction = models.ForeignKey(
+        WalletTransaction,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='marketplace_buyer_orders',
+    )
+    provider_credit_transaction = models.ForeignKey(
+        WalletTransaction,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='marketplace_provider_orders',
+    )
+    receipt_generated = models.BooleanField(default=False)
 
     class Meta:
-        ordering = ['order', 'created_at']
+        indexes = [
+            models.Index(fields=['buyer', 'status']),
+            models.Index(fields=['shop', 'status']),
+        ]
+
+    def __str__(self):
+        return f"MarketplaceOrder {self.id} ({self.buyer})"
+
+
+class MarketplaceOrderItem(BaseEntity):
+    order = models.ForeignKey(MarketplaceOrder, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='marketplace_order_items')
+    variant_id = models.CharField(max_length=128, blank=True, default='')
+    quantity = models.PositiveIntegerField(default=1)
+    unit_price_cents = models.PositiveIntegerField()
+    selected_attributes = JSONField(default=dict, blank=True)
+    custom_description = models.TextField(blank=True)
+
+    class Meta:
+        unique_together = [('order', 'product', 'variant_id')]
+        indexes = [models.Index(fields=['order'])]
+
+    def __str__(self):
+        return f"{self.quantity}x {self.product.name} in order {self.order.id}"
+
+
+class MarketplaceComplaintStatus(models.TextChoices):
+    PENDING = 'pending', 'Pending'
+    REVIEWED = 'reviewed', 'Reviewed'
+    RESOLVED = 'resolved', 'Resolved'
+
+
+class MarketplaceComplaint(BaseEntity):
+    order = models.ForeignKey(MarketplaceOrder, on_delete=models.CASCADE, related_name='complaints')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='marketplace_complaints')
+    text = models.TextField()
+    attachment = models.FileField(upload_to='commerce/marketplace/complaints/', null=True, blank=True)
+    status = models.CharField(max_length=32, choices=MarketplaceComplaintStatus.choices, default=MarketplaceComplaintStatus.PENDING)
+
+    class Meta:
+        indexes = [models.Index(fields=['order'])]
+
+    def __str__(self):
+        return f"Complaint {self.id} for order {self.order.id}"
 
 
 class ProductRating(BaseEntity):
@@ -721,61 +891,6 @@ class ProductAuthenticityCheck(BaseEntity):
     result = JSONField(default=dict, blank=True)
     confidence = models.FloatField(null=True, blank=True)
     checked_at = models.DateTimeField(null=True, blank=True)
-
-
-class Order(BaseEntity):
-    ORDER_STATUS = [('PENDING','Pending'),('PAID','Paid'),('SHIPPED','Shipped'),('DELIVERED','Delivered'),('CANCELLED','Cancelled'),('REFUNDED','Refunded')]
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='orders')
-    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name='orders')
-    status = models.CharField(max_length=20, choices=ORDER_STATUS, default='PENDING')
-    subtotal = models.DecimalField(max_digits=12, decimal_places=2)
-    tax = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    shipping = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    total = models.DecimalField(max_digits=12, decimal_places=2)
-    currency = models.CharField(
-        max_length=8,
-        choices=[(KIS_COIN_CODE, KIS_COIN_CODE)],
-        default=KIS_COIN_CODE,
-    )
-    paid_at = models.DateTimeField(null=True, blank=True)
-    shipped_at = models.DateTimeField(null=True, blank=True)
-    delivered_at = models.DateTimeField(null=True, blank=True)
-    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    discount_code = models.CharField(max_length=64, blank=True)
-    referral_code = models.CharField(max_length=64, blank=True)
-
-
-class OrderItem(BaseEntity):
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items')
-    product = models.ForeignKey(Product, on_delete=models.SET_NULL, null=True, blank=True)
-    name = models.CharField(max_length=255)
-    quantity = models.IntegerField(default=1)
-    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
-    currency = models.CharField(
-        max_length=8,
-        choices=[(KIS_COIN_CODE, KIS_COIN_CODE)],
-        default=KIS_COIN_CODE,
-    )
-    variant = JSONField(default=dict, blank=True)
-    applied_discount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-
-
-class Payment(BaseEntity):
-    PAYMENT_STATUS = [('PENDING','Pending'),('SUCCESS','Success'),('FAILED','Failed'),('REFUNDED','Refunded')]
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='payments')
-    provider = models.CharField(max_length=100)
-    method = models.CharField(max_length=50)
-    amount = models.DecimalField(max_digits=12, decimal_places=2)
-    currency = models.CharField(
-        max_length=8,
-        choices=[(KIS_COIN_CODE, KIS_COIN_CODE)],
-        default=KIS_COIN_CODE,
-    )
-    status = models.CharField(max_length=20, choices=PAYMENT_STATUS, default='PENDING')
-    provider_ref = models.CharField(max_length=255, blank=True)
-    captured_at = models.DateTimeField(null=True, blank=True)
-    refunded_at = models.DateTimeField(null=True, blank=True)
-    fraud_score = models.FloatField(null=True, blank=True)
 
 
 class Promotion(BaseEntity):
@@ -892,3 +1007,126 @@ class FraudSignal(BaseEntity):
     score = models.FloatField()
     details = JSONField(default=dict, blank=True)
     processed = models.BooleanField(default=False)
+
+
+class OrderStatus(models.TextChoices):
+    TEMPORAL = "temporal", "Temporal"
+    ESCROW = "escrow", "Escrow"
+    CANCELLED = "cancelled", "Cancelled"
+    SATISFIED = "satisfied", "Satisfied"
+    COMPLETED = "completed", "Completed"
+
+
+class Order(BaseEntity):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="orders",
+    )
+    shop = models.ForeignKey(Shop, on_delete=models.CASCADE, related_name="orders")
+    provider = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="received_orders",
+        null=True,
+        blank=True,
+    )
+    total_cents = models.BigIntegerField(default=0)
+    currency = models.CharField(max_length=8, default=KIS_COIN_CODE)
+    status = models.CharField(max_length=32, choices=OrderStatus.choices, default=OrderStatus.TEMPORAL)
+    metadata = JSONField(default=dict, blank=True)
+    wallet_transaction = models.ForeignKey(
+        WalletTransaction,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="orders",
+    )
+    provider_transaction = models.ForeignKey(
+        WalletTransaction,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="provider_orders",
+    )
+    escrow_expires_at = models.DateTimeField(null=True, blank=True)
+
+    is_buyer = models.BooleanField(default=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["status"]), models.Index(fields=["user"]), models.Index(fields=["shop"])]
+    def __str__(self):
+        return f"Order {self.id} · {self.status}"
+
+
+class OrderItem(BaseEntity):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="items")
+    product = models.ForeignKey("Product", on_delete=models.CASCADE)
+    variant_id = models.CharField(max_length=255, blank=True)
+    sku = models.CharField(max_length=128, blank=True)
+    unit_price_cents = models.BigIntegerField(default=0)
+    quantity = models.PositiveIntegerField(default=1)
+    selected_attributes = JSONField(default=dict, blank=True)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        unique_together = ("order", "product", "variant_id")
+        indexes = [models.Index(fields=["product"])]
+
+    def line_total(self):
+        return self.unit_price_cents * self.quantity
+
+
+class Payment(BaseEntity):
+    PAYMENT_STATUS = [
+        ("pending", "Pending"),
+        ("escrow", "Escrow"),
+        ("success", "Success"),
+        ("failed", "Failed"),
+        ("refunded", "Refunded"),
+    ]
+    PAYMENT_ROLE = [
+        ("buyer", "Buyer debit"),
+        ("provider", "Provider payout"),
+        ("escrow_release", "Escrow release"),
+    ]
+
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="payments")
+    provider = models.CharField(max_length=100)
+    method = models.CharField(max_length=50)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=8, choices=[(KIS_COIN_CODE, KIS_COIN_CODE)], default=KIS_COIN_CODE)
+    status = models.CharField(max_length=20, choices=PAYMENT_STATUS, default="pending")
+    role = models.CharField(max_length=32, choices=PAYMENT_ROLE, default="buyer")
+    provider_ref = models.CharField(max_length=255, blank=True)
+    related_payment = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="related_payments",
+    )
+    captured_at = models.DateTimeField(null=True, blank=True)
+    refunded_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["order", "status"])]
+
+    def __str__(self):
+        return f"Payment {self.id} · {self.role} ({self.status})"
+
+
+class Complaint(BaseEntity):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="complaints")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    description = models.TextField()
+    receipt_file = models.FileField(upload_to="commerce/complaints/", null=True, blank=True)
+    resolved = models.BooleanField(default=False)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["order", "user"])]
+
+    def __str__(self):
+        return f"Complaint {self.id} · Order {self.order_id}"

@@ -9,10 +9,11 @@ from django.utils.text import slugify
 
 from apps.accounts.models import User
 from apps.commerce.constants import KIS_COIN_CODE
+from apps.commerce.category_catalog import ensure_catalog_categories
 from apps.commerce.models import (
+    CatalogCategory,
     Product,
     Shop,
-    ShopCategory,
     ShopLandingPage,
     ShopLandingTestimonial,
     ShopService,
@@ -222,6 +223,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         summary_lines = []
+        ensure_catalog_categories()
         for index, entry in enumerate(MERCHANTS):
             phone = f"{entry['country_code']}{entry['phone']}"
             email = f"{entry['username']}@demo.kis"
@@ -257,8 +259,6 @@ class Command(BaseCommand):
 
             self.sync_testimonials(landing_page, entry)
 
-            self.ensure_categories(shop, entry)
-
             product_defaults = self.build_product_defaults(
                 entry,
                 shop,
@@ -269,6 +269,9 @@ class Command(BaseCommand):
                 sku=f"{shop_slug.upper()}-SIGNATURE",
                 defaults=product_defaults,
             )
+            product_catalogs = self.select_catalog_categories('product', 2, index)
+            if product_catalogs:
+                product.catalog_categories.set(product_catalogs)
 
             service_defaults = self.build_service_defaults(
                 entry,
@@ -281,6 +284,9 @@ class Command(BaseCommand):
                 slug=slugify(f"{shop_slug}-service"),
                 defaults=service_defaults,
             )
+            service_catalogs = self.select_catalog_categories('service', 2, index)
+            if service_catalogs:
+                service.catalog_categories.set(service_catalogs)
 
             summary_lines.append(
                 f"{user.username}: user={'created' if user_created else 'updated'}, "
@@ -408,28 +414,7 @@ class Command(BaseCommand):
                 },
             )
 
-    def ensure_categories(self, shop, entry):
-        ShopCategory.objects.update_or_create(
-            shop=shop,
-            slug=slugify(f"{shop.slug}-products"),
-            defaults={
-                "name": f"{entry['visible_name']} Collections",
-                "description": f"Curated goods inspired by {entry['city']} and beyond.",
-                "category_type": "product",
-            },
-        )
-        ShopCategory.objects.update_or_create(
-            shop=shop,
-            slug=slugify(f"{shop.slug}-services"),
-            defaults={
-                "name": f"{entry['visible_name']} Services",
-                "description": f"High-touch experiences delivered in {entry['city']} and remotely.",
-                "category_type": "service",
-            },
-        )
-
     def build_product_defaults(self, entry, shop, price, slug):
-        product_category = ShopCategory.objects.get(slug=slugify(f"{shop.slug}-products"), shop=shop)
         return {
             "shop": shop,
             "name": f"{entry['visible_name']} Signature Box",
@@ -447,7 +432,6 @@ class Command(BaseCommand):
                 {"name": "Standard", "sku": f"{slug.upper()}-STD"},
                 {"name": "Deluxe", "sku": f"{slug.upper()}-DLX"},
             ],
-            "categories": [product_category.name],
             "attributes": {
                 "material": "Carbon fiber weave",
                 "finish": "Satin graphite",
@@ -465,7 +449,6 @@ class Command(BaseCommand):
                 "verified_at": timezone.now().isoformat(),
                 "issuer": "KIS Auth Vault",
             },
-            "category": product_category,
             "availability": "Ships within 2 business days.",
             "coverage": f"{entry['city']}, {entry['state']}, United States",
             "location": f"{entry['city']}, {entry['state']}",
@@ -475,7 +458,6 @@ class Command(BaseCommand):
         }
 
     def build_service_defaults(self, entry, shop, price, slug):
-        service_category = ShopCategory.objects.get(slug=slugify(f"{shop.slug}-services"), shop=shop)
         availability = {
             "slots": [
                 {"day": "monday", "start": "09:00", "end": "18:00"},
@@ -540,7 +522,6 @@ class Command(BaseCommand):
             "negotiable": False,
             "tax_inclusive": True,
             "quote_required": False,
-            "category": service_category,
             "availability": availability,
             "availability_rules": [
                 {"rule": "min_notice_hours", "value": 24},
@@ -594,6 +575,15 @@ class Command(BaseCommand):
             "is_featured": True,
             "other_shops_discount": Decimal("4.00"),
         }
+
+    def select_catalog_categories(self, category_type: str, count: int, offset: int):
+        categories = list(CatalogCategory.objects.filter(category_type=category_type).order_by('slug'))
+        if not categories:
+            return []
+        return [
+            categories[(offset + idx) % len(categories)]
+            for idx in range(min(count, len(categories)))
+        ]
 
     def update_model(self, instance, defaults):
         for key, value in defaults.items():

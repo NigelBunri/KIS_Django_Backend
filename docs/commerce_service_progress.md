@@ -9,7 +9,7 @@
 - **In-progress tasks**
   - Phase 4 (broadcast & discovery): featured/tag ranking, additional metadata exposure, and feed filtering enhancements.
 - **Blocked tasks**
-  - Full automated regression verification is still blocked: the sandbox Postgres endpoint at 127.0.0.1:5432 refuses connections (`Operation not permitted`), and SQLite continues to choke on `commerce.0021_remove_shopservice_currency_shopservice_addons_and_more` because the JSON defaults include `[]` values that SQLite cannot parse. Manual Feature-flag toggling awaits an accessible PostgreSQL host.
+  - Full automated regression verification is still blocked: the sandbox Postgres endpoint at 10.14.20.99:5432 refuses connections (`Operation not permitted`), and SQLite continues to choke on `commerce.0021_remove_shopservice_currency_shopservice_addons_and_more` because the JSON defaults include `[]` values that SQLite cannot parse. Manual Feature-flag toggling awaits an accessible PostgreSQL host.
 - **Deferred tasks**
   - None yet; every future phase is tracked in the handoff doc.
 - **Tests added**
@@ -27,9 +27,9 @@
   - Terms acceptance gating (`SERVICE_REQUIRE_TERMS_ACCEPTANCE`).
   - Refund policy window and reschedule metadata checks (`SERVICE_ENFORCE_REFUND_POLICY`, `SERVICE_ENFORCE_RESCHEDULE_POLICY`).
 - **Tests executed**
-  - `python3 manage.py test apps.commerce.tests.ServiceBookingAPITests` (fails because the sandbox Postgres endpoint at 127.0.0.1:5432 is unavailable: `OperationalError: connection is bad`).
+  - `python3 manage.py test apps.commerce.tests.ServiceBookingAPITests` (fails because the sandbox Postgres endpoint at 10.14.20.99:5432 is unavailable: `OperationalError: connection is bad`).
   - `DATABASE_URL=sqlite:////tmp/testdb.sqlite3 python3 manage.py test apps.commerce.tests.ServiceBookingAPITests` (runs migrations but fails on `commerce.0021_remove_shopservice_currency_shopservice_addons_and_more` with `sqlite3.OperationalError: near "[]": syntax error`).
-  - `DATABASE_URL=postgresql://kis_dev_user@localhost:5432/kis_test python3 manage.py migrate` (fails because the connection attempt to 127.0.0.1:5432 is blocked with `Operation not permitted`).
+  - `DATABASE_URL=postgresql://kis_dev_user@10.14.20.99:5432/kis_test python3 manage.py migrate` (fails because the connection attempt to 10.14.20.99:5432 is blocked with `Operation not permitted`).
 - **Migrations added**
   - `apps/commerce/migrations/0025_add_servicebooking_metadata.py` adds the `metadata` JSONField to `ServiceBooking`.
   - `apps/commerce/migrations/0035_servicebookingreceipt.py` creates `ServiceBookingReceipt` so each deposit or remaining payment produces its own receipt snapshot and URL.

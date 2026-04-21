@@ -1,28 +1,67 @@
 from .base import *  # noqa
 import dj_database_url
+import sys
 
 DEBUG = os.environ.get("DEBUG", "True").lower() in ("1", "true", "yes", "on")
+LOCAL_DEV_HOST = os.environ.get("DEV_SERVER_HOST", "10.14.20.99").strip() or "10.14.20.99"
+LOCAL_DEV_PORT = os.environ.get("DEV_SERVER_PORT", "8000").strip() or "8000"
 
 SECURE_SSL_REDIRECT = False
 
 if os.environ.get("ALLOW_ALL_HOSTS", "False").lower() in ("1", "true", "yes", "on"):
     ALLOWED_HOSTS = ["*"]
 else:
-    ALLOWED_HOSTS = [host.strip() for host in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1,10.0.2.2").split(",") if host.strip()]
+    ALLOWED_HOSTS = [
+        host.strip()
+        for host in os.environ.get("ALLOWED_HOSTS", f"{LOCAL_DEV_HOST},10.0.2.2").split(",")
+        if host.strip()
+    ]
+if LOCAL_DEV_HOST not in ALLOWED_HOSTS and ALLOWED_HOSTS != ["*"]:
+    ALLOWED_HOSTS.append(LOCAL_DEV_HOST)
 if "testserver" not in ALLOWED_HOSTS:
     ALLOWED_HOSTS.append("testserver")
 
+SITE_URL = os.environ.get("SITE_URL", f"http://{LOCAL_DEV_HOST}:{LOCAL_DEV_PORT}").rstrip("/")
+API_BASE_URL = os.environ.get("API_BASE_URL", SITE_URL).rstrip("/")
+
+# In local development the app host changes frequently between loopback/LAN.
+# Do not hard-fail JWT validation on issuer/audience drift for already-issued tokens.
+SIMPLE_JWT = {
+    **SIMPLE_JWT,
+    "ISSUER": None,
+    "AUDIENCE": None,
+}
+
+IS_TEST_RUN = len(sys.argv) > 1 and sys.argv[1] == "test"
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", None)
+
 # Local DB: leave default sqlite unless DATABASE_URL provided.
 DATABASE_URL = os.environ.get("DATABASE_URL", None)
-if DATABASE_URL:
+if IS_TEST_RUN and not TEST_DATABASE_URL:
+    DATABASES["default"] = {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": str(BASE_DIR / "test_db.sqlite3"),
+    }
+elif TEST_DATABASE_URL:
+    DATABASES["default"] = dj_database_url.parse(
+        TEST_DATABASE_URL,
+        conn_max_age=int(os.environ.get("PG_CONN_MAX_AGE", "600")),
+    )
+elif DATABASE_URL:
     DATABASES["default"] = dj_database_url.parse(
         DATABASE_URL,
         conn_max_age=int(os.environ.get("PG_CONN_MAX_AGE", "600")),
     )
 
 DATABASES["default"].setdefault("TEST", {})
-DATABASES["default"]["TEST"].setdefault("NAME", "kis_test")
-DATABASES["default"]["TEST"].setdefault("MIRROR", "default")
+if DATABASES["default"].get("ENGINE") == "django.db.backends.sqlite3":
+    DATABASES["default"]["TEST"].setdefault("NAME", str(BASE_DIR / "test_db.sqlite3"))
+else:
+    DATABASES["default"]["TEST"].setdefault("NAME", "kis_test")
+
+test_mirror = os.environ.get("TEST_DATABASE_MIRROR", "").strip()
+if test_mirror:
+    DATABASES["default"]["TEST"].setdefault("MIRROR", test_mirror)
 
 # In local, make email backend console
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"

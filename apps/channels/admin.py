@@ -9,12 +9,15 @@ class ChannelAdmin(admin.ModelAdmin):
     list_display = (
         "name",
         "slug",
+        "channel_type",
+        "category",
+        "order",
         "owner",
         "partner",
         "community",
         "is_archived",
         "created_at",
     )
-    list_filter = ("is_archived", "partner", "community")
+    list_filter = ("is_archived", "channel_type", "partner", "community", "category")
     search_fields = ("name", "slug", "owner__username", "owner__email")
-    raw_id_fields = ("owner", "conversation", "partner", "community")
+    raw_id_fields = ("owner", "conversation", "partner", "community", "category")

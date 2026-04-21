@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from uuid import uuid4
 
 from django.contrib.auth import get_user_model
 from django.test import override_settings
@@ -9,6 +10,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
+from apps.billing.models import WalletLedgerEntry
 from apps.billing.services import get_wallet_account
 from apps.health_ops.models import (
     EngineCompletionMode,
@@ -22,6 +24,7 @@ from apps.health_ops.models import (
     ServiceWorkflowSession,
     WorkflowStatus,
 )
+from apps.health_ops.serializers import PaymentBillingStartSerializer
 
 
 User = get_user_model()
@@ -106,6 +109,18 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
             base_cost_micro=0,
         )
         self.client.force_authenticate(self.user)
+
+    def test_payment_billing_serializer_keeps_micro_amount_unchanged(self):
+        serializer = PaymentBillingStartSerializer(
+            data={
+                "workflow_session_id": str(uuid4()),
+                "total_amount_micro": 123456,
+                "payable_amount_micro": 654321,
+            }
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["total_amount_micro"], 123456)
+        self.assertEqual(serializer.validated_data["payable_amount_micro"], 654321)
 
     def _create_workflow(self, mappings: list[ServiceEngineMap]) -> ServiceWorkflowSession:
         workflow = ServiceWorkflowSession.objects.create(
@@ -340,6 +355,13 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
 
         wallet.refresh_from_db()
         self.assertEqual(wallet.balance_cents, 30000)
+        ledger = WalletLedgerEntry.objects.filter(
+            user=self.user,
+            reference=f"health_ops_billing:{billing_session_id}",
+            kind="purchase",
+        ).order_by("created_at")
+        self.assertEqual(ledger.count(), 1)
+        self.assertEqual(ledger.first().amount_cents, -20000)
 
         billing_session = PaymentBillingSession.objects.get(id=billing_session_id)
         self.assertEqual(billing_session.status, "paid")

@@ -2,9 +2,11 @@
 import csv
 import json
 import os
+from datetime import timedelta
 
 from django.conf import settings
-from django.db import models  # 👈 for models.Q
+from django.db import models, transaction
+from django.utils.dateparse import parse_datetime
 from django.utils import timezone
 
 from rest_framework import viewsets, status
@@ -23,8 +25,10 @@ from apps.partners.models import (
     PartnerMembership,
     PartnerMembershipStatus,
     PartnerApplication,
+    PartnerInvite,
     PartnerJobPost,
     PartnerApplicationStatus,
+    PartnerOnboardingProgress,
     PartnerPolicy,
     PartnerRole,
     PartnerRoleAssignment,
@@ -48,6 +52,8 @@ from apps.partners.models import (
     PartnerOrganizationAppType,
     PartnerOrganizationAppAccessLog,
     PartnerProfileLink,
+    PartnerServerCategory,
+    PartnerModerationAction,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -60,6 +66,7 @@ from apps.chat.models import (
     BaseConversationRole,
     Conversation,
     ConversationMember,
+    ConversationNotificationLevel,
     ConversationSettings,
     ConversationType,
     ConversationSendPolicy,
@@ -72,7 +79,9 @@ from apps.partners.serializers import (
     PartnerDiscoverSerializer,
     PartnerApplicationSerializer,
     PartnerApplicationDetailSerializer,
+    PartnerInviteSerializer,
     PartnerJobPostSerializer,
+    PartnerOnboardingProgressSerializer,
     PartnerOrganizationAppAccessLogSerializer,
     PartnerPostSerializer,
     PartnerPostCreateSerializer,
@@ -94,6 +103,9 @@ from apps.partners.serializers import (
     PartnerOrganizationProfileSerializer,
     PartnerOrganizationAppSerializer,
     PartnerProfileLinkSerializer,
+    PartnerServerCategorySerializer,
+    PartnerModerationActionSerializer,
+    PartnerMemberDirectoryEntrySerializer,
 )
 from apps.moderation.models import UserBlock
 from apps.accounts.feature_gate import require_feature
@@ -103,6 +115,9 @@ from apps.partners.services import (
     apply_partner_policy,
     ensure_default_organization_app,
     log_organization_app_access,
+    partner_user_can_access,
+    partner_user_can_manage,
+    get_partner_user_roles,
     user_has_partner_permission,
     log_partner_audit,
     evaluate_partner_dlp,
@@ -114,6 +129,7 @@ from apps.partners.services import (
     deactivate_partner_profile,
     reactivate_partner_profile,
     get_partner_organization_apps_for_user,
+    filter_partner_channels_for_user,
 )
 
 import logging
@@ -237,20 +253,31 @@ class PartnerViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """
-        For now:
+        Default visibility:
         - Return partners where the user is the owner, OR
-        - The user is a member of the partner's main conversation (if exists).
+        - the user has an active PartnerMembership, OR
+        - the user is a legacy member of the partner's main conversation.
+
+        Public join flows need access to the partner object before a membership exists.
         """
         user = self.request.user
 
-        # Only used in the filter; import kept here if needed elsewhere
-        from apps.chat.models import ConversationMember  # noqa: F401
+        base_qs = Partner.objects.select_related("owner", "main_conversation")
+        if self.action in {"apply", "subscribe"}:
+            return base_qs.filter(is_active=True)
 
         return (
-            Partner.objects
-            .select_related("owner", "main_conversation")
+            base_qs
             .filter(
                 models.Q(owner=user)
+                | models.Q(
+                    memberships__user=user,
+                    memberships__status__in=(
+                        PartnerMembershipStatus.MEMBER,
+                        PartnerMembershipStatus.SUBSCRIBER,
+                    ),
+                    memberships__is_banned=False,
+                )
                 | models.Q(
                     main_conversation__memberships__user=user,
                     main_conversation__memberships__left_at__isnull=True,
@@ -274,14 +301,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
         return super().create(request, *args, **kwargs)
 
     def _user_can_access_partner(self, partner: Partner, user) -> bool:
-        if partner.owner_id == user.id:
-            return True
-        if partner.main_conversation_id:
-            return partner.main_conversation.memberships.filter(
-                user=user,
-                left_at__isnull=True,
-            ).exists()
-        return False
+        return partner_user_can_access(partner, user)
 
     def _member_role(self, partner: Partner, user):
         if not partner.main_conversation_id:
@@ -293,47 +313,20 @@ class PartnerViewSet(viewsets.ModelViewSet):
         return member.base_role if member else None
 
     def _ui_role(self, partner: Partner, user) -> str:
-        if partner.owner_id == user.id:
-            return "owner"
-        base_role = self._member_role(partner, user)
-        if base_role == BaseConversationRole.ADMIN:
-            return "admin"
-        if base_role == BaseConversationRole.OWNER:
-            return "owner"
+        roles = get_partner_user_roles(partner, user)
+        for role in ("owner", "admin", "manager", "analyst", "viewer", "member"):
+            if role in roles:
+                return role
         return "member"
 
     def _user_can_manage_partner(self, partner: Partner, user) -> bool:
-        if partner.owner_id == user.id:
-            return True
-        role = self._member_role(partner, user)
-        return role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN)
+        return partner_user_can_manage(partner, user)
 
     def _user_partner_roles(self, partner: Partner, user) -> set[str]:
-        roles = set()
-        if partner.owner_id == user.id:
-            roles.add("owner")
-        base_role = self._member_role(partner, user)
-        if base_role == BaseConversationRole.ADMIN:
-            roles.add("admin")
-        elif base_role == BaseConversationRole.OWNER:
-            roles.add("owner")
-        else:
-            roles.add("member")
-        membership = PartnerMembership.objects.filter(partner=partner, user=user).first()
-        if membership and membership.role:
-            roles.add(membership.role)
-        return roles
+        return get_partner_user_roles(partner, user)
 
     def _user_can_manage_organization_apps(self, partner: Partner, user) -> bool:
-        if partner.owner_id == user.id:
-            return True
-        role = self._member_role(partner, user)
-        if role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
-            return True
-        membership = PartnerMembership.objects.filter(partner=partner, user=user).first()
-        if membership and membership.role in ("owner", "admin", "manager"):
-            return True
-        return False
+        return partner_user_can_manage(partner, user)
 
     def _require_permission(self, partner: Partner, user, codename: str) -> None:
         if self._user_can_manage_partner(partner, user):
@@ -348,10 +341,10 @@ class PartnerViewSet(viewsets.ModelViewSet):
     def _ensure_conversation_member(self, partner: Partner, user, base_role: str) -> None:
         if not partner.main_conversation_id:
             return
-        ConversationMember.objects.get_or_create(
+        ConversationMember.objects.update_or_create(
             conversation_id=partner.main_conversation_id,
             user=user,
-            defaults={"base_role": base_role},
+            defaults={"base_role": base_role, "left_at": None},
         )
 
     def _auto_assign_membership(self, partner: Partner, user, config: dict | None):
@@ -386,6 +379,317 @@ class PartnerViewSet(viewsets.ModelViewSet):
                     user=user,
                     defaults={"base_role": BaseConversationRole.MEMBER},
                 )
+
+    def _get_membership(self, partner: Partner, user) -> PartnerMembership | None:
+        if not user or user.is_anonymous:
+            return None
+        return PartnerMembership.objects.filter(partner=partner, user=user).first()
+
+    def _activate_partner_membership(
+        self,
+        *,
+        partner: Partner,
+        user,
+        status_value: str,
+        membership_role: str,
+    ) -> PartnerMembership:
+        membership, _ = PartnerMembership.objects.update_or_create(
+            partner=partner,
+            user=user,
+            defaults={
+                "status": status_value,
+                "role": membership_role,
+                "is_banned": False,
+                "banned_at": None,
+                "removed_at": None,
+            },
+        )
+        base_role = BaseConversationRole.MEMBER
+        if status_value == PartnerMembershipStatus.SUBSCRIBER or membership_role == "subscriber":
+            base_role = BaseConversationRole.READONLY
+        self._ensure_conversation_member(partner, user, base_role)
+        return membership
+
+    def _partner_onboarding_config(self, partner: Partner) -> dict:
+        config = getattr(partner, "join_config", None)
+        criteria = getattr(config, "criteria", None) or {}
+        role_options = criteria.get("role_options")
+        roles = []
+        if isinstance(role_options, list) and role_options:
+            allowed_ids = {str(item) for item in role_options}
+            allowed_names = {str(item).strip().lower() for item in role_options}
+            for role in partner.roles.order_by("name"):
+                if str(role.id) in allowed_ids or role.name.strip().lower() in allowed_names:
+                    roles.append({"id": str(role.id), "name": role.name, "description": role.description})
+
+        default_channels = criteria.get("default_channels")
+        if not isinstance(default_channels, list):
+            default_channels = []
+
+        return {
+            "rules_text": criteria.get("rules_text") or criteria.get("rules") or "",
+            "welcome_message": criteria.get("welcome_message") or "",
+            "default_channel_ids": [str(channel_id) for channel_id in default_channels if channel_id],
+            "role_options": roles,
+        }
+
+    def _upsert_onboarding_progress(
+        self,
+        *,
+        partner: Partner,
+        user,
+        invite: PartnerInvite | None = None,
+        defaults: dict | None = None,
+    ) -> PartnerOnboardingProgress:
+        payload = defaults or {}
+        progress, _ = PartnerOnboardingProgress.objects.get_or_create(
+            partner=partner,
+            user=user,
+            defaults={
+                "invite": invite,
+                "selected_role_ids": payload.get("selected_role_ids", []),
+                "selected_channel_ids": payload.get("selected_channel_ids", []),
+                "onboarding_snapshot": payload.get("onboarding_snapshot", self._partner_onboarding_config(partner)),
+            },
+        )
+        changed_fields: list[str] = []
+        if invite and progress.invite_id != invite.id:
+            progress.invite = invite
+            changed_fields.append("invite")
+        if payload:
+            for field_name in ("selected_role_ids", "selected_channel_ids", "onboarding_snapshot"):
+                if field_name in payload:
+                    setattr(progress, field_name, payload[field_name])
+                    changed_fields.append(field_name)
+        if changed_fields:
+            changed_fields.append("updated_at")
+            progress.save(update_fields=changed_fields)
+        return progress
+
+    def _member_directory_payload(self, partner: Partner):
+        memberships = (
+            PartnerMembership.objects.filter(partner=partner)
+            .select_related("user", "user__profile")
+            .order_by("role", "created_at")
+        )
+        role_lookup: dict[int, set[str]] = {}
+        assignments = (
+            PartnerRoleAssignment.objects.filter(partner=partner)
+            .select_related("role", "user")
+            .order_by("role__name")
+        )
+        for assignment in assignments:
+            role_lookup.setdefault(assignment.user_id, set()).add(assignment.role.name)
+
+        entries = []
+        for membership in memberships:
+            user = membership.user
+            profile = getattr(user, "profile", None)
+            entries.append(
+                {
+                    "user_id": str(user.id),
+                    "display_name": getattr(user, "display_name", None),
+                    "username": getattr(user, "username", None),
+                    "avatar_url": getattr(profile, "avatar_url", None) if profile else None,
+                    "membership_status": membership.status,
+                    "membership_role": membership.role,
+                    "role_names": sorted(role_lookup.get(user.id, set())),
+                    "is_muted": membership.is_muted,
+                    "is_banned": membership.is_banned,
+                    "timed_out_until": membership.timed_out_until,
+                    "joined_at": membership.created_at,
+                }
+            )
+        return entries
+
+    def _landing_builder_config(self, partner: Partner) -> dict:
+        setting = PartnerSetting.objects.filter(partner=partner, key=LANDING_PAGE_BUILDER_KEY).first()
+        if not setting:
+            return {}
+        return _normalize_landing_builder_config(setting.config or {})
+
+    def _public_hub_payload(self, partner: Partner) -> dict:
+        profile, _ = PartnerOrganizationProfile.objects.get_or_create(
+            partner=partner,
+            defaults={"display_name": partner.name},
+        )
+        apps = get_partner_organization_apps_for_user(partner, self.request.user)
+        active_member_count = PartnerMembership.objects.filter(
+            partner=partner,
+            status__in=(PartnerMembershipStatus.MEMBER, PartnerMembershipStatus.SUBSCRIBER),
+            is_banned=False,
+        ).count()
+        return {
+            "partner_id": str(partner.id),
+            "name": partner.name,
+            "slug": partner.slug,
+            "description": partner.description,
+            "avatar_url": partner.avatar_url,
+            "profile": PartnerOrganizationProfileSerializer(profile).data,
+            "landing_builder": self._landing_builder_config(partner),
+            "public_metrics": {
+                "active_members": active_member_count,
+                "channels": partner.channels.filter(is_archived=False).count(),
+                "apps": len(apps),
+                "categories": partner.server_categories.count(),
+            },
+            "apps": [
+                {
+                    "id": str(app.id),
+                    "name": app.name,
+                    "type": app.type,
+                    "description": app.description,
+                    "module": app.module,
+                    "badge_label": app.badge_label,
+                    "link": app.link,
+                }
+                for app in apps
+            ],
+        }
+
+    def _experience_templates_payload(self, partner: Partner) -> list[dict]:
+        profile = getattr(partner, "organization_profile", None)
+        industry = (getattr(profile, "industry", "") or "").strip().lower()
+        apps = list(partner.organization_apps.filter(is_active=True))
+        active_types = {app.type for app in apps}
+
+        templates = [
+            {
+                "key": "community-campus",
+                "title": "Community Campus",
+                "description": "Learning-first partner experience with onboarding, cohorts, and education apps.",
+                "fits": bool("education" in active_types or "school" in industry or "education" in industry),
+                "accent": "emerald",
+            },
+            {
+                "key": "ministry-broadcast",
+                "title": "Ministry Broadcast Hub",
+                "description": "Broadcast-led partner experience with announcements, follow-up, and events.",
+                "fits": bool("church" in industry or "ministry" in industry or "broadcast" in active_types),
+                "accent": "amber",
+            },
+            {
+                "key": "care-network",
+                "title": "Care Network",
+                "description": "Health and support oriented server with protected teams and intake routing.",
+                "fits": bool("health" in active_types or "care" in industry or "health" in industry),
+                "accent": "cyan",
+            },
+            {
+                "key": "commerce-club",
+                "title": "Commerce Club",
+                "description": "Commerce-oriented server with storefront, partner teams, and sales automation.",
+                "fits": bool("commerce" in active_types or "retail" in industry or "commerce" in industry),
+                "accent": "rose",
+            },
+        ]
+        return templates
+
+    def _team_structure_payload(self, partner: Partner) -> dict:
+        memberships = (
+            PartnerMembership.objects.filter(partner=partner)
+            .select_related("user")
+            .order_by("role", "created_at")
+        )
+        buckets: dict[str, list[dict]] = {}
+        role_assignments = (
+            PartnerRoleAssignment.objects.filter(partner=partner)
+            .select_related("role", "user")
+            .order_by("role__name")
+        )
+        assignment_lookup: dict[int, list[str]] = {}
+        for assignment in role_assignments:
+            assignment_lookup.setdefault(assignment.user_id, []).append(assignment.role.name)
+
+        for membership in memberships:
+            lane = membership.role or "member"
+            buckets.setdefault(lane, []).append(
+                {
+                    "user_id": str(membership.user_id),
+                    "display_name": getattr(membership.user, "display_name", None) or getattr(membership.user, "username", None),
+                    "status": membership.status,
+                    "role_assignments": assignment_lookup.get(membership.user_id, []),
+                    "is_banned": membership.is_banned,
+                }
+            )
+
+        return {
+            "owner_id": str(partner.owner_id),
+            "lanes": [{"key": key, "members": value} for key, value in buckets.items()],
+        }
+
+    def _differentiator_insights_payload(self, partner: Partner) -> dict:
+        memberships = PartnerMembership.objects.filter(partner=partner)
+        active_members = memberships.filter(
+            status__in=(PartnerMembershipStatus.MEMBER, PartnerMembershipStatus.SUBSCRIBER),
+            is_banned=False,
+        )
+        onboarding_total = PartnerOnboardingProgress.objects.filter(partner=partner).count()
+        onboarding_completed = PartnerOnboardingProgress.objects.filter(partner=partner, completed_at__isnull=False).count()
+        role_health = (
+            memberships.values("role")
+            .annotate(count=models.Count("id"))
+            .order_by("-count", "role")
+        )
+        app_access = (
+            PartnerOrganizationAppAccessLog.objects.filter(app__partner=partner)
+            .values("app__name")
+            .annotate(count=models.Count("id"))
+            .order_by("-count", "app__name")[:5]
+        )
+        active_member_ids = set(active_members.values_list("user_id", flat=True))
+        assigned_member_ids = set(
+            PartnerRoleAssignment.objects.filter(partner=partner).values_list("user_id", flat=True)
+        )
+
+        return {
+            "onboarding_funnel": {
+                "started": onboarding_total,
+                "completed": onboarding_completed,
+                "completion_rate": round((onboarding_completed / onboarding_total) * 100, 1) if onboarding_total else 0,
+            },
+            "team_activation": {
+                "active_members": len(active_member_ids),
+                "assigned_members": len(assigned_member_ids),
+                "assignment_rate": round((len(assigned_member_ids & active_member_ids) / len(active_member_ids)) * 100, 1)
+                if active_member_ids
+                else 0,
+            },
+            "role_health": [{"role": item["role"], "count": item["count"]} for item in role_health],
+            "app_adoption": [{"app": item["app__name"], "count": item["count"]} for item in app_access],
+        }
+
+    def _automation_recipe_payload(self, partner: Partner) -> list[dict]:
+        active_apps = {app.type for app in partner.organization_apps.filter(is_active=True)}
+        return [
+            {
+                "key": "onboarding-followup",
+                "title": "Onboarding Follow-up",
+                "description": "Trigger a follow-up when onboarding is started but not completed.",
+                "trigger": "member.joined",
+                "conditions": {"onboarding_completed": False},
+                "actions": [{"type": "notify_admins"}, {"type": "tag_member", "value": "needs_onboarding"}],
+                "fits": True,
+            },
+            {
+                "key": "education-activation",
+                "title": "Education Activation",
+                "description": "Route new members into education cohorts and starter channels.",
+                "trigger": "member.joined",
+                "conditions": {"app_type": "education"},
+                "actions": [{"type": "assign_app_module", "value": "education"}, {"type": "subscribe_default_channels"}],
+                "fits": "education" in active_apps,
+            },
+            {
+                "key": "broadcast-escalation",
+                "title": "Broadcast Escalation",
+                "description": "Escalate high-value announcement interactions to the operations team.",
+                "trigger": "post.broadcast",
+                "conditions": {"engagement_threshold": 25},
+                "actions": [{"type": "notify_role", "value": "Manager"}, {"type": "snapshot_report", "value": "engagement"}],
+                "fits": "broadcast" in active_apps,
+            },
+        ]
 
     def _validate_profile_key(self, profile_key: str) -> str:
         valid_keys = {choice[0] for choice in PartnerProfileLink.PROFILE_CHOICES}
@@ -1594,6 +1898,71 @@ class PartnerViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @action(detail=True, methods=["get", "post"], url_path="server-categories")
+    def server_categories(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            if not self._user_can_manage_partner(partner, request.user):
+                raise PermissionDenied("Not allowed to manage server categories.")
+            serializer = PartnerServerCategorySerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            category = serializer.save(partner=partner)
+            return Response(PartnerServerCategorySerializer(category).data, status=status.HTTP_201_CREATED)
+
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view server categories.")
+        categories = partner.server_categories.order_by("order", "name")
+        serializer = PartnerServerCategorySerializer(categories, many=True)
+        return Response({"categories": serializer.data}, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path=r"server-categories/(?P<category_id>[^/.]+)",
+    )
+    def server_category_detail(self, request, pk=None, category_id=None):
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to manage server categories.")
+        category = PartnerServerCategory.objects.filter(id=category_id, partner=partner).first()
+        if not category:
+            return Response({"detail": "Category not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == "DELETE":
+            category.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = PartnerServerCategorySerializer(category, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(PartnerServerCategorySerializer(category).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="server-layout")
+    def server_layout(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view server layout.")
+
+        categories = list(partner.server_categories.order_by("order", "name"))
+        category_serializer = PartnerServerCategorySerializer(categories, many=True)
+        channels = (
+            partner.channels
+            .select_related("conversation", "owner", "community", "category")
+            .prefetch_related("permission_overwrites__role", "permission_overwrites__user")
+            .filter(is_archived=False)
+            .order_by("category__order", "category__name", "order", "name")
+        )
+        visible_channels = filter_partner_channels_for_user(list(channels), request.user)
+        channel_serializer = ChannelDetailSerializer(visible_channels, many=True, context={"request": request})
+        return Response(
+            {
+                "partner_id": str(partner.id),
+                "categories": category_serializer.data,
+                "channels": channel_serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
     @action(
         detail=True,
         methods=["get", "post"],
@@ -1657,7 +2026,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["patch"], url_path="settings")
     def update_settings(self, request, pk=None):
         partner = self.get_object()
-        if not self._user_can_access_partner(partner, request.user):
+        if not self._user_can_manage_partner(partner, request.user):
             raise PermissionDenied("Not allowed to update settings.")
 
         updates = request.data.get("updates", [])
@@ -1782,6 +2151,71 @@ class PartnerViewSet(viewsets.ModelViewSet):
         )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["get"], url_path="public-hub")
+    def public_hub(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view the partner hub.")
+        return Response(self._public_hub_payload(partner), status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="differentiator-insights")
+    def differentiator_insights(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.reports.view")
+        return Response(self._differentiator_insights_payload(partner), status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="team-structure")
+    def team_structure(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.roles.view")
+        return Response(self._team_structure_payload(partner), status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="automation-recipes")
+    def automation_recipes(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.automation.view")
+        return Response({"recipes": self._automation_recipe_payload(partner)}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="automation-recipes/apply")
+    def automation_recipe_apply(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.automation.manage")
+        recipe_key = str(request.data.get("recipe_key") or "").strip()
+        if not recipe_key:
+            raise ValidationError({"recipe_key": "recipe_key is required."})
+
+        recipe = next((item for item in self._automation_recipe_payload(partner) if item["key"] == recipe_key), None)
+        if not recipe:
+            raise ValidationError({"recipe_key": "Unknown automation recipe."})
+
+        rule = PartnerAutomationRule.objects.create(
+            partner=partner,
+            name=recipe["title"],
+            description=recipe["description"],
+            trigger=recipe["trigger"],
+            conditions=recipe["conditions"],
+            actions=recipe["actions"],
+            is_active=True,
+            created_by=request.user,
+        )
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.automation.recipe.apply",
+            target_type="partner_automation_rule",
+            target_id=str(rule.id),
+            metadata={"recipe_key": recipe_key},
+            request=request,
+        )
+        return Response(PartnerAutomationRuleSerializer(rule).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"], url_path="experience-templates")
+    def experience_templates(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view experience templates.")
+        return Response({"templates": self._experience_templates_payload(partner)}, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["patch"], url_path="join-config")
     def update_join_config(self, request, pk=None):
         partner = self.get_object()
@@ -1808,12 +2242,395 @@ class PartnerViewSet(viewsets.ModelViewSet):
 
         return Response({"detail": "Join config updated."}, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["get", "patch"], url_path="screening")
+    def screening(self, request, pk=None):
+        partner = self.get_object()
+        config, _ = PartnerJoinConfig.objects.get_or_create(partner=partner)
+        criteria = dict(config.criteria or {})
+
+        if request.method == "GET":
+            if not self._user_can_access_partner(partner, request.user):
+                raise PermissionDenied("Not allowed to view screening settings.")
+            return Response(
+                {
+                    "enabled": bool(criteria.get("screening_enabled", False)),
+                    "require_rules_acceptance": bool(criteria.get("require_rules_acceptance", False)),
+                    "rules_text": criteria.get("rules_text") or criteria.get("rules") or "",
+                    "screening_questions": criteria.get("screening_questions") or [],
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to manage screening settings.")
+
+        if "enabled" in request.data:
+            criteria["screening_enabled"] = bool(request.data.get("enabled"))
+        if "require_rules_acceptance" in request.data:
+            criteria["require_rules_acceptance"] = bool(request.data.get("require_rules_acceptance"))
+        if "rules_text" in request.data:
+            criteria["rules_text"] = str(request.data.get("rules_text") or "").strip()
+        if "screening_questions" in request.data:
+            questions = request.data.get("screening_questions") or []
+            if not isinstance(questions, list):
+                raise ValidationError({"screening_questions": "Expected a list."})
+            criteria["screening_questions"] = questions
+
+        config.criteria = criteria
+        config.save(update_fields=["criteria", "updated_at"])
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.screening.update",
+            target_type="partner_join_config",
+            target_id=str(config.id),
+            metadata={"keys": list((request.data or {}).keys())},
+            request=request,
+        )
+        return Response(
+            {
+                "enabled": bool(criteria.get("screening_enabled", False)),
+                "require_rules_acceptance": bool(criteria.get("require_rules_acceptance", False)),
+                "rules_text": criteria.get("rules_text") or "",
+                "screening_questions": criteria.get("screening_questions") or [],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get", "patch"], url_path="notification-preferences")
+    def notification_preferences(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to manage notification preferences.")
+
+        valid_levels = set(ConversationNotificationLevel.values)
+
+        if request.method == "PATCH":
+            server_level = request.data.get("server_notification_level")
+            if server_level is not None:
+                if server_level not in valid_levels:
+                    raise ValidationError({"server_notification_level": "Invalid notification level."})
+                if not partner.main_conversation_id:
+                    raise ValidationError({"server_notification_level": "Partner has no main conversation."})
+                ConversationMember.objects.update_or_create(
+                    conversation_id=partner.main_conversation_id,
+                    user=request.user,
+                    defaults={
+                        "base_role": BaseConversationRole.READONLY,
+                        "left_at": None,
+                        "notification_level": server_level,
+                    },
+                )
+
+            channel_updates = request.data.get("channel_notifications")
+            if channel_updates is not None:
+                if not isinstance(channel_updates, list):
+                    raise ValidationError({"channel_notifications": "Expected a list."})
+                channel_map = {
+                    str(channel.id): channel
+                    for channel in filter_partner_channels_for_user(
+                        list(
+                            partner.channels.select_related("conversation", "category").filter(is_archived=False)
+                        ),
+                        request.user,
+                    )
+                }
+                for update in channel_updates:
+                    channel_id = str(update.get("channel_id") or "")
+                    level = update.get("notification_level")
+                    if not channel_id or level not in valid_levels:
+                        raise ValidationError({"channel_notifications": "Invalid channel notification payload."})
+                    channel = channel_map.get(channel_id)
+                    if not channel or not channel.conversation_id:
+                        raise ValidationError({"channel_notifications": f"Invalid channel: {channel_id}"})
+                    base_role = (
+                        BaseConversationRole.MEMBER
+                        if channel.can_post
+                        else BaseConversationRole.READONLY
+                    )
+                    ConversationMember.objects.update_or_create(
+                        conversation_id=channel.conversation_id,
+                        user=request.user,
+                        defaults={
+                            "base_role": base_role,
+                            "left_at": None,
+                            "notification_level": level,
+                        },
+                    )
+
+        server_member = None
+        if partner.main_conversation_id:
+            server_member = ConversationMember.objects.filter(
+                conversation_id=partner.main_conversation_id,
+                user=request.user,
+                left_at__isnull=True,
+            ).first()
+
+        visible_channels = filter_partner_channels_for_user(
+            list(partner.channels.select_related("conversation", "category").filter(is_archived=False)),
+            request.user,
+        )
+        channel_members = {
+            str(member.conversation_id): member
+            for member in ConversationMember.objects.filter(
+                user=request.user,
+                left_at__isnull=True,
+                conversation_id__in=[channel.conversation_id for channel in visible_channels if channel.conversation_id],
+            )
+        }
+        return Response(
+            {
+                "server_notification_level": getattr(
+                    server_member,
+                    "notification_level",
+                    ConversationNotificationLevel.ALL,
+                ),
+                "channel_notifications": [
+                    {
+                        "channel_id": str(channel.id),
+                        "channel_name": channel.name,
+                        "notification_level": getattr(
+                            channel_members.get(str(channel.conversation_id)),
+                            "notification_level",
+                            ConversationNotificationLevel.ALL,
+                        ),
+                    }
+                    for channel in visible_channels
+                ],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get", "post"], url_path="invites")
+    def invites(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "GET":
+            if not self._user_can_manage_partner(partner, request.user):
+                raise PermissionDenied("Not allowed to view invites.")
+            invites = partner.invites.select_related("created_by").order_by("-created_at")
+            return Response(PartnerInviteSerializer(invites, many=True).data, status=status.HTTP_200_OK)
+
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to create invites.")
+        serializer = PartnerInviteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        invite = serializer.save(partner=partner, created_by=request.user)
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.invite.create",
+            target_type="partner_invite",
+            target_id=str(invite.id),
+            metadata={"code": invite.code, "max_uses": invite.max_uses},
+            request=request,
+        )
+        return Response(PartnerInviteSerializer(invite).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"invites/(?P<invite_id>[^/.]+)")
+    def invite_detail(self, request, pk=None, invite_id=None):
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to manage invites.")
+        invite = PartnerInvite.objects.filter(id=invite_id, partner=partner).first()
+        if not invite:
+            return Response({"detail": "Invite not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == "DELETE":
+            invite.is_active = False
+            invite.save(update_fields=["is_active", "updated_at"])
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.invite.disable",
+                target_type="partner_invite",
+                target_id=str(invite.id),
+                metadata={"code": invite.code},
+                request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = PartnerInviteSerializer(invite, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.invite.update",
+            target_type="partner_invite",
+            target_id=str(invite.id),
+            metadata={"fields": list((request.data or {}).keys())},
+            request=request,
+        )
+        return Response(PartnerInviteSerializer(invite).data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="redeem-invite")
+    def redeem_invite(self, request):
+        code = str(request.data.get("code") or "").strip().upper()
+        if not code:
+            raise ValidationError({"code": "Invite code is required."})
+
+        with transaction.atomic():
+            invite = PartnerInvite.objects.select_for_update().select_related("partner").filter(code=code).first()
+            if not invite:
+                return Response({"detail": "Invite not found."}, status=status.HTTP_404_NOT_FOUND)
+            if not invite.is_redeemable():
+                return Response({"detail": "Invite is no longer redeemable."}, status=status.HTTP_400_BAD_REQUEST)
+
+            partner = invite.partner
+            membership = self._get_membership(partner, request.user)
+            if membership and membership.is_banned:
+                raise PermissionDenied("You are banned from this partner.")
+
+            normalized_role = (invite.membership_role or "member").strip().lower()
+            status_value = (
+                PartnerMembershipStatus.SUBSCRIBER
+                if normalized_role == "subscriber"
+                else PartnerMembershipStatus.MEMBER
+            )
+            self._activate_partner_membership(
+                partner=partner,
+                user=request.user,
+                status_value=status_value,
+                membership_role=normalized_role,
+            )
+            if invite.auto_assign:
+                self._auto_assign_membership(partner, request.user, invite.auto_assign)
+            progress = self._upsert_onboarding_progress(
+                partner=partner,
+                user=request.user,
+                invite=invite,
+                defaults={"onboarding_snapshot": self._partner_onboarding_config(partner)},
+            )
+            invite.use_count += 1
+            invite.save(update_fields=["use_count", "updated_at"])
+
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.invite.redeem",
+            target_type="partner_invite",
+            target_id=str(invite.id),
+            metadata={"code": invite.code},
+            request=request,
+        )
+        dispatch_partner_webhooks(
+            partner=partner,
+            event="member.joined",
+            payload={
+                "user_id": str(request.user.id),
+                "status": status_value,
+                "role": normalized_role,
+                "invite_id": str(invite.id),
+            },
+        )
+        run_partner_automation_rules(
+            partner=partner,
+            event="member.joined",
+            payload={
+                "user_id": str(request.user.id),
+                "status": status_value,
+                "role": normalized_role,
+                "invite_id": str(invite.id),
+            },
+            actor=request.user,
+        )
+        return Response(
+            {
+                "detail": "Invite redeemed.",
+                "partner_id": str(partner.id),
+                "onboarding": PartnerOnboardingProgressSerializer(progress).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get"], url_path="onboarding")
+    def onboarding(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to access onboarding.")
+        progress = self._upsert_onboarding_progress(partner=partner, user=request.user)
+        return Response(
+            {
+                "config": self._partner_onboarding_config(partner),
+                "progress": PartnerOnboardingProgressSerializer(progress).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="onboarding/complete")
+    def complete_onboarding(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to complete onboarding.")
+
+        onboarding_config = self._partner_onboarding_config(partner)
+        allowed_role_ids = {item["id"] for item in onboarding_config["role_options"]}
+        selected_role_ids = request.data.get("role_ids") or []
+        selected_channel_ids = request.data.get("channel_ids") or onboarding_config["default_channel_ids"]
+        accept_rules = bool(request.data.get("accept_rules"))
+
+        if not isinstance(selected_role_ids, list):
+            raise ValidationError({"role_ids": "Expected a list of role ids."})
+        if not isinstance(selected_channel_ids, list):
+            raise ValidationError({"channel_ids": "Expected a list of channel ids."})
+
+        invalid_role_ids = [role_id for role_id in selected_role_ids if str(role_id) not in allowed_role_ids]
+        if invalid_role_ids:
+            raise ValidationError({"role_ids": f"Unsupported onboarding role ids: {invalid_role_ids}"})
+
+        progress = self._upsert_onboarding_progress(
+            partner=partner,
+            user=request.user,
+            defaults={
+                "selected_role_ids": [str(role_id) for role_id in selected_role_ids],
+                "selected_channel_ids": [str(channel_id) for channel_id in selected_channel_ids],
+                "onboarding_snapshot": onboarding_config,
+            },
+        )
+
+        if accept_rules:
+            progress.rules_accepted_at = timezone.now()
+        for role in PartnerRole.objects.filter(partner=partner, id__in=selected_role_ids):
+            PartnerRoleAssignment.objects.get_or_create(
+                partner=partner,
+                role=role,
+                user=request.user,
+                defaults={"scope_type": PartnerRoleAssignment.SCOPE_GLOBAL, "scope_id": ""},
+            )
+        if selected_channel_ids:
+            self._auto_assign_membership(
+                partner,
+                request.user,
+                {"channels": selected_channel_ids},
+            )
+        progress.completed_at = timezone.now()
+        progress.save(
+            update_fields=[
+                "rules_accepted_at",
+                "completed_at",
+                "updated_at",
+            ]
+        )
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.onboarding.complete",
+            target_type="partner_onboarding_progress",
+            target_id=str(progress.id),
+            metadata={"selected_role_ids": progress.selected_role_ids, "selected_channel_ids": progress.selected_channel_ids},
+            request=request,
+        )
+        return Response(PartnerOnboardingProgressSerializer(progress).data, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["post"], url_path="apply")
     def apply(self, request, pk=None):
         partner = self.get_object()
         config = getattr(partner, "join_config", None)
         if config and not config.allow_apply:
             raise PermissionDenied("Applications are disabled for this partner.")
+        membership = self._get_membership(partner, request.user)
+        if membership and membership.is_banned:
+            raise PermissionDenied("You are banned from this partner.")
 
         job_post = None
         job_post_id = request.data.get("job_post")
@@ -1847,20 +2664,21 @@ class PartnerViewSet(viewsets.ModelViewSet):
         PartnerMembership.objects.update_or_create(
             partner=partner,
             user=request.user,
-            defaults={"status": PartnerMembershipStatus.PENDING, "role": "member"},
+            defaults={"status": PartnerMembershipStatus.PENDING, "role": "member", "is_banned": False, "banned_at": None},
         )
 
         if config and config.auto_approve:
             application.status = PartnerApplicationStatus.APPROVED
             application.save(update_fields=["status", "updated_at"])
-            PartnerMembership.objects.update_or_create(
+            self._activate_partner_membership(
                 partner=partner,
                 user=request.user,
-                defaults={"status": PartnerMembershipStatus.MEMBER, "role": "member"},
+                status_value=PartnerMembershipStatus.MEMBER,
+                membership_role="member",
             )
-            self._ensure_conversation_member(partner, request.user, BaseConversationRole.MEMBER)
             if job_post:
                 self._auto_assign_membership(partner, request.user, job_post.auto_assign)
+            self._upsert_onboarding_progress(partner=partner, user=request.user)
             dispatch_partner_webhooks(
                 partner=partner,
                 event="member.joined",
@@ -1944,13 +2762,17 @@ class PartnerViewSet(viewsets.ModelViewSet):
         config = getattr(partner, "join_config", None)
         if config and not config.allow_subscribe:
             raise PermissionDenied("Subscriptions are disabled for this partner.")
+        membership = self._get_membership(partner, request.user)
+        if membership and membership.is_banned:
+            raise PermissionDenied("You are banned from this partner.")
 
-        PartnerMembership.objects.update_or_create(
+        self._activate_partner_membership(
             partner=partner,
             user=request.user,
-            defaults={"status": PartnerMembershipStatus.SUBSCRIBER, "role": "subscriber"},
+            status_value=PartnerMembershipStatus.SUBSCRIBER,
+            membership_role="subscriber",
         )
-        self._ensure_conversation_member(partner, request.user, BaseConversationRole.READONLY)
+        self._upsert_onboarding_progress(partner=partner, user=request.user)
         dispatch_partner_webhooks(
             partner=partner,
             event="member.joined",
@@ -1986,14 +2808,15 @@ class PartnerViewSet(viewsets.ModelViewSet):
         application.status = PartnerApplicationStatus.APPROVED
         application.save(update_fields=["status", "updated_at"])
 
-        PartnerMembership.objects.update_or_create(
+        self._activate_partner_membership(
             partner=partner,
             user=application.user,
-            defaults={"status": PartnerMembershipStatus.MEMBER, "role": "member"},
+            status_value=PartnerMembershipStatus.MEMBER,
+            membership_role="member",
         )
-        self._ensure_conversation_member(partner, application.user, BaseConversationRole.MEMBER)
         if application.job_post_id:
             self._auto_assign_membership(partner, application.user, application.job_post.auto_assign)
+        self._upsert_onboarding_progress(partner=partner, user=application.user)
         dispatch_partner_webhooks(
             partner=partner,
             event="member.joined",
@@ -2015,6 +2838,119 @@ class PartnerViewSet(viewsets.ModelViewSet):
         )
 
         return Response({"detail": "Application approved."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="members")
+    def members(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view members.")
+        payload = self._member_directory_payload(partner)
+        serializer = PartnerMemberDirectoryEntrySerializer(payload, many=True)
+        return Response({"members": serializer.data}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="moderation-actions")
+    def moderation_actions(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view moderation actions.")
+        actions = partner.moderation_actions.select_related("actor", "user", "membership").order_by("-created_at")[:100]
+        return Response(PartnerModerationActionSerializer(actions, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path=r"members/(?P<member_user_id>[^/.]+)/moderate")
+    def moderate_member(self, request, pk=None, member_user_id=None):
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to moderate members.")
+        membership = PartnerMembership.objects.filter(partner=partner, user_id=member_user_id).first()
+        if not membership:
+            return Response({"detail": "Partner membership not found."}, status=status.HTTP_404_NOT_FOUND)
+        if partner.owner_id == membership.user_id:
+            raise PermissionDenied("The partner owner cannot be moderated here.")
+
+        action_type = str(request.data.get("action") or "").strip().lower()
+        reason = str(request.data.get("reason") or "").strip()
+        expires_at = request.data.get("expires_at")
+        if action_type not in {
+            PartnerModerationAction.ActionType.MUTE,
+            PartnerModerationAction.ActionType.UNMUTE,
+            PartnerModerationAction.ActionType.TIMEOUT,
+            PartnerModerationAction.ActionType.KICK,
+            PartnerModerationAction.ActionType.BAN,
+            PartnerModerationAction.ActionType.UNBAN,
+        }:
+            raise ValidationError({"action": "Unsupported moderation action."})
+
+        if expires_at:
+            expires_at = parse_datetime(str(expires_at))
+            if expires_at is None:
+                raise ValidationError({"expires_at": "Invalid ISO datetime."})
+            if timezone.is_naive(expires_at):
+                expires_at = timezone.make_aware(expires_at, timezone.get_current_timezone())
+        else:
+            expires_at = None
+
+        update_fields = ["updated_at"]
+        now = timezone.now()
+        if action_type == PartnerModerationAction.ActionType.MUTE:
+            membership.is_muted = True
+            membership.muted_until = expires_at
+            update_fields.extend(["is_muted", "muted_until"])
+        elif action_type == PartnerModerationAction.ActionType.UNMUTE:
+            membership.is_muted = False
+            membership.muted_until = None
+            update_fields.extend(["is_muted", "muted_until"])
+        elif action_type == PartnerModerationAction.ActionType.TIMEOUT:
+            membership.timed_out_until = expires_at or (now + timedelta(hours=24))
+            update_fields.append("timed_out_until")
+        elif action_type == PartnerModerationAction.ActionType.KICK:
+            membership.status = PartnerMembershipStatus.REMOVED
+            membership.removed_at = now
+            update_fields.extend(["status", "removed_at"])
+            ConversationMember.objects.filter(
+                conversation_id=partner.main_conversation_id,
+                user_id=membership.user_id,
+                left_at__isnull=True,
+            ).update(left_at=now)
+        elif action_type == PartnerModerationAction.ActionType.BAN:
+            membership.status = PartnerMembershipStatus.REMOVED
+            membership.is_banned = True
+            membership.banned_at = now
+            membership.removed_at = now
+            update_fields.extend(["status", "is_banned", "banned_at", "removed_at"])
+            ConversationMember.objects.filter(
+                conversation_id=partner.main_conversation_id,
+                user_id=membership.user_id,
+                left_at__isnull=True,
+            ).update(left_at=now)
+        elif action_type == PartnerModerationAction.ActionType.UNBAN:
+            membership.is_banned = False
+            membership.banned_at = None
+            if membership.status == PartnerMembershipStatus.REMOVED:
+                membership.status = PartnerMembershipStatus.SUBSCRIBER
+                update_fields.append("status")
+            update_fields.extend(["is_banned", "banned_at"])
+
+        membership.save(update_fields=update_fields)
+        moderation_action = PartnerModerationAction.objects.create(
+            partner=partner,
+            user=membership.user,
+            actor=request.user,
+            membership=membership,
+            action_type=action_type,
+            reason=reason,
+            expires_at=expires_at,
+            metadata={"request": request.data},
+        )
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action=f"partner.moderation.{action_type}",
+            target_type="partner_membership",
+            target_id=str(membership.id),
+            metadata={"user_id": str(membership.user_id), "reason": reason},
+            request=request,
+        )
+        return Response(PartnerModerationActionSerializer(moderation_action).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get"], url_path="links")
     def profile_links(self, request, pk=None):
@@ -2079,14 +3015,7 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
         return PartnerPostSerializer
 
     def _user_can_access_partner(self, partner: Partner, user) -> bool:
-        if partner.owner_id == user.id:
-            return True
-        if partner.main_conversation_id:
-            return partner.main_conversation.memberships.filter(
-                user=user,
-                left_at__isnull=True,
-            ).exists()
-        return False
+        return partner_user_can_access(partner, user)
 
     def _member_role(self, partner: Partner, user):
         if not partner.main_conversation_id:
@@ -2120,6 +3049,13 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
 
         accessible_partners = Partner.objects.filter(
             models.Q(owner=user)
+            | models.Q(
+                memberships__user=user,
+                memberships__status__in=(
+                    PartnerMembershipStatus.MEMBER,
+                    PartnerMembershipStatus.SUBSCRIBER,
+                ),
+            )
             | models.Q(
                 main_conversation__memberships__user=user,
                 main_conversation__memberships__left_at__isnull=True,
