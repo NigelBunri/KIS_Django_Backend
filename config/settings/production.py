@@ -4,6 +4,8 @@ import os
 import dj_database_url  # ensure this package is in production requirements
 from django.core.exceptions import ImproperlyConfigured
 
+from .base import _is_weak_secret
+
 DEBUG = False
 ALLOWED_HOSTS = [host.strip() for host in os.environ.get("ALLOWED_HOSTS", "").split(",") if host.strip()]
 if not ALLOWED_HOSTS:
