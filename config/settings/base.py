@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import timedelta
 from hashlib import sha256
 from django.core.management.utils import get_random_secret_key
+import dj_database_url
 
 # NEW: load .env early so all os.environ lookups work everywhere
 try:
@@ -159,6 +160,10 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
 
     # Common middleware
     "common.middleware.RequestLoggingMiddleware",
@@ -187,13 +192,26 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
-# Database default is sqlite (override in local/production)
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+# Database
+# In production/testing on Render, DATABASE_URL should point to Supabase Postgres.
+# In local development, if DATABASE_URL is missing, we fall back to SQLite.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+if DATABASE_URL:
+    DATABASES = {
+        "default": dj_database_url.parse(
+            DATABASE_URL,
+            conn_max_age=int(os.environ.get("PG_CONN_MAX_AGE", "600")),
+            ssl_require=DATABASE_URL.startswith("postgres"),
+        )
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": str(BASE_DIR / "db.sqlite3"),
+        }
+    }
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
