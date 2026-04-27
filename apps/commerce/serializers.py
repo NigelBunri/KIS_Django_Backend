@@ -16,6 +16,7 @@ from django.utils.text import slugify
 from rest_framework import serializers
 from .availability import normalize_availability_payload, derive_availability_rules_from_payload
 from .constants import KIS_COIN_CODE
+from common.media_urls import absolutize_backend_media, normalize_image_payload
 from .models import (
     Shop,
     ShopLandingPage,
@@ -121,6 +122,10 @@ def _normalize_landing_string(value, default=''):
     return str(value)
 
 
+def _normalize_landing_image_string(value, default=''):
+    return normalize_image_payload(_normalize_landing_string(value, default))
+
+
 def _normalize_landing_list(value):
     return value if isinstance(value, list) else []
 
@@ -167,7 +172,7 @@ def _normalize_landing_testimonials(items):
     return normalized
 
 
-def _build_landing_builder_payload(landing_page):
+def _build_landing_builder_payload(landing_page, request=None):
     raw_builder = deepcopy(getattr(landing_page, 'builder_data', {}) or {})
     builder = raw_builder if isinstance(raw_builder, dict) else {}
     sections = _normalize_landing_list(builder.get('sections'))
@@ -186,13 +191,13 @@ def _build_landing_builder_payload(landing_page):
             many=True,
         ).data
 
-    hero_image = _normalize_landing_string(
+    hero_image = absolutize_backend_media(_normalize_landing_string(
         hero.get('imageUrl')
         or hero.get('image_url')
         or hero.get('image')
         or builder.get('hero_image_url')
         or landing_page.hero_image_url
-    )
+    ), request=request)
     hero_cta_text = _normalize_landing_string(
         hero.get('ctaLabel')
         or hero.get('ctaText')
@@ -389,9 +394,7 @@ class ProductImageSerializer(serializers.ModelSerializer):
         except ValueError:
             return ''
         request = self.context.get('request')
-        if request is not None:
-            return request.build_absolute_uri(url)
-        return url
+        return absolutize_backend_media(url, request=request)
 
 
 class ServiceImageSerializer(serializers.ModelSerializer):
@@ -407,9 +410,7 @@ class ServiceImageSerializer(serializers.ModelSerializer):
         except ValueError:
             return ''
         request = self.context.get('request')
-        if request is not None:
-            return request.build_absolute_uri(url)
-        return url
+        return absolutize_backend_media(url, request=request)
 
 
 class ShopTeamMemberSerializer(serializers.ModelSerializer):
@@ -472,14 +473,14 @@ class ShopLandingTestimonialSerializer(serializers.ModelSerializer):
 
 class ShopLandingPageSerializer(serializers.Serializer):
     def to_representation(self, instance):
-        return _build_landing_builder_payload(instance)
+        return _build_landing_builder_payload(instance, request=self.context.get('request'))
 
 
 class LandingPageField(serializers.Field):
     def to_representation(self, value):
         if not value:
             return {}
-        return ShopLandingPageSerializer(value).data
+        return ShopLandingPageSerializer(value, context=getattr(self.parent, 'context', {})).data
 
     def to_internal_value(self, data):
         if data is None:
@@ -536,7 +537,7 @@ class ShopSerializer(serializers.ModelSerializer):
         )
 
     def get_image_url(self, obj):
-        return obj.image_url
+        return absolutize_backend_media(obj.image_url, request=self.context.get('request'))
 
     def get_team_members(self, obj):
         members = getattr(obj, 'team_members', None)
@@ -615,7 +616,7 @@ class ShopSerializer(serializers.ModelSerializer):
         normalized_core_fields = {
             'headline': _normalize_landing_string(hero_title),
             'subheadline': _normalize_landing_string(hero_slogan),
-            'hero_image_url': _normalize_landing_string(hero_image_url),
+            'hero_image_url': _normalize_landing_image_string(hero_image_url),
             'hero_cta_text': _normalize_landing_string(hero_cta_text),
             'hero_cta_url': _normalize_landing_string(hero_cta_url),
         }
@@ -823,10 +824,7 @@ class ProductSerializer(serializers.ModelSerializer):
                 except (ValueError, AttributeError):
                     url_candidate = ''
 
-        if url_candidate and request:
-            return request.build_absolute_uri(url_candidate)
-
-        return url_candidate
+        return absolutize_backend_media(url_candidate, request=request)
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -1446,10 +1444,10 @@ class ShopServiceSerializer(serializers.ModelSerializer):
                 url = ''
             if url:
                 request = self.context.get('request')
-                return request.build_absolute_uri(url) if request is not None else url
+                return absolutize_backend_media(url, request=request)
         stored_url = str(getattr(obj, 'image_url', '') or '').strip()
         if stored_url:
-            return stored_url
+            return absolutize_backend_media(stored_url, request=self.context.get('request'))
         first_image = getattr(obj, 'images', None)
         if first_image is None:
             return ''
@@ -1461,8 +1459,11 @@ class ShopServiceSerializer(serializers.ModelSerializer):
                 return ''
             if url:
                 request = self.context.get('request')
-                return request.build_absolute_uri(url) if request is not None else url
+                return absolutize_backend_media(url, request=request)
         return ''
+
+    def validate_image_url(self, value):
+        return normalize_image_payload(value)
 
     def _generate_unique_slug(self, value: str, shop: Shop | None) -> str:
         base = slugify(value) or 'service'
@@ -2144,9 +2145,7 @@ class CartItemSerializer(serializers.ModelSerializer):
         except AttributeError:
             url = getattr(product, 'image_url', '') or ''
         request = self.context.get('request')
-        if url and request:
-            return request.build_absolute_uri(url)
-        return url
+        return absolutize_backend_media(url, request=request)
 
     def get_product_name(self, obj):
         return obj.product.name if obj.product else None

@@ -6,6 +6,7 @@ from urllib.parse import urljoin, urlparse
 from django.conf import settings
 
 from apps.broadcasts.models import BroadcastVideo
+from common.media_urls import absolutize_backend_media, strip_backend_origin
 
 
 THUMBNAIL_SUBDIRECTORY = "broadcast_thumbnails"
@@ -39,19 +40,11 @@ def _get_preferred_public_base_url(request) -> str | None:
 
 
 def build_absolute_url(request, value: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return text
-    if text.startswith(("http://", "https://")):
-        return text
-    if text.startswith("//"):
-        return f"https:{text}"
-    base = _get_preferred_public_base_url(request)
-    if base:
-        return urljoin(f"{base.rstrip('/')}/", text.lstrip("/"))
-    if request is not None:
-        return request.build_absolute_uri(text)
-    return text
+    return absolutize_backend_media(value, request=request)
+
+
+def normalize_media_reference(value: str, request=None) -> str:
+    return strip_backend_origin(value, request=request)
 
 
 def build_media_url(request, relative_path: str) -> str:

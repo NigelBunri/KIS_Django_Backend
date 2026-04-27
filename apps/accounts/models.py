@@ -28,6 +28,8 @@ import uuid
 import secrets
 import hashlib
 import hmac
+
+from common.media_urls import normalize_image_payload
 import datetime
 import re
 
@@ -374,6 +376,11 @@ class Profile(BaseEntity):
         verbose_name = "Profile"
         verbose_name_plural = "Profiles"
         indexes = [models.Index(fields=["user"])]
+
+    def save(self, *args, **kwargs):
+        self.avatar_url = normalize_image_payload(self.avatar_url) or None
+        self.cover_url = normalize_image_payload(self.cover_url) or None
+        super().save(*args, **kwargs)
 
     def update_completion(self) -> int:
         """Recompute a simple completion heuristic and persist."""

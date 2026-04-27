@@ -5,6 +5,8 @@ from typing import Any
 
 from rest_framework import serializers
 
+from common.media_urls import absolutize_backend_media, normalize_image_payload
+
 from .models import (
     HealthDashboardInstitutionLandingPage,
     HealthDashboardLandingPageAddress,
@@ -96,6 +98,11 @@ class HealthDashboardLandingPageImageSerializer(serializers.ModelSerializer):
         model = HealthDashboardLandingPageImage
         fields = ("id", "image_url", "caption", "sort_order")
 
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload["image_url"] = absolutize_backend_media(payload.get("image_url"), request=self.context.get("request"))
+        return payload
+
 
 class HealthDashboardLandingPageSocialLinkSerializer(serializers.ModelSerializer):
     class Meta:
@@ -152,6 +159,11 @@ class HealthDashboardLandingPageSerializer(serializers.ModelSerializer):
         payload["heroSubheadline"] = payload.get("hero_subheadline", "")
         payload["heroCtaLabel"] = payload.get("hero_cta_label", "")
         payload["heroCtaUrl"] = payload.get("hero_cta_url", "")
+        payload["logo_url"] = absolutize_backend_media(payload.get("logo_url"), request=self.context.get("request"))
+        payload["background_image_url"] = absolutize_backend_media(
+            payload.get("background_image_url"),
+            request=self.context.get("request"),
+        )
         payload["logoUrl"] = payload.get("logo_url", "")
         payload["backgroundImageUrl"] = payload.get("background_image_url", "")
         payload["backgroundColorKey"] = payload.get("background_color_key", "")
@@ -255,6 +267,11 @@ class HealthDashboardLandingPageUpsertSerializer(serializers.Serializer):
         _copy_alias(payload, "social_links", "socialLinks")
         _copy_alias(payload, "operating_hours", "operatingHours")
 
+        if "logo_url" in payload:
+            payload["logo_url"] = normalize_image_payload(payload.get("logo_url"))
+        if "background_image_url" in payload:
+            payload["background_image_url"] = normalize_image_payload(payload.get("background_image_url"))
+
         address = payload.get("address")
         if isinstance(address, dict):
             address_payload = dict(address)
@@ -296,6 +313,8 @@ class HealthDashboardLandingPageUpsertSerializer(serializers.Serializer):
                     continue
                 image_payload = dict(row)
                 _copy_alias(image_payload, "image_url", "imageUrl")
+                if "image_url" in image_payload:
+                    image_payload["image_url"] = normalize_image_payload(image_payload.get("image_url"))
                 normalized_images.append(image_payload)
             payload["images"] = normalized_images
 

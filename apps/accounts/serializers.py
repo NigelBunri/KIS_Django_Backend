@@ -2,6 +2,7 @@
 Serializers for accounts app. Advanced validations, nested create/update and read-only protections.
 """
 from rest_framework import serializers
+from common.media_urls import absolutize_backend_media, normalize_image_payload
 from django.db import transaction, IntegrityError
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
@@ -22,6 +23,8 @@ from .models import (
     AccountTier,
     Subscription,
     Session,
+    Device,
+    E2EDeviceKey,
     UsageQuota,
     ApiToken,
     API_TOKEN_DEFAULT_EXPIRES_DAYS,
@@ -162,14 +165,20 @@ class ProfileSerializer(serializers.ModelSerializer):
             request = self.context.get("request")
             url = obj.avatar_file.url
             return request.build_absolute_uri(url) if request else url
-        return obj.avatar_url
+        return absolutize_backend_media(obj.avatar_url, request=self.context.get("request")) or None
 
     def get_cover_url(self, obj: Profile) -> str | None:
         if obj.cover_file:
             request = self.context.get("request")
             url = obj.cover_file.url
             return request.build_absolute_uri(url) if request else url
-        return obj.cover_url
+        return absolutize_backend_media(obj.cover_url, request=self.context.get("request")) or None
+
+    def validate_avatar_url(self, value):
+        return normalize_image_payload(value)
+
+    def validate_cover_url(self, value):
+        return normalize_image_payload(value)
 
     def update(self, instance, validated_data):
         result = super().update(instance, validated_data)
@@ -838,6 +847,52 @@ class SessionSerializer(serializers.ModelSerializer):
         if not validated_data.get("expires_at"):
             validated_data["expires_at"] = timezone.now() + datetime.timedelta(days=30)
         return super().create(validated_data)
+
+
+class DeviceSessionSerializer(serializers.ModelSerializer):
+    has_e2ee_keys = serializers.SerializerMethodField()
+    current = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Device
+        fields = (
+            "id",
+            "device_id",
+            "platform",
+            "name",
+            "user_agent",
+            "last_ip",
+            "last_seen_at",
+            "has_e2ee_keys",
+            "current",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_has_e2ee_keys(self, obj):
+        return E2EDeviceKey.objects.filter(user=obj.user, device=obj).exists()
+
+    def get_current(self, obj):
+        request = self.context.get("request")
+        if not request:
+            return False
+        header_device_id = (
+            request.headers.get("X-Device-Id")
+            or request.headers.get("X-Device-ID")
+            or request.headers.get("X-DeviceId")
+        )
+        return bool(header_device_id and str(header_device_id) == str(obj.device_id))
+
+
+class E2EEDeviceBundleSerializer(serializers.Serializer):
+    user_id = serializers.CharField()
+    device_id = serializers.CharField()
+    identity_key = serializers.CharField()
+    signed_prekey = serializers.DictField()
+    one_time_prekey = serializers.DictField(allow_null=True)
+    registration_id = serializers.IntegerField(allow_null=True)
+    last_seen_at = serializers.DateTimeField(allow_null=True)
 
 
 # -------------------------------------------------------------------

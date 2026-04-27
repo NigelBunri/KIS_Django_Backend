@@ -1,6 +1,7 @@
 # core/serializers.py
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Dict
 
 from django.apps import apps
@@ -802,6 +803,31 @@ class DataAccessConsentSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "created_at", "updated_at")
 
 
+class HealthDataAccessGrantSerializer(serializers.ModelSerializer):
+    patient = serializers.PrimaryKeyRelatedField(queryset=models.PatientMasterRecord.objects.all())
+    granted_to = serializers.PrimaryKeyRelatedField(queryset=UserModel.objects.all())
+    granted_by = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = models.HealthDataAccessGrant
+        fields = [
+            "id",
+            "patient",
+            "granted_to",
+            "granted_by",
+            "role",
+            "scope",
+            "status",
+            "expires_at",
+            "allow_emergency_override",
+            "note",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ("id", "granted_by", "created_at", "updated_at")
+
+
 class DepartmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Department
@@ -966,6 +992,430 @@ class PatientMasterRecordDetailSerializer(PatientMasterRecordSerializer):
         ]
 
 
+class PatientCanonicalHealthProfileSerializer(serializers.Serializer):
+    patient_id = serializers.UUIDField(source="id", read_only=True)
+    profile_source = serializers.CharField(read_only=True, default="core_patient_master")
+    linked_user_id = serializers.SerializerMethodField()
+    identity = serializers.SerializerMethodField()
+    emergency = serializers.SerializerMethodField()
+    care_summary = serializers.SerializerMethodField()
+    allergies = serializers.SerializerMethodField()
+    medications = serializers.SerializerMethodField()
+    vitals = serializers.SerializerMethodField()
+    wellness_metrics = serializers.SerializerMethodField()
+    wellness_trends = serializers.SerializerMethodField()
+    appointments = serializers.SerializerMethodField()
+    encounters = serializers.SerializerMethodField()
+    consents = serializers.SerializerMethodField()
+    problems = serializers.SerializerMethodField()
+    immunizations = serializers.SerializerMethodField()
+    procedures = serializers.SerializerMethodField()
+    documents = serializers.SerializerMethodField()
+    affiliations = serializers.SerializerMethodField()
+    provenance = serializers.SerializerMethodField()
+    completeness = serializers.SerializerMethodField()
+
+    def _get_primary_contact(self, instance):
+        return instance.primary_contact if isinstance(instance.primary_contact, dict) else {}
+
+    def _get_linked_user(self, instance):
+        explicit = self.context.get("linked_user")
+        if explicit is not None:
+            return explicit
+
+        primary_contact = self._get_primary_contact(instance)
+        user_id = str(primary_contact.get("user_id") or instance.metadata.get("user_id") or "").strip()
+        if user_id:
+            try:
+                return UserModel.objects.filter(id=user_id).first()
+            except Exception:
+                return None
+
+        email = str(primary_contact.get("email") or "").strip()
+        if email:
+            user = UserModel.objects.filter(email__iexact=email).first()
+            if user:
+                return user
+
+        phone_candidates = [
+            primary_contact.get("phone"),
+            primary_contact.get("phone_number"),
+        ]
+        for phone_value in phone_candidates:
+            phone = str(phone_value or "").strip()
+            if not phone:
+                continue
+            user = UserModel.objects.filter(phone=phone).first() or UserModel.objects.filter(phone_number=phone).first()
+            if user:
+                return user
+        return None
+
+    def _serialize_broadcast_institutions(self, user):
+        if not user or not getattr(user, "is_authenticated", False):
+            return {
+                "owned_institutions": [],
+                "member_institutions": [],
+                "total_institutions": 0,
+            }
+
+        BroadcastHealthInstitution = apps.get_model("broadcasts", "BroadcastHealthInstitution")
+        BroadcastHealthInstitutionMember = apps.get_model("broadcasts", "BroadcastHealthInstitutionMember")
+
+        owned_qs = (
+            BroadcastHealthInstitution.objects.filter(owner_user=user)
+            .order_by("-updated_at")
+            .values("id", "institution_uid", "name", "institution_type", "membership_open", "members_target_count")
+        )
+        member_qs = (
+            BroadcastHealthInstitutionMember.objects.filter(user=user)
+            .select_related("institution")
+            .order_by("-updated_at")
+        )
+
+        owned = [
+            {
+                "id": str(item["id"]),
+                "institution_uid": item["institution_uid"],
+                "name": item["name"],
+                "institution_type": item["institution_type"],
+                "membership_open": item["membership_open"],
+                "members_target_count": item["members_target_count"],
+                "relationship": "owner",
+            }
+            for item in owned_qs
+        ]
+
+        member = []
+        seen_member_ids = {item["id"] for item in owned}
+        for row in member_qs:
+            institution = getattr(row, "institution", None)
+            if institution is None:
+                continue
+            institution_id = str(getattr(institution, "id", "") or "")
+            if institution_id in seen_member_ids:
+                continue
+            member.append(
+                {
+                    "id": institution_id,
+                    "institution_uid": institution.institution_uid,
+                    "name": institution.name,
+                    "institution_type": institution.institution_type,
+                    "membership_open": institution.membership_open,
+                    "members_target_count": institution.members_target_count,
+                    "relationship": str(getattr(row, "role", "") or "member"),
+                }
+            )
+
+        return {
+            "owned_institutions": owned,
+            "member_institutions": member,
+            "total_institutions": len(owned) + len(member),
+        }
+
+    def get_linked_user_id(self, instance):
+        linked_user = self._get_linked_user(instance)
+        return str(linked_user.id) if linked_user else None
+
+    def get_identity(self, instance):
+        primary_contact = self._get_primary_contact(instance)
+        return {
+            "mrn": instance.mrn,
+            "first_name": instance.first_name,
+            "last_name": instance.last_name,
+            "full_name": " ".join(part for part in [instance.first_name, instance.last_name] if part).strip(),
+            "dob": instance.dob.isoformat() if instance.dob else None,
+            "gender": instance.gender,
+            "status": instance.status,
+            "organization_id": str(instance.organization_id) if instance.organization_id else None,
+            "primary_contact": primary_contact,
+        }
+
+    def get_emergency(self, instance):
+        emergency_contact = instance.emergency_contact if isinstance(instance.emergency_contact, dict) else {}
+        metadata = instance.metadata if isinstance(instance.metadata, dict) else {}
+        return {
+            "emergency_contact": emergency_contact,
+            "blood_type": metadata.get("blood_type"),
+            "medical_notes": metadata.get("medical_notes"),
+            "share_ready": bool(emergency_contact or metadata.get("blood_type") or metadata.get("medical_notes")),
+        }
+
+    def get_care_summary(self, instance):
+        latest_appointment = instance.appointments.order_by("-scheduled_at").first()
+        latest_encounter = instance.encounters.order_by("-created_at").first()
+        latest_vitals = list(instance.vitals.order_by("-recorded_at")[:3])
+        active_medications = instance.medications.filter(
+            status__in=[
+                models.MedicationOrder.STATUS_ACTIVE,
+                models.MedicationOrder.STATUS_REQUESTED,
+            ]
+        ).count()
+        active_allergies = instance.allergies.filter(status=models.AllergyRecord.STATUS_ACTIVE).count()
+        return {
+            "active_medications_count": active_medications,
+            "active_allergies_count": active_allergies,
+            "active_problem_count": instance.problems.filter(clinical_status=models.ProblemRecord.STATUS_ACTIVE).count(),
+            "immunizations_count": instance.immunizations.count(),
+            "procedures_count": instance.procedures.count(),
+            "documents_count": instance.documents.count(),
+            "appointments_count": instance.appointments.count(),
+            "encounters_count": instance.encounters.count(),
+            "latest_appointment_at": latest_appointment.scheduled_at.isoformat() if latest_appointment else None,
+            "latest_encounter_at": latest_encounter.created_at.isoformat() if latest_encounter else None,
+            "latest_vital_types": [vital.vital_type for vital in latest_vitals],
+        }
+
+    def get_allergies(self, instance):
+        allergies = instance.allergies.order_by("-recorded_at")[:10]
+        return [
+            {
+                "id": str(item.id),
+                "agent": item.agent,
+                "category": item.category,
+                "severity": item.severity,
+                "reaction": item.reaction,
+                "status": item.status,
+                "recorded_at": item.recorded_at.isoformat() if item.recorded_at else None,
+            }
+            for item in allergies
+        ]
+
+    def get_medications(self, instance):
+        medications = instance.medications.order_by("-created_at")[:10]
+        return [
+            {
+                "id": str(item.id),
+                "drug_name": item.drug_name,
+                "dosage": item.dosage,
+                "route": item.route,
+                "frequency": item.frequency,
+                "duration": item.duration,
+                "status": item.status,
+                "notes": item.notes,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+            }
+            for item in medications
+        ]
+
+    def get_vitals(self, instance):
+        vitals = instance.vitals.order_by("-recorded_at")[:10]
+        return [
+            {
+                "id": str(item.id),
+                "vital_type": item.vital_type,
+                "value": str(item.value),
+                "units": item.units,
+                "recorded_at": item.recorded_at.isoformat() if item.recorded_at else None,
+                "notes": item.notes,
+            }
+            for item in vitals
+        ]
+
+    def get_wellness_metrics(self, instance):
+        metrics = instance.wellness_metrics.order_by("-recorded_at", "-created_at")[:10]
+        return WellnessMetricSerializer(metrics, many=True).data
+
+    def get_wellness_trends(self, instance):
+        return build_wellness_trend_summary(instance)
+
+    def get_appointments(self, instance):
+        appointments = instance.appointments.order_by("-scheduled_at")[:10]
+        return AppointmentSerializer(appointments, many=True).data
+
+    def get_encounters(self, instance):
+        encounters = instance.encounters.order_by("-created_at")[:10]
+        return EncounterSerializer(encounters, many=True).data
+
+    def get_consents(self, instance):
+        consents = instance.consents.order_by("-granted_at")[:10]
+        return ConsentRecordSerializer(consents, many=True).data
+
+    def get_problems(self, instance):
+        problems = instance.problems.order_by("-created_at")[:10]
+        return ProblemRecordSerializer(problems, many=True).data
+
+    def get_immunizations(self, instance):
+        immunizations = instance.immunizations.order_by("-administered_at", "-created_at")[:10]
+        return ImmunizationRecordSerializer(immunizations, many=True).data
+
+    def get_procedures(self, instance):
+        procedures = instance.procedures.order_by("-performed_at", "-created_at")[:10]
+        return ProcedureRecordSerializer(procedures, many=True).data
+
+    def get_documents(self, instance):
+        documents = instance.documents.order_by("-issued_at", "-created_at")[:10]
+        return HealthDocumentSerializer(documents, many=True).data
+
+    def get_affiliations(self, instance):
+        linked_user = self._get_linked_user(instance)
+        return self._serialize_broadcast_institutions(linked_user)
+
+    def get_provenance(self, instance):
+        return {
+            "patient_record_updated_at": instance.updated_at.isoformat() if instance.updated_at else None,
+            "institution_source": "broadcast_health_profile",
+            "clinical_source": "core_patient_master",
+        }
+
+    def get_completeness(self, instance):
+        metadata = instance.metadata if isinstance(instance.metadata, dict) else {}
+        return {
+            "has_emergency_contact": bool(instance.emergency_contact),
+            "has_blood_type": bool(metadata.get("blood_type")),
+            "has_active_allergies": instance.allergies.filter(status=models.AllergyRecord.STATUS_ACTIVE).exists(),
+            "has_active_medications": instance.medications.filter(
+                status__in=[
+                    models.MedicationOrder.STATUS_ACTIVE,
+                    models.MedicationOrder.STATUS_REQUESTED,
+                ]
+            ).exists(),
+            "has_vitals": instance.vitals.exists(),
+            "has_consents": instance.consents.exists(),
+            "has_problem_list": instance.problems.exists(),
+            "has_immunizations": instance.immunizations.exists(),
+            "has_procedures": instance.procedures.exists(),
+            "has_documents": instance.documents.exists(),
+            "has_wellness_metrics": instance.wellness_metrics.exists(),
+        }
+
+
+class PatientHealthSummarySerializer(serializers.Serializer):
+    id = serializers.UUIDField(source="id", read_only=True)
+    patient_id = serializers.UUIDField(source="id", read_only=True)
+    identity = serializers.SerializerMethodField()
+    care_summary = serializers.SerializerMethodField()
+    emergency = serializers.SerializerMethodField()
+    top_allergies = serializers.SerializerMethodField()
+    active_medications = serializers.SerializerMethodField()
+    recent_vitals = serializers.SerializerMethodField()
+    wellness = serializers.SerializerMethodField()
+    recent_appointments = serializers.SerializerMethodField()
+    recent_encounters = serializers.SerializerMethodField()
+    family_profiles = serializers.SerializerMethodField()
+    consents = serializers.SerializerMethodField()
+    problems = serializers.SerializerMethodField()
+    immunizations = serializers.SerializerMethodField()
+    procedures = serializers.SerializerMethodField()
+    documents = serializers.SerializerMethodField()
+    affiliations = serializers.SerializerMethodField()
+    provenance = serializers.SerializerMethodField()
+
+    def _canonical(self, instance):
+        cache_key = f"_patient_health_summary_{getattr(instance, 'id', '')}"
+        cached = self.context.get(cache_key)
+        if cached is None:
+            cached = PatientCanonicalHealthProfileSerializer(instance, context=self.context).data
+            self.context[cache_key] = cached
+        return cached
+
+    def get_identity(self, instance):
+        return self._canonical(instance).get("identity", {})
+
+    def get_care_summary(self, instance):
+        return self._canonical(instance).get("care_summary", {})
+
+    def get_emergency(self, instance):
+        return self._canonical(instance).get("emergency", {})
+
+    def get_top_allergies(self, instance):
+        return self._canonical(instance).get("allergies", [])[:5]
+
+    def get_active_medications(self, instance):
+        rows = self._canonical(instance).get("medications", [])
+        return [row for row in rows if str(row.get("status") or "").lower() in {"active", "requested"}][:5]
+
+    def get_recent_vitals(self, instance):
+        return self._canonical(instance).get("vitals", [])[:5]
+
+    def get_wellness(self, instance):
+        canonical = self._canonical(instance)
+        return {
+            "recent_metrics": canonical.get("wellness_metrics", [])[:6],
+            "trends": canonical.get("wellness_trends", {}),
+        }
+
+    def get_recent_appointments(self, instance):
+        return self._canonical(instance).get("appointments", [])[:3]
+
+    def get_recent_encounters(self, instance):
+        return self._canonical(instance).get("encounters", [])[:3]
+
+    def get_family_profiles(self, instance):
+        rows = instance.family_profiles.all().order_by("relationship")[:5]
+        return FamilyProfileSerializer(rows, many=True).data
+
+    def get_consents(self, instance):
+        return self._canonical(instance).get("consents", [])[:5]
+
+    def get_problems(self, instance):
+        return self._canonical(instance).get("problems", [])[:5]
+
+    def get_immunizations(self, instance):
+        return self._canonical(instance).get("immunizations", [])[:5]
+
+    def get_procedures(self, instance):
+        return self._canonical(instance).get("procedures", [])[:5]
+
+    def get_documents(self, instance):
+        return self._canonical(instance).get("documents", [])[:5]
+
+    def get_affiliations(self, instance):
+        return self._canonical(instance).get("affiliations", {})
+
+    def get_provenance(self, instance):
+        return self._canonical(instance).get("provenance", {})
+
+
+class PatientEmergencyCardSerializer(serializers.Serializer):
+    patient_id = serializers.UUIDField(source="id", read_only=True)
+    identity = serializers.SerializerMethodField()
+    emergency = serializers.SerializerMethodField()
+    severe_allergies = serializers.SerializerMethodField()
+    active_medications = serializers.SerializerMethodField()
+    generated_at = serializers.SerializerMethodField()
+
+    def _canonical(self, instance):
+        cache_key = f"_patient_emergency_card_{getattr(instance, 'id', '')}"
+        cached = self.context.get(cache_key)
+        if cached is None:
+            cached = PatientCanonicalHealthProfileSerializer(instance, context=self.context).data
+            self.context[cache_key] = cached
+        return cached
+
+    def get_identity(self, instance):
+        identity = dict(self._canonical(instance).get("identity", {}))
+        return {
+            "full_name": identity.get("full_name"),
+            "dob": identity.get("dob"),
+            "gender": identity.get("gender"),
+            "mrn": identity.get("mrn"),
+        }
+
+    def get_emergency(self, instance):
+        emergency = dict(self._canonical(instance).get("emergency", {}))
+        return {
+            "blood_type": emergency.get("blood_type"),
+            "medical_notes": emergency.get("medical_notes"),
+            "emergency_contact": emergency.get("emergency_contact") or {},
+            "share_ready": bool(emergency.get("share_ready")),
+        }
+
+    def get_severe_allergies(self, instance):
+        rows = self._canonical(instance).get("allergies", [])
+        return [
+            row
+            for row in rows
+            if str(row.get("severity") or "").lower() in {"severe", "moderate"}
+        ][:5]
+
+    def get_active_medications(self, instance):
+        rows = self._canonical(instance).get("medications", [])
+        return [row for row in rows if str(row.get("status") or "").lower() in {"active", "requested"}][:5]
+
+    def get_generated_at(self, instance):
+        return timezone.now().isoformat()
+
+
 class MedicationOrderSerializer(serializers.ModelSerializer):
     patient = serializers.PrimaryKeyRelatedField(queryset=models.PatientMasterRecord.objects.all())
     profile = serializers.PrimaryKeyRelatedField(queryset=models.MedicalProfile.objects.all(), allow_null=True, required=False)
@@ -1095,6 +1545,311 @@ class MedicationAdherenceReminderSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ("id", "created_at", "updated_at")
+
+
+class ProblemRecordSerializer(serializers.ModelSerializer):
+    patient = serializers.PrimaryKeyRelatedField(queryset=models.PatientMasterRecord.objects.all())
+    profile = serializers.PrimaryKeyRelatedField(queryset=models.MedicalProfile.objects.all(), allow_null=True, required=False)
+    diagnosed_by = serializers.PrimaryKeyRelatedField(queryset=UserModel.objects.all(), allow_null=True, required=False)
+
+    class Meta:
+        model = models.ProblemRecord
+        fields = [
+            "id",
+            "patient",
+            "profile",
+            "diagnosed_by",
+            "title",
+            "code",
+            "code_system",
+            "clinical_status",
+            "verification_status",
+            "severity",
+            "onset_date",
+            "resolved_at",
+            "notes",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class ImmunizationRecordSerializer(serializers.ModelSerializer):
+    patient = serializers.PrimaryKeyRelatedField(queryset=models.PatientMasterRecord.objects.all())
+    profile = serializers.PrimaryKeyRelatedField(queryset=models.MedicalProfile.objects.all(), allow_null=True, required=False)
+    administered_by = serializers.PrimaryKeyRelatedField(queryset=UserModel.objects.all(), allow_null=True, required=False)
+
+    class Meta:
+        model = models.ImmunizationRecord
+        fields = [
+            "id",
+            "patient",
+            "profile",
+            "administered_by",
+            "vaccine_name",
+            "vaccine_code",
+            "manufacturer",
+            "lot_number",
+            "status",
+            "administered_at",
+            "dose_number",
+            "series_name",
+            "notes",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class ProcedureRecordSerializer(serializers.ModelSerializer):
+    patient = serializers.PrimaryKeyRelatedField(queryset=models.PatientMasterRecord.objects.all())
+    profile = serializers.PrimaryKeyRelatedField(queryset=models.MedicalProfile.objects.all(), allow_null=True, required=False)
+    performed_by = serializers.PrimaryKeyRelatedField(queryset=UserModel.objects.all(), allow_null=True, required=False)
+
+    class Meta:
+        model = models.ProcedureRecord
+        fields = [
+            "id",
+            "patient",
+            "profile",
+            "performed_by",
+            "procedure_name",
+            "procedure_code",
+            "status",
+            "performed_at",
+            "location",
+            "notes",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class HealthDocumentSerializer(serializers.ModelSerializer):
+    patient = serializers.PrimaryKeyRelatedField(queryset=models.PatientMasterRecord.objects.all())
+    profile = serializers.PrimaryKeyRelatedField(queryset=models.MedicalProfile.objects.all(), allow_null=True, required=False)
+    uploaded_by = serializers.PrimaryKeyRelatedField(queryset=UserModel.objects.all(), allow_null=True, required=False)
+
+    class Meta:
+        model = models.HealthDocument
+        fields = [
+            "id",
+            "patient",
+            "profile",
+            "uploaded_by",
+            "title",
+            "category",
+            "source_type",
+            "source_label",
+            "status",
+            "file_url",
+            "mime_type",
+            "issued_at",
+            "notes",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class HealthRecordExchangeLogSerializer(serializers.ModelSerializer):
+    patient = serializers.PrimaryKeyRelatedField(read_only=True)
+    actor = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = models.HealthRecordExchangeLog
+        fields = [
+            "id",
+            "patient",
+            "actor",
+            "direction",
+            "exchange_format",
+            "source_label",
+            "status",
+            "summary",
+            "raw_payload",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+
+class WellnessMetricSerializer(serializers.ModelSerializer):
+    patient = serializers.PrimaryKeyRelatedField(queryset=models.PatientMasterRecord.objects.all())
+    profile = serializers.PrimaryKeyRelatedField(queryset=models.MedicalProfile.objects.all(), allow_null=True, required=False)
+    recorded_by = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = models.WellnessMetric
+        fields = [
+            "id",
+            "patient",
+            "profile",
+            "recorded_by",
+            "metric_type",
+            "source",
+            "source_label",
+            "measurement_window",
+            "value",
+            "units",
+            "normalized_value",
+            "normalized_units",
+            "secondary_value",
+            "secondary_units",
+            "recorded_at",
+            "period_start",
+            "period_end",
+            "is_clinically_verified",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ("id", "recorded_by", "normalized_value", "normalized_units", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        metric_type = attrs.get("metric_type") or getattr(self.instance, "metric_type", "")
+        measurement_window = attrs.get("measurement_window") or getattr(
+            self.instance,
+            "measurement_window",
+            models.WellnessMetric.WINDOW_INSTANT,
+        )
+        units = str(attrs.get("units") or getattr(self.instance, "units", "") or "").strip()
+        value = attrs.get("value") if "value" in attrs else getattr(self.instance, "value", None)
+        secondary_value = attrs.get("secondary_value") if "secondary_value" in attrs else getattr(self.instance, "secondary_value", None)
+        secondary_units = str(
+            attrs.get("secondary_units") or getattr(self.instance, "secondary_units", "") or ""
+        ).strip()
+
+        if value is None:
+            raise serializers.ValidationError({"value": "This field is required."})
+
+        normalized_value, normalized_units = normalize_wellness_metric(metric_type, value, units, secondary_value, secondary_units)
+        attrs["normalized_value"] = normalized_value
+        attrs["normalized_units"] = normalized_units
+
+        if metric_type == models.WellnessMetric.METRIC_SLEEP and measurement_window == models.WellnessMetric.WINDOW_INSTANT:
+            attrs["measurement_window"] = models.WellnessMetric.WINDOW_SLEEP
+        if metric_type == models.WellnessMetric.METRIC_STEPS and measurement_window == models.WellnessMetric.WINDOW_INSTANT:
+            attrs["measurement_window"] = models.WellnessMetric.WINDOW_DAILY
+
+        return attrs
+
+
+def normalize_wellness_metric(metric_type, value, units, secondary_value=None, secondary_units=""):
+    value_decimal = Decimal(str(value))
+    normalized_units = units
+    normalized_value = value_decimal
+    lower_units = str(units or "").strip().lower()
+    secondary_decimal = Decimal(str(secondary_value)) if secondary_value is not None else None
+
+    if metric_type == models.WellnessMetric.METRIC_STEPS:
+        normalized_units = "count"
+    elif metric_type == models.WellnessMetric.METRIC_SLEEP:
+        if lower_units in {"minute", "minutes", "min"}:
+            normalized_value = value_decimal / Decimal("60")
+            normalized_units = "hour"
+        else:
+            normalized_units = "hour" if lower_units in {"hour", "hours", "hr", "hrs", "h"} else units or "hour"
+    elif metric_type == models.WellnessMetric.METRIC_HEART_RATE:
+        normalized_units = "bpm"
+    elif metric_type == models.WellnessMetric.METRIC_WEIGHT:
+        if lower_units in {"g", "gram", "grams"}:
+            normalized_value = value_decimal / Decimal("1000")
+            normalized_units = "kg"
+        elif lower_units in {"lb", "lbs", "pound", "pounds"}:
+            normalized_value = value_decimal * Decimal("0.45359237")
+            normalized_units = "kg"
+        else:
+            normalized_units = "kg" if lower_units in {"kg", "kilogram", "kilograms"} else units or "kg"
+    elif metric_type == models.WellnessMetric.METRIC_BLOOD_PRESSURE:
+        normalized_units = "mmHg"
+        normalized_value = value_decimal
+        if secondary_decimal is None:
+            secondary_decimal = Decimal("0")
+    elif metric_type == models.WellnessMetric.METRIC_BLOOD_GLUCOSE:
+        if lower_units in {"mg/dl", "mgdl"}:
+            normalized_units = "mg/dL"
+        elif lower_units in {"mmol/l", "mmol"}:
+            normalized_value = value_decimal * Decimal("18.0182")
+            normalized_units = "mg/dL"
+        else:
+            normalized_units = units or "mg/dL"
+    elif metric_type == models.WellnessMetric.METRIC_WORKOUT:
+        if lower_units in {"minute", "minutes", "min"}:
+            normalized_value = value_decimal
+            normalized_units = "minute"
+        else:
+            normalized_units = units or "minute"
+
+    return normalized_value, normalized_units
+
+
+def build_wellness_trend_summary(instance):
+    tracked_types = [
+        models.WellnessMetric.METRIC_STEPS,
+        models.WellnessMetric.METRIC_SLEEP,
+        models.WellnessMetric.METRIC_HEART_RATE,
+        models.WellnessMetric.METRIC_WEIGHT,
+        models.WellnessMetric.METRIC_BLOOD_PRESSURE,
+        models.WellnessMetric.METRIC_BLOOD_GLUCOSE,
+        models.WellnessMetric.METRIC_WORKOUT,
+    ]
+    metrics_qs = instance.wellness_metrics.order_by("-recorded_at", "-created_at")
+    summary = {}
+
+    for metric_type in tracked_types:
+        rows = list(metrics_qs.filter(metric_type=metric_type)[:14])
+        if not rows:
+            continue
+
+        values = [Decimal(str(row.normalized_value if row.normalized_value is not None else row.value)) for row in rows]
+        latest = rows[0]
+        latest_value = values[0]
+        baseline = values[-1]
+        delta = latest_value - baseline
+        direction = "flat"
+        if delta > 0:
+            direction = "up"
+        elif delta < 0:
+            direction = "down"
+
+        point_series = []
+        for row in reversed(rows[:7]):
+            point_series.append(
+                {
+                    "recorded_at": row.recorded_at.isoformat() if row.recorded_at else None,
+                    "value": str(row.normalized_value if row.normalized_value is not None else row.value),
+                    "units": row.normalized_units or row.units,
+                    "source": row.source,
+                }
+            )
+
+        summary[metric_type] = {
+            "latest": {
+                "value": str(latest_value),
+                "units": latest.normalized_units or latest.units,
+                "recorded_at": latest.recorded_at.isoformat() if latest.recorded_at else None,
+                "source": latest.source,
+                "source_label": latest.source_label,
+                "is_clinically_verified": latest.is_clinically_verified,
+                "secondary_value": str(latest.secondary_value) if latest.secondary_value is not None else None,
+                "secondary_units": latest.secondary_units or None,
+            },
+            "summary": {
+                "entries": len(rows),
+                "direction": direction,
+                "delta": str(delta),
+                "average": str(sum(values) / Decimal(len(values))),
+                "window": "last_14_records",
+            },
+            "series": point_series,
+        }
+
+    return summary
 
 
 class SupplyForecastSerializer(serializers.ModelSerializer):

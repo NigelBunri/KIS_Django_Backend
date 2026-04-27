@@ -12,6 +12,7 @@ from apps.communities.models import Community
 from apps.partners.models import Partner
 from apps.billing.models import WalletTransaction
 from apps.commerce.constants import KIS_COIN_CODE
+from common.media_urls import normalize_image_payload
 
 
 class BroadcastSourceType(models.TextChoices):
@@ -427,6 +428,24 @@ class EducationInstitution(models.Model):
     def __str__(self):
         return self.name
 
+    def save(self, *args, **kwargs):
+        if isinstance(self.branding, dict):
+            image_keys = {
+                "logo_url",
+                "logoUrl",
+                "image_url",
+                "imageUrl",
+                "banner_image_url",
+                "bannerImageUrl",
+                "cover_image_url",
+                "coverImageUrl",
+            }
+            self.branding = {
+                key: normalize_image_payload(value) if key in image_keys else value
+                for key, value in self.branding.items()
+            }
+        super().save(*args, **kwargs)
+
 
 class EducationInstitutionMembership(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -608,6 +627,7 @@ class EducationInstitutionProgram(models.Model):
     code = models.CharField(max_length=64, blank=True, default="")
     summary = models.TextField(blank=True, default="")
     description = models.TextField(blank=True, default="")
+    cover_image_url = models.URLField(blank=True, default="")
     status = models.CharField(
         max_length=16,
         choices=EducationAcademicRecordStatus.choices,
@@ -731,6 +751,7 @@ class EducationInstitutionCourse(models.Model):
     code = models.CharField(max_length=64, blank=True, default="")
     summary = models.TextField(blank=True, default="")
     description = models.TextField(blank=True, default="")
+    cover_image_url = models.URLField(blank=True, default="")
     status = models.CharField(
         max_length=16,
         choices=EducationAcademicRecordStatus.choices,
@@ -808,6 +829,7 @@ class EducationInstitutionLesson(models.Model):
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
     content = models.TextField(blank=True, default="")
+    cover_image_url = models.URLField(blank=True, default="")
     lesson_order = models.PositiveIntegerField(default=0)
     duration_minutes = models.PositiveIntegerField(default=0)
     is_preview = models.BooleanField(default=False)
@@ -940,6 +962,7 @@ class EducationInstitutionClassSession(models.Model):
     )
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
+    cover_image_url = models.URLField(blank=True, default="")
     starts_at = models.DateTimeField()
     ends_at = models.DateTimeField()
     timezone_name = models.CharField(max_length=64, blank=True, default="UTC")
@@ -1042,6 +1065,7 @@ class EducationInstitutionMaterial(models.Model):
     )
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
+    cover_image_url = models.URLField(blank=True, default="")
     kind = models.CharField(
         max_length=16,
         choices=EducationMaterialKind.choices,
@@ -1108,6 +1132,7 @@ class EducationInstitutionAssessment(models.Model):
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
     instructions = models.TextField(blank=True, default="")
+    cover_image_url = models.URLField(blank=True, default="")
     assessment_type = models.CharField(
         max_length=16,
         choices=EducationAssessmentType.choices,
@@ -1337,6 +1362,7 @@ class EducationInstitutionEvent(models.Model):
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
     description = models.TextField(blank=True, default="")
+    cover_image_url = models.URLField(blank=True, default="")
     starts_at = models.DateTimeField()
     ends_at = models.DateTimeField()
     timezone_name = models.CharField(max_length=64, blank=True, default="UTC")
@@ -1466,6 +1492,10 @@ class EducationInstitutionBroadcast(models.Model):
 
     def __str__(self):
         return self.title
+
+    def save(self, *args, **kwargs):
+        self.cover_image_url = normalize_image_payload(self.cover_image_url)
+        super().save(*args, **kwargs)
 
 
 class EducationInstitutionEnrollment(models.Model):

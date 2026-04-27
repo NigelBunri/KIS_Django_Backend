@@ -1,6 +1,7 @@
 # chat/serializers.py
 from apps.accounts.serializers import UserSerializer
 from rest_framework import serializers
+from common.media_urls import absolutize_backend_media, normalize_image_payload
 
 from .models import (
     Conversation,
@@ -9,6 +10,20 @@ from .models import (
     MessageThreadLink,
     BaseConversationRole,
 )
+
+
+class ConversationImageUrlSerializerMixin:
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        if "avatar_url" in payload:
+            payload["avatar_url"] = absolutize_backend_media(
+                payload.get("avatar_url"),
+                request=self.context.get("request"),
+            )
+        return payload
+
+    def validate_avatar_url(self, value):
+        return normalize_image_payload(value)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +81,7 @@ class ConversationMemberSerializer(serializers.ModelSerializer):
 #  CONVERSATION LIST & DETAIL
 # ---------------------------------------------------------------------------
 
-class ConversationListSerializer(serializers.ModelSerializer):
+class ConversationListSerializer(ConversationImageUrlSerializerMixin, serializers.ModelSerializer):
     """
     Lightweight serializer for listing conversations in the chat list.
 
@@ -86,6 +101,10 @@ class ConversationListSerializer(serializers.ModelSerializer):
     group_id = serializers.SerializerMethodField()
     community_id = serializers.SerializerMethodField()
     is_community_group = serializers.SerializerMethodField()
+    unread_count = serializers.SerializerMethodField()
+    has_mention = serializers.SerializerMethodField()
+    last_read_seq = serializers.SerializerMethodField()
+    read_state_authoritative = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
@@ -109,7 +128,25 @@ class ConversationListSerializer(serializers.ModelSerializer):
             "group_id",
             "community_id",
             "is_community_group",
+            "unread_count",
+            "has_mention",
+            "last_read_seq",
+            "read_state_authoritative",
         ]
+
+    def _current_member(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        user_id = getattr(user, "id", None)
+        if not user_id:
+            return None
+        memberships = getattr(obj, "memberships", None)
+        if memberships is None:
+            return None
+        for member in memberships.all():
+            if member.user_id == user_id and member.left_at is None:
+                return member
+        return None
 
     def get_group_id(self, obj):
         group = getattr(obj, "group", None)
@@ -131,8 +168,26 @@ class ConversationListSerializer(serializers.ModelSerializer):
         group = getattr(obj, "group", None)
         return bool(group and group.community_id)
 
+    def get_unread_count(self, obj):
+        member = self._current_member(obj)
+        if not member:
+            return 0
+        last_seq = max(int(getattr(obj, "last_message_seq", 0) or 0), 0)
+        read_seq = max(int(getattr(member, "last_read_seq", 0) or 0), 0)
+        return max(last_seq - read_seq, 0)
 
-class ConversationDetailSerializer(serializers.ModelSerializer):
+    def get_has_mention(self, obj):
+        return False
+
+    def get_last_read_seq(self, obj):
+        member = self._current_member(obj)
+        return int(getattr(member, "last_read_seq", 0) or 0) if member else 0
+
+    def get_read_state_authoritative(self, obj):
+        return True
+
+
+class ConversationDetailSerializer(ConversationImageUrlSerializerMixin, serializers.ModelSerializer):
     """
     Detailed view including settings and member list.
 
@@ -194,7 +249,7 @@ class ConversationDetailSerializer(serializers.ModelSerializer):
 #  CONVERSATION CREATE (groups / channels / threads)
 # ---------------------------------------------------------------------------
 
-class ConversationCreateSerializer(serializers.ModelSerializer):
+class ConversationCreateSerializer(ConversationImageUrlSerializerMixin, serializers.ModelSerializer):
     """
     Used for creating new group/channel/thread conversations from Django side.
 

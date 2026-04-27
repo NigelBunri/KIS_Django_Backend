@@ -30,6 +30,12 @@ from .views import (
     MedicationOrderViewSet,
     AllergyRecordViewSet,
     VitalSignViewSet,
+    WellnessMetricViewSet,
+    ProblemRecordViewSet,
+    ImmunizationRecordViewSet,
+    ProcedureRecordViewSet,
+    HealthDocumentViewSet,
+    HealthRecordExchangeLogViewSet,
     TelemedicineSessionViewSet,
     TelemedicineDeviceViewSet,
     VoiceDictationViewSet,
@@ -49,6 +55,7 @@ from .views import (
     RegulatoryReportViewSet,
     ComplianceDocumentViewSet,
     DataAccessConsentViewSet,
+    HealthDataAccessGrantViewSet,
     CommandCenterOverview,
     MedicalContextView,
 )
@@ -84,6 +91,12 @@ router.register(r"patients/appointments", AppointmentViewSet, basename="patienta
 router.register(r"patients/medications", MedicationOrderViewSet, basename="patientmedication")
 router.register(r"patients/allergies", AllergyRecordViewSet, basename="patientallergy")
 router.register(r"patients/vitals", VitalSignViewSet, basename="patientvital")
+router.register(r"patients/wellness-metrics", WellnessMetricViewSet, basename="patientwellnessmetric")
+router.register(r"patients/problems", ProblemRecordViewSet, basename="patientproblem")
+router.register(r"patients/immunizations", ImmunizationRecordViewSet, basename="patientimmunization")
+router.register(r"patients/procedures", ProcedureRecordViewSet, basename="patientprocedure")
+router.register(r"patients/documents", HealthDocumentViewSet, basename="patientdocument")
+router.register(r"patients/exchange-logs", HealthRecordExchangeLogViewSet, basename="patientexchangelog")
 router.register(r"telemedicine/sessions", TelemedicineSessionViewSet, basename="telemedsession")
 router.register(r"telemedicine/devices", TelemedicineDeviceViewSet, basename="telemeddevice")
 router.register(r"telemedicine/dictations", VoiceDictationViewSet, basename="telemeddictation")
@@ -98,6 +111,7 @@ router.register(r"compliance/credentials", CredentialVerificationViewSet, basena
 router.register(r"compliance/regulatory-reports", RegulatoryReportViewSet, basename="regulatoryreport")
 router.register(r"compliance/documents", ComplianceDocumentViewSet, basename="compliancedocument")
 router.register(r"compliance/data-access", DataAccessConsentViewSet, basename="dataaccess")
+router.register(r"patients/access-grants", HealthDataAccessGrantViewSet, basename="patientaccessgrant")
 router.register(r"medical/inventory", InventoryItemViewSet, basename="medicalinventory")
 router.register(r"medical/diagnostic-orders", DiagnosticOrderViewSet, basename="medicaldiagnosticorder")
 router.register(r"medical/imaging", ImagingStudyViewSet, basename="medicalimaging")

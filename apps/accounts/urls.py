@@ -15,6 +15,9 @@ from .views import (
     TwoFactorDisableView,
     E2EERegisterKeysView,
     E2EEFetchBundleView,
+    E2EEFetchDeviceBundlesView,
+    DeviceSessionsView,
+    DeviceSessionDetailView,
     UserSkillViewSet,
     UserViewSet,
     ProfileViewSet,
@@ -70,6 +73,9 @@ urlpatterns = [
     path("auth/2fa/disable/", TwoFactorDisableView.as_view(), name="auth-2fa-disable"),
     path("auth/e2ee/keys/", E2EERegisterKeysView.as_view(), name="auth-e2ee-keys"),
     path("auth/e2ee/keys/<uuid:user_id>/", E2EEFetchBundleView.as_view(), name="auth-e2ee-keys-user"),
+    path("auth/e2ee/keys/<uuid:user_id>/devices/", E2EEFetchDeviceBundlesView.as_view(), name="auth-e2ee-keys-user-devices"),
+    path("auth/devices/", DeviceSessionsView.as_view(), name="auth-devices"),
+    path("auth/devices/<str:device_id>/", DeviceSessionDetailView.as_view(), name="auth-device-detail"),
 
     # Optional: direct SimpleJWT endpoints (tooling-friendly)
     path("auth/jwt/create/",  TokenObtainPairView.as_view(), name="jwt-create"),

@@ -21,7 +21,7 @@ class BaseEntity(models.Model):
 
 class Flag(BaseEntity):
     SOURCE_CHOICES = [("USER", "User"), ("SYSTEM", "System"), ("AI", "AI")]
-    TARGET_TYPES = [("POST", "Post"), ("COMMENT", "Comment"), ("GROUP", "Group"), ("CHANNEL", "Channel"), ("USER", "User")]
+    TARGET_TYPES = [("POST", "Post"), ("COMMENT", "Comment"), ("GROUP", "Group"), ("CHANNEL", "Channel"), ("USER", "User"), ("STATUS", "Status")]
     SEVERITY = [("LOW", "Low"), ("MEDIUM", "Medium"), ("HIGH", "High"), ("CRITICAL", "Critical")]
     STATUS = [("PENDING", "Pending"), ("REVIEWED", "Reviewed"), ("ACTIONED", "Actioned"), ("DISMISSED", "Dismissed")]
     ESCALATION = [("AUTO", "Auto"), ("MODERATOR", "Moderator"), ("ADMIN", "Admin")]

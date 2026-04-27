@@ -2,6 +2,7 @@
 from django.db import models
 from rest_framework import serializers
 
+from apps.chat.discussion import get_discussion_count
 from apps.communities.models import (
     Community,
     CommunityMembership,
@@ -16,7 +17,22 @@ from apps.communities.models import (
 from apps.chat.models import ConversationType  # must include POST
 from apps.accounts.models import User
 from common.rich_text import build_plain_text_document, process_rich_text_document
+from common.media_urls import absolutize_backend_media, normalize_image_payload
 from django.utils.text import slugify
+
+
+class CommunityImageUrlSerializerMixin:
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        if "avatar_url" in payload:
+            payload["avatar_url"] = absolutize_backend_media(
+                payload.get("avatar_url"),
+                request=self.context.get("request"),
+            )
+        return payload
+
+    def validate_avatar_url(self, value):
+        return normalize_image_payload(value)
 
 
 class CommunityUserSerializer(serializers.ModelSerializer):
@@ -28,10 +44,13 @@ class CommunityUserSerializer(serializers.ModelSerializer):
 
     def get_avatar_url(self, obj):
         profile = getattr(obj, "profile", None)
-        return getattr(profile, "avatar_url", None) if profile else None
+        return absolutize_backend_media(
+            getattr(profile, "avatar_url", None) if profile else None,
+            request=self.context.get("request"),
+        )
 
 
-class CommunityListSerializer(serializers.ModelSerializer):
+class CommunityListSerializer(CommunityImageUrlSerializerMixin, serializers.ModelSerializer):
     main_conversation_id = serializers.UUIDField(
         source="main_conversation.id",
         read_only=True,
@@ -59,7 +78,7 @@ class CommunityListSerializer(serializers.ModelSerializer):
         ]
 
 
-class CommunityDetailSerializer(serializers.ModelSerializer):
+class CommunityDetailSerializer(CommunityImageUrlSerializerMixin, serializers.ModelSerializer):
     main_conversation_id = serializers.UUIDField(
         source="main_conversation.id",
         read_only=True,
@@ -109,7 +128,7 @@ class CommunityDetailSerializer(serializers.ModelSerializer):
         ]
 
 
-class CommunityCreateSerializer(serializers.ModelSerializer):
+class CommunityCreateSerializer(CommunityImageUrlSerializerMixin, serializers.ModelSerializer):
     """
     For creating a community under a partner.
 
@@ -367,7 +386,10 @@ class CommunityPostSerializer(serializers.ModelSerializer):
         return list(qs)
 
     def get_comments_count(self, obj):
-        return obj.comments.filter(is_deleted=False).count()
+        return get_discussion_count(
+            obj,
+            legacy_comment_queryset=obj.comments.filter(is_deleted=False),
+        )
 
     def get_has_reacted(self, obj):
         request = self.context.get("request")

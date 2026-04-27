@@ -19,6 +19,7 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.core.phone_utils import to_e164
+from common.media_urls import absolutize_backend_media
 from django.utils.translation import gettext_lazy as _
 import pyotp
 
@@ -79,6 +80,8 @@ from .serializers import (
     AccountTierSerializer,
     SubscriptionSerializer,
     SessionSerializer,
+    DeviceSessionSerializer,
+    E2EEDeviceBundleSerializer,
     ExperienceSerializer,
     EducationSerializer,
     UserSkillSerializer,
@@ -303,8 +306,8 @@ def _can_view_field(owner: User, viewer: Optional[User], rule: Optional[ProfileF
 def _resolve_media_url(request, file_field, fallback_url):
     if file_field:
         url = file_field.url
-        return request.build_absolute_uri(url) if request else url
-    return fallback_url
+        return absolutize_backend_media(url, request=request)
+    return absolutize_backend_media(fallback_url, request=request) or None
 
 
 def _build_profile_payload(profile: Profile, viewer: Optional[User], request=None) -> dict:
@@ -1017,6 +1020,108 @@ class E2EEFetchBundleView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+def _serialize_e2ee_bundle_for_device(target: User, device: Device) -> Optional[dict]:
+    key = E2EDeviceKey.objects.filter(user=target, device=device).first()
+    if not key:
+        return None
+
+    prekey = None
+    with transaction.atomic():
+        candidate = (
+            E2EPreKey.objects.select_for_update()
+            .filter(user=target, device=device, consumed_at__isnull=True)
+            .order_by("created_at")
+            .first()
+        )
+        if candidate:
+            candidate.consumed_at = timezone.now()
+            candidate.save(update_fields=["consumed_at", "updated_at"])
+            prekey = {"id": candidate.prekey_id, "key": candidate.prekey}
+
+    return {
+        "user_id": str(target.id),
+        "device_id": device.device_id,
+        "identity_key": key.identity_key,
+        "signed_prekey": {
+            "id": key.signed_prekey_id,
+            "key": key.signed_prekey,
+            "signature": key.signed_prekey_signature,
+        },
+        "one_time_prekey": prekey,
+        "registration_id": key.registration_id,
+        "last_seen_at": device.last_seen_at,
+    }
+
+
+@extend_schema(
+    summary="Fetch E2EE bundles for all active devices of a user",
+    responses={200: E2EEDeviceBundleSerializer(many=True)},
+    tags=["Auth"],
+)
+class E2EEFetchDeviceBundlesView(APIView):
+    authentication_classes = (DeviceBoundJWTAuthentication,)
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, user_id: str):
+        target = get_object_or_404(User, id=user_id)
+        devices = Device.objects.filter(user=target).order_by("-last_seen_at")
+        bundles = []
+        for device in devices:
+            bundle = _serialize_e2ee_bundle_for_device(target, device)
+            if bundle:
+                bundles.append(bundle)
+
+        if not bundles:
+            return Response({"detail": "No device keys"}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = E2EEDeviceBundleSerializer(bundles, many=True)
+        return Response({"user_id": str(target.id), "devices": serializer.data}, status=status.HTTP_200_OK)
+
+
+@extend_schema(
+    summary="List active devices for the authenticated user",
+    responses={200: DeviceSessionSerializer(many=True)},
+    tags=["Auth"],
+)
+class DeviceSessionsView(APIView):
+    authentication_classes = (DeviceBoundJWTAuthentication,)
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        devices = (
+            Device.objects.filter(user=request.user)
+            .order_by("-last_seen_at", "-created_at")
+        )
+        serializer = DeviceSessionSerializer(devices, many=True, context={"request": request})
+        return Response({"devices": serializer.data}, status=status.HTTP_200_OK)
+
+
+@extend_schema(
+    summary="Revoke one device for the authenticated user",
+    tags=["Auth"],
+)
+class DeviceSessionDetailView(APIView):
+    authentication_classes = (DeviceBoundJWTAuthentication,)
+    permission_classes = (IsAuthenticated,)
+
+    def delete(self, request, device_id: str):
+        current_device_id = (
+            request.headers.get("X-Device-Id")
+            or request.headers.get("X-Device-ID")
+            or request.headers.get("X-DeviceId")
+            or ""
+        )
+        if str(device_id) == str(current_device_id):
+            return Response({"detail": "Use logout to end the current device session."}, status=status.HTTP_400_BAD_REQUEST)
+
+        device = get_object_or_404(Device, user=request.user, device_id=str(device_id))
+        E2EDeviceKey.objects.filter(user=request.user, device=device).delete()
+        E2EPreKey.objects.filter(user=request.user, device=device).delete()
+        device.delete()
+        AuditLog.log(actor=request.user, action="device.revoked", meta={"device_id": device_id})
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 # -----------------------------
 # Core viewsets with Swagger docs (JWT-protected)

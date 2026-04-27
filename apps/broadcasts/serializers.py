@@ -6,6 +6,8 @@ from rest_framework import serializers
 
 from apps.broadcasts.media_utils import build_media_url, ensure_local_thumbnail
 from apps.broadcasts.health_engine_policy import is_service_medium_allowed
+from apps.core.money import parse_decimal_amount
+from common.media_urls import absolutize_backend_media
 
 from .models import (
     BroadcastFeature,
@@ -45,6 +47,114 @@ from apps.partners.models import Partner
 from apps.communities.models import Community
 from apps.accounts.models import User
 
+
+class LenientDecimalField(serializers.DecimalField):
+    def to_internal_value(self, data):
+        if data in (None, "") and self.allow_null:
+            return None
+        parsed = parse_decimal_amount(data)
+        if parsed is None:
+            self.fail("invalid")
+        return super().to_internal_value(str(parsed))
+
+
+def _education_humanize(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.replace("_", " ").replace("-", " ").title()
+
+
+def _education_present_value(value):
+    if value in (None, ""):
+        return ""
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value if item not in (None, ""))
+    return str(value)
+
+
+def _education_detail_item(label: str, value, key: str = "") -> dict:
+    return {
+        "key": key or label.lower().replace(" ", "_"),
+        "label": label,
+        "value": _education_present_value(value),
+    }
+
+
+def _education_detail_section(title: str, items: list[dict]) -> dict:
+    visible_items = [item for item in items if item.get("value") not in (None, "")]
+    return {"title": title, "items": visible_items}
+
+
+def _education_detail_summary(
+    *,
+    module: str,
+    title: str,
+    subtitle: str = "",
+    description: str = "",
+    status: str = "",
+    highlights: list[dict] | None = None,
+    sections: list[dict] | None = None,
+) -> dict:
+    visible_sections = [section for section in (sections or []) if section.get("items")]
+    return {
+        "variant": "education-module-detail",
+        "eyebrow": module,
+        "module": module,
+        "title": title or module,
+        "subtitle": subtitle,
+        "description": description,
+        "status": {
+            "value": status or "",
+            "label": _education_humanize(status),
+        },
+        "highlights": [item for item in (highlights or []) if item.get("value") not in (None, "")],
+        "sections": visible_sections,
+    }
+
+
+def _attach_education_detail_summary(payload: dict, summary: dict) -> dict:
+    payload["detail_summary"] = summary
+    payload["detailSummary"] = summary
+    return payload
+
+
+def _attach_education_cover_image(payload: dict, cover_image_url: str, context: dict | None = None) -> dict:
+    absolute_url = absolutize_backend_media(cover_image_url, (context or {}).get("request"))
+    payload["cover_image_url"] = absolute_url
+    payload["cover_url"] = absolute_url
+    payload["coverUrl"] = absolute_url
+    return payload
+
+
+def _education_effective_broadcast_cover_image(instance: EducationInstitutionBroadcast) -> str:
+    explicit_cover = str(instance.cover_image_url or "").strip()
+    metadata = instance.metadata if isinstance(instance.metadata, dict) else {}
+    manual_cover = bool(metadata.get("manual_cover_image"))
+    if explicit_cover and manual_cover:
+        return explicit_cover
+
+    prioritized_entities: list[object | None]
+    if instance.broadcast_kind == "program":
+        prioritized_entities = [instance.program, instance.course, instance.lesson, instance.class_session, instance.event]
+    elif instance.broadcast_kind == "course":
+        prioritized_entities = [instance.course, instance.lesson, instance.class_session, instance.event, instance.program]
+    elif instance.broadcast_kind == "lesson":
+        prioritized_entities = [instance.lesson, instance.class_session, instance.course, instance.event, instance.program]
+    elif instance.broadcast_kind == "class_session":
+        prioritized_entities = [instance.class_session, instance.lesson, instance.course, instance.event, instance.program]
+    elif instance.broadcast_kind in {"event", "training_session"}:
+        prioritized_entities = [instance.event, instance.class_session, instance.lesson, instance.course, instance.program]
+    else:
+        prioritized_entities = [instance.program, instance.course, instance.lesson, instance.class_session, instance.event]
+
+    for entity in prioritized_entities:
+        value = str(getattr(entity, "cover_image_url", "") or "").strip()
+        if value:
+            return value
+    return explicit_cover or ""
 
 
 
@@ -252,6 +362,12 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
     pending_application_count = serializers.SerializerMethodField()
     current_membership = serializers.SerializerMethodField()
     can_manage = serializers.SerializerMethodField()
+    logo_url = serializers.SerializerMethodField()
+    image_url = serializers.SerializerMethodField()
+    banner_image_url = serializers.SerializerMethodField()
+    logoUrl = serializers.SerializerMethodField()
+    imageUrl = serializers.SerializerMethodField()
+    bannerImageUrl = serializers.SerializerMethodField()
 
     class Meta:
         model = EducationInstitution
@@ -264,6 +380,12 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
             "contact_email",
             "contact_phone",
             "branding",
+            "logo_url",
+            "image_url",
+            "banner_image_url",
+            "logoUrl",
+            "imageUrl",
+            "bannerImageUrl",
             "settings",
             "metadata",
             "is_active",
@@ -313,6 +435,86 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
             "administrator",
         }
 
+    def get_logo_url(self, obj: EducationInstitution) -> str:
+        branding = obj.branding or {}
+        value = branding.get("logo_url") or branding.get("logoUrl") or branding.get("image_url") or branding.get("imageUrl") or ""
+        return absolutize_backend_media(value, request=self.context.get("request"))
+
+    def get_image_url(self, obj: EducationInstitution) -> str:
+        branding = obj.branding or {}
+        value = branding.get("image_url") or branding.get("imageUrl") or branding.get("logo_url") or branding.get("logoUrl") or ""
+        return absolutize_backend_media(value, request=self.context.get("request"))
+
+    def get_banner_image_url(self, obj: EducationInstitution) -> str:
+        branding = obj.branding or {}
+        value = (
+            branding.get("banner_image_url")
+            or branding.get("bannerImageUrl")
+            or branding.get("cover_image_url")
+            or branding.get("coverImageUrl")
+            or ""
+        )
+        return absolutize_backend_media(value, request=self.context.get("request"))
+
+    def get_logoUrl(self, obj: EducationInstitution) -> str:
+        return self.get_logo_url(obj)
+
+    def get_imageUrl(self, obj: EducationInstitution) -> str:
+        return self.get_image_url(obj)
+
+    def get_bannerImageUrl(self, obj: EducationInstitution) -> str:
+        return self.get_banner_image_url(obj)
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        branding = dict(payload.get("branding") or {})
+        request = self.context.get("request")
+        for key in (
+            "logo_url",
+            "logoUrl",
+            "image_url",
+            "imageUrl",
+            "banner_image_url",
+            "bannerImageUrl",
+            "cover_image_url",
+            "coverImageUrl",
+        ):
+            if branding.get(key):
+                branding[key] = absolutize_backend_media(branding.get(key), request=request)
+        payload["branding"] = branding
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Education Institution",
+                title=payload.get("name") or "",
+                subtitle=_education_humanize(payload.get("institution_type")),
+                description=payload.get("description") or "",
+                status="active" if payload.get("is_active") else "inactive",
+                highlights=[
+                    _education_detail_item("Membership", _education_humanize(payload.get("membership_policy"))),
+                    _education_detail_item("Active members", payload.get("active_member_count")),
+                    _education_detail_item("Pending applications", payload.get("pending_application_count")),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Contact",
+                        [
+                            _education_detail_item("Email", payload.get("contact_email")),
+                            _education_detail_item("Phone", payload.get("contact_phone")),
+                        ],
+                    ),
+                    _education_detail_section(
+                        "Branding",
+                        [
+                            _education_detail_item("Logo", payload.get("logo_url")),
+                            _education_detail_item("Image", payload.get("image_url")),
+                            _education_detail_item("Banner", payload.get("banner_image_url")),
+                        ],
+                    ),
+                ],
+            ),
+        )
+
 
 class EducationInstitutionProgramSerializer(serializers.ModelSerializer):
     class Meta:
@@ -323,11 +525,39 @@ class EducationInstitutionProgramSerializer(serializers.ModelSerializer):
             "code",
             "summary",
             "description",
+            "cover_image_url",
             "status",
             "metadata",
             "created_at",
             "updated_at",
         ]
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Program",
+                title=payload.get("title") or "",
+                subtitle=payload.get("code") or "",
+                description=payload.get("description") or payload.get("summary") or "",
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Code", payload.get("code")),
+                    _education_detail_item("Status", _education_humanize(payload.get("status"))),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Overview",
+                        [
+                            _education_detail_item("Summary", payload.get("summary")),
+                            _education_detail_item("Description", payload.get("description")),
+                        ],
+                    ),
+                ],
+            ),
+        )
 
 
 class EducationInstitutionStaffAssignmentSerializer(serializers.ModelSerializer):
@@ -377,6 +607,7 @@ class EducationInstitutionCourseSerializer(serializers.ModelSerializer):
             "code",
             "summary",
             "description",
+            "cover_image_url",
             "status",
             "duration_minutes",
             "seat_limit",
@@ -385,6 +616,35 @@ class EducationInstitutionCourseSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Course",
+                title=payload.get("title") or "",
+                subtitle=payload.get("code") or "",
+                description=payload.get("description") or payload.get("summary") or "",
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Duration", f"{payload.get('duration_minutes')} min" if payload.get("duration_minutes") else ""),
+                    _education_detail_item("Seats", payload.get("seat_limit")),
+                    _education_detail_item("Status", _education_humanize(payload.get("status"))),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Overview",
+                        [
+                            _education_detail_item("Code", payload.get("code")),
+                            _education_detail_item("Summary", payload.get("summary")),
+                            _education_detail_item("Description", payload.get("description")),
+                        ],
+                    ),
+                ],
+            ),
+        )
 
 
 class EducationInstitutionCourseModuleItemSerializer(serializers.ModelSerializer):
@@ -415,6 +675,38 @@ class EducationInstitutionCourseModuleItemSerializer(serializers.ModelSerializer
             "updated_at",
         ]
 
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        title = payload.get("title_override") or _education_humanize(payload.get("item_type"))
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Module Item",
+                title=title,
+                subtitle=_education_humanize(payload.get("item_type")),
+                description=payload.get("summary_override") or "",
+                status="",
+                highlights=[
+                    _education_detail_item("Order", payload.get("item_order")),
+                    _education_detail_item("Estimated time", f"{payload.get('estimated_minutes')} min" if payload.get("estimated_minutes") else ""),
+                    _education_detail_item("Type", _education_humanize(payload.get("item_type"))),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Linked record",
+                        [
+                            _education_detail_item("Lesson", payload.get("lesson_id")),
+                            _education_detail_item("Material", payload.get("material_id")),
+                            _education_detail_item("Class session", payload.get("class_session_id")),
+                            _education_detail_item("Assessment", payload.get("assessment_id")),
+                            _education_detail_item("Event", payload.get("event_id")),
+                            _education_detail_item("Broadcast", payload.get("broadcast_id")),
+                        ],
+                    ),
+                ],
+            ),
+        )
+
 
 class EducationInstitutionCourseModuleSerializer(serializers.ModelSerializer):
     course_id = serializers.UUIDField(source="course.id", read_only=True)
@@ -436,6 +728,33 @@ class EducationInstitutionCourseModuleSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Course Module",
+                title=payload.get("title") or "",
+                subtitle=f"Module {payload.get('module_order')}" if payload.get("module_order") else "",
+                description=payload.get("summary") or "",
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Order", payload.get("module_order")),
+                    _education_detail_item("Preview", payload.get("is_preview")),
+                    _education_detail_item("Items", len(payload.get("items") or [])),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Overview",
+                        [
+                            _education_detail_item("Summary", payload.get("summary")),
+                            _education_detail_item("Status", _education_humanize(payload.get("status"))),
+                        ],
+                    ),
+                ],
+            ),
+        )
+
 
 class EducationInstitutionLessonSerializer(serializers.ModelSerializer):
     course_id = serializers.UUIDField(source="course.id", read_only=True)
@@ -448,6 +767,7 @@ class EducationInstitutionLessonSerializer(serializers.ModelSerializer):
             "title",
             "summary",
             "content",
+            "cover_image_url",
             "lesson_order",
             "duration_minutes",
             "is_preview",
@@ -456,6 +776,35 @@ class EducationInstitutionLessonSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        content = payload.get("content") or ""
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Lesson",
+                title=payload.get("title") or "",
+                subtitle=f"Lesson {payload.get('lesson_order')}" if payload.get("lesson_order") else "",
+                description=payload.get("summary") or content[:180],
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Duration", f"{payload.get('duration_minutes')} min" if payload.get("duration_minutes") else ""),
+                    _education_detail_item("Preview", payload.get("is_preview")),
+                    _education_detail_item("Order", payload.get("lesson_order")),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Lesson details",
+                        [
+                            _education_detail_item("Summary", payload.get("summary")),
+                            _education_detail_item("Content preview", content[:240]),
+                        ],
+                    ),
+                ],
+            ),
+        )
 
 
 class EducationInstitutionClassSessionSerializer(serializers.ModelSerializer):
@@ -470,6 +819,7 @@ class EducationInstitutionClassSessionSerializer(serializers.ModelSerializer):
             "lesson_id",
             "title",
             "summary",
+            "cover_image_url",
             "starts_at",
             "ends_at",
             "timezone_name",
@@ -482,6 +832,43 @@ class EducationInstitutionClassSessionSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Class Session",
+                title=payload.get("title") or "",
+                subtitle=_education_humanize(payload.get("delivery_mode")),
+                description=payload.get("summary") or "",
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Starts", payload.get("starts_at")),
+                    _education_detail_item("Ends", payload.get("ends_at")),
+                    _education_detail_item("Seats", payload.get("seat_limit")),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Schedule",
+                        [
+                            _education_detail_item("Starts at", payload.get("starts_at")),
+                            _education_detail_item("Ends at", payload.get("ends_at")),
+                            _education_detail_item("Timezone", payload.get("timezone_name")),
+                        ],
+                    ),
+                    _education_detail_section(
+                        "Delivery",
+                        [
+                            _education_detail_item("Mode", _education_humanize(payload.get("delivery_mode"))),
+                            _education_detail_item("Location", payload.get("location_text")),
+                            _education_detail_item("Meeting URL", payload.get("meeting_url")),
+                        ],
+                    ),
+                ],
+            ),
+        )
 
 
 class EducationInstitutionMaterialSerializer(serializers.ModelSerializer):
@@ -512,6 +899,7 @@ class EducationInstitutionMaterialSerializer(serializers.ModelSerializer):
             "assessment_ids",
             "title",
             "summary",
+            "cover_image_url",
             "kind",
             "resource_url",
             "resource_name",
@@ -523,6 +911,46 @@ class EducationInstitutionMaterialSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Material",
+                title=payload.get("title") or "",
+                subtitle=_education_humanize(payload.get("kind")),
+                description=payload.get("summary") or "",
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Kind", _education_humanize(payload.get("kind"))),
+                    _education_detail_item("Downloadable", payload.get("is_downloadable")),
+                    _education_detail_item("Resource", payload.get("resource_name") or payload.get("resource_url")),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Resource",
+                        [
+                            _education_detail_item("Name", payload.get("resource_name")),
+                            _education_detail_item("URL", payload.get("resource_url")),
+                            _education_detail_item("MIME type", payload.get("resource_mime_type")),
+                            _education_detail_item("Storage path", payload.get("storage_path")),
+                        ],
+                    ),
+                    _education_detail_section(
+                        "Linked modules",
+                        [
+                            _education_detail_item("Programs", payload.get("program_ids")),
+                            _education_detail_item("Courses", payload.get("course_ids")),
+                            _education_detail_item("Lessons", payload.get("lesson_ids")),
+                            _education_detail_item("Class sessions", payload.get("class_session_ids")),
+                            _education_detail_item("Assessments", payload.get("assessment_ids")),
+                        ],
+                    ),
+                ],
+            ),
+        )
 
     def get_program_ids(self, obj):
         ids = list(obj.program_links.values_list("id", flat=True))
@@ -571,6 +999,7 @@ class EducationInstitutionAssessmentOptionSerializer(serializers.ModelSerializer
 
 class EducationInstitutionAssessmentQuestionSerializer(serializers.ModelSerializer):
     options = EducationInstitutionAssessmentOptionSerializer(many=True, read_only=True)
+    points = LenientDecimalField(max_digits=8, decimal_places=2, required=False)
 
     class Meta:
         model = EducationInstitutionAssessmentQuestion
@@ -587,12 +1016,40 @@ class EducationInstitutionAssessmentQuestionSerializer(serializers.ModelSerializ
             "updated_at",
         ]
 
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Assessment Question",
+                title=payload.get("prompt") or "",
+                subtitle=_education_humanize(payload.get("question_type")),
+                status="required" if payload.get("is_required") else "optional",
+                highlights=[
+                    _education_detail_item("Points", payload.get("points")),
+                    _education_detail_item("Order", payload.get("question_order")),
+                    _education_detail_item("Options", len(payload.get("options") or [])),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Question",
+                        [
+                            _education_detail_item("Prompt", payload.get("prompt")),
+                            _education_detail_item("Type", _education_humanize(payload.get("question_type"))),
+                            _education_detail_item("Required", payload.get("is_required")),
+                        ],
+                    ),
+                ],
+            ),
+        )
+
 
 class EducationInstitutionAssessmentSerializer(serializers.ModelSerializer):
     course_id = serializers.UUIDField(source="course.id", read_only=True)
     lesson_id = serializers.UUIDField(source="lesson.id", read_only=True)
     class_session_id = serializers.UUIDField(source="class_session.id", read_only=True)
     questions = EducationInstitutionAssessmentQuestionSerializer(many=True, read_only=True)
+    total_points = LenientDecimalField(max_digits=8, decimal_places=2, read_only=True)
 
     class Meta:
         model = EducationInstitutionAssessment
@@ -604,6 +1061,7 @@ class EducationInstitutionAssessmentSerializer(serializers.ModelSerializer):
             "title",
             "summary",
             "instructions",
+            "cover_image_url",
             "assessment_type",
             "status",
             "starts_at",
@@ -619,6 +1077,36 @@ class EducationInstitutionAssessmentSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Assessment",
+                title=payload.get("title") or "",
+                subtitle=_education_humanize(payload.get("assessment_type")),
+                description=payload.get("summary") or payload.get("instructions") or "",
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Duration", f"{payload.get('duration_minutes')} min" if payload.get("duration_minutes") else ""),
+                    _education_detail_item("Passing score", f"{payload.get('passing_score_percent')}%" if payload.get("passing_score_percent") not in (None, "") else ""),
+                    _education_detail_item("Total points", payload.get("total_points")),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Assessment rules",
+                        [
+                            _education_detail_item("Instructions", payload.get("instructions")),
+                            _education_detail_item("Max attempts", payload.get("max_attempts")),
+                            _education_detail_item("Starts at", payload.get("starts_at")),
+                            _education_detail_item("Ends at", payload.get("ends_at")),
+                        ],
+                    ),
+                ],
+            ),
+        )
+
 
 class EducationInstitutionAssessmentResponseOptionSerializer(serializers.ModelSerializer):
     option_id = serializers.UUIDField(source="option.id", read_only=True)
@@ -631,6 +1119,7 @@ class EducationInstitutionAssessmentResponseOptionSerializer(serializers.ModelSe
 class EducationInstitutionAssessmentResponseSerializer(serializers.ModelSerializer):
     question_id = serializers.UUIDField(source="question.id", read_only=True)
     selected_options = EducationInstitutionAssessmentResponseOptionSerializer(many=True, read_only=True)
+    earned_points = LenientDecimalField(max_digits=8, decimal_places=2, required=False)
 
     class Meta:
         model = EducationInstitutionAssessmentResponse
@@ -653,6 +1142,8 @@ class EducationInstitutionAssessmentSubmissionSerializer(serializers.ModelSerial
     user_id = serializers.UUIDField(source="user.id", read_only=True)
     grader_id = serializers.UUIDField(source="grader.id", read_only=True, allow_null=True)
     responses = EducationInstitutionAssessmentResponseSerializer(many=True, read_only=True)
+    earned_points = LenientDecimalField(max_digits=8, decimal_places=2, read_only=True)
+    score_percent = LenientDecimalField(max_digits=6, decimal_places=2, read_only=True)
 
     class Meta:
         model = EducationInstitutionAssessmentSubmission
@@ -692,6 +1183,7 @@ class EducationInstitutionEventSerializer(serializers.ModelSerializer):
             "title",
             "summary",
             "description",
+            "cover_image_url",
             "starts_at",
             "ends_at",
             "timezone_name",
@@ -705,6 +1197,44 @@ class EducationInstitutionEventSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Event",
+                title=payload.get("title") or "",
+                subtitle=_education_humanize(payload.get("event_type")),
+                description=payload.get("description") or payload.get("summary") or "",
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Starts", payload.get("starts_at")),
+                    _education_detail_item("Delivery", _education_humanize(payload.get("delivery_mode"))),
+                    _education_detail_item("Seats", payload.get("seat_limit")),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Schedule",
+                        [
+                            _education_detail_item("Starts at", payload.get("starts_at")),
+                            _education_detail_item("Ends at", payload.get("ends_at")),
+                            _education_detail_item("Timezone", payload.get("timezone_name")),
+                        ],
+                    ),
+                    _education_detail_section(
+                        "Event details",
+                        [
+                            _education_detail_item("Summary", payload.get("summary")),
+                            _education_detail_item("Description", payload.get("description")),
+                            _education_detail_item("Location", payload.get("location_text")),
+                            _education_detail_item("Meeting URL", payload.get("meeting_url")),
+                        ],
+                    ),
+                ],
+            ),
+        )
+
 
 class EducationInstitutionBroadcastSerializer(serializers.ModelSerializer):
     program_id = serializers.UUIDField(source="program.id", read_only=True, allow_null=True)
@@ -715,6 +1245,7 @@ class EducationInstitutionBroadcastSerializer(serializers.ModelSerializer):
     institution_id = serializers.UUIDField(source="institution.id", read_only=True)
     created_by_id = serializers.UUIDField(source="created_by.id", read_only=True)
     membership_policy = serializers.CharField(source="institution.membership_policy", read_only=True)
+    price_amount = LenientDecimalField(max_digits=10, decimal_places=2, allow_null=True, required=False)
 
     class Meta:
         model = EducationInstitutionBroadcast
@@ -747,6 +1278,48 @@ class EducationInstitutionBroadcastSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload = _attach_education_cover_image(
+            payload,
+            _education_effective_broadcast_cover_image(instance),
+            self.context,
+        )
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Broadcast",
+                title=payload.get("title") or "",
+                subtitle=_education_humanize(payload.get("broadcast_kind")),
+                description=payload.get("description") or payload.get("summary") or "",
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Booking", payload.get("booking_enabled")),
+                    _education_detail_item("Price", payload.get("price_amount")),
+                    _education_detail_item("Seats", payload.get("seat_limit")),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Broadcast details",
+                        [
+                            _education_detail_item("Summary", payload.get("summary")),
+                            _education_detail_item("Description", payload.get("description")),
+                            _education_detail_item("Cover image", payload.get("cover_image_url")),
+                        ],
+                    ),
+                    _education_detail_section(
+                        "Schedule and booking",
+                        [
+                            _education_detail_item("Starts at", payload.get("starts_at")),
+                            _education_detail_item("Ends at", payload.get("ends_at")),
+                            _education_detail_item("Timezone", payload.get("timezone_name")),
+                            _education_detail_item("Price currency", payload.get("price_currency")),
+                        ],
+                    ),
+                ],
+            ),
+        )
 
 
 class EducationInstitutionEnrollmentSerializer(serializers.ModelSerializer):
@@ -791,6 +1364,14 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True,
     )
+    booked_item_id = serializers.SerializerMethodField()
+    booked_item_type = serializers.SerializerMethodField()
+    booked_item_title = serializers.SerializerMethodField()
+    booked_item_summary = serializers.SerializerMethodField()
+    booked_item_starts_at = serializers.SerializerMethodField()
+    booked_item_ends_at = serializers.SerializerMethodField()
+    broadcast_title = serializers.CharField(source="broadcast.title", read_only=True, allow_null=True)
+    learner_display_name = serializers.SerializerMethodField()
 
     class Meta:
         model = EducationInstitutionBooking
@@ -809,6 +1390,14 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
             "payment_method",
             "wallet_transaction_id",
             "provider_credit_transaction_id",
+            "booked_item_id",
+            "booked_item_type",
+            "booked_item_title",
+            "booked_item_summary",
+            "booked_item_starts_at",
+            "booked_item_ends_at",
+            "broadcast_title",
+            "learner_display_name",
             "reserved_at",
             "confirmed_at",
             "provider_completed_at",
@@ -818,6 +1407,51 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def _target(self, obj: EducationInstitutionBooking):
+        targets = (
+            ("event", obj.event),
+            ("class_session", obj.class_session),
+            ("course", obj.course),
+            ("program", obj.program),
+            ("broadcast", obj.broadcast),
+        )
+        for target_type, target in targets:
+            if target is not None:
+                return target_type, target
+        return None, None
+
+    def get_booked_item_id(self, obj: EducationInstitutionBooking):
+        _target_type, target = self._target(obj)
+        return str(target.id) if target is not None else None
+
+    def get_booked_item_type(self, obj: EducationInstitutionBooking):
+        target_type, _target = self._target(obj)
+        return target_type
+
+    def get_booked_item_title(self, obj: EducationInstitutionBooking):
+        _target_type, target = self._target(obj)
+        if target is None:
+            return ""
+        return getattr(target, "title", "") or str(target)
+
+    def get_booked_item_summary(self, obj: EducationInstitutionBooking):
+        _target_type, target = self._target(obj)
+        if target is None:
+            return ""
+        return getattr(target, "summary", "") or getattr(target, "description", "") or ""
+
+    def get_booked_item_starts_at(self, obj: EducationInstitutionBooking):
+        _target_type, target = self._target(obj)
+        return getattr(target, "starts_at", None) if target is not None else None
+
+    def get_booked_item_ends_at(self, obj: EducationInstitutionBooking):
+        _target_type, target = self._target(obj)
+        return getattr(target, "ends_at", None) if target is not None else None
+
+    def get_learner_display_name(self, obj: EducationInstitutionBooking):
+        user = obj.user
+        return getattr(user, "display_name", "") or getattr(user, "username", "") or getattr(user, "email", "") or ""
 
 
 class EducationProfileCourseSerializer(serializers.ModelSerializer):

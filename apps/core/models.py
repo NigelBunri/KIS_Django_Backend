@@ -1279,6 +1279,94 @@ class DataAccessConsent(BaseEntity):
         return f"{self.patient} · {self.scope} ({self.status})"
 
 
+class HealthDataAccessGrant(BaseEntity):
+    ROLE_CAREGIVER = "caregiver"
+    ROLE_FAMILY = "family"
+    ROLE_GUARDIAN = "guardian"
+    ROLE_CLINICIAN = "clinician"
+
+    STATUS_ACTIVE = "active"
+    STATUS_REVOKED = "revoked"
+    STATUS_EXPIRED = "expired"
+    STATUS_PENDING = "pending"
+
+    SCOPE_SUMMARY = "summary"
+    SCOPE_EMERGENCY = "emergency"
+    SCOPE_RECORDS = "records"
+    SCOPE_FULL = "full"
+
+    ROLE_CHOICES = [
+        (ROLE_CAREGIVER, "Caregiver"),
+        (ROLE_FAMILY, "Family"),
+        (ROLE_GUARDIAN, "Guardian"),
+        (ROLE_CLINICIAN, "Clinician"),
+    ]
+
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_REVOKED, "Revoked"),
+        (STATUS_EXPIRED, "Expired"),
+        (STATUS_PENDING, "Pending"),
+    ]
+
+    SCOPE_CHOICES = [
+        (SCOPE_SUMMARY, "Summary"),
+        (SCOPE_EMERGENCY, "Emergency"),
+        (SCOPE_RECORDS, "Records"),
+        (SCOPE_FULL, "Full"),
+    ]
+
+    patient = models.ForeignKey(PatientMasterRecord, on_delete=models.CASCADE, related_name="access_grants")
+    granted_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="health_data_access_grants",
+    )
+    granted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="granted_health_data_access",
+    )
+    role = models.CharField(max_length=24, choices=ROLE_CHOICES, default=ROLE_CAREGIVER)
+    scope = models.CharField(max_length=24, choices=SCOPE_CHOICES, default=SCOPE_SUMMARY)
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    allow_emergency_override = models.BooleanField(default=False)
+    note = models.TextField(blank=True)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "core_health_data_access_grant"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "status"]),
+            models.Index(fields=["granted_to", "status"]),
+            models.Index(fields=["expires_at"]),
+        ]
+        constraints = [
+            UniqueConstraint(
+                fields=["patient", "granted_to", "role", "scope"],
+                name="core_health_access_grant_unique_active_scope",
+            ),
+        ]
+
+    def is_active(self) -> bool:
+        if self.status != self.STATUS_ACTIVE:
+            return False
+        if self.expires_at and timezone.now() > self.expires_at:
+            return False
+        return True
+
+    def revoke(self):
+        self.status = self.STATUS_REVOKED
+        self.save(update_fields=["status", "updated_at"])
+
+    def __str__(self):
+        return f"{self.patient} -> {self.granted_to} ({self.scope})"
+
+
 class MedicationOrder(BaseEntity):
     STATUS_REQUESTED = "requested"
     STATUS_ACTIVE = "active"
@@ -1671,6 +1759,326 @@ class VitalSign(BaseEntity):
 
     def __str__(self):
         return f"{self.patient} - {self.vital_type} {self.value}{self.units}"
+
+
+class WellnessMetric(BaseEntity):
+    METRIC_STEPS = "steps"
+    METRIC_SLEEP = "sleep"
+    METRIC_HEART_RATE = "heart_rate"
+    METRIC_WEIGHT = "weight"
+    METRIC_BLOOD_PRESSURE = "blood_pressure"
+    METRIC_BLOOD_GLUCOSE = "blood_glucose"
+    METRIC_WORKOUT = "workout"
+
+    SOURCE_MANUAL = "manual"
+    SOURCE_CLINICAL = "clinical"
+    SOURCE_APPLE_HEALTH = "apple_health"
+    SOURCE_HEALTH_CONNECT = "health_connect"
+    SOURCE_GOOGLE_FIT = "google_fit"
+    SOURCE_WEARABLE = "wearable"
+    SOURCE_IMPORTED = "imported"
+
+    WINDOW_INSTANT = "instant"
+    WINDOW_DAILY = "daily"
+    WINDOW_SLEEP = "sleep_session"
+    WINDOW_WORKOUT = "workout_session"
+
+    METRIC_CHOICES = [
+        (METRIC_STEPS, "Steps"),
+        (METRIC_SLEEP, "Sleep"),
+        (METRIC_HEART_RATE, "Heart rate"),
+        (METRIC_WEIGHT, "Weight"),
+        (METRIC_BLOOD_PRESSURE, "Blood pressure"),
+        (METRIC_BLOOD_GLUCOSE, "Blood glucose"),
+        (METRIC_WORKOUT, "Workout"),
+    ]
+
+    SOURCE_CHOICES = [
+        (SOURCE_MANUAL, "Manual"),
+        (SOURCE_CLINICAL, "Clinical"),
+        (SOURCE_APPLE_HEALTH, "Apple Health"),
+        (SOURCE_HEALTH_CONNECT, "Health Connect"),
+        (SOURCE_GOOGLE_FIT, "Google Fit"),
+        (SOURCE_WEARABLE, "Wearable"),
+        (SOURCE_IMPORTED, "Imported"),
+    ]
+
+    WINDOW_CHOICES = [
+        (WINDOW_INSTANT, "Instant"),
+        (WINDOW_DAILY, "Daily"),
+        (WINDOW_SLEEP, "Sleep session"),
+        (WINDOW_WORKOUT, "Workout session"),
+    ]
+
+    patient = models.ForeignKey(PatientMasterRecord, on_delete=models.CASCADE, related_name="wellness_metrics")
+    profile = models.ForeignKey(MedicalProfile, null=True, blank=True, on_delete=models.SET_NULL)
+    recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
+    metric_type = models.CharField(max_length=40, choices=METRIC_CHOICES)
+    source = models.CharField(max_length=40, choices=SOURCE_CHOICES, default=SOURCE_MANUAL)
+    source_label = models.CharField(max_length=120, blank=True)
+    measurement_window = models.CharField(max_length=40, choices=WINDOW_CHOICES, default=WINDOW_INSTANT)
+    value = models.DecimalField(max_digits=10, decimal_places=2)
+    units = models.CharField(max_length=24, blank=True)
+    normalized_value = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    normalized_units = models.CharField(max_length=24, blank=True)
+    secondary_value = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    secondary_units = models.CharField(max_length=24, blank=True)
+    recorded_at = models.DateTimeField(default=timezone.now)
+    period_start = models.DateTimeField(null=True, blank=True)
+    period_end = models.DateTimeField(null=True, blank=True)
+    is_clinically_verified = models.BooleanField(default=False)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "core_wellness_metric"
+        ordering = ["-recorded_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "metric_type"]),
+            models.Index(fields=["patient", "metric_type", "recorded_at"]),
+            models.Index(fields=["source", "metric_type"]),
+        ]
+
+    def __str__(self):
+        return f"{self.patient} · {self.metric_type} {self.value}{self.units}"
+
+
+class ProblemRecord(BaseEntity):
+    STATUS_ACTIVE = "active"
+    STATUS_RESOLVED = "resolved"
+    STATUS_INACTIVE = "inactive"
+
+    VERIFICATION_PROVISIONAL = "provisional"
+    VERIFICATION_CONFIRMED = "confirmed"
+    VERIFICATION_REFUTED = "refuted"
+
+    SEVERITY_LOW = "low"
+    SEVERITY_MEDIUM = "medium"
+    SEVERITY_HIGH = "high"
+
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_RESOLVED, "Resolved"),
+        (STATUS_INACTIVE, "Inactive"),
+    ]
+
+    VERIFICATION_CHOICES = [
+        (VERIFICATION_PROVISIONAL, "Provisional"),
+        (VERIFICATION_CONFIRMED, "Confirmed"),
+        (VERIFICATION_REFUTED, "Refuted"),
+    ]
+
+    SEVERITY_CHOICES = [
+        (SEVERITY_LOW, "Low"),
+        (SEVERITY_MEDIUM, "Medium"),
+        (SEVERITY_HIGH, "High"),
+    ]
+
+    patient = models.ForeignKey(PatientMasterRecord, on_delete=models.CASCADE, related_name="problems")
+    profile = models.ForeignKey(MedicalProfile, null=True, blank=True, on_delete=models.SET_NULL)
+    diagnosed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="diagnosed_problems")
+    title = models.CharField(max_length=180)
+    code = models.CharField(max_length=64, blank=True)
+    code_system = models.CharField(max_length=64, blank=True)
+    clinical_status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
+    verification_status = models.CharField(max_length=24, choices=VERIFICATION_CHOICES, default=VERIFICATION_PROVISIONAL)
+    severity = models.CharField(max_length=16, choices=SEVERITY_CHOICES, default=SEVERITY_MEDIUM)
+    onset_date = models.DateField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "core_problem_record"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "clinical_status"]),
+            models.Index(fields=["code"]),
+        ]
+
+    def __str__(self):
+        return f"{self.patient} · {self.title}"
+
+
+class ImmunizationRecord(BaseEntity):
+    STATUS_COMPLETED = "completed"
+    STATUS_DUE = "due"
+    STATUS_DECLINED = "declined"
+
+    STATUS_CHOICES = [
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_DUE, "Due"),
+        (STATUS_DECLINED, "Declined"),
+    ]
+
+    patient = models.ForeignKey(PatientMasterRecord, on_delete=models.CASCADE, related_name="immunizations")
+    profile = models.ForeignKey(MedicalProfile, null=True, blank=True, on_delete=models.SET_NULL)
+    administered_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="administered_immunizations")
+    vaccine_name = models.CharField(max_length=180)
+    vaccine_code = models.CharField(max_length=64, blank=True)
+    manufacturer = models.CharField(max_length=120, blank=True)
+    lot_number = models.CharField(max_length=80, blank=True)
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=STATUS_COMPLETED)
+    administered_at = models.DateTimeField(null=True, blank=True)
+    dose_number = models.PositiveIntegerField(null=True, blank=True)
+    series_name = models.CharField(max_length=120, blank=True)
+    notes = models.TextField(blank=True)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "core_immunization_record"
+        ordering = ["-administered_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "status"]),
+            models.Index(fields=["vaccine_code"]),
+        ]
+
+    def __str__(self):
+        return f"{self.patient} · {self.vaccine_name}"
+
+
+class ProcedureRecord(BaseEntity):
+    STATUS_SCHEDULED = "scheduled"
+    STATUS_COMPLETED = "completed"
+    STATUS_CANCELLED = "cancelled"
+
+    STATUS_CHOICES = [
+        (STATUS_SCHEDULED, "Scheduled"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_CANCELLED, "Cancelled"),
+    ]
+
+    patient = models.ForeignKey(PatientMasterRecord, on_delete=models.CASCADE, related_name="procedures")
+    profile = models.ForeignKey(MedicalProfile, null=True, blank=True, on_delete=models.SET_NULL)
+    performed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="performed_procedures")
+    procedure_name = models.CharField(max_length=180)
+    procedure_code = models.CharField(max_length=64, blank=True)
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=STATUS_COMPLETED)
+    performed_at = models.DateTimeField(null=True, blank=True)
+    location = models.CharField(max_length=180, blank=True)
+    notes = models.TextField(blank=True)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "core_procedure_record"
+        ordering = ["-performed_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "status"]),
+            models.Index(fields=["procedure_code"]),
+        ]
+
+    def __str__(self):
+        return f"{self.patient} · {self.procedure_name}"
+
+
+class HealthDocument(BaseEntity):
+    CATEGORY_LAB = "lab"
+    CATEGORY_IMAGING = "imaging"
+    CATEGORY_PRESCRIPTION = "prescription"
+    CATEGORY_DISCHARGE = "discharge"
+    CATEGORY_INSURANCE = "insurance"
+    CATEGORY_REFERRAL = "referral"
+    CATEGORY_GENERAL = "general"
+
+    SOURCE_USER = "user"
+    SOURCE_PROVIDER = "provider"
+    SOURCE_IMPORT = "import"
+
+    STATUS_ACTIVE = "active"
+    STATUS_ARCHIVED = "archived"
+
+    CATEGORY_CHOICES = [
+        (CATEGORY_LAB, "Lab"),
+        (CATEGORY_IMAGING, "Imaging"),
+        (CATEGORY_PRESCRIPTION, "Prescription"),
+        (CATEGORY_DISCHARGE, "Discharge"),
+        (CATEGORY_INSURANCE, "Insurance"),
+        (CATEGORY_REFERRAL, "Referral"),
+        (CATEGORY_GENERAL, "General"),
+    ]
+
+    SOURCE_CHOICES = [
+        (SOURCE_USER, "User"),
+        (SOURCE_PROVIDER, "Provider"),
+        (SOURCE_IMPORT, "Import"),
+    ]
+
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_ARCHIVED, "Archived"),
+    ]
+
+    patient = models.ForeignKey(PatientMasterRecord, on_delete=models.CASCADE, related_name="documents")
+    profile = models.ForeignKey(MedicalProfile, null=True, blank=True, on_delete=models.SET_NULL)
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="uploaded_health_documents")
+    title = models.CharField(max_length=180)
+    category = models.CharField(max_length=24, choices=CATEGORY_CHOICES, default=CATEGORY_GENERAL)
+    source_type = models.CharField(max_length=24, choices=SOURCE_CHOICES, default=SOURCE_USER)
+    source_label = models.CharField(max_length=120, blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
+    file_url = models.CharField(max_length=500, blank=True)
+    mime_type = models.CharField(max_length=120, blank=True)
+    issued_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "core_health_document"
+        ordering = ["-issued_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "category"]),
+            models.Index(fields=["status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.patient} · {self.title}"
+
+
+class HealthRecordExchangeLog(BaseEntity):
+    DIRECTION_EXPORT = "export"
+    DIRECTION_IMPORT = "import"
+
+    STATUS_SUCCESS = "success"
+    STATUS_PARTIAL = "partial"
+    STATUS_FAILED = "failed"
+
+    FORMAT_FHIR_BUNDLE = "fhir_bundle"
+    FORMAT_KIS_BUNDLE = "kis_bundle"
+
+    DIRECTION_CHOICES = [
+        (DIRECTION_EXPORT, "Export"),
+        (DIRECTION_IMPORT, "Import"),
+    ]
+
+    STATUS_CHOICES = [
+        (STATUS_SUCCESS, "Success"),
+        (STATUS_PARTIAL, "Partial"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    FORMAT_CHOICES = [
+        (FORMAT_FHIR_BUNDLE, "FHIR Bundle"),
+        (FORMAT_KIS_BUNDLE, "KIS Bundle"),
+    ]
+
+    patient = models.ForeignKey(PatientMasterRecord, on_delete=models.CASCADE, related_name="exchange_logs")
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="health_record_exchanges")
+    direction = models.CharField(max_length=16, choices=DIRECTION_CHOICES)
+    exchange_format = models.CharField(max_length=24, choices=FORMAT_CHOICES, default=FORMAT_FHIR_BUNDLE)
+    source_label = models.CharField(max_length=120, blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_SUCCESS)
+    summary = models.JSONField(default=dict, blank=True)
+    raw_payload = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "core_health_record_exchange_log"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "direction"]),
+            models.Index(fields=["status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.patient} · {self.direction} ({self.status})"
 
 
 class PatientFamilyProfile(BaseEntity):

@@ -6,9 +6,11 @@ import urllib.request
 from urllib.parse import unquote, urlparse
 import uuid
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 import requests
 
+from django.apps import apps as django_apps
 from django.conf import settings
 from django.db import models, transaction
 from django.db.models import Q
@@ -34,6 +36,7 @@ from apps.chat.models import (
     ConversationSendPolicy,
     ConversationJoinPolicy as ChatConversationJoinPolicy,
 )
+from apps.chat.discussion import ensure_conversation_member, ensure_post_comment_conversation
 from apps.communities.models import (
     Community,
     CommunityMembership,
@@ -45,7 +48,9 @@ from apps.accounts.models import Profile, User
 from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
 from apps.commerce.constants import KIS_COIN_CODE
 from apps.commerce.models import Product, ShopService, ShopTeamMember, ServiceBooking
+from apps.core.money import parse_decimal_amount
 import json
+from common.media_urls import absolutize_backend_media
 
 from apps.commerce.serializers import ProductSerializer, ServiceBookingSerializer
 from apps.partners.models import Partner, PartnerPost, PartnerMembership, PartnerMembershipStatus
@@ -156,6 +161,7 @@ from apps.broadcasts.media_utils import (
     build_absolute_url,
     build_media_url,
     ensure_local_thumbnail,
+    normalize_media_reference,
 )
 from apps.billing.services import (
     cents_to_credits,
@@ -358,11 +364,19 @@ class EducationCourseBroadcastView(APIView):
             education_profile = _get_education_profile_or_404(request.user, profile_id)
 
         expires_at = timezone.now() + timedelta(days=10)
+        raw_price_amount = _education_price_amount_from_payload(metadata)
+        if raw_price_amount in (None, ""):
+            raw_price_amount = _education_price_amount_from_payload(request.data)
+        normalized_price_amount = (
+            _normalize_education_decimal(raw_price_amount, "price_amount")
+            if raw_price_amount not in (None, "")
+            else None
+        )
         payload = {
             "title": title,
             "summary": metadata.get("summary") or request.data.get("summary") or "",
             "cover_image": metadata.get("cover_image") or metadata.get("cover_url") or "",
-            "price_amount": metadata.get("price_amount"),
+            "price_amount": str(normalized_price_amount) if normalized_price_amount is not None else None,
             "price_currency": metadata.get("price_currency"),
             "partner_id": str(partner.id) if partner else metadata.get("partner_id"),
             "partner_name": metadata.get("partner_name") or (partner.name if partner else None),
@@ -689,6 +703,22 @@ def _normalize_event_type(value: object, default: str = EducationInstitutionEven
 
 def _normalize_education_broadcast_kind(value: object) -> str:
     raw = str(value or "").strip().lower()
+    raw = raw.replace("-", "_").replace(" ", "_")
+    aliases = {
+        "events": EducationBroadcastKind.EVENT,
+        "education_event": EducationBroadcastKind.EVENT,
+        "institution_event": EducationBroadcastKind.EVENT,
+        "event_broadcast": EducationBroadcastKind.EVENT,
+        "training": EducationBroadcastKind.TRAINING_SESSION,
+        "training_session_broadcast": EducationBroadcastKind.TRAINING_SESSION,
+        "class": EducationBroadcastKind.CLASS_SESSION,
+        "class_session_broadcast": EducationBroadcastKind.CLASS_SESSION,
+        "notice": EducationBroadcastKind.INSTITUTION_NOTICE,
+        "announcement": EducationBroadcastKind.INSTITUTION_NOTICE,
+        "institution_announcement": EducationBroadcastKind.INSTITUTION_NOTICE,
+    }
+    if raw in aliases:
+        return aliases[raw]
     if raw in EducationBroadcastKind.values:
         return raw
     raise ValidationError({"broadcast_kind": "Unsupported education broadcast kind."})
@@ -755,6 +785,218 @@ def _normalize_education_currency(value: object, default: str = KIS_COIN_CODE) -
     if raw == KIS_COIN_CODE:
         return raw
     return default
+
+
+def _first_payload_value(payload, *keys: str):
+    if not hasattr(payload, "get"):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _nested_payload_value(payload, *keys: str):
+    value = _first_payload_value(payload, *keys)
+    if value not in (None, ""):
+        return value
+    if not hasattr(payload, "get"):
+        return None
+    for container_key in ("target", "entity", "source", "item", "record", "metadata"):
+        container = payload.get(container_key)
+        if isinstance(container, dict):
+            value = _first_payload_value(container, *keys)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _coerce_payload_id(value, *keys: str):
+    if isinstance(value, dict):
+        return _first_payload_value(value, *keys, "id", "uuid", "pk")
+    return value
+
+
+def _education_price_amount_from_payload(payload):
+    raw = _nested_payload_value(payload, "price_amount", "priceAmount", "amount", "amount_kisc", "amountKisc")
+    if raw in (None, ""):
+        raw = _nested_payload_value(payload, "price", "pricing", "cost", "fee")
+    if isinstance(raw, dict):
+        raw = _first_payload_value(
+            raw,
+            "price_amount",
+            "priceAmount",
+            "amount",
+            "value",
+            "kisc",
+            "amount_kisc",
+            "amountKisc",
+            "displayAmount",
+            "display_amount",
+        )
+    if isinstance(raw, str) and raw.strip().lower() in {"free", "none", "null", "n/a", "na", "no charge", "[object object]"}:
+        return None
+    return raw
+
+
+def _education_broadcast_kind_from_targets(
+    value: object,
+    *,
+    program=None,
+    course=None,
+    lesson=None,
+    class_session=None,
+    event=None,
+) -> str:
+    if value not in (None, ""):
+        return _normalize_education_broadcast_kind(value)
+    if event:
+        if event.event_type == EducationInstitutionEventType.TRAINING_SESSION:
+            return EducationBroadcastKind.TRAINING_SESSION
+        return EducationBroadcastKind.EVENT
+    if class_session:
+        return EducationBroadcastKind.CLASS_SESSION
+    if lesson:
+        return EducationBroadcastKind.LESSON
+    if course:
+        return EducationBroadcastKind.COURSE
+    if program:
+        return EducationBroadcastKind.PROGRAM
+    return EducationBroadcastKind.INSTITUTION_NOTICE
+
+
+def _normalize_education_decimal(value: object, field_name: str, *, allow_none: bool = True) -> Decimal | None:
+    if value in (None, ""):
+        if allow_none:
+            return None
+        raise ValidationError({field_name: "A decimal value is required."})
+    parsed = parse_decimal_amount(value)
+    if parsed is None:
+        raise ValidationError({field_name: "Enter a valid decimal value."})
+    if parsed < 0:
+        raise ValidationError({field_name: "Value cannot be negative."})
+    return parsed.quantize(Decimal("0.01"))
+
+
+def _normalize_education_branding_payload(payload, existing: dict | None = None) -> dict:
+    branding = dict(existing or {})
+    raw_branding = payload.get("branding") if hasattr(payload, "get") else None
+    if isinstance(raw_branding, dict):
+        branding.update(raw_branding)
+
+    alias_map = {
+        "logo_url": ("logo_url", "logoUrl", "logo", "avatar_url", "avatarUrl"),
+        "image_url": ("image_url", "imageUrl", "institution_image_url", "institutionImageUrl"),
+        "banner_image_url": ("banner_image_url", "bannerImageUrl", "cover_image_url", "coverImageUrl", "cover_url", "coverUrl"),
+    }
+    for target_key, aliases in alias_map.items():
+        value = _first_payload_value(payload, *aliases)
+        if value is not None:
+            branding[target_key] = normalize_media_reference(str(value).strip())
+
+    for target_key in alias_map:
+        if branding.get(target_key):
+            branding[target_key] = normalize_media_reference(branding[target_key])
+
+    if "image_url" not in branding and branding.get("logo_url"):
+        branding["image_url"] = branding["logo_url"]
+    if "logo_url" not in branding and branding.get("image_url"):
+        branding["logo_url"] = branding["image_url"]
+
+    # Preserve camelCase aliases for older frontend consumers.
+    if branding.get("logo_url"):
+        branding["logoUrl"] = branding["logo_url"]
+    if branding.get("image_url"):
+        branding["imageUrl"] = branding["image_url"]
+    if branding.get("banner_image_url"):
+        branding["bannerImageUrl"] = branding["banner_image_url"]
+    return branding
+
+
+def _education_cover_image_from_payload(payload) -> str:
+    value = _first_payload_value(
+        payload,
+        "cover_image_url",
+        "coverImageUrl",
+        "cover_image",
+        "coverImage",
+        "cover_url",
+        "coverUrl",
+        "image_url",
+        "imageUrl",
+    )
+    return normalize_media_reference(str(value or "").strip())
+
+
+def _education_cover_image_in_payload(payload) -> bool:
+    return any(
+        key in payload
+        for key in (
+            "cover_image_url",
+            "coverImageUrl",
+            "cover_image",
+            "coverImage",
+            "cover_url",
+            "coverUrl",
+            "image_url",
+            "imageUrl",
+        )
+    )
+
+
+def _education_source_cover_image(
+    *,
+    program: EducationInstitutionProgram | None = None,
+    course: EducationInstitutionCourse | None = None,
+    lesson: EducationInstitutionLesson | None = None,
+    class_session: EducationInstitutionClassSession | None = None,
+    material: EducationInstitutionMaterial | None = None,
+    assessment: EducationInstitutionAssessment | None = None,
+    event: EducationInstitutionEvent | None = None,
+) -> str:
+    for entity in (program, course, lesson, class_session, material, assessment, event):
+        value = normalize_media_reference(str(getattr(entity, "cover_image_url", "") or "").strip())
+        if value:
+            return value
+    return ""
+
+
+def _education_effective_broadcast_cover_image(broadcast: EducationInstitutionBroadcast) -> str:
+    explicit_cover = normalize_media_reference(broadcast.cover_image_url)
+    metadata = broadcast.metadata if isinstance(broadcast.metadata, dict) else {}
+    manual_cover = bool(metadata.get("manual_cover_image"))
+    if explicit_cover and manual_cover:
+        return explicit_cover
+
+    prioritized_entities: list[object | None] = []
+    if broadcast.broadcast_kind == EducationBroadcastKind.PROGRAM:
+        prioritized_entities = [broadcast.program, broadcast.course, broadcast.lesson, broadcast.class_session, broadcast.event]
+    elif broadcast.broadcast_kind == EducationBroadcastKind.COURSE:
+        prioritized_entities = [broadcast.course, broadcast.lesson, broadcast.class_session, broadcast.event, broadcast.program]
+    elif broadcast.broadcast_kind == EducationBroadcastKind.LESSON:
+        prioritized_entities = [broadcast.lesson, broadcast.class_session, broadcast.course, broadcast.event, broadcast.program]
+    elif broadcast.broadcast_kind == EducationBroadcastKind.CLASS_SESSION:
+        prioritized_entities = [broadcast.class_session, broadcast.lesson, broadcast.course, broadcast.event, broadcast.program]
+    elif broadcast.broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION}:
+        prioritized_entities = [broadcast.event, broadcast.class_session, broadcast.lesson, broadcast.course, broadcast.program]
+    else:
+        prioritized_entities = [broadcast.program, broadcast.course, broadcast.lesson, broadcast.class_session, broadcast.event]
+
+    for entity in prioritized_entities:
+        value = normalize_media_reference(str(getattr(entity, "cover_image_url", "") or "").strip())
+        if value:
+            return value
+    return explicit_cover or ""
+
+
+def _sync_education_source_broadcasts(*entities: object) -> None:
+    for entity in entities:
+        broadcasts_manager = getattr(entity, "broadcasts", None)
+        if broadcasts_manager is None:
+            continue
+        for broadcast in broadcasts_manager.all():
+            _sync_education_broadcast_item(broadcast)
 
 
 def _education_booking_provider_user(booking: EducationInstitutionBooking) -> User:
@@ -1414,6 +1656,7 @@ def _education_broadcast_source_snapshot(
 def _build_education_broadcast_metadata(broadcast: EducationInstitutionBroadcast) -> dict[str, Any]:
     source_entity_id, source_entity_type = _education_broadcast_source_snapshot(broadcast)
     institution = broadcast.institution
+    cover_image_url = _education_effective_broadcast_cover_image(broadcast)
     return {
         "broadcast_id": str(broadcast.id),
         "institution_id": str(institution.id),
@@ -1430,7 +1673,7 @@ def _build_education_broadcast_metadata(broadcast: EducationInstitutionBroadcast
         "title": broadcast.title,
         "summary": broadcast.summary,
         "description": broadcast.description,
-        "cover_image_url": broadcast.cover_image_url,
+        "cover_image_url": cover_image_url,
         "starts_at": broadcast.starts_at.isoformat() if broadcast.starts_at else None,
         "ends_at": broadcast.ends_at.isoformat() if broadcast.ends_at else None,
         "timezone_name": broadcast.timezone_name,
@@ -1551,6 +1794,12 @@ def _build_broadcast_viewer_state(
     membership = broadcast.institution.memberships.filter(user=user).first()
     enrollment = broadcast.enrollments.filter(user=user).first()
     booking = broadcast.bookings.filter(user=user).first()
+    enrollment_status = enrollment.status if enrollment else None
+    booking_status = booking.status if booking else None
+    has_learning_access = enrollment_status in {
+        EducationEnrollmentStatus.ENROLLED,
+        EducationEnrollmentStatus.COMPLETED,
+    }
     return {
         "membership": {
             "status": membership.status,
@@ -1558,6 +1807,11 @@ def _build_broadcast_viewer_state(
         } if membership else None,
         "enrollment": EducationInstitutionEnrollmentSerializer(enrollment).data if enrollment else None,
         "booking": EducationInstitutionBookingSerializer(booking).data if booking else None,
+        "enrollment_status": enrollment_status,
+        "booking_status": booking_status,
+        "has_learning_access": has_learning_access,
+        "can_access_content": has_learning_access,
+        "payment_required": bool(broadcast.booking_enabled) and bool(broadcast.price_amount),
         "can_apply_membership": not membership
         and broadcast.institution.membership_policy
         != EducationInstitutionMembershipPolicy.CLOSED,
@@ -1600,7 +1854,7 @@ def _education_discovery_item_from_broadcast(
         "type": item_type,
         "title": broadcast.title,
         "summary": broadcast.summary or broadcast.description,
-        "coverUrl": broadcast.cover_image_url or "",
+        "coverUrl": absolutize_backend_media(_education_effective_broadcast_cover_image(broadcast)) if _education_effective_broadcast_cover_image(broadcast) else "",
         "partnerId": str(broadcast.institution_id),
         "partnerName": broadcast.institution.name,
         "language": str((broadcast.metadata or {}).get("language") or "English"),
@@ -1646,17 +1900,19 @@ def _education_discovery_item_from_broadcast(
     return item
 
 
-def _build_public_institution_summary(institution: EducationInstitution) -> dict[str, Any]:
+def _build_public_institution_summary(institution: EducationInstitution, request=None) -> dict[str, Any]:
     branding = institution.branding or {}
     published = institution.education_broadcasts.filter(status=EducationBroadcastStatus.PUBLISHED)
+    logo_url = branding.get("logo_url") or branding.get("image_url")
+    image_url = branding.get("image_url") or branding.get("logo_url")
     return {
         "id": str(institution.id),
         "name": institution.name,
         "description": institution.description,
         "institutionType": institution.institution_type,
         "membershipPolicy": institution.membership_policy,
-        "logoUrl": branding.get("logo_url") or branding.get("image_url"),
-        "imageUrl": branding.get("image_url") or branding.get("logo_url"),
+        "logoUrl": build_absolute_url(request, logo_url) if logo_url else "",
+        "imageUrl": build_absolute_url(request, image_url) if image_url else "",
         "programCount": institution.programs.count(),
         "courseCount": institution.courses_v2.count(),
         "eventCount": institution.events.count(),
@@ -1782,7 +2038,7 @@ def _build_education_discovery_payload(user: User, request) -> dict[str, Any]:
         if str(broadcast.institution_id) not in spotlight_map:
             spotlight_map[str(broadcast.institution_id)] = broadcast.institution
     for institution in list(spotlight_map.values())[:12]:
-        institution_spotlights.append(_build_public_institution_summary(institution))
+        institution_spotlights.append(_build_public_institution_summary(institution, request))
     return {
         "hero_course": items[0] if items else None,
         "sections": sections,
@@ -1934,6 +2190,64 @@ def _flatten_learning_outline(course_outline: list[dict[str, Any]]) -> list[dict
                 }
             )
     return flat
+
+
+def _sanitize_learning_item_content_for_public_preview(
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    next_item = dict(item)
+    content = dict(next_item.get("content") or {})
+    item_type = str(next_item.get("type") or "")
+    if item_type == EducationCourseModuleItemType.LESSON:
+        content["content"] = ""
+        materials = []
+        for material in content.get("materials") or []:
+            materials.append(
+                {
+                    "id": material.get("id"),
+                    "title": material.get("title"),
+                    "kind": material.get("kind"),
+                    "resource_url": "",
+                    "resource_name": material.get("resource_name"),
+                    "resource_mime_type": material.get("resource_mime_type"),
+                    "is_downloadable": False,
+                }
+            )
+        content["materials"] = materials
+    elif item_type == EducationCourseModuleItemType.MATERIAL:
+        content["resource_url"] = ""
+        content["storage_path"] = ""
+        content["is_downloadable"] = False
+    elif item_type == EducationCourseModuleItemType.CLASS_SESSION:
+        content["meeting_url"] = ""
+    elif item_type == EducationCourseModuleItemType.ASSESSMENT:
+        content["questions"] = []
+    elif item_type == EducationCourseModuleItemType.EVENT:
+        content["meeting_url"] = ""
+    next_item["content"] = content
+    return next_item
+
+
+def _sanitize_learning_outline_for_public_viewer(
+    course_outline: list[dict[str, Any]],
+    *,
+    has_learning_access: bool,
+) -> list[dict[str, Any]]:
+    if has_learning_access:
+        return course_outline
+    sanitized_outline: list[dict[str, Any]] = []
+    for module in course_outline:
+        items = [
+            _sanitize_learning_item_content_for_public_preview(item)
+            for item in (module.get("items") or [])
+        ]
+        sanitized_outline.append(
+            {
+                **module,
+                "items": items,
+            }
+        )
+    return sanitized_outline
 
 
 def _update_learning_enrollment_metadata(
@@ -2133,10 +2447,15 @@ def _build_public_education_content_detail(
         .filter(user=request.user, status__in=[EducationEnrollmentStatus.ENROLLED, EducationEnrollmentStatus.COMPLETED])
         .first()
     )
+    has_learning_access = enrollment is not None
+    course_outline = _sanitize_learning_outline_for_public_viewer(
+        course_outline,
+        has_learning_access=has_learning_access,
+    )
     progress_payload = _build_learning_progress_payload(broadcast, course_outline, enrollment)
     insights_payload = _build_public_learning_insights(broadcast, course_outline, enrollment, progress_payload)
     enrollment_metadata = enrollment.metadata or {} if enrollment else {}
-    institution_summary = _build_public_institution_summary(institution)
+    institution_summary = _build_public_institution_summary(institution, request)
     trust_signals = _build_public_content_trust_signals(broadcast, course_outline)
     detail_item: dict[str, Any] = {
         "id": str(broadcast.id),
@@ -2144,7 +2463,7 @@ def _build_public_education_content_detail(
         "title": broadcast.title,
         "summary": broadcast.summary or broadcast.description,
         "description": broadcast.description,
-        "coverUrl": broadcast.cover_image_url or "",
+        "coverUrl": build_absolute_url(request, _education_effective_broadcast_cover_image(broadcast)) if _education_effective_broadcast_cover_image(broadcast) else "",
         "partnerId": str(institution.id),
         "partnerName": institution.name,
         "language": str((broadcast.metadata or {}).get("language") or "English"),
@@ -2286,7 +2605,7 @@ def _build_education_hub_payload(user: User, request) -> dict[str, Any]:
         .filter(institution_id__in=institution_ids, status=EducationBroadcastStatus.PUBLISHED)
         .order_by("-published_at", "-created_at")[:8]
     )
-    broadcast_serializer = EducationInstitutionBroadcastSerializer(published_broadcasts, many=True)
+    broadcast_serializer = EducationInstitutionBroadcastSerializer(published_broadcasts, many=True, context={"request": request})
     recent_broadcasts = broadcast_serializer.data
     for row, broadcast in zip(recent_broadcasts, published_broadcasts):
         row["viewer_state"] = _build_broadcast_viewer_state(broadcast, user)
@@ -2350,7 +2669,7 @@ def _build_education_institution_dashboard_payload(institution: EducationInstitu
     recent_broadcasts_qs = institution.education_broadcasts.select_related(
         "institution", "course", "lesson", "class_session", "event"
     ).order_by("-published_at", "-created_at")[:5]
-    recent_broadcasts = EducationInstitutionBroadcastSerializer(recent_broadcasts_qs, many=True).data
+    recent_broadcasts = EducationInstitutionBroadcastSerializer(recent_broadcasts_qs, many=True, context={"request": request}).data
     for row, broadcast in zip(recent_broadcasts, recent_broadcasts_qs):
         row["viewer_state"] = _build_broadcast_viewer_state(broadcast, request.user)
     modules = [
@@ -2381,6 +2700,15 @@ def _build_education_institution_dashboard_payload(institution: EducationInstitu
     }
 
 
+def _with_primary_detail_summary(payload: dict[str, Any], primary_key: str) -> dict[str, Any]:
+    primary = payload.get(primary_key) or {}
+    summary = primary.get("detail_summary") if isinstance(primary, dict) else None
+    if summary:
+        payload["detail_summary"] = summary
+        payload["detailSummary"] = summary
+    return payload
+
+
 def _build_program_detail_payload(
     institution: EducationInstitution,
     program: EducationInstitutionProgram,
@@ -2393,9 +2721,10 @@ def _build_program_detail_payload(
     enrollments_qs = institution.enrollments.filter(program=program).order_by("-created_at")
     bookings_qs = institution.bookings.filter(program=program).order_by("-created_at")
     staff_assignments_qs = institution.staff_assignments.filter(program=program).select_related("membership__user").order_by("-created_at")
-    return {
+    program_payload = EducationInstitutionProgramSerializer(program).data
+    return _with_primary_detail_summary({
         "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
-        "program": EducationInstitutionProgramSerializer(program).data,
+        "program": program_payload,
         "metrics": {
             "course_count": courses_qs.count(),
             "material_count": materials_qs.count(),
@@ -2408,11 +2737,11 @@ def _build_program_detail_payload(
         "courses": EducationInstitutionCourseSerializer(courses_qs[:20], many=True).data,
         "materials": EducationInstitutionMaterialSerializer(materials_qs[:20], many=True).data,
         "events": EducationInstitutionEventSerializer(events_qs[:20], many=True).data,
-        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:20], many=True).data,
+        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:20], many=True, context={"request": request}).data,
         "enrollments": EducationInstitutionEnrollmentSerializer(enrollments_qs[:20], many=True).data,
         "bookings": EducationInstitutionBookingSerializer(bookings_qs[:20], many=True).data,
         "staff_assignments": EducationInstitutionStaffAssignmentSerializer(staff_assignments_qs[:20], many=True).data,
-    }
+    }, "program")
 
 
 def _module_item_target(item: EducationInstitutionCourseModuleItem) -> Any:
@@ -2991,9 +3320,10 @@ def _build_course_detail_payload(
         broadcasts_qs,
         request,
     )
-    return {
+    course_payload = EducationInstitutionCourseSerializer(course).data
+    return _with_primary_detail_summary({
         "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
-        "course": EducationInstitutionCourseSerializer(course).data,
+        "course": course_payload,
         "program": EducationInstitutionProgramSerializer(course.program).data if course.program else None,
         "metrics": {
             "module_count": len(course_outline),
@@ -3014,11 +3344,11 @@ def _build_course_detail_payload(
         "materials": EducationInstitutionMaterialSerializer(materials_qs[:50], many=True).data,
         "assessments": EducationInstitutionAssessmentSerializer(assessments_qs[:50], many=True).data,
         "events": EducationInstitutionEventSerializer(events_qs[:50], many=True).data,
-        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True).data,
+        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True, context={"request": request}).data,
         "enrollments": EducationInstitutionEnrollmentSerializer(enrollments_qs[:50], many=True).data,
         "bookings": EducationInstitutionBookingSerializer(bookings_qs[:50], many=True).data,
         "staff_assignments": EducationInstitutionStaffAssignmentSerializer(staff_assignments_qs[:50], many=True).data,
-    }
+    }, "course")
 
 
 def _build_lesson_detail_payload(
@@ -3031,10 +3361,11 @@ def _build_lesson_detail_payload(
     assessments_qs = lesson.assessments.order_by("title", "-created_at")
     broadcasts_qs = lesson.broadcasts.order_by("-published_at", "-created_at")
     enrollments_qs = lesson.enrollments.order_by("-created_at")
-    return {
+    lesson_payload = EducationInstitutionLessonSerializer(lesson).data
+    return _with_primary_detail_summary({
         "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
         "course": EducationInstitutionCourseSerializer(lesson.course).data,
-        "lesson": EducationInstitutionLessonSerializer(lesson).data,
+        "lesson": lesson_payload,
         "metrics": {
             "material_count": materials_qs.count(),
             "class_session_count": class_qs.count(),
@@ -3045,9 +3376,9 @@ def _build_lesson_detail_payload(
         "materials": EducationInstitutionMaterialSerializer(materials_qs[:50], many=True).data,
         "class_sessions": EducationInstitutionClassSessionSerializer(class_qs[:50], many=True).data,
         "assessments": EducationInstitutionAssessmentSerializer(assessments_qs[:50], many=True).data,
-        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True).data,
+        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True, context={"request": request}).data,
         "enrollments": EducationInstitutionEnrollmentSerializer(enrollments_qs[:50], many=True).data,
-    }
+    }, "lesson")
 
 
 def _build_class_session_detail_payload(
@@ -3062,12 +3393,13 @@ def _build_class_session_detail_payload(
     enrollments_qs = class_session.enrollments.order_by("-created_at")
     bookings_qs = class_session.bookings.order_by("-created_at")
     staff_assignments_qs = class_session.staff_assignments.select_related("membership__user").order_by("-created_at")
-    return {
+    class_session_payload = EducationInstitutionClassSessionSerializer(class_session).data
+    return _with_primary_detail_summary({
         "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
         "program": EducationInstitutionProgramSerializer(class_session.course.program).data if class_session.course and class_session.course.program else None,
         "course": EducationInstitutionCourseSerializer(class_session.course).data if class_session.course else None,
         "lesson": EducationInstitutionLessonSerializer(class_session.lesson).data if class_session.lesson else None,
-        "class_session": EducationInstitutionClassSessionSerializer(class_session).data,
+        "class_session": class_session_payload,
         "metrics": {
             "material_count": materials_qs.count(),
             "assessment_count": assessments_qs.count(),
@@ -3080,11 +3412,11 @@ def _build_class_session_detail_payload(
         "materials": EducationInstitutionMaterialSerializer(materials_qs[:50], many=True).data,
         "assessments": EducationInstitutionAssessmentSerializer(assessments_qs[:50], many=True).data,
         "events": EducationInstitutionEventSerializer(events_qs[:50], many=True).data,
-        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True).data,
+        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True, context={"request": request}).data,
         "enrollments": EducationInstitutionEnrollmentSerializer(enrollments_qs[:50], many=True).data,
         "bookings": EducationInstitutionBookingSerializer(bookings_qs[:50], many=True).data,
         "staff_assignments": EducationInstitutionStaffAssignmentSerializer(staff_assignments_qs[:50], many=True).data,
-    }
+    }, "class_session")
 
 
 def _build_student_membership_detail_payload(
@@ -3144,7 +3476,7 @@ def _build_staff_membership_detail_payload(
             "broadcast_count": broadcasts_qs.count(),
         },
         "staff_assignments": EducationInstitutionStaffAssignmentSerializer(assignments_qs[:50], many=True).data,
-        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True).data,
+        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True, context={"request": request}).data,
     }
 
 
@@ -3163,7 +3495,8 @@ def _build_assessment_detail_payload(
         "class_session",
         "event",
     ).order_by("-created_at")
-    return {
+    assessment_payload = EducationInstitutionAssessmentSerializer(assessment).data
+    return _with_primary_detail_summary({
         "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
         "program": EducationInstitutionProgramSerializer(assessment.course.program).data
         if assessment.course and assessment.course.program
@@ -3171,7 +3504,7 @@ def _build_assessment_detail_payload(
         "course": EducationInstitutionCourseSerializer(assessment.course).data if assessment.course else None,
         "lesson": EducationInstitutionLessonSerializer(assessment.lesson).data if assessment.lesson else None,
         "class_session": EducationInstitutionClassSessionSerializer(assessment.class_session).data if assessment.class_session else None,
-        "assessment": EducationInstitutionAssessmentSerializer(assessment).data,
+        "assessment": assessment_payload,
         "metrics": {
             "question_count": questions_qs.count(),
             "material_count": materials_qs.count(),
@@ -3185,7 +3518,7 @@ def _build_assessment_detail_payload(
         "materials": EducationInstitutionMaterialSerializer(materials_qs[:50], many=True).data,
         "submissions": EducationInstitutionAssessmentSubmissionSerializer(submissions_qs[:50], many=True).data,
         "staff_assignments": EducationInstitutionStaffAssignmentSerializer(staff_assignments_qs[:50], many=True).data,
-    }
+    }, "assessment")
 
 
 def _build_event_detail_payload(
@@ -3215,12 +3548,13 @@ def _build_event_detail_payload(
         if material_filter
         else institution.materials.none()
     )
-    return {
+    event_payload = EducationInstitutionEventSerializer(event).data
+    return _with_primary_detail_summary({
         "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
         "program": EducationInstitutionProgramSerializer(event.program).data if event.program else None,
         "course": EducationInstitutionCourseSerializer(event.course).data if event.course else None,
         "class_session": EducationInstitutionClassSessionSerializer(event.class_session).data if event.class_session else None,
-        "event": EducationInstitutionEventSerializer(event).data,
+        "event": event_payload,
         "metrics": {
             "broadcast_count": broadcasts_qs.count(),
             "booking_count": bookings_qs.count(),
@@ -3228,12 +3562,12 @@ def _build_event_detail_payload(
             "staff_assignment_count": staff_assignments_qs.count(),
             "related_material_count": related_materials_qs.count(),
         },
-        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True).data,
+        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:50], many=True, context={"request": request}).data,
         "bookings": EducationInstitutionBookingSerializer(bookings_qs[:50], many=True).data,
         "enrollments": EducationInstitutionEnrollmentSerializer(enrollments_qs[:50], many=True).data,
         "staff_assignments": EducationInstitutionStaffAssignmentSerializer(staff_assignments_qs[:50], many=True).data,
         "materials": EducationInstitutionMaterialSerializer(related_materials_qs[:50], many=True).data,
-    }
+    }, "event")
 
 
 def _build_broadcast_detail_payload(
@@ -3270,14 +3604,14 @@ def _build_broadcast_detail_payload(
     else:
         target_staff_assignments_qs = institution.staff_assignments.none()
     target_staff_assignments_qs = target_staff_assignments_qs.select_related("membership__user").order_by("-created_at")
-    payload = {
+    payload = _with_primary_detail_summary({
         "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
         "program": EducationInstitutionProgramSerializer(broadcast.program).data if broadcast.program else None,
         "course": EducationInstitutionCourseSerializer(broadcast.course).data if broadcast.course else None,
         "lesson": EducationInstitutionLessonSerializer(broadcast.lesson).data if broadcast.lesson else None,
         "class_session": EducationInstitutionClassSessionSerializer(broadcast.class_session).data if broadcast.class_session else None,
         "event": EducationInstitutionEventSerializer(broadcast.event).data if broadcast.event else None,
-        "broadcast": EducationInstitutionBroadcastSerializer(broadcast).data,
+        "broadcast": EducationInstitutionBroadcastSerializer(broadcast, context={"request": request}).data,
         "metrics": {
             "enrollment_count": enrollments_qs.count(),
             "booking_count": bookings_qs.count(),
@@ -3287,7 +3621,7 @@ def _build_broadcast_detail_payload(
         "enrollments": EducationInstitutionEnrollmentSerializer(enrollments_qs[:50], many=True).data,
         "bookings": EducationInstitutionBookingSerializer(bookings_qs[:50], many=True).data,
         "staff_assignments": EducationInstitutionStaffAssignmentSerializer(target_staff_assignments_qs[:50], many=True).data,
-    }
+    }, "broadcast")
     payload["broadcast"]["viewer_state"] = _build_broadcast_viewer_state(broadcast, request.user)
     return payload
 
@@ -3331,7 +3665,7 @@ def _build_enrollment_detail_payload(
         "lesson": EducationInstitutionLessonSerializer(enrollment.lesson).data if enrollment.lesson else None,
         "class_session": EducationInstitutionClassSessionSerializer(enrollment.class_session).data if enrollment.class_session else None,
         "event": EducationInstitutionEventSerializer(enrollment.event).data if enrollment.event else None,
-        "broadcast": EducationInstitutionBroadcastSerializer(enrollment.broadcast).data if enrollment.broadcast else None,
+        "broadcast": EducationInstitutionBroadcastSerializer(enrollment.broadcast, context={"request": request}).data if enrollment.broadcast else None,
         "enrollment": EducationInstitutionEnrollmentSerializer(enrollment).data,
         "metrics": {
             "related_booking_count": related_bookings_qs.count(),
@@ -3386,7 +3720,7 @@ def _build_booking_detail_payload(
         "course": EducationInstitutionCourseSerializer(booking.course).data if booking.course else None,
         "class_session": EducationInstitutionClassSessionSerializer(booking.class_session).data if booking.class_session else None,
         "event": EducationInstitutionEventSerializer(booking.event).data if booking.event else None,
-        "broadcast": EducationInstitutionBroadcastSerializer(target_broadcast).data if target_broadcast else None,
+        "broadcast": EducationInstitutionBroadcastSerializer(target_broadcast, context={"request": request}).data if target_broadcast else None,
         "booking": EducationInstitutionBookingSerializer(booking).data,
         "metrics": {
             "seat_count": int(booking.seat_count or 0),
@@ -3735,6 +4069,207 @@ def _compose_health_profile_payload(
     return _ensure_health_profile_structure(payload)
 
 
+def _resolve_core_patient_for_user(user):
+    if not getattr(user, "is_authenticated", False):
+        return None
+
+    PatientMasterRecord = django_apps.get_model("core", "PatientMasterRecord")
+    user_id = str(getattr(user, "id", "") or "").strip()
+    email = str(getattr(user, "email", "") or "").strip()
+    phone_candidates = [
+        str(getattr(user, "phone", "") or "").strip(),
+        str(getattr(user, "phone_number", "") or "").strip(),
+    ]
+
+    patient = PatientMasterRecord.objects.filter(primary_contact__user_id=user_id).order_by("-updated_at").first()
+    if patient:
+        return patient
+    if email:
+        patient = PatientMasterRecord.objects.filter(primary_contact__email__iexact=email).order_by("-updated_at").first()
+        if patient:
+            return patient
+    for phone in phone_candidates:
+        if not phone:
+            continue
+        patient = (
+            PatientMasterRecord.objects.filter(primary_contact__phone=phone).order_by("-updated_at").first()
+            or PatientMasterRecord.objects.filter(primary_contact__phone_number=phone).order_by("-updated_at").first()
+        )
+        if patient:
+            return patient
+    return None
+
+
+def _default_primary_contact_for_user(user) -> dict[str, Any]:
+    if not getattr(user, "is_authenticated", False):
+        return {}
+    return {
+        "user_id": str(getattr(user, "id", "") or ""),
+        "email": str(getattr(user, "email", "") or ""),
+        "phone": str(getattr(user, "phone", "") or ""),
+        "phone_number": str(getattr(user, "phone_number", "") or ""),
+        "display_name": (
+            str(getattr(user, "display_name", "") or "").strip()
+            or str(getattr(user, "username", "") or "").strip()
+            or str(getattr(user, "email", "") or "").strip()
+        ),
+    }
+
+
+def _extract_identity_payload(health_payload: dict[str, Any]) -> dict[str, Any]:
+    identity = health_payload.get("identity")
+    if isinstance(identity, dict):
+        return dict(identity)
+    return {}
+
+
+def _extract_emergency_payload(health_payload: dict[str, Any]) -> dict[str, Any]:
+    emergency = health_payload.get("emergency")
+    if isinstance(emergency, dict):
+        return dict(emergency)
+    return {}
+
+
+def _merge_health_profile_core_fields(profile: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    identity_updates = updates.get("identity")
+    if isinstance(identity_updates, dict):
+        existing_identity = profile.get("identity") if isinstance(profile.get("identity"), dict) else {}
+        merged_identity = dict(existing_identity)
+        for key in ("first_name", "last_name", "full_name", "dob", "gender", "primary_contact"):
+            value = identity_updates.get(key)
+            if value is not None:
+                merged_identity[key] = value
+        profile["identity"] = merged_identity
+
+    emergency_updates = updates.get("emergency")
+    if isinstance(emergency_updates, dict):
+        existing_emergency = profile.get("emergency") if isinstance(profile.get("emergency"), dict) else {}
+        merged_emergency = dict(existing_emergency)
+        for key in ("emergency_contact", "blood_type", "medical_notes"):
+            value = emergency_updates.get(key)
+            if value is not None:
+                merged_emergency[key] = value
+        profile["emergency"] = merged_emergency
+
+    for key in ("primary_contact", "emergency_contact", "blood_type", "medical_notes", "profile_name"):
+        value = updates.get(key)
+        if value is not None:
+            profile[key] = value
+
+    return profile
+
+
+def _sync_core_patient_from_health_profile(user, health_payload: dict[str, Any]):
+    PatientMasterRecord = django_apps.get_model("core", "PatientMasterRecord")
+
+    patient = _resolve_core_patient_for_user(user)
+    identity = _extract_identity_payload(health_payload)
+    emergency = _extract_emergency_payload(health_payload)
+
+    primary_contact = health_payload.get("primary_contact")
+    if not isinstance(primary_contact, dict):
+        primary_contact = identity.get("primary_contact")
+    if not isinstance(primary_contact, dict) or not primary_contact:
+        primary_contact = _default_primary_contact_for_user(user)
+
+    emergency_contact = health_payload.get("emergency_contact")
+    if not isinstance(emergency_contact, dict):
+        emergency_contact = emergency.get("emergency_contact")
+    if not isinstance(emergency_contact, dict):
+        emergency_contact = {}
+
+    first_name = str(
+        identity.get("first_name")
+        or health_payload.get("first_name")
+        or getattr(user, "display_name", "")
+        or "Health"
+    ).strip() or "Health"
+    last_name = str(
+        identity.get("last_name")
+        or health_payload.get("last_name")
+        or getattr(user, "username", "")
+        or "Profile"
+    ).strip() or "Profile"
+    gender = str(
+        identity.get("gender")
+        or health_payload.get("gender")
+        or PatientMasterRecord.GENDER_UNKNOWN
+    ).strip() or PatientMasterRecord.GENDER_UNKNOWN
+    dob_value = identity.get("dob") or health_payload.get("dob")
+
+    metadata = dict(patient.metadata if patient and isinstance(patient.metadata, dict) else {})
+    for key, value in {
+        "blood_type": emergency.get("blood_type") or health_payload.get("blood_type"),
+        "medical_notes": emergency.get("medical_notes") or health_payload.get("medical_notes"),
+        "health_profile_name": health_payload.get("profile_name"),
+    }.items():
+        if value is not None:
+            metadata[key] = value
+    metadata["linked_health_profile_user_id"] = str(getattr(user, "id", "") or "")
+
+    defaults = {
+        "first_name": first_name,
+        "last_name": last_name,
+        "gender": gender,
+        "primary_contact": primary_contact,
+        "emergency_contact": emergency_contact,
+        "metadata": metadata,
+    }
+    if dob_value:
+        defaults["dob"] = dob_value
+
+    if patient is None:
+        patient = PatientMasterRecord.objects.create(
+            mrn=f"KIS-HP-{uuid.uuid4().hex[:10].upper()}",
+            **defaults,
+        )
+    else:
+        for field, value in defaults.items():
+            setattr(patient, field, value)
+        patient.save()
+
+    return patient
+
+
+def _merge_core_patient_into_health_profile(health_payload: dict[str, Any], patient) -> dict[str, Any]:
+    payload = dict(health_payload or {})
+    patient_metadata = patient.metadata if isinstance(getattr(patient, "metadata", None), dict) else {}
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    emergency = payload.get("emergency") if isinstance(payload.get("emergency"), dict) else {}
+
+    identity.update(
+        {
+            "patient_id": str(getattr(patient, "id", "") or ""),
+            "mrn": getattr(patient, "mrn", ""),
+            "first_name": getattr(patient, "first_name", ""),
+            "last_name": getattr(patient, "last_name", ""),
+            "full_name": " ".join(
+                part for part in [getattr(patient, "first_name", ""), getattr(patient, "last_name", "")] if part
+            ).strip(),
+            "dob": patient.dob.isoformat() if getattr(patient, "dob", None) else None,
+            "gender": getattr(patient, "gender", ""),
+            "primary_contact": patient.primary_contact if isinstance(getattr(patient, "primary_contact", None), dict) else {},
+        }
+    )
+    emergency.update(
+        {
+            "emergency_contact": patient.emergency_contact if isinstance(getattr(patient, "emergency_contact", None), dict) else {},
+            "blood_type": patient_metadata.get("blood_type"),
+            "medical_notes": patient_metadata.get("medical_notes"),
+        }
+    )
+
+    payload["identity"] = identity
+    payload["emergency"] = emergency
+    payload["primary_contact"] = identity.get("primary_contact") or {}
+    payload["emergency_contact"] = emergency.get("emergency_contact") or {}
+    payload["blood_type"] = emergency.get("blood_type")
+    payload["medical_notes"] = emergency.get("medical_notes")
+    payload["linked_patient_id"] = str(getattr(patient, "id", "") or "")
+    payload["linked_patient_mrn"] = getattr(patient, "mrn", "")
+    return payload
+
+
 def _load_user_profiles(user, include_member_institutions: bool = False):
     prefs = dict(getattr(user, "preferences", {}) or {})
     profiles = dict(prefs.get("profiles") or {})
@@ -3761,6 +4296,9 @@ def _load_user_profiles(user, include_member_institutions: bool = False):
         health_profile,
         profiles.get("health") if isinstance(profiles.get("health"), dict) else None,
     )
+    linked_patient = _resolve_core_patient_for_user(user)
+    if linked_patient:
+        health_payload = _merge_core_patient_into_health_profile(health_payload, linked_patient)
 
     local_institutions = _ensure_institution_data(health_payload.get("institutions") or [])
     owned_institutions = [inst for inst in local_institutions if _is_user_owner_of_institution(user, inst)]
@@ -3841,7 +4379,11 @@ def _save_user_profiles(user, profiles):
             defaults={"payload": _prepare_health_profile_for_storage(health_payload)},
         )
         _sync_health_profile_tables_from_payload(health_profile, health_payload)
-        persisted_profiles["health"] = _compose_health_profile_payload(health_profile)
+        linked_patient = _sync_core_patient_from_health_profile(user, health_payload)
+        persisted_profiles["health"] = _merge_core_patient_into_health_profile(
+            _compose_health_profile_payload(health_profile),
+            linked_patient,
+        )
 
     market_payload = persisted_profiles.get("market")
     if isinstance(market_payload, dict):
@@ -6996,30 +7538,13 @@ class BroadcastCommentRoomView(APIView):
         except BroadcastItem.DoesNotExist:
             return Response({"detail": "Broadcast item not found."}, status=404)
 
-        conversation = item.comment_conversation
-        if not conversation:
-            title = "Broadcast comments"
-            conversation = Conversation.objects.create(
-                type=ConversationType.POST,
-                title=title,
-                description=f"Comments for broadcast item {item.id}",
-                created_by=request.user,
-            )
-            ConversationSettings.objects.get_or_create(
-                conversation=conversation,
-                defaults={
-                    "send_policy": ConversationSendPolicy.ALL_MEMBERS,
-                    "join_policy": ChatConversationJoinPolicy.OPEN,
-                },
-            )
-            item.comment_conversation = conversation
-            item.save(update_fields=["comment_conversation"])
-
-        ConversationMember.objects.get_or_create(
-            conversation=conversation,
-            user=request.user,
-            defaults={"base_role": BaseConversationRole.MEMBER},
+        conversation = ensure_post_comment_conversation(
+            item,
+            actor=request.user,
+            title="Broadcast comments",
+            description=f"Comments for broadcast item {item.id}",
         )
+        ensure_conversation_member(conversation, request.user)
 
         return Response(
             {"conversation_id": str(conversation.id), "title": conversation.title},
@@ -7443,7 +7968,7 @@ class EducationInstitutionListView(APIView):
             membership_policy=_normalize_institution_membership_policy(request.data.get("membership_policy")),
             contact_email=str(request.data.get("contact_email") or "").strip(),
             contact_phone=str(request.data.get("contact_phone") or "").strip(),
-            branding=request.data.get("branding") if isinstance(request.data.get("branding"), dict) else {},
+            branding=_normalize_education_branding_payload(request.data),
             settings=request.data.get("settings") if isinstance(request.data.get("settings"), dict) else {},
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
@@ -7477,7 +8002,10 @@ class EducationInstitutionDetailView(APIView):
     def get(self, request, institution_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
         serializer = EducationInstitutionSerializer(institution, context={"request": request})
-        return Response({"institution": serializer.data}, status=status.HTTP_200_OK)
+        return Response(
+            _with_primary_detail_summary({"institution": serializer.data}, "institution"),
+            status=status.HTTP_200_OK,
+        )
 
     @transaction.atomic
     def patch(self, request, institution_id: str):
@@ -7502,8 +8030,22 @@ class EducationInstitutionDetailView(APIView):
         contact_phone = request.data.get("contact_phone")
         if isinstance(contact_phone, str):
             institution.contact_phone = contact_phone.strip()
-        if isinstance(request.data.get("branding"), dict):
-            institution.branding = request.data.get("branding")
+        if isinstance(request.data.get("branding"), dict) or any(
+            key in request.data
+            for key in (
+                "logo_url",
+                "logoUrl",
+                "image_url",
+                "imageUrl",
+                "institution_image_url",
+                "institutionImageUrl",
+                "banner_image_url",
+                "bannerImageUrl",
+                "cover_image_url",
+                "coverImageUrl",
+            )
+        ):
+            institution.branding = _normalize_education_branding_payload(request.data, existing=institution.branding or {})
         if isinstance(request.data.get("settings"), dict):
             institution.settings = request.data.get("settings")
         if isinstance(request.data.get("metadata"), dict):
@@ -8040,6 +8582,7 @@ class EducationInstitutionProgramListView(APIView):
             code=str(request.data.get("code") or "").strip(),
             summary=str(request.data.get("summary") or "").strip(),
             description=str(request.data.get("description") or "").strip(),
+            cover_image_url=_education_cover_image_from_payload(request.data),
             status=_normalize_academic_status(request.data.get("status")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
@@ -8075,11 +8618,14 @@ class EducationInstitutionProgramDetailView(APIView):
         description = request.data.get("description")
         if isinstance(description, str):
             program.description = description.strip()
+        if _education_cover_image_in_payload(request.data):
+            program.cover_image_url = _education_cover_image_from_payload(request.data)
         if "status" in request.data:
             program.status = _normalize_academic_status(request.data.get("status"), program.status)
         if isinstance(request.data.get("metadata"), dict):
             program.metadata = request.data.get("metadata")
         program.save()
+        _sync_education_source_broadcasts(program)
         serializer = EducationInstitutionProgramSerializer(program)
         return Response({"program": serializer.data}, status=status.HTTP_200_OK)
 
@@ -8123,6 +8669,7 @@ class EducationInstitutionCourseListView(APIView):
             code=str(request.data.get("code") or "").strip(),
             summary=str(request.data.get("summary") or "").strip(),
             description=str(request.data.get("description") or "").strip(),
+            cover_image_url=_education_cover_image_from_payload(request.data),
             status=_normalize_academic_status(request.data.get("status")),
             duration_minutes=max(int(request.data.get("duration_minutes") or 0), 0),
             seat_limit=_to_optional_positive_int(request.data.get("seat_limit")),
@@ -8161,6 +8708,8 @@ class EducationInstitutionCourseDetailView(APIView):
         description = request.data.get("description")
         if isinstance(description, str):
             course.description = description.strip()
+        if _education_cover_image_in_payload(request.data):
+            course.cover_image_url = _education_cover_image_from_payload(request.data)
         if "program_id" in request.data:
             program_id = request.data.get("program_id")
             course.program = _get_institution_program_or_404(institution, str(program_id)) if program_id else None
@@ -8175,6 +8724,7 @@ class EducationInstitutionCourseDetailView(APIView):
         if isinstance(request.data.get("settings"), dict):
             course.settings = request.data.get("settings")
         course.save()
+        _sync_education_source_broadcasts(course)
         serializer = EducationInstitutionCourseSerializer(course)
         return Response({"course": serializer.data}, status=status.HTTP_200_OK)
 
@@ -8232,7 +8782,11 @@ class EducationInstitutionCourseModuleDetailView(APIView):
         institution = _get_education_institution_or_404(request.user, institution_id)
         course = _get_institution_course_or_404(institution, course_id)
         module = _get_institution_course_module_or_404(institution, course, module_id)
-        return Response({"module": EducationInstitutionCourseModuleSerializer(module).data}, status=status.HTTP_200_OK)
+        module_payload = EducationInstitutionCourseModuleSerializer(module).data
+        return Response(
+            _with_primary_detail_summary({"module": module_payload}, "module"),
+            status=status.HTTP_200_OK,
+        )
 
     @transaction.atomic
     def patch(self, request, institution_id: str, course_id: str, module_id: str):
@@ -8325,7 +8879,11 @@ class EducationInstitutionCourseModuleItemDetailView(APIView):
         course = _get_institution_course_or_404(institution, course_id)
         module = _get_institution_course_module_or_404(institution, course, module_id)
         item = _get_institution_course_module_item_or_404(institution, course, module, item_id)
-        return Response({"item": EducationInstitutionCourseModuleItemSerializer(item).data}, status=status.HTTP_200_OK)
+        item_payload = EducationInstitutionCourseModuleItemSerializer(item).data
+        return Response(
+            _with_primary_detail_summary({"item": item_payload}, "item"),
+            status=status.HTTP_200_OK,
+        )
 
     @transaction.atomic
     def patch(self, request, institution_id: str, course_id: str, module_id: str, item_id: str):
@@ -8404,6 +8962,7 @@ class EducationInstitutionLessonListView(APIView):
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
             content=str(request.data.get("content") or "").strip(),
+            cover_image_url=_education_cover_image_from_payload(request.data),
             lesson_order=max(int(request.data.get("lesson_order") or 0), 0),
             duration_minutes=max(int(request.data.get("duration_minutes") or 0), 0),
             is_preview=_to_bool(request.data.get("is_preview")),
@@ -8444,6 +9003,8 @@ class EducationInstitutionLessonDetailView(APIView):
         content = request.data.get("content")
         if isinstance(content, str):
             lesson.content = content.strip()
+        if _education_cover_image_in_payload(request.data):
+            lesson.cover_image_url = _education_cover_image_from_payload(request.data)
         if "lesson_order" in request.data:
             lesson.lesson_order = max(int(request.data.get("lesson_order") or 0), 0)
         if "duration_minutes" in request.data:
@@ -8455,6 +9016,7 @@ class EducationInstitutionLessonDetailView(APIView):
         if isinstance(request.data.get("metadata"), dict):
             lesson.metadata = request.data.get("metadata")
         lesson.save()
+        _sync_education_source_broadcasts(lesson)
         serializer = EducationInstitutionLessonSerializer(lesson)
         return Response({"lesson": serializer.data}, status=status.HTTP_200_OK)
 
@@ -8509,6 +9071,7 @@ class EducationInstitutionClassSessionListView(APIView):
             lesson=lesson,
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
+            cover_image_url=_education_cover_image_from_payload(request.data),
             starts_at=starts_at,
             ends_at=ends_at,
             timezone_name=str(request.data.get("timezone_name") or "UTC").strip() or "UTC",
@@ -8545,6 +9108,8 @@ class EducationInstitutionClassSessionDetailView(APIView):
         summary = request.data.get("summary")
         if isinstance(summary, str):
             session.summary = summary.strip()
+        if _education_cover_image_in_payload(request.data):
+            session.cover_image_url = _education_cover_image_from_payload(request.data)
         if "course_id" in request.data:
             course_id = request.data.get("course_id")
             session.course = _get_institution_course_or_404(institution, str(course_id)) if course_id else None
@@ -8573,6 +9138,7 @@ class EducationInstitutionClassSessionDetailView(APIView):
         if isinstance(request.data.get("metadata"), dict):
             session.metadata = request.data.get("metadata")
         session.save()
+        _sync_education_source_broadcasts(session)
         serializer = EducationInstitutionClassSessionSerializer(session)
         return Response({"class_session": serializer.data}, status=status.HTTP_200_OK)
 
@@ -8679,6 +9245,7 @@ class EducationInstitutionMaterialListView(APIView):
             assessment=assessments[0] if assessments else None,
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
+            cover_image_url=_education_cover_image_from_payload(request.data),
             kind=_normalize_material_kind(request.data.get("kind")),
             resource_url=str(request.data.get("resource_url") or "").strip(),
             resource_name=str(request.data.get("resource_name") or "").strip(),
@@ -8716,7 +9283,10 @@ class EducationInstitutionMaterialDetailView(APIView):
             ).get(id=material.id)
         )
         serializer = EducationInstitutionMaterialSerializer(material)
-        return Response({"material": serializer.data}, status=status.HTTP_200_OK)
+        return Response(
+            _with_primary_detail_summary({"material": serializer.data}, "material"),
+            status=status.HTTP_200_OK,
+        )
 
     @transaction.atomic
     def patch(self, request, institution_id: str, material_id: str):
@@ -8729,6 +9299,8 @@ class EducationInstitutionMaterialDetailView(APIView):
         summary = request.data.get("summary")
         if isinstance(summary, str):
             material.summary = summary.strip()
+        if _education_cover_image_in_payload(request.data):
+            material.cover_image_url = _education_cover_image_from_payload(request.data)
         programs = list(material.program_links.all()) or ([material.program] if material.program else [])
         courses = list(material.course_links.all()) or ([material.course] if material.course else [])
         lessons = list(material.lesson_links.all()) or ([material.lesson] if material.lesson else [])
@@ -8879,6 +9451,7 @@ class EducationInstitutionEventListView(APIView):
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
             description=str(request.data.get("description") or "").strip(),
+            cover_image_url=_education_cover_image_from_payload(request.data),
             starts_at=starts_at,
             ends_at=ends_at,
             timezone_name=str(request.data.get("timezone_name") or "UTC").strip() or "UTC",
@@ -8916,6 +9489,8 @@ class EducationInstitutionEventDetailView(APIView):
             value = request.data.get(field)
             if isinstance(value, str):
                 setattr(event, field, value.strip())
+        if _education_cover_image_in_payload(request.data):
+            event.cover_image_url = _education_cover_image_from_payload(request.data)
         if "program_id" in request.data:
             program_id = request.data.get("program_id")
             event.program = _get_institution_program_or_404(institution, str(program_id)) if program_id else None
@@ -8937,7 +9512,6 @@ class EducationInstitutionEventDetailView(APIView):
             event.starts_at = _parse_dt(request.data.get("starts_at"))
         if "ends_at" in request.data and request.data.get("ends_at"):
             event.ends_at = _parse_dt(request.data.get("ends_at"))
-        print("Nigel see it now: ", event.ends_at, event.starts_at)
         if event.ends_at <= event.starts_at:
             raise ValidationError({"detail": "ends_at must be after starts_at."})
         if "timezone_name" in request.data:
@@ -8951,6 +9525,7 @@ class EducationInstitutionEventDetailView(APIView):
         if isinstance(request.data.get("metadata"), dict):
             event.metadata = request.data.get("metadata")
         event.save()
+        _sync_education_source_broadcasts(event)
         serializer = EducationInstitutionEventSerializer(event)
         return Response({"event": serializer.data}, status=status.HTTP_200_OK)
 
@@ -8977,30 +9552,63 @@ class EducationInstitutionBroadcastListView(APIView):
             qs = qs.filter(broadcast_kind=_normalize_education_broadcast_kind(request.query_params.get("broadcast_kind")))
         if membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationBroadcastStatus.PUBLISHED)
-        serializer = EducationInstitutionBroadcastSerializer(qs, many=True)
+        serializer = EducationInstitutionBroadcastSerializer(qs, many=True, context={"request": request})
         return Response({"broadcasts": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
     def post(self, request, institution_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
         manager_membership = _require_manage_institution_membership(request.user, institution)
-        broadcast_kind = _normalize_education_broadcast_kind(request.data.get("broadcast_kind"))
 
         program = None
         course = None
         lesson = None
         class_session = None
         event = None
-        if request.data.get("program_id"):
-            program = _get_institution_program_or_404(institution, str(request.data.get("program_id")))
-        if request.data.get("course_id"):
-            course = _get_institution_course_or_404(institution, str(request.data.get("course_id")))
-        if request.data.get("lesson_id"):
-            lesson = _get_institution_lesson_or_404(institution, str(request.data.get("lesson_id")))
-        if request.data.get("class_session_id"):
-            class_session = _get_institution_class_session_or_404(institution, str(request.data.get("class_session_id")))
-        if request.data.get("event_id"):
-            event = _get_institution_event_or_404(institution, str(request.data.get("event_id")))
+        program_id = _coerce_payload_id(
+            _nested_payload_value(request.data, "program_id", "programId", "program"),
+            "program_id",
+            "programId",
+        )
+        course_id = _coerce_payload_id(
+            _nested_payload_value(request.data, "course_id", "courseId", "course"),
+            "course_id",
+            "courseId",
+        )
+        lesson_id = _coerce_payload_id(
+            _nested_payload_value(request.data, "lesson_id", "lessonId", "lesson"),
+            "lesson_id",
+            "lessonId",
+        )
+        class_session_id = _coerce_payload_id(
+            _nested_payload_value(request.data, "class_session_id", "classSessionId", "class_session", "classSession"),
+            "class_session_id",
+            "classSessionId",
+        )
+        event_id = _coerce_payload_id(
+            _nested_payload_value(request.data, "event_id", "eventId", "event", "target_id", "targetId", "entity_id", "entityId"),
+            "event_id",
+            "eventId",
+        )
+        if program_id:
+            program = _get_institution_program_or_404(institution, str(program_id))
+        if course_id:
+            course = _get_institution_course_or_404(institution, str(course_id))
+        if lesson_id:
+            lesson = _get_institution_lesson_or_404(institution, str(lesson_id))
+        if class_session_id:
+            class_session = _get_institution_class_session_or_404(institution, str(class_session_id))
+        if event_id:
+            event = _get_institution_event_or_404(institution, str(event_id))
+
+        broadcast_kind = _education_broadcast_kind_from_targets(
+            _nested_payload_value(request.data, "broadcast_kind", "broadcastKind", "broadcast_type", "broadcastType", "kind"),
+            program=program,
+            course=course,
+            lesson=lesson,
+            class_session=class_session,
+            event=event,
+        )
 
         program, course = _validate_program_course_pair(program, course)
         course, lesson = _validate_course_lesson_pair(course, lesson)
@@ -9018,10 +9626,12 @@ class EducationInstitutionBroadcastListView(APIView):
             raise ValidationError({"event_id": "Event is required for event/training broadcasts."})
         if broadcast_kind == EducationBroadcastKind.INSTITUTION_NOTICE and any([program, course, lesson, class_session, event]):
             raise ValidationError({"broadcast_kind": "Institution notices should not target a specific academic entity."})
-        if event and broadcast_kind == EducationBroadcastKind.TRAINING_SESSION and event.event_type != EducationInstitutionEventType.TRAINING_SESSION:
-            raise ValidationError({"event_id": "Selected event is not a training session."})
-        if event and broadcast_kind == EducationBroadcastKind.EVENT and event.event_type != EducationInstitutionEventType.EVENT:
-            raise ValidationError({"event_id": "Selected event is not a standard event."})
+        if event and broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION}:
+            broadcast_kind = (
+                EducationBroadcastKind.TRAINING_SESSION
+                if event.event_type == EducationInstitutionEventType.TRAINING_SESSION
+                else EducationBroadcastKind.EVENT
+            )
 
         default_title = (
             (program.title if program else None)
@@ -9060,6 +9670,9 @@ class EducationInstitutionBroadcastListView(APIView):
             else (event.seat_limit if event else (course.seat_limit if course else None))
         )
         published_at = timezone.now()
+        raw_price_amount = _education_price_amount_from_payload(request.data)
+        manual_cover_image = _education_cover_image_in_payload(request.data)
+        cover_image_url = _education_cover_image_from_payload(request.data) if manual_cover_image else ""
         broadcast = EducationInstitutionBroadcast.objects.create(
             institution=institution,
             created_by=request.user,
@@ -9072,13 +9685,13 @@ class EducationInstitutionBroadcastListView(APIView):
             title=str(request.data.get("title") or default_title).strip() or default_title,
             summary=str(request.data.get("summary") or default_summary).strip(),
             description=str(request.data.get("description") or default_description).strip(),
-            cover_image_url=str(request.data.get("cover_image_url") or "").strip(),
+            cover_image_url=cover_image_url,
             starts_at=starts_at,
             ends_at=ends_at,
             timezone_name=str(request.data.get("timezone_name") or timezone_name).strip() or timezone_name,
             seat_limit=_to_optional_positive_int(request.data.get("seat_limit")) if "seat_limit" in request.data else seat_limit,
             booking_enabled=_to_bool(request.data.get("booking_enabled")),
-            price_amount=request.data.get("price_amount") if request.data.get("price_amount") not in ("", None) else None,
+            price_amount=_normalize_education_decimal(raw_price_amount, "price_amount") if raw_price_amount not in (None, "") else None,
             price_currency=_normalize_education_currency(request.data.get("price_currency")),
             status=_normalize_education_broadcast_status(request.data.get("status")),
             published_at=published_at,
@@ -9087,11 +9700,13 @@ class EducationInstitutionBroadcastListView(APIView):
                 **(request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {}),
                 "institution_membership_policy": institution.membership_policy,
                 "manager_role": manager_membership.role,
+                "manual_cover_image": manual_cover_image,
             },
         )
         _sync_education_broadcast_item(broadcast)
         serializer = EducationInstitutionBroadcastSerializer(
-            _get_institution_broadcast_or_404(institution, str(broadcast.id))
+            _get_institution_broadcast_or_404(institution, str(broadcast.id)),
+            context={"request": request},
         )
         return Response({"broadcast": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -9118,20 +9733,40 @@ class EducationInstitutionBroadcastDetailView(APIView):
         institution = _get_education_institution_or_404(request.user, institution_id)
         _require_manage_institution_membership(request.user, institution)
         broadcast = _get_institution_broadcast_or_404(institution, broadcast_id)
-        if "program_id" in request.data:
-            program_id = request.data.get("program_id")
+        if any(key in request.data for key in ("program_id", "programId", "program")):
+            program_id = _coerce_payload_id(
+                _nested_payload_value(request.data, "program_id", "programId", "program"),
+                "program_id",
+                "programId",
+            )
             broadcast.program = _get_institution_program_or_404(institution, str(program_id)) if program_id else None
-        if "course_id" in request.data:
-            course_id = request.data.get("course_id")
+        if any(key in request.data for key in ("course_id", "courseId", "course")):
+            course_id = _coerce_payload_id(
+                _nested_payload_value(request.data, "course_id", "courseId", "course"),
+                "course_id",
+                "courseId",
+            )
             broadcast.course = _get_institution_course_or_404(institution, str(course_id)) if course_id else None
-        if "lesson_id" in request.data:
-            lesson_id = request.data.get("lesson_id")
+        if any(key in request.data for key in ("lesson_id", "lessonId", "lesson")):
+            lesson_id = _coerce_payload_id(
+                _nested_payload_value(request.data, "lesson_id", "lessonId", "lesson"),
+                "lesson_id",
+                "lessonId",
+            )
             broadcast.lesson = _get_institution_lesson_or_404(institution, str(lesson_id)) if lesson_id else None
-        if "class_session_id" in request.data:
-            class_session_id = request.data.get("class_session_id")
+        if any(key in request.data for key in ("class_session_id", "classSessionId", "class_session", "classSession")):
+            class_session_id = _coerce_payload_id(
+                _nested_payload_value(request.data, "class_session_id", "classSessionId", "class_session", "classSession"),
+                "class_session_id",
+                "classSessionId",
+            )
             broadcast.class_session = _get_institution_class_session_or_404(institution, str(class_session_id)) if class_session_id else None
-        if "event_id" in request.data:
-            event_id = request.data.get("event_id")
+        if any(key in request.data for key in ("event_id", "eventId", "event", "target", "target_id", "targetId", "entity_id", "entityId")):
+            event_id = _coerce_payload_id(
+                _nested_payload_value(request.data, "event_id", "eventId", "event", "target_id", "targetId", "entity_id", "entityId"),
+                "event_id",
+                "eventId",
+            )
             broadcast.event = _get_institution_event_or_404(institution, str(event_id)) if event_id else None
         broadcast.program, broadcast.course = _validate_program_course_pair(broadcast.program, broadcast.course)
         broadcast.course, broadcast.lesson = _validate_course_lesson_pair(broadcast.course, broadcast.lesson)
@@ -9142,8 +9777,15 @@ class EducationInstitutionBroadcastDetailView(APIView):
             broadcast.course,
             broadcast.class_session,
         )
-        if "broadcast_kind" in request.data:
-            broadcast.broadcast_kind = _normalize_education_broadcast_kind(request.data.get("broadcast_kind"))
+        if any(key in request.data for key in ("broadcast_kind", "broadcastKind", "broadcast_type", "broadcastType", "kind")):
+            broadcast.broadcast_kind = _education_broadcast_kind_from_targets(
+                _nested_payload_value(request.data, "broadcast_kind", "broadcastKind", "broadcast_type", "broadcastType", "kind"),
+                program=broadcast.program,
+                course=broadcast.course,
+                lesson=broadcast.lesson,
+                class_session=broadcast.class_session,
+                event=broadcast.event,
+            )
         if broadcast.broadcast_kind == EducationBroadcastKind.PROGRAM and not broadcast.program:
             raise ValidationError({"program_id": "Program is required for program broadcasts."})
         if broadcast.broadcast_kind == EducationBroadcastKind.COURSE and not broadcast.course:
@@ -9154,21 +9796,41 @@ class EducationInstitutionBroadcastDetailView(APIView):
             raise ValidationError({"class_session_id": "Class session is required for class broadcasts."})
         if broadcast.broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION} and not broadcast.event:
             raise ValidationError({"event_id": "Event is required for event or training broadcasts."})
+        if broadcast.event and broadcast.broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION}:
+            broadcast.broadcast_kind = (
+                EducationBroadcastKind.TRAINING_SESSION
+                if broadcast.event.event_type == EducationInstitutionEventType.TRAINING_SESSION
+                else EducationBroadcastKind.EVENT
+            )
         if broadcast.broadcast_kind == EducationBroadcastKind.INSTITUTION_NOTICE and any(
             [broadcast.program, broadcast.course, broadcast.lesson, broadcast.class_session, broadcast.event]
         ):
             raise ValidationError({"broadcast_kind": "Institution notices cannot target a specific academic entity."})
-        for field in ("title", "summary", "description", "cover_image_url", "timezone_name"):
+        for field in ("title", "summary", "description", "timezone_name"):
             if field in request.data:
                 setattr(broadcast, field, str(request.data.get(field) or "").strip())
+        if _education_cover_image_in_payload(request.data):
+            broadcast.cover_image_url = _education_cover_image_from_payload(request.data)
+            metadata = dict(broadcast.metadata) if isinstance(broadcast.metadata, dict) else {}
+            metadata["manual_cover_image"] = True
+            broadcast.metadata = metadata
+        elif isinstance(broadcast.metadata, dict):
+            metadata = dict(broadcast.metadata)
+            metadata["manual_cover_image"] = False
+            broadcast.metadata = metadata
         if "price_currency" in request.data:
             broadcast.price_currency = _normalize_education_currency(request.data.get("price_currency"))
         if "seat_limit" in request.data:
             broadcast.seat_limit = _to_optional_positive_int(request.data.get("seat_limit"))
         if "booking_enabled" in request.data:
             broadcast.booking_enabled = _to_bool(request.data.get("booking_enabled"))
-        if "price_amount" in request.data:
-            broadcast.price_amount = request.data.get("price_amount") if request.data.get("price_amount") not in ("", None) else None
+        if any(key in request.data for key in ("price_amount", "priceAmount", "price", "pricing", "cost", "fee", "amount", "amount_kisc", "amountKisc")):
+            raw_price_amount = _education_price_amount_from_payload(request.data)
+            broadcast.price_amount = (
+                _normalize_education_decimal(raw_price_amount, "price_amount")
+                if raw_price_amount not in (None, "")
+                else None
+            )
         if "status" in request.data:
             broadcast.status = _normalize_education_broadcast_status(request.data.get("status"), broadcast.status)
         if "starts_at" in request.data:
@@ -9187,7 +9849,7 @@ class EducationInstitutionBroadcastDetailView(APIView):
             broadcast.published_at = timezone.now()
         broadcast.save()
         _sync_education_broadcast_item(broadcast)
-        serializer = EducationInstitutionBroadcastSerializer(broadcast)
+        serializer = EducationInstitutionBroadcastSerializer(broadcast, context={"request": request})
         return Response({"broadcast": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -9422,7 +10084,7 @@ class EducationBroadcastCatalogView(APIView):
         )
         if request.query_params.get("broadcast_kind"):
             qs = qs.filter(broadcast_kind=_normalize_education_broadcast_kind(request.query_params.get("broadcast_kind")))
-        serializer = EducationInstitutionBroadcastSerializer(qs, many=True)
+        serializer = EducationInstitutionBroadcastSerializer(qs, many=True, context={"request": request})
         results = serializer.data
         for row, broadcast in zip(results, qs):
             row["viewer_state"] = _build_broadcast_viewer_state(broadcast, request.user)
@@ -10063,6 +10725,7 @@ class EducationInstitutionAssessmentListView(APIView):
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
             instructions=str(request.data.get("instructions") or "").strip(),
+            cover_image_url=_education_cover_image_from_payload(request.data),
             assessment_type=_normalize_assessment_type(request.data.get("assessment_type")),
             status=_normalize_academic_status(request.data.get("status")),
             starts_at=starts_at,
@@ -10100,6 +10763,8 @@ class EducationInstitutionAssessmentDetailView(APIView):
             value = request.data.get(field)
             if isinstance(value, str):
                 setattr(assessment, field, value.strip())
+        if _education_cover_image_in_payload(request.data):
+            assessment.cover_image_url = _education_cover_image_from_payload(request.data)
         if "course_id" in request.data:
             cid = request.data.get("course_id")
             assessment.course = _get_institution_course_or_404(institution, str(cid)) if cid else None
@@ -10172,7 +10837,7 @@ class EducationInstitutionAssessmentQuestionListView(APIView):
             prompt=prompt,
             question_type=_normalize_assessment_question_type(request.data.get("question_type")),
             question_order=max(int(request.data.get("question_order") or 0), 0),
-            points=request.data.get("points") or 1,
+            points=_normalize_education_decimal(request.data.get("points") or 1, "points", allow_none=False),
             is_required=_to_bool(request.data.get("is_required"), default=True),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
@@ -10205,7 +10870,11 @@ class EducationInstitutionAssessmentQuestionDetailView(APIView):
         if "question_order" in request.data:
             question.question_order = max(int(request.data.get("question_order") or 0), 0)
         if "points" in request.data:
-            question.points = request.data.get("points") or question.points
+            question.points = _normalize_education_decimal(
+                request.data.get("points"),
+                "points",
+                allow_none=False,
+            )
         if "is_required" in request.data:
             question.is_required = _to_bool(request.data.get("is_required"), default=question.is_required)
         if isinstance(request.data.get("metadata"), dict):
@@ -10437,7 +11106,11 @@ class EducationInstitutionAssessmentSubmissionActionView(APIView):
                     question=question,
                 )
                 if "earned_points" in row:
-                    response.earned_points = row.get("earned_points") or response.earned_points
+                    response.earned_points = _normalize_education_decimal(
+                        row.get("earned_points"),
+                        "earned_points",
+                        allow_none=False,
+                    )
                 if "is_correct" in row:
                     response.is_correct = row.get("is_correct")
                 if "grader_feedback" in row:
@@ -10602,6 +11275,7 @@ class ProfileCreationView(APIView):
 
         updated_institutions = existing_institutions + sanitized_institutions
         health['institutions'] = updated_institutions
+        health = _merge_health_profile_core_fields(health, payload)
         health = _ensure_health_profile_structure(health)
         health['profile_name'] = payload.get('profile_name') or health.get('profile_name') or 'Health Profile'
         health['features'] = HEALTH_SYSTEM_FEATURES
@@ -12484,6 +13158,7 @@ class ProfileManagementView(APIView):
                 locked = _enforce_immutable_owner(existing, institution)
                 locked_institutions.append(_sanitize_institution(locked) or locked)
             profile['institutions'] = locked_institutions
+        profile = _merge_health_profile_core_fields(profile, updates)
         profile = _ensure_health_profile_structure(profile)
         appointments = updates.get('appointments') or []
         if appointments:

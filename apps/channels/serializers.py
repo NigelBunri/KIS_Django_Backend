@@ -10,6 +10,21 @@ from apps.chat.models import (
     ConversationSendPolicy,
     ConversationType,
 )
+from common.media_urls import absolutize_backend_media, normalize_image_payload
+
+
+class ChannelImageUrlSerializerMixin:
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        if "avatar_url" in payload:
+            payload["avatar_url"] = absolutize_backend_media(
+                payload.get("avatar_url"),
+                request=self.context.get("request"),
+            )
+        return payload
+
+    def validate_avatar_url(self, value):
+        return normalize_image_payload(value)
 
 
 def _member_for(channel: Channel, user):
@@ -33,7 +48,7 @@ def _can_send(channel: Channel, member: ConversationMember | None, user=None) ->
     return True
 
 
-class ChannelListSerializer(serializers.ModelSerializer):
+class ChannelListSerializer(ChannelImageUrlSerializerMixin, serializers.ModelSerializer):
     conversation_id = serializers.UUIDField(source="conversation.id", read_only=True)
     is_subscribed = serializers.SerializerMethodField()
     member_role = serializers.SerializerMethodField()
@@ -79,7 +94,7 @@ class ChannelListSerializer(serializers.ModelSerializer):
         return _can_send(obj, member, self.context["request"].user)
 
 
-class ChannelDetailSerializer(serializers.ModelSerializer):
+class ChannelDetailSerializer(ChannelImageUrlSerializerMixin, serializers.ModelSerializer):
     conversation_id = serializers.UUIDField(source="conversation.id", read_only=True)
     is_subscribed = serializers.SerializerMethodField()
     member_role = serializers.SerializerMethodField()
@@ -132,7 +147,7 @@ class ChannelDetailSerializer(serializers.ModelSerializer):
         return _can_send(obj, member, self.context["request"].user)
 
 
-class ChannelCreateSerializer(serializers.ModelSerializer):
+class ChannelCreateSerializer(ChannelImageUrlSerializerMixin, serializers.ModelSerializer):
     """
     For creating a channel; automatically creates the backing Conversation
     and membership for the owner.

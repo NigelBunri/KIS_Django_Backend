@@ -8,6 +8,7 @@ from django.db import models
 from django.utils import timezone
 
 from apps.accounts.models import User
+from common.media_urls import normalize_image_payload
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +185,10 @@ class Conversation(models.Model):
     def __str__(self) -> str:
         return f"{self.get_type_display()}:{self.id}"
 
+    def save(self, *args, **kwargs):
+        self.avatar_url = normalize_image_payload(self.avatar_url)
+        super().save(*args, **kwargs)
+
 
 class BaseConversationRole(models.TextChoices):
     """
@@ -253,6 +258,16 @@ class ConversationMember(models.Model):
         help_text="If true, user shouldn't receive messages from this conversation.",
     )
 
+    last_read_seq = models.BigIntegerField(
+        default=0,
+        help_text="Highest authoritative conversation sequence read by this member.",
+    )
+    last_read_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Timestamp when the member last advanced the read watermark.",
+    )
+
     joined_at = models.DateTimeField(default=timezone.now)
     left_at = models.DateTimeField(null=True, blank=True)
 
@@ -264,6 +279,7 @@ class ConversationMember(models.Model):
             models.Index(fields=['user', 'joined_at']),
             models.Index(fields=['conversation', 'base_role']),
             models.Index(fields=['user', 'notification_level']),
+            models.Index(fields=['conversation', 'last_read_seq']),
         ]
 
     def __str__(self) -> str:

@@ -48,6 +48,7 @@ from django.utils.text import slugify
 from django.contrib.postgres.fields import ArrayField
 from django.core.exceptions import ValidationError
 from apps.billing.models import WalletTransaction
+from common.media_urls import normalize_image_payload
 
 from .constants import KIS_COIN_CODE
 
@@ -134,6 +135,10 @@ class ShopLandingPage(BaseEntity):
 
     def __str__(self):
         return f"Landing page for {self.shop.name}"
+
+    def save(self, *args, **kwargs):
+        self.hero_image_url = normalize_image_payload(self.hero_image_url)
+        super().save(*args, **kwargs)
 
 
 class ShopLandingTestimonial(BaseEntity):
@@ -296,6 +301,10 @@ class ShopService(BaseEntity):
 
     def __str__(self):
         return f"Service {self.name} ({self.shop.name})"
+
+    def save(self, *args, **kwargs):
+        self.image_url = normalize_image_payload(self.image_url)
+        super().save(*args, **kwargs)
 
 
 class ServiceBooking(BaseEntity):
@@ -752,6 +761,10 @@ class ProductVariant(BaseEntity):
 
     def __str__(self):
         return f"Variant {self.sku or self.id} of {self.product.name}"
+
+    def save(self, *args, **kwargs):
+        self.image_url = normalize_image_payload(self.image_url)
+        super().save(*args, **kwargs)
 
 
 class Cart(BaseEntity):

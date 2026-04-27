@@ -1,4 +1,5 @@
 import tempfile
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -6,7 +7,16 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.utils import timezone
 from apps.accounts.models import Profile
-from apps.broadcasts.models import BroadcastFeedProfile, BroadcastItem, BroadcastMarketProfile, BroadcastSourceType, BroadcastVideo
+from apps.broadcasts.models import (
+    BroadcastFeedProfile,
+    BroadcastItem,
+    BroadcastMarketProfile,
+    BroadcastSourceType,
+    BroadcastVideo,
+    EducationInstitution,
+    EducationInstitutionBroadcast,
+    EducationInstitutionEvent,
+)
 from apps.channels.models import Channel
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
 from apps.communities.models import Community, CommunityMembership, CommunityRole
@@ -46,6 +56,65 @@ class BroadcastProfileManageTests(APITestCase):
         self.assertIsInstance(profile, dict)
         account_profile = Profile.objects.get(user=self.user)
         self.assertTrue(BroadcastMarketProfile.objects.filter(profile=account_profile).exists())
+
+    def test_manage_market_profile_merges_attachments_without_dropping_existing_entries(self):
+        first = self.client.post(
+            '/api/v1/broadcasts/profiles/manage/',
+            {
+                'profile_type': 'market_profile',
+                'updates': {
+                    'attachments': [
+                        {'url': 'https://example.com/one.jpg', 'name': 'one.jpg'},
+                    ],
+                    'shops': [{'id': 'shop_1', 'name': 'Shop One'}],
+                },
+            },
+            format='json',
+        )
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+
+        second = self.client.post(
+            '/api/v1/broadcasts/profiles/manage/',
+            {
+                'profile_type': 'market_profile',
+                'updates': {
+                    'attachments': [
+                        {'url': 'https://example.com/two.jpg', 'name': 'two.jpg'},
+                    ],
+                },
+            },
+            format='json',
+        )
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        profile = second.data.get('profile') or {}
+        attachments = profile.get('attachments') or []
+        self.assertEqual(len(attachments), 2)
+        self.assertEqual(profile.get('shops') or [], [{'id': 'shop_1', 'name': 'Shop One'}])
+
+    def test_manage_education_profile_bootstraps_structure_and_appends_modules(self):
+        response = self.client.post(
+            '/api/v1/broadcasts/profiles/manage/',
+            {
+                'profile_type': 'education_profile',
+                'updates': {
+                    'modules': [
+                        {
+                            'title': 'Orientation',
+                            'summary': 'Start here',
+                            'resource_url': 'https://example.com/orientation.pdf',
+                        }
+                    ],
+                },
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        profile = response.data.get('profile') or {}
+        self.assertIn('courses', profile)
+        self.assertIn('modules', profile)
+        self.assertEqual(len(profile.get('modules') or []), 1)
+        self.assertEqual((profile.get('modules') or [])[0].get('title'), 'Orientation')
 
     def test_feed_entry_create_bootstraps_feed_profile_when_missing(self):
         response = self.client.post(
@@ -532,6 +601,216 @@ class BroadcastProfileManageTests(APITestCase):
             for row in (page_one.data.get('results') or []) + (page_two.data.get('results') or [])
         }
         self.assertTrue({str(first.id), str(second.id), str(third.id)}.issubset(collected_ids))
+
+
+class EducationInstitutionFormNormalizationTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            phone="5553034040",
+            username="education_form_user",
+            password="secret",
+            country="NG",
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_institution_image_aliases_are_saved_and_returned(self):
+        with override_settings(API_BASE_URL="http://10.112.162.99:8000", SITE_URL="http://10.112.162.99:8000"):
+            response = self.client.post(
+                "/api/v1/broadcasts/education/institutions/",
+                {
+                    "name": "Image Academy",
+                    "description": "Institution with direct image aliases.",
+                    "imageUrl": "http://10.112.162.99:8000/media/institutions/institution.jpg",
+                    "logoUrl": "http://10.112.162.99:8000/media/institutions/logo.jpg",
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        institution = response.data.get("institution") or {}
+        self.assertEqual(institution.get("image_url"), "http://10.112.162.99:8000/media/institutions/institution.jpg")
+        self.assertEqual(institution.get("logo_url"), "http://10.112.162.99:8000/media/institutions/logo.jpg")
+        branding = institution.get("branding") or {}
+        self.assertEqual(branding.get("image_url"), "http://10.112.162.99:8000/media/institutions/institution.jpg")
+        self.assertEqual(branding.get("logo_url"), "http://10.112.162.99:8000/media/institutions/logo.jpg")
+        stored = EducationInstitution.objects.get(id=institution["id"])
+        self.assertEqual(stored.branding.get("image_url"), "/media/institutions/institution.jpg")
+        self.assertEqual(stored.branding.get("logo_url"), "/media/institutions/logo.jpg")
+
+    def test_education_broadcast_price_accepts_formatted_decimal(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Pricing Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution_id = create_response.data["institution"]["id"]
+
+        with override_settings(API_BASE_URL="http://10.112.162.99:8000", SITE_URL="http://10.112.162.99:8000"):
+            response = self.client.post(
+                f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
+                {
+                    "broadcast_kind": "institution_notice",
+                    "title": "Paid orientation",
+                    "priceAmount": "KISC 1,200.50",
+                    "coverImageUrl": "http://10.112.162.99:8000/media/education/orientation.jpg",
+                    "booking_enabled": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        broadcast = EducationInstitutionBroadcast.objects.get(id=response.data["broadcast"]["id"])
+        self.assertEqual(str(broadcast.price_amount), "1200.50")
+        self.assertEqual(broadcast.cover_image_url, "/media/education/orientation.jpg")
+        self.assertEqual(
+            response.data["broadcast"]["cover_image_url"],
+            "http://10.112.162.99:8000/media/education/orientation.jpg",
+        )
+
+    def test_education_broadcast_price_accepts_nested_price_object(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Nested Pricing Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution_id = create_response.data["institution"]["id"]
+
+        response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
+            {
+                "broadcast_kind": "institution_notice",
+                "title": "Nested paid orientation",
+                "price": {"amount": "KISC 1,200.50", "currency": "KISC"},
+                "booking_enabled": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        broadcast = EducationInstitutionBroadcast.objects.get(id=response.data["broadcast"]["id"])
+        self.assertEqual(str(broadcast.price_amount), "1200.50")
+
+    def test_education_broadcast_free_price_does_not_fail_decimal_validation(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Free Pricing Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution_id = create_response.data["institution"]["id"]
+
+        response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
+            {
+                "broadcast_kind": "institution_notice",
+                "title": "Free orientation",
+                "price": "free",
+                "booking_enabled": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        broadcast = EducationInstitutionBroadcast.objects.get(id=response.data["broadcast"]["id"])
+        self.assertIsNone(broadcast.price_amount)
+
+    def test_education_broadcast_patch_ignores_javascript_object_price_string(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Patch Pricing Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution_id = create_response.data["institution"]["id"]
+        broadcast_response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
+            {
+                "broadcast_kind": "institution_notice",
+                "title": "Patch price event",
+                "priceAmount": "25.00",
+            },
+            format="json",
+        )
+        self.assertEqual(broadcast_response.status_code, status.HTTP_201_CREATED, broadcast_response.data)
+        broadcast_id = broadcast_response.data["broadcast"]["id"]
+
+        response = self.client.patch(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/{broadcast_id}/",
+            {"price": "[object Object]"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        broadcast = EducationInstitutionBroadcast.objects.get(id=broadcast_id)
+        self.assertIsNone(broadcast.price_amount)
+
+    def test_event_broadcast_accepts_camel_case_event_payload(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Event Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution = EducationInstitution.objects.get(id=create_response.data["institution"]["id"])
+        event = EducationInstitutionEvent.objects.create(
+            institution=institution,
+            title="Campus open day",
+            summary="Meet the faculty.",
+            starts_at=timezone.now() + timedelta(days=1),
+            ends_at=timezone.now() + timedelta(days=1, hours=2),
+            event_type="event",
+            status="published",
+        )
+
+        response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution.id}/broadcasts/",
+            {
+                "broadcastKind": "event",
+                "eventId": str(event.id),
+                "title": "Campus open day broadcast",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        broadcast = EducationInstitutionBroadcast.objects.get(id=response.data["broadcast"]["id"])
+        self.assertEqual(broadcast.broadcast_kind, "event")
+        self.assertEqual(broadcast.event_id, event.id)
+
+    def test_event_broadcast_infers_kind_from_nested_target(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Nested Event Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution = EducationInstitution.objects.get(id=create_response.data["institution"]["id"])
+        event = EducationInstitutionEvent.objects.create(
+            institution=institution,
+            title="Nested open day",
+            starts_at=timezone.now() + timedelta(days=1),
+            ends_at=timezone.now() + timedelta(days=1, hours=2),
+            event_type="event",
+            status="published",
+        )
+
+        response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution.id}/broadcasts/",
+            {
+                "target": {"eventId": str(event.id)},
+                "type": "online",
+                "title": "Nested event broadcast",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        broadcast = EducationInstitutionBroadcast.objects.get(id=response.data["broadcast"]["id"])
+        self.assertEqual(broadcast.broadcast_kind, "event")
+        self.assertEqual(broadcast.event_id, event.id)
 
 
 class BroadcastVideoContractTests(APITestCase):

@@ -6,6 +6,7 @@ from django.utils import timezone
 from apps.accounts.models import User
 from apps.chat.models import Conversation
 from apps.chat.models import Conversation
+from common.media_urls import normalize_image_payload
 
 
 class CommunityVisibility(models.TextChoices):
@@ -124,6 +125,10 @@ class Community(models.Model):
 
     def __str__(self) -> str:
         return self.name
+
+    def save(self, *args, **kwargs):
+        self.avatar_url = normalize_image_payload(self.avatar_url)
+        super().save(*args, **kwargs)
 
 
 class CommunityMembership(models.Model):

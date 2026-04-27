@@ -72,6 +72,7 @@ from apps.chat.models import (
     ConversationSendPolicy,
     ConversationJoinPolicy as ChatConversationJoinPolicy,
 )
+from apps.chat.discussion import ensure_conversation_member, ensure_post_comment_conversation
 from apps.partners.serializers import (
     PartnerListSerializer,
     PartnerDetailSerializer,
@@ -3185,30 +3186,14 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Not allowed to comment.")
         self._ensure_can_engage(post.partner, request.user)
 
-        conversation = post.comment_conversation
-        if not conversation:
-            created_by = post.author or request.user
-            conversation = Conversation.objects.create(
-                type=ConversationType.POST,
-                title=f"{post.partner.name} comments",
-                description=f"Comments for partner post {post.id}",
-                created_by=created_by,
-            )
-            ConversationSettings.objects.get_or_create(
-                conversation=conversation,
-                defaults={
-                    "send_policy": ConversationSendPolicy.ALL_MEMBERS,
-                    "join_policy": ChatConversationJoinPolicy.OPEN,
-                },
-            )
-            post.comment_conversation = conversation
-            post.save(update_fields=["comment_conversation"])
-
-        ConversationMember.objects.get_or_create(
-            conversation=conversation,
-            user=request.user,
-            defaults={"base_role": BaseConversationRole.MEMBER},
+        conversation = ensure_post_comment_conversation(
+            post,
+            actor=request.user,
+            created_by=post.author or request.user,
+            title=f"{post.partner.name} comments",
+            description=f"Comments for partner post {post.id}",
         )
+        ensure_conversation_member(conversation, request.user)
 
         return Response(
             {"conversation_id": str(conversation.id), "title": conversation.title},

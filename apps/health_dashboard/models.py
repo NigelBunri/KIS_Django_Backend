@@ -5,6 +5,7 @@ from django.utils import timezone
 
 from apps.accounts.models import User
 from apps.broadcasts.models import BroadcastHealthInstitution, BroadcastHealthInstitutionService
+from common.media_urls import normalize_image_payload
 
 
 class TimeStampedUUIDModel(models.Model):
@@ -50,6 +51,11 @@ class HealthDashboardInstitution(TimeStampedUUIDModel):
             models.Index(fields=["owner_user", "institution_type"]),
             models.Index(fields=["is_active"]),
         ]
+
+    def save(self, *args, **kwargs):
+        self.landing_background_image_url = normalize_image_payload(self.landing_background_image_url)
+        self.landing_logo_url = normalize_image_payload(self.landing_logo_url)
+        super().save(*args, **kwargs)
 
 
 class HealthDashboardCard(TimeStampedUUIDModel):
@@ -137,6 +143,10 @@ class HealthDashboardHero(TimeStampedUUIDModel):
 
     class Meta:
         db_table = "health_dashboard_hero"
+
+    def save(self, *args, **kwargs):
+        self.image_url = normalize_image_payload(self.image_url)
+        super().save(*args, **kwargs)
 
 
 class HealthDashboardContact(TimeStampedUUIDModel):
@@ -290,6 +300,11 @@ class HealthDashboardInstitutionLandingPage(TimeStampedUUIDModel):
             models.Index(fields=["dashboard", "is_published"]),
         ]
 
+    def save(self, *args, **kwargs):
+        self.logo_url = normalize_image_payload(self.logo_url)
+        self.background_image_url = normalize_image_payload(self.background_image_url)
+        super().save(*args, **kwargs)
+
 
 class HealthDashboardLandingPageContact(TimeStampedUUIDModel):
     landing_page = models.OneToOneField(
@@ -375,6 +390,10 @@ class HealthDashboardLandingPageImage(TimeStampedUUIDModel):
         indexes = [
             models.Index(fields=["landing_page", "sort_order"]),
         ]
+
+    def save(self, *args, **kwargs):
+        self.image_url = normalize_image_payload(self.image_url)
+        super().save(*args, **kwargs)
 
 
 class HealthDashboardLandingPageSocialLink(TimeStampedUUIDModel):

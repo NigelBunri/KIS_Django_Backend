@@ -38,11 +38,31 @@ from apps.partners.models import (
     default_app_visibility,
 )
 from apps.chat.models import ConversationType
+from apps.chat.discussion import get_discussion_count
 from apps.chat.models import ConversationMember, BaseConversationRole
+from common.media_urls import absolutize_backend_media, normalize_image_payload
 from common.rich_text import build_plain_text_document, process_rich_text_document
 
 
-class PartnerListSerializer(serializers.ModelSerializer):
+class PartnerImageUrlSerializerMixin:
+    image_url_fields = ("avatar_url", "logo_url")
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        request = self.context.get("request")
+        for field in self.image_url_fields:
+            if field in payload:
+                payload[field] = absolutize_backend_media(payload.get(field), request=request)
+        return payload
+
+    def validate_avatar_url(self, value):
+        return normalize_image_payload(value)
+
+    def validate_logo_url(self, value):
+        return normalize_image_payload(value)
+
+
+class PartnerListSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSerializer):
     main_conversation_id = serializers.UUIDField(
         source="main_conversation.id",
         read_only=True,
@@ -108,7 +128,7 @@ class PartnerJoinConfigSerializer(serializers.ModelSerializer):
         ]
 
 
-class PartnerDiscoverSerializer(serializers.ModelSerializer):
+class PartnerDiscoverSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSerializer):
     main_conversation_id = serializers.UUIDField(
         source="main_conversation.id",
         read_only=True,
@@ -151,7 +171,7 @@ class PartnerDiscoverSerializer(serializers.ModelSerializer):
         return application.status if application else None
 
 
-class PartnerDetailSerializer(serializers.ModelSerializer):
+class PartnerDetailSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSerializer):
     main_conversation_id = serializers.UUIDField(
         source="main_conversation.id",
         read_only=True,
@@ -231,7 +251,7 @@ class PartnerDetailSerializer(serializers.ModelSerializer):
         return member.base_role if member else None
 
 
-class PartnerCreateSerializer(serializers.ModelSerializer):
+class PartnerCreateSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSerializer):
     """
     Used for creating a Partner. Optionally also creates a main POST Conversation.
 
@@ -399,7 +419,10 @@ class PartnerPostSerializer(serializers.ModelSerializer):
         return list(qs)
 
     def get_comments_count(self, obj):
-        return obj.comments.filter(is_deleted=False).count()
+        return get_discussion_count(
+            obj,
+            legacy_comment_queryset=obj.comments.filter(is_deleted=False),
+        )
 
     def get_has_reacted(self, obj):
         request = self.context.get("request")
@@ -994,7 +1017,7 @@ class PartnerSettingSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "partner", "updated_by", "updated_at"]
 
 
-class PartnerOrganizationProfileSerializer(serializers.ModelSerializer):
+class PartnerOrganizationProfileSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSerializer):
     class Meta:
         model = PartnerOrganizationProfile
         fields = [

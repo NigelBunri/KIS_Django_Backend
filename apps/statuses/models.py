@@ -14,6 +14,17 @@ class StatusType(models.TextChoices):
     TEXT = "text", "Text"
 
 
+class StatusVisibility(models.TextChoices):
+    CONTACTS = "contacts", "My contacts"
+    CONTACTS_EXCEPT = "contacts_except", "My contacts except"
+    ONLY_SHARE_WITH = "only_share_with", "Only share with"
+
+
+class StatusReplyPermission(models.TextChoices):
+    CONTACTS = "contacts", "Contacts"
+    NOBODY = "nobody", "Nobody"
+
+
 def status_upload_path(instance: "StatusItem", filename: str) -> str:
     return f"statuses/{instance.user_id}/{timezone.now().strftime('%Y/%m/%d')}/{filename}"
 
@@ -31,6 +42,17 @@ class StatusItem(models.Model):
     file = models.FileField(upload_to=status_upload_path, null=True, blank=True)
     duration_ms = models.PositiveIntegerField(null=True, blank=True)
     style = models.JSONField(default=dict, blank=True)
+    visibility = models.CharField(
+        max_length=32,
+        choices=StatusVisibility.choices,
+        default=StatusVisibility.CONTACTS,
+        db_index=True,
+    )
+    reply_permission = models.CharField(
+        max_length=16,
+        choices=StatusReplyPermission.choices,
+        default=StatusReplyPermission.CONTACTS,
+    )
     expires_at = models.DateTimeField(db_index=True)
     is_deleted = models.BooleanField(default=False)
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
@@ -54,6 +76,36 @@ class StatusItem(models.Model):
         return f"Status {self.id} ({self.type})"
 
 
+class StatusAudienceTarget(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    status = models.ForeignKey(
+        StatusItem,
+        on_delete=models.CASCADE,
+        related_name="audience_targets",
+    )
+    target_user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="status_audience_targets",
+    )
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["status", "target_user"],
+                name="status_audience_target_unique",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["status", "target_user"]),
+            models.Index(fields=["target_user", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"StatusAudienceTarget {self.status_id} -> {self.target_user_id}"
+
+
 class StatusItemView(models.Model):
     """
     Tracks who has viewed a status item.
@@ -74,3 +126,33 @@ class StatusItemView(models.Model):
 
     def __str__(self) -> str:
         return f"StatusView {self.status_id} by {self.user_id}"
+
+
+class StatusMute(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="status_mutes",
+    )
+    muted_user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="muted_in_statuses",
+    )
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "muted_user"],
+                name="status_mute_unique",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "muted_user"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"StatusMute {self.user_id} -> {self.muted_user_id}"

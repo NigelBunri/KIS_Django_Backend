@@ -1,5 +1,8 @@
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.authentication import JWTAuthentication
+from django.utils import timezone
+
+from .models import Device
 
 
 class DeviceBoundJWTAuthentication(JWTAuthentication):
@@ -32,6 +35,12 @@ class DeviceBoundJWTAuthentication(JWTAuthentication):
 
         if str(token_device_id) != str(header_device_id):
             raise AuthenticationFailed("Device mismatch")
+
+        device = Device.objects.filter(user=user, device_id=str(token_device_id)).first()
+        if not device:
+            raise AuthenticationFailed("Device session revoked")
+
+        Device.objects.filter(pk=device.pk).update(last_seen_at=timezone.now())
 
         return (user, validated_token)
 

@@ -19,8 +19,10 @@ from apps.partners.models import (
     PartnerOrganizationApp,
     PartnerOrganizationAppType,
     PartnerOrganizationProfile,
+    PartnerPost,
     PartnerRole,
 )
+from apps.partners.serializers import PartnerPostSerializer
 
 
 class PartnerApiTests(TestCase):
@@ -329,3 +331,62 @@ class PartnerApiTests(TestCase):
                 name="Onboarding Follow-up",
             ).exists()
         )
+
+    def test_partner_post_comment_room_is_reused_and_membership_is_created(self):
+        partner = self._create_partner()
+        PartnerMembership.objects.create(
+            partner=partner,
+            user=self.member,
+            status=PartnerMembershipStatus.MEMBER,
+            role="member",
+        )
+        ConversationMember.objects.create(
+            conversation=partner.main_conversation,
+            user=self.member,
+            base_role=BaseConversationRole.MEMBER,
+        )
+        post = PartnerPost.objects.create(
+            partner=partner,
+            author=self.owner,
+            text_plain="Comment here",
+            text_preview="Comment here",
+        )
+
+        self.client.force_authenticate(self.member)
+        first = self.client.post(f"/api/v1/partners/posts/{post.id}/comment-room/", {}, format="json")
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        conversation_id = first.data.get("conversation_id")
+        self.assertTrue(conversation_id)
+
+        second = self.client.post(f"/api/v1/partners/posts/{post.id}/comment-room/", {}, format="json")
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.assertEqual(second.data.get("conversation_id"), conversation_id)
+
+        self.assertTrue(
+            ConversationMember.objects.filter(
+                conversation_id=conversation_id,
+                user=self.member,
+                left_at__isnull=True,
+            ).exists()
+        )
+
+    def test_partner_post_serializer_prefers_comment_conversation_sequence_for_count(self):
+        partner = self._create_partner()
+        discussion = Conversation.objects.create(
+            type=ConversationType.POST,
+            title="Partner comments",
+            description="Canonical discussion",
+            created_by=self.owner,
+            last_message_seq=6,
+        )
+        post = PartnerPost.objects.create(
+            partner=partner,
+            author=self.owner,
+            text_plain="Comment source",
+            text_preview="Comment source",
+            comment_conversation=discussion,
+        )
+
+        payload = PartnerPostSerializer(post).data
+
+        self.assertEqual(payload["comments_count"], 6)

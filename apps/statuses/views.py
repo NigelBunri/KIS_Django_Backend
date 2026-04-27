@@ -3,8 +3,8 @@ from __future__ import annotations
 import uuid
 from collections import defaultdict
 from datetime import timedelta
-from typing import Iterable
 
+from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -13,8 +13,14 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 
-from apps.accounts.models import User
-from apps.statuses.models import StatusItem, StatusItemView
+from apps.accounts.models import User, UserContact
+from apps.moderation.models import AuditLog, Flag, UserBlock
+from apps.statuses.models import (
+    StatusItem,
+    StatusItemView,
+    StatusMute,
+    StatusVisibility,
+)
 from apps.statuses.serializers import StatusItemSerializer, StatusCreateSerializer
 
 
@@ -31,12 +37,14 @@ class StatusViewSet(viewsets.ModelViewSet):
             return StatusCreateSerializer
         return StatusItemSerializer
 
-    def _parse_user_ids(self) -> list[str]:
+    def _parse_user_ids(self) -> set[str] | None:
         request = self.request
         ids: set[str] = set()
+        has_filter = False
 
         raw_ids = request.query_params.get("userIds") or request.query_params.get("user_ids")
         if raw_ids:
+            has_filter = True
             for token in raw_ids.split(","):
                 token = token.strip()
                 if not token:
@@ -48,32 +56,150 @@ class StatusViewSet(viewsets.ModelViewSet):
 
         raw_phones = request.query_params.get("phones")
         if raw_phones:
+            has_filter = True
             phones = [p.strip() for p in raw_phones.split(",") if p.strip()]
             if phones:
                 found = User.objects.filter(phone__in=phones).values_list("id", flat=True)
                 ids.update({str(uid) for uid in found})
 
+        if not has_filter:
+            return None
         ids.add(str(request.user.id))
-        return list(ids)
+        return ids
 
-    def get_queryset(self):
+    def _get_status_contacts(self) -> tuple[set[str], set[str], set[str]]:
+        user = self.request.user
+        outgoing_contact_ids = set(
+            str(value)
+            for value in UserContact.objects.filter(
+                user=user,
+                contact_user__isnull=False,
+            ).values_list("contact_user_id", flat=True)
+        )
+        incoming_contact_ids = set(
+            str(value)
+            for value in UserContact.objects.filter(contact_user=user).values_list("user_id", flat=True)
+        )
+        mutual_contact_ids = outgoing_contact_ids & incoming_contact_ids
+        return outgoing_contact_ids, incoming_contact_ids, mutual_contact_ids
+
+    def _get_blocked_user_ids(self) -> set[str]:
+        user = self.request.user
+        blocked_by_me = UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
+        blocked_me = UserBlock.objects.filter(blocked=user).values_list("blocker_id", flat=True)
+        return {str(value) for value in blocked_by_me} | {str(value) for value in blocked_me}
+
+    def _get_muted_user_ids(self) -> set[str]:
+        return {
+            str(value)
+            for value in StatusMute.objects.filter(user=self.request.user).values_list("muted_user_id", flat=True)
+        }
+
+    def _can_view_status(
+        self,
+        status_item: StatusItem,
+        *,
+        viewer_id: str,
+        mutual_contact_ids: set[str],
+        blocked_user_ids: set[str],
+    ) -> bool:
+        author_id = str(status_item.user_id)
+        if author_id == viewer_id:
+            return True
+        if author_id in blocked_user_ids or viewer_id in blocked_user_ids:
+            return False
+        if author_id not in mutual_contact_ids:
+            return False
+        if status_item.visibility == StatusVisibility.CONTACTS:
+            return True
+        target_ids = {
+            str(target.target_user_id)
+            for target in getattr(status_item, "_prefetched_objects_cache", {}).get("audience_targets", [])
+        }
+        if not target_ids:
+            target_ids = {
+                str(value)
+                for value in status_item.audience_targets.values_list("target_user_id", flat=True)
+            }
+        if status_item.visibility == StatusVisibility.CONTACTS_EXCEPT:
+            return viewer_id not in target_ids
+        if status_item.visibility == StatusVisibility.ONLY_SHARE_WITH:
+            return viewer_id in target_ids
+        return False
+
+    def _base_status_queryset(self):
         now = timezone.now()
-        base = (
-            StatusItem.objects
-            .select_related("user", "user__profile")
+        return (
+            StatusItem.objects.select_related("user", "user__profile")
+            .prefetch_related("audience_targets")
+            .annotate(view_count=Count("views", distinct=True))
             .filter(is_deleted=False, expires_at__gt=now)
         )
+
+    def _build_viewed_by_preview(self, items: list[StatusItem]) -> dict[str, list[dict]]:
+        owner_items = [item for item in items if item.user_id == self.request.user.id]
+        if not owner_items:
+            return {}
+        rows = (
+            StatusItemView.objects.filter(status__in=owner_items)
+            .select_related("user")
+            .order_by("-viewed_at")
+        )
+        preview: dict[str, list[dict]] = defaultdict(list)
+        for row in rows:
+            bucket = preview[str(row.status_id)]
+            if len(bucket) >= 5:
+                continue
+            bucket.append(
+                {
+                    "id": str(row.user_id),
+                    "display_name": row.user.display_name or row.user.phone or f"User {row.user_id}",
+                    "viewed_at": row.viewed_at,
+                }
+            )
+        return preview
+
+    def _serialize_status_items(self, request, items: list[StatusItem], viewed_ids: set[str], mutual_contact_ids: set[str]):
+        return StatusItemSerializer(
+            items,
+            many=True,
+            context={
+                "request": request,
+                "viewed_ids": viewed_ids,
+                "mutual_contact_ids": mutual_contact_ids,
+                "viewed_by_preview": self._build_viewed_by_preview(items),
+            },
+        ).data
+
+    def get_queryset(self):
+        base = self._base_status_queryset()
         if self.action in ("retrieve", "update", "partial_update", "destroy"):
             return base.filter(user=self.request.user)
         return base
 
     def list(self, request, *args, **kwargs):
-        user_ids = self._parse_user_ids()
-        items = (
+        requested_user_ids = self._parse_user_ids()
+        viewer_id = str(request.user.id)
+        _, _, mutual_contact_ids = self._get_status_contacts()
+        blocked_user_ids = self._get_blocked_user_ids()
+        muted_user_ids = self._get_muted_user_ids()
+        base_items = (
             self.filter_queryset(self.get_queryset())
-            .filter(user_id__in=user_ids)
+            .exclude(user_id__in=blocked_user_ids)
+            .exclude(user_id__in=muted_user_ids)
             .order_by("-created_at")
         )
+        items = [
+            item
+            for item in base_items
+            if (requested_user_ids is None or str(item.user_id) in requested_user_ids)
+            and self._can_view_status(
+                item,
+                viewer_id=viewer_id,
+                mutual_contact_ids=mutual_contact_ids,
+                blocked_user_ids=blocked_user_ids,
+            )
+        ]
         viewed_ids = set(
             str(sid)
             for sid in StatusItemView.objects.filter(
@@ -95,12 +221,14 @@ class StatusViewSet(viewsets.ModelViewSet):
                     "display_name": user.display_name or user.phone or f"User {user.id}",
                     "avatar_url": getattr(user.profile, "avatar_url", None),
                 },
-                "items": StatusItemSerializer(
+                "items": self._serialize_status_items(
+                    request,
                     user_items,
-                    many=True,
-                    context={"request": request, "viewed_ids": viewed_ids},
-                ).data,
+                    viewed_ids,
+                    mutual_contact_ids,
+                ),
                 "latest_at": user_items[0].created_at,
+                "is_muted": user_id in muted_user_ids,
             }
             grouped[user_id]["has_unseen"] = any(
                 not item.get("viewed") for item in grouped[user_id]["items"]
@@ -151,6 +279,7 @@ class StatusViewSet(viewsets.ModelViewSet):
             .filter(user=request.user)
             .order_by("-created_at")
         )
+        _, _, mutual_contact_ids = self._get_status_contacts()
         viewed_ids = set(
             str(sid)
             for sid in StatusItemView.objects.filter(
@@ -158,17 +287,13 @@ class StatusViewSet(viewsets.ModelViewSet):
                 status_id__in=[item.id for item in items],
             ).values_list("status_id", flat=True)
         )
-        data = StatusItemSerializer(
-            items,
-            many=True,
-            context={"request": request, "viewed_ids": viewed_ids},
-        ).data
+        data = self._serialize_status_items(request, list(items), viewed_ids, mutual_contact_ids)
         return Response({"results": data}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="view")
     def mark_view(self, request, pk=None):
         try:
-            status_item = StatusItem.objects.get(
+            status_item = self._base_status_queryset().get(
                 id=pk,
                 is_deleted=False,
                 expires_at__gt=timezone.now(),
@@ -176,5 +301,177 @@ class StatusViewSet(viewsets.ModelViewSet):
         except StatusItem.DoesNotExist:
             return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        _, _, mutual_contact_ids = self._get_status_contacts()
+        blocked_user_ids = self._get_blocked_user_ids()
+        if not self._can_view_status(
+            status_item,
+            viewer_id=str(request.user.id),
+            mutual_contact_ids=mutual_contact_ids,
+            blocked_user_ids=blocked_user_ids,
+        ):
+            return Response({"detail": "You cannot view this status."}, status=status.HTTP_403_FORBIDDEN)
+
         StatusItemView.objects.get_or_create(status=status_item, user=request.user)
+        AuditLog.objects.create(
+            actor_id=request.user.id,
+            action="status.view",
+            target_type="STATUS",
+            target_id=status_item.id,
+            metadata={"author_id": str(status_item.user_id)},
+        )
         return Response({"viewed": True, "id": str(status_item.id)}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"], url_path="search")
+    def search(self, request):
+        query = (request.query_params.get("q") or "").strip()
+        type_filter = (request.query_params.get("type") or "").strip().lower()
+        viewer_id = str(request.user.id)
+        _, _, mutual_contact_ids = self._get_status_contacts()
+        blocked_user_ids = self._get_blocked_user_ids()
+        muted_user_ids = self._get_muted_user_ids()
+
+        items = self.get_queryset().exclude(user_id__in=blocked_user_ids).exclude(user_id__in=muted_user_ids)
+        if type_filter:
+            items = items.filter(type=type_filter)
+        if query:
+            items = items.filter(
+                Q(text__icontains=query)
+                | Q(user__display_name__icontains=query)
+                | Q(user__phone__icontains=query)
+            )
+        items = [
+            item
+            for item in items.order_by("-created_at")[:100]
+            if self._can_view_status(
+                item,
+                viewer_id=viewer_id,
+                mutual_contact_ids=mutual_contact_ids,
+                blocked_user_ids=blocked_user_ids,
+            )
+        ]
+        viewed_ids = set(
+            str(sid)
+            for sid in StatusItemView.objects.filter(
+                user=request.user,
+                status_id__in=[item.id for item in items],
+            ).values_list("status_id", flat=True)
+        )
+        data = self._serialize_status_items(request, items, viewed_ids, mutual_contact_ids)
+        return Response({"results": data, "count": len(data)}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="viewers")
+    def viewers(self, request, pk=None):
+        try:
+            status_item = self.get_queryset().get(id=pk, user=request.user)
+        except StatusItem.DoesNotExist:
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        rows = (
+            StatusItemView.objects.filter(status=status_item)
+            .select_related("user")
+            .order_by("-viewed_at")
+        )
+        results = [
+            {
+                "id": str(row.user_id),
+                "display_name": row.user.display_name or row.user.phone or f"User {row.user_id}",
+                "viewed_at": row.viewed_at,
+            }
+            for row in rows
+        ]
+        return Response(
+            {
+                "status_id": str(status_item.id),
+                "view_count": len(results),
+                "results": results,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"], url_path="mute")
+    def mute(self, request):
+        target_user_id = str(request.data.get("user_id") or "").strip()
+        if not target_user_id:
+            raise ValidationError({"user_id": "This field is required."})
+        if target_user_id == str(request.user.id):
+            raise ValidationError({"user_id": "You cannot mute yourself."})
+        try:
+            target_user = User.objects.get(id=target_user_id)
+        except User.DoesNotExist:
+            raise ValidationError({"user_id": "User not found."})
+
+        mute, created = StatusMute.objects.get_or_create(user=request.user, muted_user=target_user)
+        AuditLog.objects.create(
+            actor_id=request.user.id,
+            action="status.mute",
+            target_type="USER",
+            target_id=target_user.id,
+            metadata={"created": created},
+        )
+        return Response(
+            {
+                "muted": True,
+                "created": created,
+                "user_id": str(target_user.id),
+                "mute_id": str(mute.id),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"], url_path="unmute")
+    def unmute(self, request):
+        target_user_id = str(request.data.get("user_id") or "").strip()
+        if not target_user_id:
+            raise ValidationError({"user_id": "This field is required."})
+        deleted, _ = StatusMute.objects.filter(
+            user=request.user,
+            muted_user_id=target_user_id,
+        ).delete()
+        AuditLog.objects.create(
+            actor_id=request.user.id,
+            action="status.unmute",
+            target_type="USER",
+            target_id=target_user_id,
+            metadata={"removed": deleted > 0},
+        )
+        return Response(
+            {
+                "muted": False,
+                "removed": deleted > 0,
+                "user_id": target_user_id,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="report")
+    def report(self, request, pk=None):
+        try:
+            status_item = self._base_status_queryset().get(id=pk)
+        except StatusItem.DoesNotExist:
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        reason = (request.data.get("reason") or "").strip() or "status_report"
+        flag = Flag.objects.create(
+            source="USER",
+            target_type="STATUS",
+            target_id=status_item.id,
+            reporter_id=request.user.id,
+            reason=reason,
+            severity="MEDIUM",
+            tags=["status"],
+        )
+        AuditLog.objects.create(
+            actor_id=request.user.id,
+            action="status.report",
+            target_type="STATUS",
+            target_id=status_item.id,
+            metadata={"flag_id": str(flag.id), "reason": reason},
+        )
+        return Response(
+            {
+                "reported": True,
+                "flag_id": str(flag.id),
+                "status_id": str(status_item.id),
+            },
+            status=status.HTTP_201_CREATED,
+        )

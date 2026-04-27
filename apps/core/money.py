@@ -15,6 +15,16 @@ def parse_decimal_amount(value) -> Decimal | None:
         return None
     if isinstance(value, Decimal):
         return value
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.lower() in {"free", "none", "null", "n/a", "na", "no charge", "[object object]"}:
+            return Decimal("0")
+        for token in ("KISC", "kisc", "USD", "usd", "$", "₦", "€", "£"):
+            normalized = normalized.replace(token, "")
+        normalized = normalized.replace(",", "").strip()
+        value = normalized
     try:
         return Decimal(str(value).strip())
     except (InvalidOperation, TypeError, ValueError):

@@ -215,6 +215,70 @@ class ConversationViewSet(viewsets.ModelViewSet):
             )
         return Response(self.get_serializer(instance).data)
 
+    @action(detail=False, methods=["get"], url_path="search")
+    def search(self, request):
+        query = (request.query_params.get("q") or "").strip()
+        kind = (request.query_params.get("type") or "").strip()
+        qs = self.get_queryset()
+        if kind:
+            qs = qs.filter(type=kind)
+        if query:
+            qs = qs.filter(
+                Q(title__icontains=query)
+                | Q(description__icontains=query)
+                | Q(last_message_preview__icontains=query)
+                | Q(memberships__user__display_name__icontains=query)
+                | Q(memberships__user__phone__icontains=query)
+                | Q(memberships__user__username__icontains=query)
+            ).distinct()
+        qs = qs.order_by("-last_message_at", "-updated_at")[:50]
+        data = ConversationListSerializer(qs, many=True, context={"request": request}).data
+        return Response({"results": data, "count": len(data)}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"], url_path="participant-search")
+    def participant_search(self, request):
+        query = (request.query_params.get("q") or "").strip()
+        if not query:
+            return Response({"results": [], "count": 0}, status=status.HTTP_200_OK)
+
+        qs = (
+            ConversationMember.objects
+            .filter(
+                conversation__in=self.get_queryset(),
+                left_at__isnull=True,
+            )
+            .select_related("user", "conversation")
+            .filter(
+                Q(display_name__icontains=query)
+                | Q(user__display_name__icontains=query)
+                | Q(user__phone__icontains=query)
+                | Q(user__username__icontains=query)
+            )
+            .order_by("user__display_name", "user__phone")[:50]
+        )
+        results = []
+        seen: set[tuple[str, str]] = set()
+        for member in qs:
+            key = (str(member.conversation_id), str(member.user_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(
+                {
+                    "conversation_id": str(member.conversation_id),
+                    "conversation_title": member.conversation.title or "",
+                    "user": {
+                        "id": str(member.user_id),
+                        "display_name": member.user.display_name or member.user.phone or f"User {member.user_id}",
+                        "phone": member.user.phone,
+                        "username": member.user.username,
+                    },
+                    "membership_display_name": member.display_name,
+                    "base_role": member.base_role,
+                }
+            )
+        return Response({"results": results, "count": len(results)}, status=status.HTTP_200_OK)
+
     # ------------------------------------------------------------------
     # Direct conversations (DM request flow)
     # ------------------------------------------------------------------
@@ -438,30 +502,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
     # ------------------------------------------------------------------
     @action(
         detail=True,
-        methods=['get'],
-        url_path='member-ids',
-        permission_classes=[],
-        authentication_classes=[],
-    )
-    def member_ids(self, request, pk=None):
-        require_internal_auth(request)
-
-        try:
-            conversation = Conversation.objects.get(pk=pk)
-        except Conversation.DoesNotExist:
-            return Response({"detail": "Not found"}, status=404)
-
-        member_ids = list(
-            ConversationMember.objects.filter(
-                conversation=conversation,
-                left_at__isnull=True,
-            ).values_list('user_id', flat=True)
-        )
-
-        return Response({"member_ids": [str(mid) for mid in member_ids]})
-
-    @action(
-        detail=True,
         methods=['patch'],
         url_path='update-last-message',
         permission_classes=[],
@@ -496,6 +536,70 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.save(update_fields=['last_message_at', 'last_message_preview'])
 
         return Response({"ok": True})
+
+    @action(
+        detail=True,
+        methods=['patch'],
+        url_path='update-read-state',
+        permission_classes=[],
+        authentication_classes=[],
+    )
+    def update_read_state(self, request, pk=None):
+        require_internal_auth(request)
+
+        user_id = request.data.get("user_id")
+        incoming_seq = request.data.get("last_read_seq")
+        incoming_at = request.data.get("last_read_at")
+
+        if not user_id:
+            return Response({"detail": "user_id required"}, status=400)
+        if incoming_seq is None:
+            return Response({"detail": "last_read_seq required"}, status=400)
+
+        try:
+            last_read_seq = max(int(incoming_seq), 0)
+        except (TypeError, ValueError):
+            return Response({"detail": "last_read_seq must be an integer"}, status=400)
+
+        try:
+            conversation = Conversation.objects.get(pk=pk)
+        except Conversation.DoesNotExist:
+            return Response({"detail": "Not found"}, status=404)
+
+        member = ConversationMember.objects.filter(
+            conversation=conversation,
+            user_id=user_id,
+            left_at__isnull=True,
+        ).first()
+        if not member:
+            return Response({"detail": "Member not found"}, status=404)
+
+        next_seq = min(last_read_seq, int(conversation.last_message_seq or 0))
+        if next_seq <= int(member.last_read_seq or 0):
+            return Response({
+                "ok": True,
+                "ignored": True,
+                "last_read_seq": int(member.last_read_seq or 0),
+            })
+
+        parsed_at = timezone.now()
+        if incoming_at:
+            parsed = parse_datetime(str(incoming_at))
+            if not parsed:
+                return Response({"detail": "Invalid last_read_at"}, status=400)
+            if timezone.is_naive(parsed):
+                parsed = timezone.make_aware(parsed, timezone=timezone.utc)
+            parsed_at = parsed
+
+        member.last_read_seq = next_seq
+        member.last_read_at = parsed_at
+        member.save(update_fields=["last_read_seq", "last_read_at"])
+
+        return Response({
+            "ok": True,
+            "last_read_seq": int(member.last_read_seq or 0),
+            "last_read_at": member.last_read_at.isoformat() if member.last_read_at else None,
+        })
 
 
     @action(
@@ -594,10 +698,14 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if member.is_blocked:
             return Response({"isMember": True, "isBlocked": True, "role": member.base_role, "scopes": []})
 
-        # Allow messaging during pending direct requests (frontend handles UX)
-
         can_send = True
         settings = ConversationSettings.objects.filter(conversation=conversation).first()
+        if (
+            conversation.type == ConversationType.DIRECT
+            and conversation.request_state == ConversationRequestState.PENDING
+            and conversation.request_recipient_id == member.user_id
+        ):
+            can_send = False
         if conversation.is_locked and member.base_role not in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
             can_send = False
         if member.base_role == BaseConversationRole.READONLY:

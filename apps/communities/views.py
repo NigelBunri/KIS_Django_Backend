@@ -45,6 +45,7 @@ from apps.chat.models import (
     ConversationSendPolicy,
     ConversationJoinPolicy as ChatConversationJoinPolicy,
 )
+from apps.chat.discussion import ensure_conversation_member, ensure_post_comment_conversation
 from apps.feed_personalization import (
     get_affinity_profile,
     log_feed_interaction,
@@ -686,30 +687,14 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
         if not membership:
             raise PermissionDenied("Join the community to comment.")
 
-        conversation = post.comment_conversation
-        if not conversation:
-            created_by = post.author or request.user
-            conversation = Conversation.objects.create(
-                type=ConversationType.POST,
-                title=f"{post.community.name} comments",
-                description=f"Comments for community post {post.id}",
-                created_by=created_by,
-            )
-            ConversationSettings.objects.get_or_create(
-                conversation=conversation,
-                defaults={
-                    "send_policy": ConversationSendPolicy.ALL_MEMBERS,
-                    "join_policy": ChatConversationJoinPolicy.OPEN,
-                },
-            )
-            post.comment_conversation = conversation
-            post.save(update_fields=["comment_conversation"])
-
-        ConversationMember.objects.get_or_create(
-            conversation=conversation,
-            user=request.user,
-            defaults={"base_role": BaseConversationRole.MEMBER},
+        conversation = ensure_post_comment_conversation(
+            post,
+            actor=request.user,
+            created_by=post.author or request.user,
+            title=f"{post.community.name} comments",
+            description=f"Comments for community post {post.id}",
         )
+        ensure_conversation_member(conversation, request.user)
 
         return Response(
             {"conversation_id": str(conversation.id), "title": conversation.title},

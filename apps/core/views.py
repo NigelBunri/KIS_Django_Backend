@@ -2,6 +2,7 @@
 from django.shortcuts import get_object_or_404
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from decimal import Decimal
@@ -21,6 +22,7 @@ from drf_spectacular.utils import extend_schema, OpenApiParameter
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 
 from . import models, serializers
+from .interoperability import export_patient_fhir_bundle, import_patient_fhir_bundle
 
 from apps.notifications import services as notification_services
 
@@ -28,6 +30,39 @@ from apps.notifications import services as notification_services
 from django.apps import apps
 from django.conf import settings
 UserModel = apps.get_model(settings.AUTH_USER_MODEL)
+
+
+def _resolve_patient_for_user(user):
+    if not getattr(user, "is_authenticated", False):
+        return None
+
+    user_id = str(getattr(user, "id", "") or "").strip()
+    email = str(getattr(user, "email", "") or "").strip()
+    phone_candidates = [
+        str(getattr(user, "phone", "") or "").strip(),
+        str(getattr(user, "phone_number", "") or "").strip(),
+    ]
+
+    patient = models.PatientMasterRecord.objects.filter(primary_contact__user_id=user_id).order_by("-updated_at").first()
+    if patient:
+        return patient
+
+    if email:
+        patient = models.PatientMasterRecord.objects.filter(primary_contact__email__iexact=email).order_by("-updated_at").first()
+        if patient:
+            return patient
+
+    for phone in phone_candidates:
+        if not phone:
+            continue
+        patient = (
+            models.PatientMasterRecord.objects.filter(primary_contact__phone=phone).order_by("-updated_at").first()
+            or models.PatientMasterRecord.objects.filter(primary_contact__phone_number=phone).order_by("-updated_at").first()
+        )
+        if patient:
+            return patient
+
+    return None
 
 
 def _user_org_ids(user):
@@ -39,6 +74,82 @@ def _user_org_ids(user):
         user.medical_staff_profiles.filter(profile__organization_id__isnull=False).values_list(
             "profile__organization_id", flat=True
         )
+    )
+
+
+def _is_patient_owner(user, patient):
+    if not getattr(user, "is_authenticated", False) or not patient:
+        return False
+    user_id = str(getattr(user, "id", "") or "").strip()
+    primary_contact = patient.primary_contact if isinstance(patient.primary_contact, dict) else {}
+    return bool(user_id and str(primary_contact.get("user_id") or "").strip() == user_id)
+
+
+def _active_health_access_grant(user, patient):
+    if not getattr(user, "is_authenticated", False) or not patient:
+        return None
+    candidate = (
+        patient.access_grants.filter(granted_to=user, status=models.HealthDataAccessGrant.STATUS_ACTIVE)
+        .order_by("-created_at")
+        .first()
+    )
+    if candidate and candidate.is_active():
+        return candidate
+    return None
+
+
+def _health_scope_allows(grant, required_scope: str, emergency: bool = False) -> bool:
+    if not grant:
+        return False
+    if emergency and grant.allow_emergency_override:
+        return True
+    if grant.scope == models.HealthDataAccessGrant.SCOPE_FULL:
+        return True
+    if grant.scope == required_scope:
+        return True
+    if required_scope == models.HealthDataAccessGrant.SCOPE_SUMMARY and grant.scope in {
+        models.HealthDataAccessGrant.SCOPE_RECORDS,
+        models.HealthDataAccessGrant.SCOPE_EMERGENCY,
+    }:
+        return True
+    if required_scope == models.HealthDataAccessGrant.SCOPE_EMERGENCY and grant.scope == models.HealthDataAccessGrant.SCOPE_RECORDS:
+        return True
+    return False
+
+
+def _can_access_patient_record(user, patient, required_scope: str = models.HealthDataAccessGrant.SCOPE_SUMMARY, emergency: bool = False):
+    if getattr(user, "is_superuser", False):
+        return True, "superuser", None
+    if _is_patient_owner(user, patient):
+        return True, "owner", None
+    if patient.organization_id and user and getattr(user, "is_authenticated", False):
+        org_ids = _user_org_ids(user)
+        if org_ids is None or patient.organization_id in org_ids:
+            return True, "provider", None
+    grant = _active_health_access_grant(user, patient)
+    if grant and _health_scope_allows(grant, required_scope, emergency=emergency):
+        return True, "delegate", grant
+    return False, "", None
+
+
+def _log_patient_access(actor, patient, action: str, reason: str, grant=None, metadata=None):
+    payload = {
+        "patient_id": str(patient.id),
+        "reason": reason,
+    }
+    if grant is not None:
+        payload["grant_id"] = str(grant.id)
+        payload["grant_scope"] = grant.scope
+        payload["grant_role"] = grant.role
+    if metadata:
+        payload.update(metadata)
+    models.ComplianceAuditLog.log(
+        actor=actor,
+        action=action,
+        target_type="PatientMasterRecord",
+        target_id=str(patient.id),
+        severity=models.ComplianceAuditLog.SEVERITY_MEDIUM,
+        metadata=payload,
     )
 
 
@@ -509,6 +620,64 @@ class DataAccessConsentViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Patients"])
+class HealthDataAccessGrantViewSet(viewsets.ModelViewSet):
+    queryset = models.HealthDataAccessGrant.objects.select_related("patient", "granted_to", "granted_by").all()
+    serializer_class = serializers.HealthDataAccessGrantSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["patient", "granted_to", "role", "scope", "status"]
+    ordering_fields = ["created_at", "expires_at"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if getattr(self.request.user, "is_superuser", False):
+            return queryset
+        patient_ids = models.PatientMasterRecord.objects.filter(
+            primary_contact__user_id=str(getattr(self.request.user, "id", "") or "")
+        ).values_list("id", flat=True)
+        return queryset.filter(Q(granted_to=self.request.user) | Q(patient_id__in=patient_ids))
+
+    def perform_create(self, serializer):
+        patient = serializer.validated_data.get("patient")
+        allowed, reason, _grant = _can_access_patient_record(
+            self.request.user,
+            patient,
+            required_scope=models.HealthDataAccessGrant.SCOPE_FULL,
+        )
+        if not allowed or reason not in {"owner", "superuser"}:
+            raise PermissionDenied("Only the patient owner can grant health data access.")
+        grant = serializer.save(granted_by=self.request.user)
+        _log_patient_access(
+            self.request.user,
+            patient,
+            action="health_data_access.grant.create",
+            reason="owner_grant",
+            grant=grant,
+            metadata={"granted_to": str(grant.granted_to_id), "scope": grant.scope},
+        )
+
+    @action(detail=True, methods=["post"])
+    def revoke(self, request, pk=None):
+        grant = self.get_object()
+        allowed, reason, _ = _can_access_patient_record(
+            request.user,
+            grant.patient,
+            required_scope=models.HealthDataAccessGrant.SCOPE_FULL,
+        )
+        if not allowed or (reason not in {"owner", "superuser"} and grant.granted_to_id != request.user.id):
+            raise PermissionDenied("You cannot revoke this access grant.")
+        grant.revoke()
+        _log_patient_access(
+            request.user,
+            grant.patient,
+            action="health_data_access.grant.revoke",
+            reason="grant_revoked",
+            grant=grant,
+        )
+        return Response(self.get_serializer(grant).data)
+
+
+@extend_schema(tags=["Patients"])
 class PatientMasterRecordViewSet(viewsets.ModelViewSet):
     queryset = (
         models.PatientMasterRecord.objects.select_related("organization")
@@ -517,6 +686,14 @@ class PatientMasterRecordViewSet(viewsets.ModelViewSet):
             "consents",
             "encounters",
             "appointments",
+            "medications",
+            "allergies",
+            "vitals",
+            "wellness_metrics",
+            "problems",
+            "immunizations",
+            "procedures",
+            "documents",
         )
         .all()
     )
@@ -551,8 +728,338 @@ class PatientMasterRecordViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"])
     def summary(self, request, pk=None):
         patient = self.get_object()
+        allowed, reason, grant = _can_access_patient_record(
+            request.user,
+            patient,
+            required_scope=models.HealthDataAccessGrant.SCOPE_SUMMARY,
+        )
+        if not allowed:
+            raise PermissionDenied("You do not have access to this patient summary.")
+        _log_patient_access(request.user, patient, "patient.summary.read", reason, grant=grant)
         serializer = serializers.PatientMasterRecordDetailSerializer(patient)
         return Response(serializer.data)
+
+    @extend_schema(
+        summary="Get canonical patient health profile",
+        responses=serializers.PatientCanonicalHealthProfileSerializer,
+    )
+    @action(detail=True, methods=["get"], url_path="health-profile")
+    def health_profile(self, request, pk=None):
+        patient = self.get_object()
+        allowed, reason, grant = _can_access_patient_record(
+            request.user,
+            patient,
+            required_scope=models.HealthDataAccessGrant.SCOPE_RECORDS,
+        )
+        if not allowed:
+            raise PermissionDenied("You do not have access to this health profile.")
+        _log_patient_access(request.user, patient, "patient.health_profile.read", reason, grant=grant)
+        serializer = serializers.PatientCanonicalHealthProfileSerializer(patient, context={"request": request})
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Get patient-facing health summary",
+        responses=serializers.PatientHealthSummarySerializer,
+    )
+    @action(detail=True, methods=["get"], url_path="health-summary")
+    def health_summary(self, request, pk=None):
+        patient = self.get_object()
+        allowed, reason, grant = _can_access_patient_record(
+            request.user,
+            patient,
+            required_scope=models.HealthDataAccessGrant.SCOPE_SUMMARY,
+        )
+        if not allowed:
+            raise PermissionDenied("You do not have access to this health summary.")
+        _log_patient_access(request.user, patient, "patient.health_summary.read", reason, grant=grant)
+        serializer = serializers.PatientHealthSummarySerializer(patient, context={"request": request})
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Get patient emergency card",
+        responses=serializers.PatientEmergencyCardSerializer,
+    )
+    @action(detail=True, methods=["get"], url_path="emergency-card")
+    def emergency_card(self, request, pk=None):
+        patient = self.get_object()
+        allowed, reason, grant = _can_access_patient_record(
+            request.user,
+            patient,
+            required_scope=models.HealthDataAccessGrant.SCOPE_EMERGENCY,
+            emergency=True,
+        )
+        if not allowed:
+            raise PermissionDenied("You do not have access to this emergency card.")
+        _log_patient_access(request.user, patient, "patient.emergency_card.read", reason, grant=grant)
+        serializer = serializers.PatientEmergencyCardSerializer(patient, context={"request": request})
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Get my canonical health profile",
+        responses=serializers.PatientCanonicalHealthProfileSerializer,
+    )
+    @action(detail=False, methods=["get"], url_path="my-health-profile")
+    def my_health_profile(self, request):
+        patient = _resolve_patient_for_user(request.user)
+        if not patient:
+            return Response(
+                {
+                    "detail": "No linked patient master record found for the current user.",
+                    "code": "patient_profile_not_linked",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        _log_patient_access(request.user, patient, "patient.health_profile.read", "owner")
+        serializer = serializers.PatientCanonicalHealthProfileSerializer(
+            patient,
+            context={"request": request, "linked_user": request.user},
+        )
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Get my patient-facing health summary",
+        responses=serializers.PatientHealthSummarySerializer,
+    )
+    @action(detail=False, methods=["get"], url_path="my-health-summary")
+    def my_health_summary(self, request):
+        patient = _resolve_patient_for_user(request.user)
+        if not patient:
+            return Response(
+                {
+                    "detail": "No linked patient master record found for the current user.",
+                    "code": "patient_profile_not_linked",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        _log_patient_access(request.user, patient, "patient.health_summary.read", "owner")
+        serializer = serializers.PatientHealthSummarySerializer(
+            patient,
+            context={"request": request, "linked_user": request.user},
+        )
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Get my emergency card",
+        responses=serializers.PatientEmergencyCardSerializer,
+    )
+    @action(detail=False, methods=["get"], url_path="my-emergency-card")
+    def my_emergency_card(self, request):
+        patient = _resolve_patient_for_user(request.user)
+        if not patient:
+            return Response(
+                {
+                    "detail": "No linked patient master record found for the current user.",
+                    "code": "patient_profile_not_linked",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        _log_patient_access(request.user, patient, "patient.emergency_card.read", "owner")
+        serializer = serializers.PatientEmergencyCardSerializer(
+            patient,
+            context={"request": request, "linked_user": request.user},
+        )
+        return Response(serializer.data)
+
+    @extend_schema(summary="Get sharing summary for patient health data")
+    @action(detail=True, methods=["get"], url_path="sharing-summary")
+    def sharing_summary(self, request, pk=None):
+        patient = self.get_object()
+        allowed, reason, grant = _can_access_patient_record(
+            request.user,
+            patient,
+            required_scope=models.HealthDataAccessGrant.SCOPE_SUMMARY,
+        )
+        if not allowed:
+            raise PermissionDenied("You do not have access to this sharing summary.")
+        _log_patient_access(request.user, patient, "patient.sharing_summary.read", reason, grant=grant)
+        grants = patient.access_grants.select_related("granted_to", "granted_by").order_by("-created_at")[:20]
+        return Response(
+            {
+                "patient_id": str(patient.id),
+                "viewer_mode": reason,
+                "grants": serializers.HealthDataAccessGrantSerializer(grants, many=True).data,
+                "active_grants_count": patient.access_grants.filter(status=models.HealthDataAccessGrant.STATUS_ACTIVE).count(),
+            }
+        )
+
+    @extend_schema(summary="Get access history for patient health data")
+    @action(detail=True, methods=["get"], url_path="access-history")
+    def access_history(self, request, pk=None):
+        patient = self.get_object()
+        allowed, reason, grant = _can_access_patient_record(
+            request.user,
+            patient,
+            required_scope=models.HealthDataAccessGrant.SCOPE_SUMMARY,
+        )
+        if not allowed:
+            raise PermissionDenied("You do not have access to this access history.")
+        _log_patient_access(request.user, patient, "patient.access_history.read", reason, grant=grant)
+        logs = models.ComplianceAuditLog.objects.filter(
+            target_type="PatientMasterRecord",
+            target_id=str(patient.id),
+        ).order_by("-created_at")[:50]
+        return Response(
+            {
+                "patient_id": str(patient.id),
+                "results": serializers.ComplianceAuditLogSerializer(logs, many=True).data,
+            }
+        )
+
+    @extend_schema(summary="Get my sharing summary for health data")
+    @action(detail=False, methods=["get"], url_path="my-sharing-summary")
+    def my_sharing_summary(self, request):
+        patient = _resolve_patient_for_user(request.user)
+        if not patient:
+            return Response(
+                {"detail": "No linked patient master record found for the current user.", "code": "patient_profile_not_linked"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        grants = patient.access_grants.select_related("granted_to", "granted_by").order_by("-created_at")[:20]
+        return Response(
+            {
+                "patient_id": str(patient.id),
+                "viewer_mode": "owner",
+                "grants": serializers.HealthDataAccessGrantSerializer(grants, many=True).data,
+                "active_grants_count": patient.access_grants.filter(status=models.HealthDataAccessGrant.STATUS_ACTIVE).count(),
+            }
+        )
+
+    @extend_schema(summary="Get my access history for health data")
+    @action(detail=False, methods=["get"], url_path="my-access-history")
+    def my_access_history(self, request):
+        patient = _resolve_patient_for_user(request.user)
+        if not patient:
+            return Response(
+                {"detail": "No linked patient master record found for the current user.", "code": "patient_profile_not_linked"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        logs = models.ComplianceAuditLog.objects.filter(
+            target_type="PatientMasterRecord",
+            target_id=str(patient.id),
+        ).order_by("-created_at")[:50]
+        return Response(
+            {
+                "patient_id": str(patient.id),
+                "results": serializers.ComplianceAuditLogSerializer(logs, many=True).data,
+            }
+        )
+
+    @extend_schema(summary="Export patient health record bundle")
+    @action(detail=True, methods=["get"], url_path="export-bundle")
+    def export_bundle(self, request, pk=None):
+        patient = self.get_object()
+        bundle = export_patient_fhir_bundle(patient)
+        models.HealthRecordExchangeLog.objects.create(
+            patient=patient,
+            actor=request.user if getattr(request.user, "is_authenticated", False) else None,
+            direction=models.HealthRecordExchangeLog.DIRECTION_EXPORT,
+            exchange_format=models.HealthRecordExchangeLog.FORMAT_FHIR_BUNDLE,
+            source_label="patient_export",
+            status=models.HealthRecordExchangeLog.STATUS_SUCCESS,
+            summary={"entry_count": len(bundle.get("entry") or [])},
+            raw_payload=bundle,
+        )
+        return Response(bundle)
+
+    @extend_schema(summary="Import patient health record bundle")
+    @action(detail=True, methods=["post"], url_path="import-bundle")
+    def import_bundle(self, request, pk=None):
+        patient = self.get_object()
+        bundle = request.data.get("bundle") if isinstance(request.data, dict) else None
+        if not isinstance(bundle, dict):
+            raise ValidationError({"bundle": "A bundle object is required."})
+        try:
+            summary = import_patient_fhir_bundle(patient=patient, bundle=bundle, actor=request.user)
+            models.HealthRecordExchangeLog.objects.create(
+                patient=patient,
+                actor=request.user if getattr(request.user, "is_authenticated", False) else None,
+                direction=models.HealthRecordExchangeLog.DIRECTION_IMPORT,
+                exchange_format=models.HealthRecordExchangeLog.FORMAT_FHIR_BUNDLE,
+                source_label=str(request.data.get("source_label") or "bundle_import"),
+                status=models.HealthRecordExchangeLog.STATUS_SUCCESS,
+                summary=summary,
+                raw_payload=bundle,
+            )
+            models.ComplianceAuditLog.log(
+                actor=request.user,
+                action="health_record.import",
+                target_type="PatientMasterRecord",
+                target_id=str(patient.id),
+                metadata=summary,
+            )
+            return Response({"patient_id": str(patient.id), "summary": summary}, status=status.HTTP_200_OK)
+        except Exception as exc:
+            models.HealthRecordExchangeLog.objects.create(
+                patient=patient,
+                actor=request.user if getattr(request.user, "is_authenticated", False) else None,
+                direction=models.HealthRecordExchangeLog.DIRECTION_IMPORT,
+                exchange_format=models.HealthRecordExchangeLog.FORMAT_FHIR_BUNDLE,
+                source_label=str(request.data.get("source_label") or "bundle_import"),
+                status=models.HealthRecordExchangeLog.STATUS_FAILED,
+                summary={"error": str(exc)},
+                raw_payload=bundle,
+            )
+            raise ValidationError({"bundle": str(exc)})
+
+    @extend_schema(summary="Export my health record bundle")
+    @action(detail=False, methods=["get"], url_path="my-export-bundle")
+    def my_export_bundle(self, request):
+        patient = _resolve_patient_for_user(request.user)
+        if not patient:
+            return Response(
+                {"detail": "No linked patient master record found for the current user.", "code": "patient_profile_not_linked"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        bundle = export_patient_fhir_bundle(patient)
+        models.HealthRecordExchangeLog.objects.create(
+            patient=patient,
+            actor=request.user if getattr(request.user, "is_authenticated", False) else None,
+            direction=models.HealthRecordExchangeLog.DIRECTION_EXPORT,
+            exchange_format=models.HealthRecordExchangeLog.FORMAT_FHIR_BUNDLE,
+            source_label="my_patient_export",
+            status=models.HealthRecordExchangeLog.STATUS_SUCCESS,
+            summary={"entry_count": len(bundle.get("entry") or [])},
+            raw_payload=bundle,
+        )
+        return Response(bundle)
+
+    @extend_schema(summary="Import into my health record from bundle")
+    @action(detail=False, methods=["post"], url_path="my-import-bundle")
+    def my_import_bundle(self, request):
+        patient = _resolve_patient_for_user(request.user)
+        if not patient:
+            return Response(
+                {"detail": "No linked patient master record found for the current user.", "code": "patient_profile_not_linked"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        bundle = request.data.get("bundle") if isinstance(request.data, dict) else None
+        if not isinstance(bundle, dict):
+            raise ValidationError({"bundle": "A bundle object is required."})
+        try:
+            summary = import_patient_fhir_bundle(patient=patient, bundle=bundle, actor=request.user)
+            models.HealthRecordExchangeLog.objects.create(
+                patient=patient,
+                actor=request.user if getattr(request.user, "is_authenticated", False) else None,
+                direction=models.HealthRecordExchangeLog.DIRECTION_IMPORT,
+                exchange_format=models.HealthRecordExchangeLog.FORMAT_FHIR_BUNDLE,
+                source_label=str(request.data.get("source_label") or "my_bundle_import"),
+                status=models.HealthRecordExchangeLog.STATUS_SUCCESS,
+                summary=summary,
+                raw_payload=bundle,
+            )
+            return Response({"patient_id": str(patient.id), "summary": summary}, status=status.HTTP_200_OK)
+        except Exception as exc:
+            models.HealthRecordExchangeLog.objects.create(
+                patient=patient,
+                actor=request.user if getattr(request.user, "is_authenticated", False) else None,
+                direction=models.HealthRecordExchangeLog.DIRECTION_IMPORT,
+                exchange_format=models.HealthRecordExchangeLog.FORMAT_FHIR_BUNDLE,
+                source_label=str(request.data.get("source_label") or "my_bundle_import"),
+                status=models.HealthRecordExchangeLog.STATUS_FAILED,
+                summary={"error": str(exc)},
+                raw_payload=bundle,
+            )
+            raise ValidationError({"bundle": str(exc)})
 
 
 @extend_schema(tags=["Patients"])
@@ -652,6 +1159,74 @@ class VitalSignViewSet(viewsets.ModelViewSet):
         vital = serializer.save(clinician=self.request.user)
         if not vital:
             return
+
+
+@extend_schema(tags=["Patients"])
+class ProblemRecordViewSet(viewsets.ModelViewSet):
+    queryset = models.ProblemRecord.objects.select_related("patient", "profile", "diagnosed_by").all()
+    serializer_class = serializers.ProblemRecordSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ["patient", "profile", "clinical_status", "verification_status", "severity"]
+    search_fields = ["title", "code", "notes"]
+
+    def perform_create(self, serializer):
+        serializer.save(diagnosed_by=self.request.user)
+
+
+@extend_schema(tags=["Patients"])
+class ImmunizationRecordViewSet(viewsets.ModelViewSet):
+    queryset = models.ImmunizationRecord.objects.select_related("patient", "profile", "administered_by").all()
+    serializer_class = serializers.ImmunizationRecordSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ["patient", "profile", "status", "vaccine_code"]
+    search_fields = ["vaccine_name", "manufacturer", "lot_number"]
+
+    def perform_create(self, serializer):
+        serializer.save(administered_by=self.request.user)
+
+
+@extend_schema(tags=["Patients"])
+class ProcedureRecordViewSet(viewsets.ModelViewSet):
+    queryset = models.ProcedureRecord.objects.select_related("patient", "profile", "performed_by").all()
+    serializer_class = serializers.ProcedureRecordSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ["patient", "profile", "status", "procedure_code"]
+    search_fields = ["procedure_name", "location", "notes"]
+
+    def perform_create(self, serializer):
+        serializer.save(performed_by=self.request.user)
+
+
+@extend_schema(tags=["Patients"])
+class HealthDocumentViewSet(viewsets.ModelViewSet):
+    queryset = models.HealthDocument.objects.select_related("patient", "profile", "uploaded_by").all()
+    serializer_class = serializers.HealthDocumentSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ["patient", "profile", "category", "status", "source_type"]
+    search_fields = ["title", "source_label", "notes", "file_url"]
+
+    def perform_create(self, serializer):
+        serializer.save(uploaded_by=self.request.user)
+
+
+@extend_schema(tags=["Patients"])
+class HealthRecordExchangeLogViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.HealthRecordExchangeLog.objects.select_related("patient", "actor").all()
+    serializer_class = serializers.HealthRecordExchangeLogSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ["patient", "direction", "exchange_format", "status"]
+
+
+@extend_schema(tags=["Patients"])
+class WellnessMetricViewSet(viewsets.ModelViewSet):
+    queryset = models.WellnessMetric.objects.select_related("patient", "profile", "recorded_by").all()
+    serializer_class = serializers.WellnessMetricSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ["patient", "profile", "metric_type", "source", "is_clinically_verified"]
+    search_fields = ["source_label"]
+
+    def perform_create(self, serializer):
+        serializer.save(recorded_by=self.request.user)
 
 
 @extend_schema(tags=["Clinical"])
