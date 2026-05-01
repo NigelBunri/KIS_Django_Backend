@@ -1,5 +1,111 @@
 # Broadcast Feeds Progress
 
+## 2026-05-01 - Phase 6 Completed: Engagement and Analytics Durability
+
+Scope:
+- Persisted broadcast feed share/view/impression events instead of logging shares only.
+- Added basic idempotency/spam controls for high-frequency engagement events.
+- Exposed durable count fields consistently on feed list rows without changing the existing card payload shape.
+- Preserved current UI behavior and existing reaction state behavior.
+
+Backend changes:
+- Added `BroadcastEngagementEvent` with event types:
+  - `impression`
+  - `view`
+  - `share`
+- Added per-user, per-broadcast, per-event window uniqueness through `window_key`.
+- Added optional idempotency-key support through either:
+  - `Idempotency-Key` request header
+  - `idempotency_key`
+  - `idempotencyKey`
+- Share events now persist through `BroadcastEngagementEvent` and return:
+  - `shared`
+  - `platform`
+  - `created`
+  - `share_count`
+- Added `POST /api/v1/broadcasts/<broadcast_id>/view/` to persist view events and return:
+  - `viewed`
+  - `created`
+  - `view_count`
+- Broadcast feed list rows now include:
+  - `share_count`
+  - `view_count`
+  - `impression_count`
+  - `comment_count`
+- Feed list impressions are recorded for returned rows and are de-duplicated within the configured impression window.
+- Existing `BroadcastReaction` behavior remains the reaction source of truth.
+
+Spam/idempotency windows:
+- Impressions: 5 minutes.
+- Views: 5 minutes.
+- Shares: 1 hour.
+- Explicit idempotency keys override time-window keys for safer client retries.
+
+Validation:
+- `python3 -m py_compile apps/broadcasts/models.py apps/broadcasts/views.py apps/broadcasts/tests.py apps/broadcasts/urls.py apps/broadcasts/migrations/0030_broadcast_engagement_event.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations broadcasts --check --dry-run` passed with no changes detected.
+- `python3 manage.py migrate broadcasts 0030 --plan` showed only the new engagement event table and indexes.
+- `python3 manage.py test apps.broadcasts.tests.BroadcastFeedPaginationHelperTests --noinput` passed with 1 test.
+
+Blocked validation:
+- Focused DRF tests were added for share durability, view idempotency, and feed count/impression behavior.
+- Local execution of those DB-backed tests again blocked during test database setup and was stopped to keep the session moving.
+- Re-run later:
+  - `python3 manage.py test apps.broadcasts.tests.BroadcastProfileManageTests.test_share_endpoint_is_repeatable_and_returns_stable_payload apps.broadcasts.tests.BroadcastProfileManageTests.test_view_endpoint_is_idempotent_within_window_and_counts_once apps.broadcasts.tests.BroadcastProfileManageTests.test_feed_list_exposes_engagement_counts_and_records_impression_once_per_window --noinput`
+
+Remaining Phase 6 follow-up:
+- Comment counts are currently exposed as `0` because broadcast comment messages live outside this app's local relational model.
+- A later Nest/Django comment-count bridge should write comment counts or comment events into the same durable analytics path.
+- Production analytics dashboards are not implemented yet; this phase adds durable source data.
+
+Best prompt for Phase 7:
+
+```text
+Please proceed with Phase 7 of the KIS 90% feed system hardening roadmap without using git commands. Focus on moderation and safety completeness for broadcast feeds. Confirm and harden report, hide, mute, block, remove broadcast, delete feed entry, and unbroadcast semantics across feed list, profile manager, and detail surfaces. Add admin-visible moderation/audit records where safe, ensure hidden posts affect only that user while muted users affect all posts from that direct feed author, preserve current UI behavior, add focused backend/frontend tests or record blockers, run safe validation, update docs/broadcast-feeds-progress.md and docs/BUILD_STATE.md, and give the best prompt for Phase 8.
+```
+
+## 2026-05-01 - Phase 5 Completed: Feed Ranking, Pagination, and Performance
+
+Scope:
+- Kept the existing broadcast feed list API compatible with current clients.
+- Added cursor-readiness without breaking `limit`, `offset`, `q`, `code`, or `source_type`.
+- Reduced unnecessary source-specific lookups where the requested source list cannot return those items.
+- Preserved current ranking/randomization behavior so frontend refresh reshuffle expectations remain valid.
+
+Backend changes:
+- `BroadcastFeedView` now accepts `cursor` as an offset-compatible cursor when `offset` is not supplied.
+- Legacy `offset` still wins when both `offset` and `cursor` are provided.
+- Broadcast feed responses now include:
+  - `cursor`
+  - `next_cursor`
+  - `previous_cursor`
+- Existing `next`, `previous`, `count`, and `results` fields remain unchanged.
+- Page URLs still include legacy `offset` and now also include the matching cursor for newer clients.
+- Empty channel, community, partner, market product, and market service paths avoid unnecessary follow-up queries where safe.
+- Market product/service detail assembly remains gated by the existing source-token behavior, preserving current API output.
+
+Ranking/randomization notes:
+- No ranking algorithm change was made in this phase.
+- The current personalization service still randomizes candidates for users without enough affinity history.
+- This keeps the frontend expectation that feed order can reshuffle on refresh, while detail traversal remains stable within the loaded response.
+
+Validation:
+- `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py test apps.broadcasts.tests.BroadcastFeedPaginationHelperTests --noinput` passed with 1 test.
+
+Remaining Phase 5 follow-up:
+- True database cursor pagination should be added after normalized feed entries exist, using a stable `(broadcasted_at, id)` cursor rather than an offset alias.
+- Large-feed performance should be measured against production-like data before tightening default limits further.
+- Full DRF pagination regression coverage should be rerun once local test database setup is consistently reliable.
+
+Best prompt for Phase 6:
+
+```text
+Please proceed with Phase 6 of the KIS 90% feed system hardening roadmap without using git commands. Focus on engagement and analytics durability. Persist share/view/impression events instead of logging only, add idempotency/spam controls where safe, expose accurate reaction/comment/share/view counts consistently in list and detail views, preserve current UI behavior, add focused backend tests or record blockers, run safe validation, update docs/broadcast-feeds-progress.md and docs/BUILD_STATE.md, and give the best prompt for Phase 7.
+```
+
 ## Scope Boundary
 
 - Scope for this document and implementation: **broadcast feeds only**
@@ -674,3 +780,238 @@ Move to the next safe broadcast-feeds-only step:
 1. run the new frontend feed suites and backend broadcast suite as the standard broadcast-feeds regression check
 2. if production rollout is near, do one manual smoke pass on a real device/simulator for feed comments and share UX
 3. otherwise, the remaining work is optional hardening rather than a core correctness blocker
+
+## 90% Feed System Hardening Roadmap
+
+Goal: bring the feed creation, broadcast lifecycle, public feed, detail view, moderation, analytics, media handling, and QA posture to a 90%+ production/global-standard level without breaking the current app.
+
+### Phase 1 - Broadcast Lifecycle Correctness
+
+Status: completed for current scope on 2026-05-01.
+
+Scope:
+- Make broadcast creation fail visibly instead of silently reporting success.
+- Return the created `broadcast_id` to clients.
+- Add a real unbroadcast/remove-live action so a queued item can be removed from the public feed without deleting the queued item.
+- Wire the React Native profile feed manager to show `Remove live` for live items.
+- Add backend regression tests for broadcast and unbroadcast behavior.
+
+Files touched in this phase:
+- `apps/broadcasts/views.py`
+- `apps/broadcasts/urls.py`
+- `apps/broadcasts/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/broadcastRoutes.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile/useProfileController.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile-screen/FeedManagementModal.tsx`
+
+Validation target:
+- `python3 manage.py check` passed.
+- `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/urls.py apps/broadcasts/tests.py` passed.
+- `python3 manage.py shell -c "from django.urls import reverse; ..."` confirmed the unbroadcast route resolves.
+- React Native `npm run typecheck` passed.
+- Targeted React Native ESLint passed for touched feed manager files.
+- Focused Django broadcast lifecycle tests were added, but the local test command blocked during test database setup in this workspace before executing test output.
+
+Remaining Phase 1 follow-up:
+- Re-run the two focused Django tests once the local test database setup issue is cleared:
+  - `apps.broadcasts.tests.BroadcastProfileManageTests.test_broadcast_feed_entry_returns_broadcast_id_and_marks_live`
+  - `apps.broadcasts.tests.BroadcastProfileManageTests.test_unbroadcast_feed_entry_removes_live_item_without_deleting_queue_entry`
+
+### Phase 2 - Creation System Unification
+
+Status: completed for current scope on 2026-05-01.
+
+Scope:
+- Connect the advanced composer payload to broadcast feed entry creation.
+- Preserve styled text documents, text preview/plain text, link, poll, event, and media captions in backend feed entries.
+- Make the profile feed manager use the same payload contract as the feed composer.
+- Add clear validation messages for missing text/media/title.
+
+What changed:
+- Backend feed entry create/update now accepts advanced composer fields:
+  - `text`
+  - `text_plain`
+  - `text_preview`
+  - `poll`
+  - `event`
+  - `link`
+  - `composer_type`
+  - `attachment_payloads`
+- Backend feed listing now emits preserved advanced fields for direct broadcast profile items.
+- Profile feed manager now exposes an `Open advanced composer` action for new queued items.
+- Advanced composer submissions are saved into the same broadcast feed queue as the existing simple form.
+- Local attachments still use the existing upload path; already-uploaded/remote composer attachments are preserved as attachment payloads.
+- Video/short-video composer payloads still use the existing broadcast video upload helper before being queued.
+- Added backend regression coverage for advanced composer payload preservation.
+
+Validation:
+- `python3 manage.py check` passed.
+- `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/tests.py` passed.
+- React Native `npm run typecheck` passed.
+- Targeted React Native ESLint passed for:
+  - `src/screens/tabs/ProfileScreen.tsx`
+  - `src/screens/tabs/profile/useProfileController.ts`
+  - `src/screens/tabs/profile-screen/FeedManagementModal.tsx`
+
+Remaining Phase 2 follow-up:
+- Run the new backend advanced-composer regression test once the local Django test database setup issue is cleared.
+- Manual smoke test on device/simulator:
+  - create styled text through advanced composer
+  - create image/video/short-video through advanced composer
+  - confirm item appears in queue
+  - broadcast item
+  - confirm public feed/detail preserves style/media
+
+### Phase 3 - Normalized Feed Data Readiness
+
+Status: completed for current abstraction-first scope on 2026-05-01.
+
+Scope:
+- Introduce a safe normalized model path or compatibility layer for feed entries, attachments, live status, and visibility while preserving current JSON profile payloads.
+- Add migration/backfill strategy documentation before data migration.
+- Reduce reliance on large mutable JSON lists for production-critical state.
+
+What changed:
+- Added `apps/broadcasts/feed_entry_store.py` as a JSON-compatible feed entry store abstraction.
+- The abstraction provides:
+  - immutable-style feed list reads
+  - append
+  - resolve
+  - replace
+  - delete
+- Refactored backend feed create/edit/delete/attachment-delete/broadcast/unbroadcast paths to use the store abstraction instead of directly mutating `profile["feeds"]` lists in each view.
+- Existing `BroadcastFeedProfile.payload` JSON behavior is preserved.
+- Added focused helper tests for the compatibility layer.
+
+Why no normalized model migration was added in this phase:
+- The existing production data shape is JSON-backed and used by multiple profile management flows.
+- A schema migration is safer after the app has a stable abstraction layer and regression evidence.
+- This phase creates the seam needed for a future dual-write/read-through migration without changing user-facing behavior.
+
+Normalized model migration plan:
+1. Add `BroadcastFeedEntry` with fields for owner/profile, title, summary, media type, text doc/plain/preview, poll/event/link payloads, composer type, live state, timestamps, and soft delete.
+2. Add `BroadcastFeedEntryAttachment` for ordered attachments and normalized media metadata.
+3. Backfill rows from `BroadcastFeedProfile.payload["feeds"]`.
+4. Dual-read through `feed_entry_store` while comparing JSON rows and normalized rows in development/staging.
+5. Dual-write create/edit/delete/broadcast/unbroadcast to both stores.
+6. Flip reads to normalized rows behind an environment flag.
+7. Keep JSON payload as rollback shadow until production confidence is proven.
+8. Remove JSON feed mutation only after backup/rollback and reporting are proven.
+
+Validation:
+- `python3 manage.py check` passed.
+- `python3 -m py_compile apps/broadcasts/feed_entry_store.py apps/broadcasts/views.py apps/broadcasts/tests.py` passed.
+- `python3 manage.py test apps.broadcasts.tests.FeedEntryStoreTests --noinput` passed with 2 tests.
+- React Native checks were not run because Phase 3 only changed backend/docs files.
+
+Remaining Phase 3 follow-up:
+- Execute the broader focused backend broadcast lifecycle tests once the local Django test DB setup issue is cleared.
+- Consider adding the normalized models in Phase 4 only after this abstraction is stable.
+
+### Phase 4 - Media Safety and Processing
+
+Status: completed for current validation-first scope on 2026-05-01.
+
+Scope:
+- Enforce per-type MIME/extension/size validation.
+- Add image/video thumbnail and video metadata guarantees.
+- Add malware/quarantine hook points.
+- Define private/public media behavior for feed attachments.
+
+What changed:
+- Added centralized feed media validation before storing uploads.
+- Added per-type allowlists for:
+  - images: `.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`
+  - videos/short videos: `.mp4`, `.mov`, `.m4v`, `.webm`
+  - audio: `.mp3`, `.m4a`, `.aac`, `.wav`, `.ogg`
+  - documents/files: `.pdf`, `.doc`, `.docx`, `.txt`
+- Added MIME allowlists matching the allowed file families.
+- Added conservative per-file size limits:
+  - images: 12 MB
+  - videos/short videos: 512 MB
+  - audio: 128 MB
+  - documents/files: 40 MB
+- Existing tier media storage checks still apply after the type-specific checks.
+- Remote/already-uploaded composer attachment payloads are now validated before entering the broadcast feed queue.
+- Remote payloads must use `http` or `https` URLs.
+- Unsafe executable-style local uploads and remote payloads are rejected with clear validation errors.
+- Attachments now receive `validation_status: validated`.
+- Attachments now receive `scan_status: not_configured` as the explicit malware-scan hook state until a scanner is integrated.
+- Remote video payloads normalize thumbnail fields into both `thumbnail_url` and `thumbUrl`.
+- Remote short-video payloads with duration metadata are rejected when duration is 4 minutes or longer.
+- Added regression tests for unsafe local upload and unsafe remote attachment payload rejection.
+
+Malware/quarantine hook plan:
+- Current phase does not add a scanner dependency to avoid breaking local development.
+- Future production hook point should sit immediately after `_store_upload` writes the file and before the feed entry is saved.
+- Recommended states for a normalized model phase:
+  - `pending_scan`
+  - `clean`
+  - `quarantined`
+  - `scan_failed`
+- Public feed rendering should only show `clean` attachments once scanner integration is enabled.
+
+Thumbnail/video metadata notes:
+- Video uploads still create `BroadcastVideo` records and attach `stream_url`/`video_id`.
+- Duration probing remains best-effort through the existing `_probe_video_duration` path.
+- Remote short-video duration is enforced when duration metadata is present.
+- Uploaded short-video duration enforcement still needs short-video intent at the upload endpoint or normalized attachment metadata.
+
+Validation:
+- `python3 manage.py check` passed.
+- `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/tests.py` passed.
+- `python3 manage.py test apps.broadcasts.tests.FeedMediaValidationTests --noinput` passed with 3 tests.
+- Focused media validation DRF tests were added, but local execution again blocked during test database setup before test output.
+
+Remaining Phase 4 follow-up:
+- Add scanner integration when production provider/tooling is selected.
+- Enforce short-video duration at the server once short-video intent is passed to the upload endpoint.
+- Consider storing attachment scan status in the future normalized attachment model.
+- Re-run the new media validation tests once the local test database setup issue is cleared:
+  - `test_feed_entry_rejects_unsupported_uploaded_media_type`
+  - `test_feed_entry_rejects_unsupported_remote_attachment_payload`
+
+### Phase 5 - Feed Ranking, Pagination, and Performance
+
+Scope:
+- Move closer to cursor pagination and source-limited query assembly.
+- Add stable ranking metadata and avoid loading large mixed-source lists into memory where possible.
+- Add performance regression checks and large-feed test fixtures.
+
+### Phase 6 - Engagement and Analytics Durability
+
+Scope:
+- Persist share/view/impression events instead of logging only.
+- Add idempotency/spam controls for engagement endpoints.
+- Expose accurate counts consistently in list and detail views.
+
+### Phase 7 - Moderation and Safety Completeness
+
+Scope:
+- Confirm report/hide/mute/block semantics across all feed surfaces.
+- Add admin moderation visibility for feed reports and risky media.
+- Add appeal/reversal hooks where needed.
+
+### Phase 8 - Global-Standard QA and Launch Evidence
+
+Scope:
+- Full backend regression suite for create/edit/delete/broadcast/unbroadcast/list/detail/react/comment/share/save/hide/mute.
+- Frontend focused tests for creator, manager, feed card, detail swipe, media fallback, and moderation actions.
+- Manual device QA checklist for iOS/Android.
+
+### Best Prompt For Phase 2
+
+Please proceed with Phase 2 of the KIS 90% feed system hardening roadmap without using git commands. Focus on creation system unification. Connect the advanced feed composer payload to broadcast feed entry creation so styled text, textPlain/textPreview, link, poll, event, media captions, short video/video/document/audio/image metadata, and attachments are preserved end to end. Keep existing profile feed manager behavior working, add clear validation messages, avoid broad UI redesign, run safe backend/frontend validation, update `docs/broadcast-feeds-progress.md` and `docs/BUILD_STATE.md`, and give the best prompt for Phase 3.
+
+### Best Prompt For Phase 3
+
+Please proceed with Phase 3 of the KIS 90% feed system hardening roadmap without using git commands. Focus on normalized feed data readiness. Design and implement the safest compatibility layer toward normalized feed entries and attachments while preserving the existing broadcast profile JSON payload behavior. Add models/migrations only if low-risk and clearly backward compatible; otherwise add the documented migration plan and read/write abstraction first. Reduce direct mutation of large JSON feed lists where safe, keep create/edit/delete/broadcast/unbroadcast working, add focused regression tests or record blockers, run safe backend/frontend validation, update `docs/broadcast-feeds-progress.md` and `docs/BUILD_STATE.md`, and give the best prompt for Phase 4.
+
+### Best Prompt For Phase 4
+
+Please proceed with Phase 4 of the KIS 90% feed system hardening roadmap without using git commands. Focus on media safety and processing for broadcast feed creation and display. Enforce safe per-type MIME/extension/size validation for image, video, short video, audio, documents, and remote attachment payloads; preserve local development; add clear validation errors; add or document malware/quarantine hook points; ensure thumbnails/video metadata are reliable; keep existing uploads and advanced composer queueing working; add focused regression tests or record blockers; run safe backend/frontend validation; update `docs/broadcast-feeds-progress.md` and `docs/BUILD_STATE.md`; and give the best prompt for Phase 5.
+
+### Best Prompt For Phase 5
+
+Please proceed with Phase 5 of the KIS 90% feed system hardening roadmap without using git commands. Focus on feed ranking, pagination, and performance. Improve the broadcast feed list path toward cursor/stable pagination and source-limited query assembly without breaking current `limit`/`offset`, `q`, `code`, and `source_type` behavior. Avoid loading unnecessary large mixed-source lists where safe, preserve randomization expectations in the frontend, add focused backend regression tests or record blockers, run safe validation, update `docs/broadcast-feeds-progress.md` and `docs/BUILD_STATE.md`, and give the best prompt for Phase 6.

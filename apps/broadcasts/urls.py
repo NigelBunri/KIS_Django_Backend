@@ -6,6 +6,7 @@ from .views import (
     BroadcastReactView,
     BroadcastCommentRoomView,
     BroadcastShareView,
+    BroadcastViewEventView,
     BroadcastSaveView,
     BroadcastHideView,
     BroadcastFeatureListView,
@@ -100,6 +101,7 @@ urlpatterns = [
     path("broadcasts/<uuid:pk>/react/", BroadcastReactView.as_view(), name="broadcast-react"),
     path("broadcasts/<uuid:pk>/comment-room/", BroadcastCommentRoomView.as_view(), name="broadcast-comment-room"),
     path("broadcasts/<uuid:pk>/share/", BroadcastShareView.as_view(), name="broadcast-share"),
+    path("broadcasts/<uuid:pk>/view/", BroadcastViewEventView.as_view(), name="broadcast-view"),
     path("broadcasts/<uuid:pk>/save/", BroadcastSaveView.as_view(), name="broadcast-save"),
     path("broadcasts/<uuid:pk>/hide/", BroadcastHideView.as_view(), name="broadcast-hide"),
     path("broadcasts/features/", BroadcastFeatureListView.as_view(), name="broadcast-features"),
@@ -141,6 +143,11 @@ urlpatterns = [
         "broadcasts/profiles/feeds/<uuid:entry_id>/broadcast/",
         BroadcastFeedEntryBroadcastView.as_view(),
         name="profile-feed-entry-broadcast",
+    ),
+    path(
+        "broadcasts/profiles/feeds/<uuid:entry_id>/unbroadcast/",
+        BroadcastFeedEntryBroadcastView.as_view(),
+        name="profile-feed-entry-unbroadcast",
     ),
     path(
         "broadcasts/profiles/feeds/<uuid:entry_id>/attachments/",

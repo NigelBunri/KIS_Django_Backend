@@ -55,6 +55,13 @@ from common.media_urls import absolutize_backend_media
 from apps.commerce.serializers import ProductSerializer, ServiceBookingSerializer
 from apps.moderation.models import UserBlock
 from apps.partners.models import Partner, PartnerPost, PartnerMembership, PartnerMembershipStatus
+from apps.broadcasts.feed_entry_store import (
+    append_feed_entry,
+    delete_feed_entry,
+    get_feed_entries,
+    replace_feed_entry,
+    resolve_feed_entry,
+)
 from apps.broadcasts.models import (
     BroadcastFeature,
     BroadcastFeatureFlag,
@@ -65,6 +72,8 @@ from apps.broadcasts.models import (
     BroadcastHealthInstitutionService,
     BroadcastItem,
     BroadcastMarketProfile,
+    BroadcastEngagementEvent,
+    BroadcastEngagementEventType,
     BroadcastReaction,
     BroadcastSourceType,
     BroadcastVideo,
@@ -469,6 +478,34 @@ class EducationProfilePermissionsView(APIView):
 SHORT_VIDEO_MAX_SECONDS = 4 * 60 - 1
 LONG_VIDEO_MIN_SECONDS = 4 * 60
 MEDIA_SUBDIRECTORY = "broadcast_videos"
+FEED_MEDIA_RULES = {
+    "image": {
+        "extensions": {".jpg", ".jpeg", ".png", ".webp", ".gif"},
+        "mimes": {"image/jpeg", "image/png", "image/webp", "image/gif"},
+        "max_bytes": 12 * 1024 * 1024,
+    },
+    "video": {
+        "extensions": {".mp4", ".mov", ".m4v", ".webm"},
+        "mimes": {"video/mp4", "video/quicktime", "video/x-m4v", "video/webm"},
+        "max_bytes": 512 * 1024 * 1024,
+    },
+    "audio": {
+        "extensions": {".mp3", ".m4a", ".aac", ".wav", ".ogg"},
+        "mimes": {"audio/mpeg", "audio/mp4", "audio/aac", "audio/wav", "audio/x-wav", "audio/ogg"},
+        "max_bytes": 128 * 1024 * 1024,
+    },
+    "file": {
+        "extensions": {".pdf", ".doc", ".docx", ".txt"},
+        "mimes": {
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "text/plain",
+        },
+        "max_bytes": 40 * 1024 * 1024,
+    },
+}
+FEED_REMOTE_ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 TRANSCRIPT_REMOVAL_WORDS = {
     "um",
     "uh",
@@ -6429,6 +6466,120 @@ class BroadcastVideoUploadSerializer(serializers.Serializer):
     transcript_segments = serializers.ListField(child=serializers.JSONField(), required=False, allow_empty=True)
 
 
+def _encode_feed_cursor(offset: int | None) -> str | None:
+    if offset is None:
+        return None
+    return f"o:{max(int(offset), 0)}"
+
+
+def _decode_feed_cursor(value: Any, default: int = 0) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    if text.startswith("o:"):
+        text = text[2:]
+    try:
+        return max(int(text), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+_BROADCAST_ENGAGEMENT_WINDOWS = {
+    BroadcastEngagementEventType.IMPRESSION: 300,
+    BroadcastEngagementEventType.VIEW: 300,
+    BroadcastEngagementEventType.SHARE: 3600,
+}
+
+
+def _broadcast_engagement_window_key(
+    event_type: str,
+    *,
+    platform: str = "",
+    idempotency_key: Any = "",
+    at: Any = None,
+) -> str:
+    explicit_key = str(idempotency_key or "").strip()
+    platform_key = re.sub(r"[^a-z0-9_.:-]+", "-", str(platform or "").strip().lower())[:48]
+    if explicit_key:
+        return f"id:{platform_key}:{explicit_key[:72]}"
+    window_seconds = max(int(_BROADCAST_ENGAGEMENT_WINDOWS.get(event_type, 300) or 300), 1)
+    event_time = at or timezone.now()
+    timestamp = int(event_time.timestamp())
+    return f"w:{platform_key}:{timestamp // window_seconds}"
+
+
+def _record_broadcast_engagement(
+    *,
+    item: BroadcastItem,
+    user: User,
+    event_type: str,
+    platform: str = "",
+    metadata: dict[str, Any] | None = None,
+    idempotency_key: Any = "",
+) -> tuple[BroadcastEngagementEvent, bool]:
+    window_key = _broadcast_engagement_window_key(
+        event_type,
+        platform=platform,
+        idempotency_key=idempotency_key,
+    )
+    return BroadcastEngagementEvent.objects.get_or_create(
+        broadcast_item=item,
+        user=user,
+        event_type=event_type,
+        window_key=window_key,
+        defaults={
+            "platform": str(platform or "")[:64],
+            "metadata": metadata or {},
+        },
+    )
+
+
+def _broadcast_engagement_counts(broadcast_ids: list[Any]) -> dict[str, dict[str, int]]:
+    ids = [item_id for item_id in broadcast_ids if item_id]
+    counts: dict[str, dict[str, int]] = {
+        str(item_id): {
+            "share_count": 0,
+            "view_count": 0,
+            "impression_count": 0,
+        }
+        for item_id in ids
+    }
+    if not ids:
+        return counts
+    rows = (
+        BroadcastEngagementEvent.objects.filter(broadcast_item_id__in=ids)
+        .values("broadcast_item_id", "event_type")
+        .annotate(total=models.Count("id"))
+    )
+    key_map = {
+        BroadcastEngagementEventType.SHARE: "share_count",
+        BroadcastEngagementEventType.VIEW: "view_count",
+        BroadcastEngagementEventType.IMPRESSION: "impression_count",
+    }
+    for row in rows:
+        broadcast_id = str(row["broadcast_item_id"])
+        count_key = key_map.get(row["event_type"])
+        if count_key:
+            counts.setdefault(
+                broadcast_id,
+                {"share_count": 0, "view_count": 0, "impression_count": 0},
+            )[count_key] = int(row["total"] or 0)
+    return counts
+
+
+def _apply_broadcast_engagement_counts(
+    items: list[dict[str, Any]],
+    counts: dict[str, dict[str, int]],
+) -> None:
+    for item in items:
+        broadcast_id = str(item.get("id") or "")
+        item_counts = counts.get(broadcast_id, {})
+        item["share_count"] = int(item_counts.get("share_count") or item.get("share_count") or 0)
+        item["view_count"] = int(item_counts.get("view_count") or item.get("view_count") or 0)
+        item["impression_count"] = int(item_counts.get("impression_count") or item.get("impression_count") or 0)
+        item["comment_count"] = int(item.get("comment_count") or 0)
+
+
 class BroadcastFeedView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -6449,12 +6600,16 @@ class BroadcastFeedView(APIView):
             params = request.query_params.copy()
             params["limit"] = str(limit)
             params["offset"] = str(max(offset_value, 0))
+            params["cursor"] = _encode_feed_cursor(offset_value) or ""
             query = params.urlencode()
             return build_absolute_url(request, f"{request.path}?{query}")
 
         limit = int(request.query_params.get("limit", 50))
         limit = max(1, min(limit, 200))
-        offset = _parse_positive_int(request.query_params.get("offset", 0), 0)
+        if "offset" in request.query_params:
+            offset = _parse_positive_int(request.query_params.get("offset", 0), 0)
+        else:
+            offset = _decode_feed_cursor(request.query_params.get("cursor"), 0)
         since = timezone.now() - timedelta(days=10)
         now = timezone.now()
         query = str(request.query_params.get("q") or "").strip().lower()
@@ -6482,6 +6637,10 @@ class BroadcastFeedView(APIView):
                 resolved_sources.extend(value)
             elif value:
                 resolved_sources.append(value)
+        resolved_source_set = set(resolved_sources)
+
+        def _include_source(source_type: str) -> bool:
+            return not resolved_source_set or source_type in resolved_source_set
         hidden_ids = {
             str(value).strip()
             for value in ((getattr(request.user, "preferences", {}) or {}).get("hidden_broadcast_ids") or [])
@@ -6654,6 +6813,7 @@ class BroadcastFeedView(APIView):
             return _build_author_payload(author_user_cache.get(user_id))
 
         broadcast_ids = [item.id for item in broadcast_items]
+        broadcast_item_map = {str(item.id): item for item in broadcast_items}
         reaction_counts = {
             row["broadcast_item_id"]: row["total"]
             for row in BroadcastReaction.objects.filter(broadcast_item_id__in=broadcast_ids)
@@ -6668,35 +6828,58 @@ class BroadcastFeedView(APIView):
             )
         }
 
-        community_broadcasts = [item for item in broadcast_items if item.source_type == BroadcastSourceType.COMMUNITY_POST]
-        partner_broadcasts = [item for item in broadcast_items if item.source_type == BroadcastSourceType.PARTNER_POST]
-        channel_broadcasts = [item for item in broadcast_items if item.source_type == BroadcastSourceType.CHANNEL_MESSAGE]
-        market_broadcasts = [item for item in broadcast_items if item.source_type == BroadcastSourceType.MARKET_PRODUCT]
-        service_broadcasts = [item for item in broadcast_items if item.source_type == BroadcastSourceType.MARKET_SERVICE]
-        profile_broadcasts = [item for item in broadcast_items if item.source_type == BroadcastSourceType.BROADCAST_FEED_ENTRY]
+        community_broadcasts = [
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.COMMUNITY_POST and _include_source(BroadcastSourceType.COMMUNITY_POST)
+        ]
+        partner_broadcasts = [
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.PARTNER_POST and _include_source(BroadcastSourceType.PARTNER_POST)
+        ]
+        channel_broadcasts = [
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.CHANNEL_MESSAGE and _include_source(BroadcastSourceType.CHANNEL_MESSAGE)
+        ]
+        market_broadcasts = [
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.MARKET_PRODUCT and _include_source(BroadcastSourceType.MARKET_PRODUCT)
+        ]
+        service_broadcasts = [
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.MARKET_SERVICE and _include_source(BroadcastSourceType.MARKET_SERVICE)
+        ]
+        profile_broadcasts = [
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.BROADCAST_FEED_ENTRY and _include_source(BroadcastSourceType.BROADCAST_FEED_ENTRY)
+        ]
 
         channel_conversation_ids = list({str(item.conversation_id) for item in channel_broadcasts if item.conversation_id})
-        channels = Channel.objects.filter(
-            conversation_id__in=channel_conversation_ids,
-            is_archived=False,
-        ).select_related("partner", "community")
-        channel_map = {str(ch.conversation_id): ch for ch in channels}
-        channel_members = set(
-            ConversationMember.objects.filter(
-                user=request.user,
-                left_at__isnull=True,
-                is_blocked=False,
+        channel_map = {}
+        channel_members = set()
+        if channel_conversation_ids:
+            channels = Channel.objects.filter(
                 conversation_id__in=channel_conversation_ids,
-            ).values_list("conversation_id", flat=True)
-        )
+                is_archived=False,
+            ).select_related("partner", "community")
+            channel_map = {str(ch.conversation_id): ch for ch in channels}
+            channel_members = set(
+                ConversationMember.objects.filter(
+                    user=request.user,
+                    left_at__isnull=True,
+                    is_blocked=False,
+                    conversation_id__in=channel_conversation_ids,
+                ).values_list("conversation_id", flat=True)
+            )
 
         channel_message_ids = [item.source_id for item in channel_broadcasts]
-        channel_messages = _fetch_channel_messages(
-            channel_conversation_ids,
-            since,
-            limit,
-            message_ids=channel_message_ids,
-        )
+        channel_messages = []
+        if channel_conversation_ids and channel_message_ids:
+            channel_messages = _fetch_channel_messages(
+                channel_conversation_ids,
+                since,
+                limit,
+                message_ids=channel_message_ids,
+            )
         channel_message_map = {
             str(msg.get("id") or msg.get("_id")): msg
             for msg in channel_messages
@@ -6752,24 +6935,28 @@ class BroadcastFeedView(APIView):
             )
 
         community_post_ids = [item.source_id for item in community_broadcasts]
-        community_posts = (
-            CommunityPost.objects.select_related("community", "author")
-            .filter(
-                id__in=community_post_ids,
-                status=CommunityPostStatus.PUBLISHED,
-                is_deleted=False,
+        community_posts = []
+        if community_post_ids:
+            community_posts = (
+                CommunityPost.objects.select_related("community", "author")
+                .filter(
+                    id__in=community_post_ids,
+                    status=CommunityPostStatus.PUBLISHED,
+                    is_deleted=False,
+                )
             )
-        )
         community_post_map = {str(post.id): post for post in community_posts}
         community_ids = {str(post.community_id) for post in community_posts}
-        community_members = set(
-            CommunityMembership.objects.filter(
-                user=request.user,
-                left_at__isnull=True,
-                is_banned=False,
-                community_id__in=community_ids,
-            ).values_list("community_id", flat=True)
-        )
+        community_members = set()
+        if community_ids:
+            community_members = set(
+                CommunityMembership.objects.filter(
+                    user=request.user,
+                    left_at__isnull=True,
+                    is_banned=False,
+                    community_id__in=community_ids,
+                ).values_list("community_id", flat=True)
+            )
 
         community_items = []
         for item in community_broadcasts:
@@ -6817,25 +7004,30 @@ class BroadcastFeedView(APIView):
             )
 
         partner_post_ids = [item.source_id for item in partner_broadcasts]
-        partner_posts = (
-            PartnerPost.objects.select_related("partner", "author")
-            .filter(
-                id__in=partner_post_ids,
-                is_deleted=False,
+        partner_posts = []
+        if partner_post_ids:
+            partner_posts = (
+                PartnerPost.objects.select_related("partner", "author")
+                .filter(
+                    id__in=partner_post_ids,
+                    is_deleted=False,
+                )
             )
-        )
         partner_post_map = {str(post.id): post for post in partner_posts}
         partner_ids = {str(post.partner_id) for post in partner_posts}
-        partner_membership_status = {
-            str(row["partner_id"]): row["status"]
-            for row in PartnerMembership.objects.filter(
-                user=request.user,
-                partner_id__in=partner_ids,
-                status__in=[PartnerMembershipStatus.MEMBER, PartnerMembershipStatus.SUBSCRIBER],
-            ).values("partner_id", "status")
-        }
-        partners = Partner.objects.filter(id__in=partner_ids).select_related("join_config")
-        partner_map = {str(p.id): p for p in partners}
+        partner_membership_status = {}
+        partner_map = {}
+        if partner_ids:
+            partner_membership_status = {
+                str(row["partner_id"]): row["status"]
+                for row in PartnerMembership.objects.filter(
+                    user=request.user,
+                    partner_id__in=partner_ids,
+                    status__in=[PartnerMembershipStatus.MEMBER, PartnerMembershipStatus.SUBSCRIBER],
+                ).values("partner_id", "status")
+            }
+            partners = Partner.objects.filter(id__in=partner_ids).select_related("join_config")
+            partner_map = {str(p.id): p for p in partners}
 
         partner_items = []
         for item in partner_broadcasts:
@@ -6896,11 +7088,13 @@ class BroadcastFeedView(APIView):
         include_service_items = bool(token_set & {"market_service", "market_all"})
 
         market_ids = [item.source_id for item in market_broadcasts]
-        market_products = (
-            Product.objects.filter(id__in=market_ids, is_deleted=False)
-            .select_related("shop__landing_page")
-            .prefetch_related("gallery_images")
-        )
+        market_products = []
+        if market_ids and include_product_items:
+            market_products = (
+                Product.objects.filter(id__in=market_ids, is_deleted=False)
+                .select_related("shop__landing_page")
+                .prefetch_related("gallery_images")
+            )
         market_map = {str(product.id): product for product in market_products}
 
         product_items = []
@@ -6974,7 +7168,7 @@ class BroadcastFeedView(APIView):
             )
 
         service_items = []
-        if service_broadcasts:
+        if service_broadcasts and include_service_items:
             service_ids = [item.source_id for item in service_broadcasts]
             market_services = (
                 ShopService.objects.filter(id__in=service_ids, is_active=True)
@@ -7106,7 +7300,7 @@ class BroadcastFeedView(APIView):
                     if normalized_attachment
                 ]
             )
-            text_plain = entry.get("summary") or entry.get("title") or ""
+            text_plain = entry.get("text_plain") or entry.get("summary") or entry.get("title") or ""
             profile_id = metadata.get("profile_id") or "main"
             profile_name = metadata.get("profile_name") or "My broadcast feed"
             author_payload = _build_author_payload(getattr(item, "broadcasted_by", None))
@@ -7228,11 +7422,16 @@ class BroadcastFeedView(APIView):
                         "broadcasted_by_id": str(item.broadcasted_by_id) if item.broadcasted_by_id else None,
                         "source_type": "healthcare",
                         "source_id": str(entry.get("id") or item.source_id),
-                        "title": service_name,
-                        "text": service_description,
-                        "text_doc": service_description,
-                        "text_plain": service_description,
-                        "attachments": attachments,
+                    "title": service_name,
+                    "text": service_description,
+                    "text_doc": entry.get("text_doc") or entry.get("text") or service_description,
+                    "text_plain": service_description,
+                    "text_preview": entry.get("text_preview") or service_description[:200],
+                    "attachments": attachments,
+                    "poll": entry.get("poll") or None,
+                    "event": entry.get("event") or None,
+                    "link": entry.get("link") or None,
+                    "composer_type": entry.get("composer_type") or None,
                         "created_at": entry.get("created_at") or entry.get("updated_at") or item.broadcasted_at.isoformat(),
                         "broadcasted_at": item.broadcasted_at.isoformat(),
                         "expires_at": item.expires_at.isoformat(),
@@ -7259,9 +7458,14 @@ class BroadcastFeedView(APIView):
                     "source_id": str(entry.get("id") or item.source_id),
                     "title": entry.get("title") or profile_name,
                     "text": text_plain,
-                    "text_doc": entry.get("summary") or "",
+                    "text_doc": entry.get("text_doc") or entry.get("text") or entry.get("summary") or "",
                     "text_plain": text_plain,
+                    "text_preview": entry.get("text_preview") or text_plain[:200],
                     "attachments": attachments,
+                    "poll": entry.get("poll") or None,
+                    "event": entry.get("event") or None,
+                    "link": entry.get("link") or None,
+                    "composer_type": entry.get("composer_type") or None,
                     "created_at": entry.get("created_at") or entry.get("updated_at") or item.broadcasted_at.isoformat(),
                     "broadcasted_at": item.broadcasted_at.isoformat(),
                     "expires_at": item.expires_at.isoformat(),
@@ -7280,13 +7484,16 @@ class BroadcastFeedView(APIView):
             )
 
         education_profile_broadcasts = [
-            item for item in broadcast_items if item.source_type == BroadcastSourceType.EDUCATION_PROFILE
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.EDUCATION_PROFILE and _include_source(BroadcastSourceType.EDUCATION_PROFILE)
         ]
         course_broadcasts = [
-            item for item in broadcast_items if item.source_type == BroadcastSourceType.EDUCATION_COURSE
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.EDUCATION_COURSE and _include_source(BroadcastSourceType.EDUCATION_COURSE)
         ]
         education_broadcasts = [
-            item for item in broadcast_items if item.source_type == BroadcastSourceType.EDUCATION_BROADCAST
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.EDUCATION_BROADCAST and _include_source(BroadcastSourceType.EDUCATION_BROADCAST)
         ]
         course_items = []
         education_profile_items = []
@@ -7440,20 +7647,43 @@ class BroadcastFeedView(APIView):
                 return query in haystack
 
             items = [item for item in items if _matches_query(item)]
+        engagement_counts = _broadcast_engagement_counts([item.get("id") for item in items])
+        _apply_broadcast_engagement_counts(items, engagement_counts)
         profile = get_affinity_profile(request.user)
         metadata = {item["id"]: {"profile": profile} for item in items}
         ranked_items = rank_feed_items(items, request.user, feed_type="broadcast", metadata_map=metadata)
         log_feed_interaction(request.user, "broadcast", "feed_impression", weight=0.05)
         count = len(ranked_items)
         results = ranked_items[offset : offset + limit]
+        for result in results:
+            item = broadcast_item_map.get(str(result.get("id") or ""))
+            if not item:
+                continue
+            try:
+                _, created = _record_broadcast_engagement(
+                    item=item,
+                    user=request.user,
+                    event_type=BroadcastEngagementEventType.IMPRESSION,
+                    metadata={"source_type": result.get("source_type") or ""},
+                )
+                if created:
+                    result["impression_count"] = int(result.get("impression_count") or 0) + 1
+            except Exception:
+                logger.exception("[broadcasts] failed to record feed impression for %s", item.id)
         next_offset = offset + limit if offset + limit < count else None
         previous_offset = offset - limit if offset > 0 else None
+        current_cursor = _encode_feed_cursor(offset)
+        next_cursor = _encode_feed_cursor(next_offset)
+        previous_cursor = _encode_feed_cursor(previous_offset)
 
         return Response(
             {
                 "count": count,
                 "next": _build_page_url(next_offset),
                 "previous": _build_page_url(previous_offset),
+                "cursor": current_cursor,
+                "next_cursor": next_cursor,
+                "previous_cursor": previous_cursor,
                 "results": results,
             }
         )
@@ -7591,16 +7821,74 @@ class BroadcastShareView(APIView):
         except BroadcastItem.DoesNotExist:
             return Response({"detail": "Broadcast item not found."}, status=404)
 
-        platform = request.data.get("platform") or "app"
-        payload = {
-            "broadcast_id": str(item.id),
-            "shared_by": str(request.user.id),
-            "platform": platform,
-            "at": timezone.now().isoformat(),
-        }
-        logger.info("[broadcasts] share recorded: %s", payload)
+        platform = str(request.data.get("platform") or "app").strip()[:64] or "app"
+        idempotency_key = (
+            request.headers.get("Idempotency-Key")
+            or request.data.get("idempotency_key")
+            or request.data.get("idempotencyKey")
+            or ""
+        )
+        _, created = _record_broadcast_engagement(
+            item=item,
+            user=request.user,
+            event_type=BroadcastEngagementEventType.SHARE,
+            platform=platform,
+            metadata={"platform": platform},
+            idempotency_key=idempotency_key,
+        )
+        log_feed_interaction(request.user, "broadcast", "share", weight=0.35)
+        counts = _broadcast_engagement_counts([item.id]).get(str(item.id), {})
+        logger.info(
+            "[broadcasts] share recorded for broadcast=%s user=%s platform=%s created=%s",
+            item.id,
+            request.user.id,
+            platform,
+            created,
+        )
 
-        return Response({"shared": True, "platform": platform}, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "shared": True,
+                "platform": platform,
+                "created": created,
+                "share_count": int(counts.get("share_count") or 0),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class BroadcastViewEventView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk=None):
+        try:
+            item = BroadcastItem.objects.get(id=pk, is_deleted=False)
+        except BroadcastItem.DoesNotExist:
+            return Response({"detail": "Broadcast item not found."}, status=404)
+
+        idempotency_key = (
+            request.headers.get("Idempotency-Key")
+            or request.data.get("idempotency_key")
+            or request.data.get("idempotencyKey")
+            or ""
+        )
+        _, created = _record_broadcast_engagement(
+            item=item,
+            user=request.user,
+            event_type=BroadcastEngagementEventType.VIEW,
+            metadata={"source_type": item.source_type},
+            idempotency_key=idempotency_key,
+        )
+        log_feed_interaction(request.user, "broadcast", "view", weight=0.15)
+        counts = _broadcast_engagement_counts([item.id]).get(str(item.id), {})
+        return Response(
+            {
+                "viewed": True,
+                "created": created,
+                "view_count": int(counts.get("view_count") or 0),
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class BroadcastSaveView(APIView):
@@ -11422,13 +11710,105 @@ def _guess_media_type_from_mime(mime: str | None) -> str:
     return 'file'
 
 
+def _media_type_from_extension(name: str | None) -> str:
+    ext = os.path.splitext(str(name or "").lower())[1]
+    for media_type, rule in FEED_MEDIA_RULES.items():
+        if ext in rule["extensions"]:
+            return media_type
+    return "file"
+
+
+def _validate_feed_media_file(file_obj) -> str:
+    name = str(getattr(file_obj, "name", "") or "")
+    ext = os.path.splitext(name.lower())[1]
+    mime = str(getattr(file_obj, "content_type", "") or "").lower()
+    guessed_type = _guess_media_type_from_mime(mime)
+    if guessed_type == "file" and ext:
+        guessed_type = _media_type_from_extension(name)
+    rule = FEED_MEDIA_RULES.get(guessed_type, FEED_MEDIA_RULES["file"])
+    if ext not in rule["extensions"]:
+        raise ValidationError({"detail": f"Unsupported {guessed_type} file extension."})
+    if mime and mime not in rule["mimes"]:
+        raise ValidationError({"detail": f"Unsupported {guessed_type} MIME type."})
+    size = int(getattr(file_obj, "size", 0) or 0)
+    if size > rule["max_bytes"]:
+        raise ValidationError({"detail": f"{guessed_type.title()} file exceeds the allowed size."})
+    return guessed_type
+
+
+def _validate_remote_feed_attachment(attachment: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(attachment)
+    url = str(normalized.get("url") or normalized.get("uri") or "").strip()
+    if url and not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        raise ValidationError({"detail": "Remote feed attachments must use http or https URLs."})
+    media_type = str(
+        normalized.get("media_type")
+        or normalized.get("kind")
+        or normalized.get("type")
+        or normalized.get("mimeType")
+        or normalized.get("mime_type")
+        or ""
+    ).lower()
+    mime = str(normalized.get("mime_type") or normalized.get("mimeType") or "").lower()
+    name = str(normalized.get("name") or normalized.get("originalName") or url or "").lower()
+    if media_type == "short_video":
+        normalized["kind"] = "short_video"
+        media_type = "video"
+    if media_type not in FEED_MEDIA_RULES:
+        media_type = _guess_media_type_from_mime(mime)
+    if media_type == "file" and name:
+        media_type = _media_type_from_extension(name)
+    rule = FEED_MEDIA_RULES.get(media_type, FEED_MEDIA_RULES["file"])
+    ext = os.path.splitext(urlparse(name).path.lower())[1]
+    if ext and ext not in rule["extensions"]:
+        raise ValidationError({"detail": f"Unsupported remote {media_type} file extension."})
+    if mime and mime not in rule["mimes"]:
+        raise ValidationError({"detail": f"Unsupported remote {media_type} MIME type."})
+    size = int(normalized.get("size") or 0)
+    if size and size > min(rule["max_bytes"], FEED_REMOTE_ATTACHMENT_MAX_BYTES):
+        raise ValidationError({"detail": f"Remote {media_type} attachment exceeds the allowed size."})
+    raw_duration = (
+        normalized.get("duration_seconds")
+        or normalized.get("durationSeconds")
+        or normalized.get("duration")
+        or 0
+    )
+    try:
+        duration_seconds = int(float(raw_duration or 0))
+    except (TypeError, ValueError):
+        duration_seconds = 0
+    if normalized.get("kind") == "short_video" and duration_seconds > SHORT_VIDEO_MAX_SECONDS:
+        raise ValidationError({"detail": "Short video attachments must be under 4 minutes."})
+    thumbnail_url = (
+        normalized.get("thumbnail_url")
+        or normalized.get("thumbnailUrl")
+        or normalized.get("thumbUrl")
+        or normalized.get("poster_url")
+        or normalized.get("posterUrl")
+    )
+    if thumbnail_url:
+        thumbnail_url = str(thumbnail_url).strip()
+        if thumbnail_url and not re.match(r"^https?://", thumbnail_url, flags=re.IGNORECASE):
+            raise ValidationError({"detail": "Remote thumbnail URLs must use http or https."})
+        normalized["thumbnail_url"] = thumbnail_url
+        normalized["thumbUrl"] = thumbnail_url
+    normalized["media_type"] = media_type
+    normalized["validation_status"] = "validated"
+    normalized["scan_status"] = normalized.get("scan_status") or "not_configured"
+    if duration_seconds:
+        normalized["duration_seconds"] = duration_seconds
+    if mime:
+        normalized["mime_type"] = mime
+    return normalized
+
+
 def _build_feed_attachment(request, file_obj):
     if not file_obj:
         return None
+    media_type = _validate_feed_media_file(file_obj)
     upload_user = request.user if request and getattr(request, "user", None) else None
     rel_path, bytes_written = _store_upload(file_obj, user=upload_user)
     url = build_media_url(request, rel_path) if request else rel_path
-    media_type = _guess_media_type_from_mime(file_obj.content_type)
 
     attachment = {
         'url': url,
@@ -11437,6 +11817,8 @@ def _build_feed_attachment(request, file_obj):
         'name': file_obj.name,
         'size': bytes_written,
         'media_type': media_type,
+        'validation_status': 'validated',
+        'scan_status': 'not_configured',
     }
 
     if media_type == 'video' and request and getattr(request, 'user', None):
@@ -11493,6 +11875,75 @@ def _parse_media_options(value: object | None) -> dict:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _parse_json_payload(value: object | None, fallback):
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed
+        except (TypeError, ValueError):
+            return fallback
+    return value
+
+
+def _normalize_composer_media_type(value: str, attachments: list[dict[str, Any]]) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"image", "video", "audio", "file", "text"}:
+        return normalized
+    if normalized in {"document", "pdf", "doc", "docx"}:
+        return "file"
+    if normalized == "short_video":
+        return "video"
+    if normalized in {"poll", "event", "link"}:
+        return "text"
+    if attachments:
+        return str(attachments[0].get("media_type") or "file").lower()
+    return "text"
+
+
+def _merge_client_attachments(
+    uploaded: list[dict[str, Any]],
+    client_payload: object | None,
+) -> list[dict[str, Any]]:
+    parsed = _parse_json_payload(client_payload, [])
+    if not isinstance(parsed, list):
+        return uploaded
+    normalized_client = [
+        _validate_remote_feed_attachment(item)
+        for item in parsed
+        if isinstance(item, dict)
+    ]
+    return uploaded + normalized_client
+
+
+def _build_composer_fields(data) -> dict[str, Any]:
+    text_doc = _parse_json_payload(data.get("text"), None)
+    poll = _parse_json_payload(data.get("poll"), None)
+    event = _parse_json_payload(data.get("event"), None)
+    link = str(data.get("link") or "").strip()
+    composer_type = str(data.get("composer_type") or data.get("composerType") or "").strip()
+    text_plain = str(data.get("text_plain") or data.get("textPlain") or "").strip()
+    text_preview = str(data.get("text_preview") or data.get("textPreview") or "").strip()
+    fields: dict[str, Any] = {}
+    if text_doc is not None:
+        fields["text"] = text_doc
+        fields["text_doc"] = text_doc
+    if text_plain:
+        fields["text_plain"] = text_plain
+    if text_preview:
+        fields["text_preview"] = text_preview
+    if isinstance(poll, dict):
+        fields["poll"] = poll
+    if isinstance(event, dict):
+        fields["event"] = event
+    if link:
+        fields["link"] = link
+    if composer_type:
+        fields["composer_type"] = composer_type
+    return fields
 
 
 def _build_feed_attachments(request, file_objects):
@@ -11632,17 +12083,14 @@ def _resolve_feed_entry(user, entry_id: str) -> dict:
     profile = profiles.get('broadcast_feed')
     if not profile:
         raise ValidationError({'detail': 'Create a broadcast feed profile first.'})
-    feeds = list(profile.get('feeds') or [])
-    for index, entry in enumerate(feeds):
-        if str(entry.get('id')) == str(entry_id):
-            return {
-                'profiles': profiles,
-                'profile': profile,
-                'feeds': feeds,
-                'index': index,
-                'entry': entry,
-            }
-    raise ValidationError({'detail': 'Feed item not found.'})
+    resolved = resolve_feed_entry(profile, entry_id)
+    return {
+        'profiles': profiles,
+        'profile': resolved.profile,
+        'feeds': resolved.feeds,
+        'index': resolved.index,
+        'entry': resolved.entry,
+    }
 
 
 def _resolve_feed_entry_for_request(request, entry_id: str) -> dict:
@@ -11650,11 +12098,12 @@ def _resolve_feed_entry_for_request(request, entry_id: str) -> dict:
     normalized_entry = _normalize_feed_entry(request, resolved["entry"])
     if normalized_entry:
         resolved["entry"] = normalized_entry
-        feeds = list(resolved["feeds"])
-        feeds[resolved["index"]] = normalized_entry
+        profile, feeds, _ = replace_feed_entry(
+            resolved["profile"],
+            entry_id,
+            lambda _entry: normalized_entry,
+        )
         resolved["feeds"] = feeds
-        profile = dict(resolved["profile"])
-        profile["feeds"] = feeds
         resolved["profile"] = profile
         profiles = dict(resolved["profiles"])
         profiles["broadcast_feed"] = profile
@@ -11729,7 +12178,7 @@ class BroadcastFeedEntriesView(APIView):
         profile = profiles.get('broadcast_feed')
         feeds = [
             normalized_entry
-            for normalized_entry in (_normalize_feed_entry(request, item) for item in (profile.get('feeds', []) if profile else []))
+            for normalized_entry in (_normalize_feed_entry(request, item) for item in get_feed_entries(profile))
             if normalized_entry
         ]
         normalized_profile = dict(profile or {}) if profile else None
@@ -11748,23 +12197,33 @@ class BroadcastFeedEntriesView(APIView):
         summary = (request.data.get('summary') or '').strip()
         media_type_input = (request.data.get('media_type') or '').strip().lower()
         files = _collect_feed_files(request)
-        attachments = _build_feed_attachments(request, files)
+        attachments = _merge_client_attachments(
+            _build_feed_attachments(request, files),
+            request.data.get("attachment_payloads") or request.data.get("attachments_payload"),
+        )
         media_options = _parse_media_options(request.data.get('media_options'))
+        composer_fields = _build_composer_fields(request.data)
+        if not summary:
+            summary = (
+                composer_fields.get("text_plain")
+                or composer_fields.get("text_preview")
+                or str((composer_fields.get("poll") or {}).get("question") or "").strip()
+                or str((composer_fields.get("event") or {}).get("title") or "").strip()
+                or composer_fields.get("link")
+                or ""
+            )
+        if not title:
+            title = summary[:80].strip()
         if not title:
             raise ValidationError({'title': 'Title is required.'})
         profiles = _load_user_profiles(request.user)
         profile = profiles.get('broadcast_feed')
         if not profile:
             profile = _bootstrap_broadcast_feed_profile(request.user, profiles)
-        media_type = media_type_input if media_type_input in {'video', 'audio', 'image', 'file', 'text'} else ''
-        if not media_type and attachments:
-            media_type = attachments[0].get('media_type', 'file')
-        if not media_type:
-            media_type = 'text'
+        media_type = _normalize_composer_media_type(media_type_input, attachments)
 
         media_options = _merge_media_options(media_type, media_options)
 
-        feeds = list(profile.get('feeds', []))
         profile_row = getattr(request.user, "profile", None)
         avatar_url = ""
         bio = ""
@@ -11787,6 +12246,7 @@ class BroadcastFeedEntriesView(APIView):
             'attachment': attachments[0] if attachments else None,
             'created_at': timezone.now().isoformat(),
             'media_options': media_options,
+            **composer_fields,
             'author': {
                 'id': str(request.user.id),
                 'profile_id': profile_row_id or None,
@@ -11795,8 +12255,7 @@ class BroadcastFeedEntriesView(APIView):
                 'bio': bio,
             },
         }
-        feeds.append(feed_entry)
-        profile['feeds'] = feeds
+        profile, feeds = append_feed_entry(profile, feed_entry)
         profile['updated_at'] = timezone.now().isoformat()
         profiles['broadcast_feed'] = profile
         _save_user_profiles(request.user, profiles)
@@ -11827,11 +12286,28 @@ class BroadcastFeedEntryDetailView(APIView):
         media_type_input = (data.get('media_type') or '').strip().lower()
 
         files = _collect_feed_files(request)
-        new_attachments = _build_feed_attachments(request, files)
+        new_attachments = _merge_client_attachments(
+            _build_feed_attachments(request, files),
+            data.get("attachment_payloads") or data.get("attachments_payload"),
+        )
         media_options_input = data.get('media_options')
         media_options = _parse_media_options(media_options_input)
         if media_options_input is None:
             media_options = entry.get('media_options') or {}
+        composer_fields = _build_composer_fields(data)
+        if not summary:
+            summary = (
+                composer_fields.get("text_plain")
+                or composer_fields.get("text_preview")
+                or str((composer_fields.get("poll") or {}).get("question") or "").strip()
+                or str((composer_fields.get("event") or {}).get("title") or "").strip()
+                or composer_fields.get("link")
+                or ""
+            )
+        if not title:
+            title = summary[:80].strip()
+        if not title:
+            raise ValidationError({'title': 'Title is required.'})
 
         retain_raw = data.get('retain_attachments')
         retained = []
@@ -11853,15 +12329,7 @@ class BroadcastFeedEntryDetailView(APIView):
 
         first_attachment = final_attachments[0] if final_attachments else None
 
-        media_type = ''
-        if media_type_input in {'video', 'audio', 'image', 'file', 'text'}:
-            media_type = media_type_input
-        elif new_attachments:
-            media_type = new_attachments[0].get('media_type', entry.get('media_type', 'file'))
-        elif first_attachment:
-            media_type = first_attachment.get('media_type', entry.get('media_type', 'file'))
-        else:
-            media_type = entry.get('media_type', 'text')
+        media_type = _normalize_composer_media_type(media_type_input or entry.get('media_type', ''), final_attachments)
 
         media_options = _merge_media_options(media_type, media_options)
 
@@ -11874,11 +12342,16 @@ class BroadcastFeedEntryDetailView(APIView):
             'attachment': first_attachment,
             'updated_at': timezone.now().isoformat(),
             'media_options': media_options,
+            **composer_fields,
         }
-        feeds = resolved['feeds']
-        feeds[resolved['index']] = updated_entry
-        resolved['profile']['feeds'] = feeds
-        resolved['profile']['updated_at'] = timezone.now().isoformat()
+        profile, feeds, updated_entry = replace_feed_entry(
+            resolved['profile'],
+            entry_id,
+            lambda _entry: updated_entry,
+        )
+        profile['updated_at'] = timezone.now().isoformat()
+        resolved['profile'] = profile
+        resolved['feeds'] = feeds
         resolved['profiles']['broadcast_feed'] = resolved['profile']
         _save_user_profiles(request.user, resolved['profiles'])
         normalized_updated_entry = _normalize_feed_entry(request, updated_entry)
@@ -11897,10 +12370,9 @@ class BroadcastFeedEntryDetailView(APIView):
 
     def delete(self, request, entry_id: str):
         resolved = self._resolve_entry(request, entry_id)
-        feeds = resolved['feeds']
-        feeds.pop(resolved['index'])
-        resolved['profile']['feeds'] = feeds
-        resolved['profile']['updated_at'] = timezone.now().isoformat()
+        profile, _feeds, _removed = delete_feed_entry(resolved['profile'], entry_id)
+        profile['updated_at'] = timezone.now().isoformat()
+        resolved['profile'] = profile
         resolved['profiles']['broadcast_feed'] = resolved['profile']
         _delete_user_broadcast(request.user, entry_id)
         _save_user_profiles(request.user, resolved['profiles'])
@@ -11950,10 +12422,14 @@ class BroadcastFeedEntryAttachmentDeleteView(APIView):
         entry['attachments'] = filtered
         entry['attachment'] = filtered[0] if filtered else None
         entry['updated_at'] = timezone.now().isoformat()
-        feeds = resolved['feeds']
-        feeds[resolved['index']] = entry
-        resolved['profile']['feeds'] = feeds
-        resolved['profile']['updated_at'] = timezone.now().isoformat()
+        profile, feeds, entry = replace_feed_entry(
+            resolved['profile'],
+            entry_id,
+            lambda _entry: entry,
+        )
+        profile['updated_at'] = timezone.now().isoformat()
+        resolved['profile'] = profile
+        resolved['feeds'] = feeds
         resolved['profiles']['broadcast_feed'] = resolved['profile']
         _save_user_profiles(request.user, resolved['profiles'])
         normalized_entry = _normalize_feed_entry(request, entry)
@@ -11983,27 +12459,84 @@ class BroadcastFeedEntryBroadcastView(APIView):
             'is_broadcast': True,
             'broadcasted_at': timezone.now().isoformat(),
         }
-        feeds = resolved['feeds']
-        feeds[resolved['index']] = entry_updated
-        profile['feeds'] = feeds
+        profile, feeds, entry_updated = replace_feed_entry(
+            profile,
+            entry_id,
+            lambda _entry: entry_updated,
+        )
         profile['updated_at'] = timezone.now().isoformat()
         resolved['profiles']['broadcast_feed'] = profile
         _save_user_profiles(request.user, resolved['profiles'])
-        try:
-            BroadcastItem.objects.update_or_create(
-                source_type=BroadcastSourceType.BROADCAST_FEED_ENTRY,
-                source_id=str(entry.get('id')),
-                defaults={
-                    'broadcasted_by': request.user,
-                    'broadcasted_at': timezone.now(),
-                    'expires_at': timezone.now() + timedelta(days=10),
-                    'is_deleted': False,
-                },
-            )
-            _sync_broadcast_feed_entry_snapshot(request.user, profile, entry_updated)
-        except Exception:
-            pass
-        return Response({'detail': 'Feed entry broadcasted.'}, status=status.HTTP_200_OK)
+        item, _ = BroadcastItem.objects.update_or_create(
+            source_type=BroadcastSourceType.BROADCAST_FEED_ENTRY,
+            source_id=str(entry.get('id')),
+            broadcasted_by=request.user,
+            defaults={
+                'broadcasted_at': timezone.now(),
+                'expires_at': timezone.now() + timedelta(days=10),
+                'is_deleted': False,
+            },
+        )
+        _sync_broadcast_feed_entry_snapshot(request.user, profile, entry_updated)
+        normalized_entry = _normalize_feed_entry(request, entry_updated)
+        normalized_feeds = [
+            normalized_feed
+            for normalized_feed in (_normalize_feed_entry(request, item) for item in feeds)
+            if normalized_feed
+        ]
+        normalized_profile = dict(profile)
+        normalized_profile['feeds'] = normalized_feeds
+        return Response(
+            {
+                'detail': 'Feed entry broadcasted.',
+                'broadcast_id': str(item.id),
+                'feed': normalized_entry,
+                'feeds': normalized_feeds,
+                'profile': normalized_profile,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, entry_id: str):
+        resolved = _resolve_feed_entry(request.user, entry_id)
+        entry = resolved['entry']
+        entry_updated = {
+            **entry,
+            'is_broadcast': False,
+            'unbroadcasted_at': timezone.now().isoformat(),
+        }
+        entry_updated.pop('broadcasted_at', None)
+        profile, feeds, entry_updated = replace_feed_entry(
+            resolved['profile'],
+            entry_id,
+            lambda _entry: entry_updated,
+        )
+        profile['updated_at'] = timezone.now().isoformat()
+        resolved['profiles']['broadcast_feed'] = profile
+        BroadcastItem.objects.filter(
+            source_type=BroadcastSourceType.BROADCAST_FEED_ENTRY,
+            source_id=str(entry.get('id')),
+            broadcasted_by=request.user,
+            is_deleted=False,
+        ).update(is_deleted=True)
+        _save_user_profiles(request.user, resolved['profiles'])
+        normalized_entry = _normalize_feed_entry(request, entry_updated)
+        normalized_feeds = [
+            normalized_feed
+            for normalized_feed in (_normalize_feed_entry(request, item) for item in feeds)
+            if normalized_feed
+        ]
+        normalized_profile = dict(profile)
+        normalized_profile['feeds'] = normalized_feeds
+        return Response(
+            {
+                'detail': 'Feed entry removed from broadcast.',
+                'feed': normalized_entry,
+                'feeds': normalized_feeds,
+                'profile': normalized_profile,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class BroadcastSubscribeView(APIView):

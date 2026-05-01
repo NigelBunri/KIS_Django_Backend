@@ -1,14 +1,16 @@
+import json
 import tempfile
 from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import override_settings
+from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from apps.accounts.models import Profile
 from apps.broadcasts.models import (
     BroadcastFeedProfile,
+    BroadcastEngagementEvent,
     BroadcastItem,
     BroadcastMarketProfile,
     BroadcastSourceType,
@@ -17,12 +19,108 @@ from apps.broadcasts.models import (
     EducationInstitutionBroadcast,
     EducationInstitutionEvent,
 )
+from apps.broadcasts.feed_entry_store import (
+    append_feed_entry,
+    delete_feed_entry,
+    replace_feed_entry,
+    resolve_feed_entry,
+)
+from apps.broadcasts.views import (
+    _decode_feed_cursor,
+    _encode_feed_cursor,
+    _validate_feed_media_file,
+    _validate_remote_feed_attachment,
+)
 from apps.channels.models import Channel
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
 from apps.communities.models import Community, CommunityMembership, CommunityRole
 from apps.partners.models import Partner, PartnerJoinConfig, PartnerMembership, PartnerMembershipStatus
 from rest_framework import status
 from rest_framework.test import APITestCase
+
+
+class FeedEntryStoreTests(SimpleTestCase):
+    def test_feed_entry_store_preserves_profile_shape_while_replacing_entry(self):
+        profile = {
+            'profile_name': 'Broadcast feed',
+            'feeds': [
+                {'id': 'one', 'title': 'One'},
+                {'id': 'two', 'title': 'Two'},
+            ],
+        }
+
+        next_profile, feeds, updated = replace_feed_entry(
+            profile,
+            'two',
+            lambda entry: {**entry, 'title': 'Two updated'},
+        )
+
+        self.assertEqual(updated['title'], 'Two updated')
+        self.assertEqual(next_profile['profile_name'], 'Broadcast feed')
+        self.assertEqual([feed['id'] for feed in feeds], ['one', 'two'])
+        self.assertEqual(profile['feeds'][1]['title'], 'Two')
+
+    def test_feed_entry_store_append_resolve_delete_flow(self):
+        profile = {'feeds': []}
+        profile, feeds = append_feed_entry(profile, {'id': 'entry-1', 'title': 'Queued'})
+        self.assertEqual(len(feeds), 1)
+        resolved = resolve_feed_entry(profile, 'entry-1')
+        self.assertEqual(resolved.entry['title'], 'Queued')
+
+        profile, feeds, removed = delete_feed_entry(profile, 'entry-1')
+        self.assertEqual(removed['id'], 'entry-1')
+        self.assertEqual(feeds, [])
+        self.assertEqual(profile['feeds'], [])
+
+
+class FeedMediaValidationTests(SimpleTestCase):
+    def test_local_feed_media_validation_rejects_unsupported_extension(self):
+        upload = SimpleUploadedFile(
+            'payload.exe',
+            b'not-safe',
+            content_type='application/x-msdownload',
+        )
+
+        with self.assertRaisesMessage(Exception, 'Unsupported'):
+            _validate_feed_media_file(upload)
+
+    def test_remote_short_video_validation_requires_duration_under_four_minutes(self):
+        with self.assertRaisesMessage(Exception, 'Short video attachments must be under 4 minutes'):
+            _validate_remote_feed_attachment(
+                {
+                    'url': 'https://cdn.example.com/clip.mp4',
+                    'mimeType': 'video/mp4',
+                    'kind': 'short_video',
+                    'duration_seconds': 300,
+                }
+            )
+
+    def test_remote_video_validation_normalizes_thumbnail_and_scan_status(self):
+        attachment = _validate_remote_feed_attachment(
+            {
+                'url': 'https://cdn.example.com/clip.mp4',
+                'mimeType': 'video/mp4',
+                'thumbUrl': 'https://cdn.example.com/thumb.jpg',
+                'duration_seconds': 42,
+            }
+        )
+
+        self.assertEqual(attachment['media_type'], 'video')
+        self.assertEqual(attachment['thumbnail_url'], 'https://cdn.example.com/thumb.jpg')
+        self.assertEqual(attachment['thumbUrl'], 'https://cdn.example.com/thumb.jpg')
+        self.assertEqual(attachment['duration_seconds'], 42)
+        self.assertEqual(attachment['validation_status'], 'validated')
+        self.assertEqual(attachment['scan_status'], 'not_configured')
+
+
+class BroadcastFeedPaginationHelperTests(SimpleTestCase):
+    def test_feed_cursor_round_trip_preserves_legacy_offset_compatibility(self):
+        self.assertEqual(_encode_feed_cursor(20), 'o:20')
+        self.assertEqual(_encode_feed_cursor(None), None)
+        self.assertEqual(_decode_feed_cursor('o:20'), 20)
+        self.assertEqual(_decode_feed_cursor('20'), 20)
+        self.assertEqual(_decode_feed_cursor('-10'), 0)
+        self.assertEqual(_decode_feed_cursor('not-a-cursor'), 0)
 
 
 class BroadcastProfileManageTests(APITestCase):
@@ -303,8 +401,79 @@ class BroadcastProfileManageTests(APITestCase):
 
         self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
         self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
-        self.assertEqual(first.data, {'shared': True, 'platform': 'app'})
-        self.assertEqual(second.data, {'shared': True, 'platform': 'app'})
+        self.assertTrue(first.data.get('shared'))
+        self.assertTrue(second.data.get('shared'))
+        self.assertEqual(first.data.get('platform'), 'app')
+        self.assertEqual(second.data.get('platform'), 'app')
+        self.assertTrue(first.data.get('created'))
+        self.assertFalse(second.data.get('created'))
+        self.assertEqual(first.data.get('share_count'), 1)
+        self.assertEqual(second.data.get('share_count'), 1)
+        self.assertEqual(
+            BroadcastEngagementEvent.objects.filter(
+                broadcast_item=item,
+                event_type='share',
+            ).count(),
+            1,
+        )
+
+    def test_view_endpoint_is_idempotent_within_window_and_counts_once(self):
+        item = BroadcastItem.objects.create(
+            source_type=BroadcastSourceType.BROADCAST_FEED_ENTRY,
+            source_id='feed-view-1',
+            broadcasted_by=self.user,
+            metadata={'entry': {'id': 'feed-view-1', 'title': 'View me'}},
+        )
+
+        first = self.client.post(f'/api/v1/broadcasts/{item.id}/view/', {}, format='json')
+        second = self.client.post(f'/api/v1/broadcasts/{item.id}/view/', {}, format='json')
+
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.assertTrue(first.data.get('created'))
+        self.assertFalse(second.data.get('created'))
+        self.assertEqual(first.data.get('view_count'), 1)
+        self.assertEqual(second.data.get('view_count'), 1)
+
+    def test_feed_list_exposes_engagement_counts_and_records_impression_once_per_window(self):
+        item = BroadcastItem.objects.create(
+            source_type=BroadcastSourceType.BROADCAST_FEED_ENTRY,
+            source_id='feed-counts-1',
+            broadcasted_by=self.user,
+            metadata={'entry': {'id': 'feed-counts-1', 'title': 'Count me'}},
+        )
+        BroadcastEngagementEvent.objects.create(
+            broadcast_item=item,
+            user=self.user,
+            event_type='share',
+            window_key='test-share',
+            platform='app',
+        )
+        BroadcastEngagementEvent.objects.create(
+            broadcast_item=item,
+            user=self.user,
+            event_type='view',
+            window_key='test-view',
+        )
+
+        first = self.client.get('/api/v1/broadcasts/?code=broadcast_feed_entry')
+        second = self.client.get('/api/v1/broadcasts/?code=broadcast_feed_entry')
+
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        matching = next((row for row in first.data.get('results') or [] if str(row.get('id')) == str(item.id)), None)
+        self.assertIsNotNone(matching)
+        self.assertEqual(matching.get('share_count'), 1)
+        self.assertEqual(matching.get('view_count'), 1)
+        self.assertGreaterEqual(matching.get('impression_count'), 1)
+        self.assertEqual(matching.get('comment_count'), 0)
+        self.assertEqual(
+            BroadcastEngagementEvent.objects.filter(
+                broadcast_item=item,
+                event_type='impression',
+            ).count(),
+            1,
+        )
 
     def test_patch_feed_entry_syncs_existing_broadcast_snapshot(self):
         profile_response = self.client.post(
@@ -356,6 +525,162 @@ class BroadcastProfileManageTests(APITestCase):
         )
         self.assertEqual(item.metadata.get('entry', {}).get('title'), 'Updated title')
         self.assertEqual(item.metadata.get('entry', {}).get('summary'), 'Updated summary')
+
+    def test_broadcast_feed_entry_returns_broadcast_id_and_marks_live(self):
+        create_response = self.client.post(
+            '/api/v1/broadcasts/profiles/feeds/',
+            {
+                'title': 'Ready to broadcast',
+                'summary': 'Broadcast lifecycle coverage',
+                'media_type': 'text',
+            },
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        entry_id = (create_response.data.get('feed') or {}).get('id')
+        self.assertTrue(entry_id)
+
+        broadcast_response = self.client.post(
+            f'/api/v1/broadcasts/profiles/feeds/{entry_id}/broadcast/',
+            {},
+            format='json',
+        )
+
+        self.assertEqual(broadcast_response.status_code, status.HTTP_200_OK, broadcast_response.data)
+        self.assertTrue(broadcast_response.data.get('broadcast_id'))
+        feed = broadcast_response.data.get('feed') or {}
+        self.assertTrue(feed.get('is_broadcast'))
+        self.assertTrue(feed.get('broadcasted_at'))
+        self.assertTrue(
+            BroadcastItem.objects.filter(
+                id=broadcast_response.data.get('broadcast_id'),
+                source_type=BroadcastSourceType.BROADCAST_FEED_ENTRY,
+                source_id=str(entry_id),
+                broadcasted_by=self.user,
+                is_deleted=False,
+            ).exists()
+        )
+
+    def test_feed_entry_create_preserves_advanced_composer_payload(self):
+        rich_doc = {
+            'type': 'doc',
+            'content': [{'type': 'paragraph', 'text': 'Styled launch'}],
+        }
+        attachment_payload = {
+            'url': 'https://cdn.example.com/video.mp4',
+            'media_type': 'video',
+            'mimeType': 'video/mp4',
+            'kind': 'short_video',
+        }
+        response = self.client.post(
+            '/api/v1/broadcasts/profiles/feeds/',
+            {
+                'title': 'Advanced composer',
+                'summary': '',
+                'media_type': 'short_video',
+                'text': json.dumps(rich_doc),
+                'text_plain': 'Styled launch',
+                'text_preview': 'Styled launch',
+                'link': 'https://example.com/launch',
+                'poll': json.dumps({'question': 'Ready?', 'options': [{'id': 'yes', 'text': 'Yes'}]}),
+                'event': json.dumps({'title': 'Launch live', 'startsAt': '2026-05-02T09:00:00Z'}),
+                'composer_type': 'short_video',
+                'attachment_payloads': json.dumps([attachment_payload]),
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        feed = response.data.get('feed') or {}
+        self.assertEqual(feed.get('text_plain'), 'Styled launch')
+        self.assertEqual(feed.get('text_doc'), rich_doc)
+        self.assertEqual(feed.get('text'), rich_doc)
+        self.assertEqual(feed.get('link'), 'https://example.com/launch')
+        self.assertEqual(feed.get('poll', {}).get('question'), 'Ready?')
+        self.assertEqual(feed.get('event', {}).get('title'), 'Launch live')
+        self.assertEqual(feed.get('composer_type'), 'short_video')
+        self.assertEqual(feed.get('media_type'), 'video')
+        self.assertEqual((feed.get('attachments') or [])[0].get('kind'), 'short_video')
+
+    def test_feed_entry_rejects_unsupported_uploaded_media_type(self):
+        upload = SimpleUploadedFile(
+            'payload.exe',
+            b'not-safe',
+            content_type='application/x-msdownload',
+        )
+
+        response = self.client.post(
+            '/api/v1/broadcasts/profiles/feeds/',
+            {
+                'title': 'Unsafe upload',
+                'summary': 'Should fail',
+                'media_type': 'file',
+                'attachments': [upload],
+            },
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Unsupported', str(response.data))
+
+    def test_feed_entry_rejects_unsupported_remote_attachment_payload(self):
+        response = self.client.post(
+            '/api/v1/broadcasts/profiles/feeds/',
+            {
+                'title': 'Unsafe remote',
+                'summary': 'Should fail',
+                'media_type': 'file',
+                'attachment_payloads': json.dumps([
+                    {
+                        'url': 'https://cdn.example.com/payload.exe',
+                        'mimeType': 'application/x-msdownload',
+                        'size': 10,
+                    }
+                ]),
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Unsupported', str(response.data))
+
+    def test_unbroadcast_feed_entry_removes_live_item_without_deleting_queue_entry(self):
+        create_response = self.client.post(
+            '/api/v1/broadcasts/profiles/feeds/',
+            {
+                'title': 'Temporary broadcast',
+                'summary': 'Will be removed from live feed',
+                'media_type': 'text',
+            },
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        entry_id = (create_response.data.get('feed') or {}).get('id')
+        self.assertTrue(entry_id)
+
+        broadcast_response = self.client.post(
+            f'/api/v1/broadcasts/profiles/feeds/{entry_id}/broadcast/',
+            {},
+            format='json',
+        )
+        self.assertEqual(broadcast_response.status_code, status.HTTP_200_OK, broadcast_response.data)
+
+        unbroadcast_response = self.client.delete(
+            f'/api/v1/broadcasts/profiles/feeds/{entry_id}/unbroadcast/',
+            {},
+            format='json',
+        )
+
+        self.assertEqual(unbroadcast_response.status_code, status.HTTP_200_OK, unbroadcast_response.data)
+        feed = unbroadcast_response.data.get('feed') or {}
+        self.assertFalse(feed.get('is_broadcast'))
+        self.assertIsNone(feed.get('broadcasted_at'))
+        self.assertTrue(feed.get('unbroadcasted_at'))
+        self.assertTrue(any(str(row.get('id')) == str(entry_id) for row in unbroadcast_response.data.get('feeds') or []))
+        self.assertFalse(
+            BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.BROADCAST_FEED_ENTRY,
+                source_id=str(entry_id),
+                broadcasted_by=self.user,
+                is_deleted=False,
+            ).exists()
+        )
 
     def test_broadcast_feed_list_deduplicates_primary_attachment(self):
         duplicate_attachment = {

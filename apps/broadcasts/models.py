@@ -1907,6 +1907,49 @@ class BroadcastReaction(models.Model):
         ]
 
 
+class BroadcastEngagementEventType(models.TextChoices):
+    IMPRESSION = "impression", "Impression"
+    VIEW = "view", "View"
+    SHARE = "share", "Share"
+
+
+class BroadcastEngagementEvent(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    broadcast_item = models.ForeignKey(
+        BroadcastItem,
+        on_delete=models.CASCADE,
+        related_name="engagement_events",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="broadcast_engagement_events",
+    )
+    event_type = models.CharField(
+        max_length=32,
+        choices=BroadcastEngagementEventType.choices,
+        db_index=True,
+    )
+    platform = models.CharField(max_length=64, blank=True, default="")
+    window_key = models.CharField(max_length=128, db_index=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "broadcast_engagement_event"
+        unique_together = [("broadcast_item", "user", "event_type", "window_key")]
+        indexes = [
+            models.Index(
+                fields=["broadcast_item", "event_type", "created_at"],
+                name="broadcast_e_broadca_b8c59e_idx",
+            ),
+            models.Index(
+                fields=["user", "event_type", "created_at"],
+                name="broadcast_e_user_id_59ae71_idx",
+            ),
+        ]
+
+
 class BroadcastFeature(models.Model):
     slug = models.CharField(max_length=64, unique=True)
     name = models.CharField(max_length=120)
