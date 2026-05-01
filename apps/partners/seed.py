@@ -7,6 +7,13 @@ from django.db.utils import OperationalError, ProgrammingError
 
 logger = logging.getLogger(__name__)
 
+KCAN_PARTNER_NAME = "KCAN, Kingdom Citizens & Ambassadors Network"
+KCAN_PARTNER_SLUG = "kcan"
+KCAN_PARTNER_DESCRIPTION = "Default KCAN system partner account and admin control hub for the app."
+KCAN_SYSTEM_USERNAME = "kcan"
+KCAN_SYSTEM_DISPLAY_NAME = "KCAN"
+LEGACY_DEFAULT_PARTNER_SLUGS = ["kcan", "cc", "kis", "christian-community-cc"]
+
 
 def ensure_kis_partner() -> None:
     try:
@@ -34,8 +41,8 @@ def _ensure_kis_partner() -> None:
     email = getattr(settings, "KIS_SYSTEM_USER_EMAIL", "support@kis.app")
     phone = getattr(settings, "KIS_SYSTEM_USER_PHONE", None)
     country = getattr(settings, "KIS_SYSTEM_USER_COUNTRY", "CM")
-    username = getattr(settings, "KIS_SYSTEM_USER_USERNAME", "cc")
-    display_name = getattr(settings, "KIS_SYSTEM_USER_DISPLAY_NAME", "Christian Community")
+    username = getattr(settings, "KIS_SYSTEM_USER_USERNAME", KCAN_SYSTEM_USERNAME)
+    display_name = getattr(settings, "KIS_SYSTEM_USER_DISPLAY_NAME", KCAN_SYSTEM_DISPLAY_NAME)
     password = getattr(settings, "KIS_SYSTEM_USER_PASSWORD", None)
 
     user = None
@@ -76,18 +83,18 @@ def _ensure_kis_partner() -> None:
         user.save(update_fields=["is_staff", "is_superuser"])
 
     with transaction.atomic():
-        partner = Partner.objects.filter(slug__in=["cc", "kis"]).first()
+        partner = Partner.objects.filter(slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).first()
         if not partner:
             partner = Partner.objects.create(
-                name="Christian Community (CC)",
-                slug="cc",
-                description="Official Christian Community partner account.",
+                name=KCAN_PARTNER_NAME,
+                slug=KCAN_PARTNER_SLUG,
+                description=KCAN_PARTNER_DESCRIPTION,
                 owner=user,
             )
         else:
-            desired_name = "Christian Community (CC)"
-            desired_slug = "cc"
-            desired_description = "Official Christian Community partner account."
+            desired_name = KCAN_PARTNER_NAME
+            desired_slug = KCAN_PARTNER_SLUG
+            desired_description = KCAN_PARTNER_DESCRIPTION
             updates = {}
             if partner.name != desired_name:
                 updates["name"] = desired_name
@@ -108,17 +115,41 @@ def _ensure_kis_partner() -> None:
         from apps.partners.models import PartnerOrganizationApp, PartnerOrganizationAppType
         ensure_partner_policy(partner)
         ensure_default_partner_roles(partner)
-        PartnerOrganizationApp.objects.get_or_create(
+        bible_app, _ = PartnerOrganizationApp.objects.get_or_create(
             partner=partner,
             type=PartnerOrganizationAppType.BIBLE,
             defaults={
-                "name": "KIS Bible",
+                "name": "KCAN Bible",
                 "slug": "bible",
-                "description": "Official Christian Community bible experience.",
-                "link": "/tabs/bible",
+                "description": "Official KCAN Bible experience.",
+                "link": "/bible",
+                "module": "partner.bible",
+                "metadata": {"internal": True, "immutable": True, "owner": "kcan"},
+                "status": "published",
+                "is_promoted_global": True,
+                "promoted_order": 20,
                 "order": 0,
             },
         )
+        bible_updates = {
+            "name": "KCAN Bible",
+            "slug": "bible",
+            "description": "Official KCAN Bible experience.",
+            "link": "/bible",
+            "module": "partner.bible",
+            "metadata": {"internal": True, "immutable": True, "owner": "kcan"},
+            "status": "published",
+            "is_promoted_global": True,
+            "promoted_order": 20,
+            "is_active": True,
+        }
+        changed = []
+        for field, value in bible_updates.items():
+            if getattr(bible_app, field) != value:
+                setattr(bible_app, field, value)
+                changed.append(field)
+        if changed:
+            bible_app.save(update_fields=[*changed, "updated_at"])
 
         if partner.main_conversation_id:
             _ensure_kis_members(partner.main_conversation)
@@ -187,7 +218,7 @@ def ensure_user_in_cc_partner(user) -> None:
     from apps.partners.models import Partner
     from apps.chat.models import ConversationMember, BaseConversationRole
 
-    partner = Partner.objects.filter(slug__in=["cc", "kis"]).select_related("main_conversation").first()
+    partner = Partner.objects.filter(slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).select_related("main_conversation").first()
     if not partner or not partner.main_conversation_id:
         return
     ConversationMember.objects.get_or_create(

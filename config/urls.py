@@ -1,19 +1,43 @@
 from django.contrib import admin
+from django.contrib.admin.views.decorators import staff_member_required
 from django.urls import path, include
+from django.utils.decorators import method_decorator
 from drf_spectacular.views import (
     SpectacularAPIView,
     SpectacularSwaggerView,
     SpectacularRedocView,
 )
 from rest_framework_simplejwt.views import (
-    TokenObtainPairView,   # POST: username/password -> { access, refresh }
-    TokenRefreshView,      # POST: { refresh } -> { access }
     TokenVerifyView,       # POST: { token } -> {} if valid
 )
+from apps.accounts.views import DeviceBoundTokenRefreshView, LoginView
 from apps.media.views import UploadFileView
 
 from django.conf import settings
 from django.conf.urls.static import static
+
+
+class StaffOnlySpectacularAPIView(SpectacularAPIView):
+    @method_decorator(staff_member_required)
+    def dispatch(self, *args, **kwargs):
+        return super().dispatch(*args, **kwargs)
+
+
+class StaffOnlySpectacularSwaggerView(SpectacularSwaggerView):
+    @method_decorator(staff_member_required)
+    def dispatch(self, *args, **kwargs):
+        return super().dispatch(*args, **kwargs)
+
+
+class StaffOnlySpectacularRedocView(SpectacularRedocView):
+    @method_decorator(staff_member_required)
+    def dispatch(self, *args, **kwargs):
+        return super().dispatch(*args, **kwargs)
+
+
+DocsSchemaView = SpectacularAPIView if settings.DEBUG else StaffOnlySpectacularAPIView
+DocsSwaggerView = SpectacularSwaggerView if settings.DEBUG else StaffOnlySpectacularSwaggerView
+DocsRedocView = SpectacularRedocView if settings.DEBUG else StaffOnlySpectacularRedocView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -51,17 +75,17 @@ urlpatterns = [
 
     # --- JWT auth endpoints (SimpleJWT) ---
     # Obtain access/refresh with username/password
-    path("api/v1/auth/jwt/create/", TokenObtainPairView.as_view(), name="jwt-create"),
+    path("api/v1/auth/jwt/create/", LoginView.as_view(), name="jwt-create"),
     # Exchange refresh for a new access
-    path("api/v1/auth/jwt/refresh/", TokenRefreshView.as_view(), name="jwt-refresh"),
+    path("api/v1/auth/jwt/refresh/", DeviceBoundTokenRefreshView.as_view(), name="jwt-refresh"),
     # Verify a token (access or refresh)
     path("api/v1/auth/jwt/verify/", TokenVerifyView.as_view(), name="jwt-verify"),
 
     # --- OpenAPI / Docs ---
-    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
-    path("api/docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
-    path("api/docs/swagger/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
-    path("api/docs/redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
+    path("api/schema/", DocsSchemaView.as_view(), name="schema"),
+    path("api/docs/", DocsSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    path("api/docs/swagger/", DocsSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    path("api/docs/redoc/", DocsRedocView.as_view(url_name="schema"), name="redoc"),
 
 
     #chat urls

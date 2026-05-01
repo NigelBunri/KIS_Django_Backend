@@ -366,7 +366,7 @@ class DirectConversationCreateSerializer(serializers.Serializer):
     """
 
     # Optional, for legacy / direct ID usage
-    peer_user_id = serializers.IntegerField(required=False)
+    peer_user_id = serializers.CharField(required=False)
 
     # New fields to match mobile payload, but we keep them optional
     type = serializers.CharField(required=False, allow_blank=True)
@@ -429,16 +429,16 @@ class DirectConversationCreateSerializer(serializers.Serializer):
         # 1) If peer_user_id is given directly, validate that path
         peer_id = raw_data.get("peer_user_id") or attrs.get("peer_user_id")
         if peer_id is not None:
-            peer_id = int(peer_id)
+            peer_id = str(peer_id).strip()
 
-            if peer_id == request.user.id:
+            if peer_id == str(request.user.id):
                 raise serializers.ValidationError(
                     {"peer_user_id": "Cannot create a direct chat with yourself."}
                 )
 
             try:
                 User.objects.get(id=peer_id)
-            except User.DoesNotExist:
+            except (User.DoesNotExist, ValueError, TypeError):
                 raise serializers.ValidationError(
                     {"peer_user_id": "Peer user does not exist."}
                 )
@@ -454,7 +454,7 @@ class DirectConversationCreateSerializer(serializers.Serializer):
             )
 
         # For a direct chat we only consider the first phone number
-        first_phone = phone_numbers[0]
+        first_phone = User.objects.normalize_phone(phone_numbers[0])
 
         try:
             # IMPORTANT: your User model uses `phone`, not `phone_number`
@@ -481,12 +481,13 @@ class DirectConversationCreateSerializer(serializers.Serializer):
 
         request = self.context["request"]
 
-        if value == request.user.id:
+        value = str(value).strip()
+        if value == str(request.user.id):
             raise serializers.ValidationError("Cannot create a direct chat with yourself.")
 
         try:
             User.objects.get(id=value)
-        except User.DoesNotExist:
+        except (User.DoesNotExist, ValueError, TypeError):
             raise serializers.ValidationError("Peer user does not exist.")
 
         return value

@@ -29,7 +29,10 @@ from apps.partners.models import (
     PartnerSetting,
     PartnerOrganizationProfile,
     PartnerOrganizationApp,
+    PartnerOrganizationAppTab,
+    PartnerOrganizationAppContentBlock,
     PartnerOrganizationAppAccessLog,
+    PartnerOrganizationAppStatus,
     PartnerProfileLink,
     PartnerServerCategory,
     PartnerChannelPermissionOverwrite,
@@ -1046,6 +1049,7 @@ class PartnerOrganizationProfileSerializer(PartnerImageUrlSerializerMixin, seria
 
 class PartnerOrganizationAppSerializer(serializers.ModelSerializer):
     partner_id = serializers.UUIDField(source="partner.id", read_only=True)
+    tabs = serializers.SerializerMethodField()
     visible_to = serializers.ListField(
         child=serializers.ChoiceField(choices=[(role, role.capitalize()) for role in PARTNER_ORG_APP_VISIBILITY_ROLES]),
         required=False,
@@ -1067,15 +1071,89 @@ class PartnerOrganizationAppSerializer(serializers.ModelSerializer):
             "icon",
             "config",
             "metadata",
+            "status",
+            "is_promoted_global",
+            "promoted_order",
+            "published_at",
             "is_active",
             "visible_to",
+            "tabs",
             "order",
             "group",
             "badge_label",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "partner_id", "created_at", "updated_at"]
+        read_only_fields = ["id", "partner_id", "is_promoted_global", "published_at", "tabs", "created_at", "updated_at"]
+
+    def get_tabs(self, obj):
+        tabs = getattr(obj, "prefetched_tabs", None)
+        if tabs is None:
+            tabs = obj.tabs.filter(is_active=True).order_by("order", "title")
+        return PartnerOrganizationAppTabSerializer(tabs, many=True, context=self.context).data
+
+
+class PartnerOrganizationAppContentBlockSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PartnerOrganizationAppContentBlock
+        fields = [
+            "id",
+            "tab",
+            "block_type",
+            "title",
+            "body",
+            "media_url",
+            "payload",
+            "order",
+            "status",
+            "is_active",
+            "published_at",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_by", "published_at", "created_at", "updated_at"]
+
+
+class PartnerOrganizationAppTabSerializer(serializers.ModelSerializer):
+    content_blocks = serializers.SerializerMethodField()
+    visible_to = serializers.ListField(
+        child=serializers.ChoiceField(choices=[(role, role.capitalize()) for role in PARTNER_ORG_APP_VISIBILITY_ROLES]),
+        required=False,
+        default=default_app_visibility,
+    )
+
+    class Meta:
+        model = PartnerOrganizationAppTab
+        fields = [
+            "id",
+            "app",
+            "title",
+            "slug",
+            "description",
+            "icon",
+            "order",
+            "is_active",
+            "visible_to",
+            "config",
+            "content_blocks",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "content_blocks", "created_at", "updated_at"]
+
+    def get_content_blocks(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        can_manage = bool(
+            user
+            and getattr(user, "is_authenticated", False)
+            and (obj.app.partner.owner_id == user.id or getattr(user, "is_staff", False))
+        )
+        blocks = obj.content_blocks.filter(is_active=True).order_by("order", "created_at")
+        if not can_manage:
+            blocks = blocks.filter(status=PartnerOrganizationAppStatus.PUBLISHED)
+        return PartnerOrganizationAppContentBlockSerializer(blocks, many=True, context=self.context).data
 
 
 class PartnerOrganizationAppAccessLogSerializer(serializers.ModelSerializer):

@@ -40,6 +40,27 @@ class SafetyAlertSerializer(serializers.ModelSerializer):
 
 
 class UserBlockSerializer(serializers.ModelSerializer):
+    blocked = serializers.PrimaryKeyRelatedField(
+        queryset=models.UserBlock._meta.get_field("blocked").remote_field.model.objects.all()
+    )
+
     class Meta:
         model = models.UserBlock
-        fields = "__all__"
+        fields = (
+            "id",
+            "blocker",
+            "blocked",
+            "reason",
+            "created_at",
+            "updated_at",
+            "is_deleted",
+        )
+        read_only_fields = ("id", "blocker", "created_at", "updated_at", "is_deleted")
+        validators = []
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        blocked = attrs.get("blocked")
+        if request and getattr(request, "user", None) and blocked == request.user:
+            raise serializers.ValidationError({"blocked": "You cannot mute yourself."})
+        return attrs

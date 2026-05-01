@@ -647,7 +647,6 @@ class WalletViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="deposit")
     def deposit(self, request):
-        print("deposit data: ", request.data)
         try:
             amount = _parse_frontend_money_to_cents(request.data)
         except ValueError as exc:

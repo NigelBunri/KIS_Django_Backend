@@ -4,10 +4,11 @@ import json
 from apps.accounts import models as accounts_models
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import ValidationError
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import StreamingHttpResponse
@@ -19,6 +20,31 @@ from .serializers import (AIJobSerializer, TranslationRequestSerializer, QnASess
                           AIModelSerializer, AIJobFeedbackSerializer, AIPipelineSerializer, AIScheduleSerializer)
 from .tasks import enqueue_ai_job
 from apps.accounts.tiers import consume_quota
+
+
+class StaffOrAuthenticatedReadOnly(BasePermission):
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in SAFE_METHODS:
+            return True
+        return request.user.is_staff or request.user.is_superuser
+
+
+class TriggeredByUserQuerysetMixin:
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_staff or user.is_superuser:
+            return qs
+        identifiers = {str(user.id)}
+        for value in (getattr(user, "username", None), getattr(user, "phone", None), getattr(user, "email", None)):
+            if value:
+                identifiers.add(str(value))
+        return qs.filter(triggered_by__in=identifiers)
+
+    def perform_create(self, serializer):
+        serializer.save(triggered_by=str(self.request.user.id))
 
 # --- OpenAPI / Swagger compatibility layer (supports drf-spectacular and drf-yasg) ---
 try:
@@ -93,12 +119,14 @@ def class_doc_decorator(tag_name: str):
 class AIModelViewSet(viewsets.ModelViewSet):
     queryset = AIModel.objects.all()
     serializer_class = AIModelSerializer
+    permission_classes = [StaffOrAuthenticatedReadOnly]
 
 
 @class_doc_decorator('AI Jobs')
-class AIJobViewSet(viewsets.ModelViewSet):
+class AIJobViewSet(TriggeredByUserQuerysetMixin, viewsets.ModelViewSet):
     queryset = AIJob.objects.all().order_by('-created_at')
     serializer_class = AIJobSerializer
+    permission_classes = [IsAuthenticated]
 
     @doc_decorator(
         summary="Run AI job",
@@ -122,6 +150,18 @@ class AIJobViewSet(viewsets.ModelViewSet):
 class TranslationRequestViewSet(viewsets.ModelViewSet):
     queryset = TranslationRequest.objects.all().order_by('-created_at')
     serializer_class = TranslationRequestSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset().select_related("job")
+        user = self.request.user
+        if user.is_staff or user.is_superuser:
+            return qs
+        identifiers = {str(user.id)}
+        for value in (getattr(user, "username", None), getattr(user, "phone", None), getattr(user, "email", None)):
+            if value:
+                identifiers.add(str(value))
+        return qs.filter(job__triggered_by__in=identifiers)
 
     @doc_decorator(
         summary="Create translation request",
@@ -140,7 +180,7 @@ class TranslationRequestViewSet(viewsets.ModelViewSet):
             'input_ref_type': data.get('input_ref_type', 'TEXT'),
             'input_ref_id': data.get('input_ref_id'),
             'metadata': data.get('metadata', {}),
-            'triggered_by': request.user.username if request.user.is_authenticated else 'ANONYMOUS'
+            'triggered_by': str(request.user.id) if request.user.is_authenticated else 'ANONYMOUS'
         }
         job = AIJob.objects.create(**job_data)
         tr = TranslationRequest.objects.create(
@@ -160,6 +200,17 @@ class TranslationRequestViewSet(viewsets.ModelViewSet):
 class QnASessionViewSet(viewsets.ModelViewSet):
     queryset = QnASession.objects.all().order_by('-last_interaction_at')
     serializer_class = QnASessionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_staff or user.is_superuser:
+            return qs
+        return qs.filter(user_id=user.id)
+
+    def perform_create(self, serializer):
+        serializer.save(user_id=self.request.user.id)
 
     @doc_decorator(
         summary="Send a message to QnA session",
@@ -177,7 +228,7 @@ class QnASessionViewSet(viewsets.ModelViewSet):
         # For free tier: forward to a local or community model microservice stub
         # Here we create an AIJob of type CUSTOM to process the message asynchronously
         job = AIJob.objects.create(job_type='CUSTOM', input_ref_type='QNA', input_ref_id=session.id,
-                                   metadata={'message': user_message}, triggered_by=request.user.username if request.user.is_authenticated else 'ANONYMOUS')
+                                   metadata={'message': user_message}, triggered_by=str(request.user.id) if request.user.is_authenticated else 'ANONYMOUS')
         enqueue_ai_job.delay(str(job.id))
         # use timezone.now() for a proper timestamp
         session.last_interaction_at = timezone.now()
@@ -189,12 +240,24 @@ class QnASessionViewSet(viewsets.ModelViewSet):
 class AIJobFeedbackViewSet(viewsets.ModelViewSet):
     queryset = AIJobFeedback.objects.all().order_by('-created_at')
     serializer_class = AIJobFeedbackSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset().select_related("job")
+        user = self.request.user
+        if user.is_staff or user.is_superuser:
+            return qs
+        return qs.filter(Q(user_id=user.id) | Q(job__triggered_by=str(user.id)))
+
+    def perform_create(self, serializer):
+        serializer.save(user_id=self.request.user.id)
 
 
 @class_doc_decorator('Pipelines')
 class AIPipelineViewSet(viewsets.ModelViewSet):
     queryset = AIPipeline.objects.all().order_by('-created_at')
     serializer_class = AIPipelineSerializer
+    permission_classes = [IsAdminUser]
 
     @doc_decorator(
         summary="Trigger pipeline",
@@ -207,7 +270,7 @@ class AIPipelineViewSet(viewsets.ModelViewSet):
         pipeline = self.get_object()
         # pipeline execution scheduled
         from .services import execute_pipeline
-        execute_pipeline.delay(str(pipeline.id), triggered_by=request.user.username if request.user.is_authenticated else 'ANONYMOUS')
+        execute_pipeline.delay(str(pipeline.id), triggered_by=str(request.user.id) if request.user.is_authenticated else 'ANONYMOUS')
         return Response({'status': 'enqueued'})
 
 
@@ -215,6 +278,7 @@ class AIPipelineViewSet(viewsets.ModelViewSet):
 class AIScheduleViewSet(viewsets.ModelViewSet):
     queryset = AISchedule.objects.all().order_by('-created_at')
     serializer_class = AIScheduleSerializer
+    permission_classes = [IsAdminUser]
     
 
 

@@ -1175,6 +1175,13 @@ class PartnerOrganizationAppType(models.TextChoices):
     EXTERNAL = "external", "External App"
 
 
+class PartnerOrganizationAppStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    REVIEW = "review", "In review"
+    PUBLISHED = "published", "Published"
+    ARCHIVED = "archived", "Archived"
+
+
 def default_app_visibility():
     return ["owner", "admin", "manager"]
 
@@ -1199,6 +1206,19 @@ class PartnerOrganizationApp(models.Model):
     config = models.JSONField(default=dict, blank=True)
     metadata = models.JSONField(default=dict, blank=True)
     visible_to = models.JSONField(default=default_app_visibility, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=PartnerOrganizationAppStatus.choices,
+        default=PartnerOrganizationAppStatus.DRAFT,
+        db_index=True,
+    )
+    is_promoted_global = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Only KCAN/platform-controlled apps should be promoted into the main app navigation.",
+    )
+    promoted_order = models.PositiveIntegerField(default=0)
+    published_at = models.DateTimeField(null=True, blank=True)
     group = models.CharField(max_length=128, blank=True)
     badge_label = models.CharField(max_length=128, blank=True)
     is_active = models.BooleanField(default=True)
@@ -1212,10 +1232,94 @@ class PartnerOrganizationApp(models.Model):
         indexes = [
             models.Index(fields=["partner", "type"], name="partner_org_app_pt_idx"),
             models.Index(fields=["partner", "order"], name="partner_org_app_po_idx"),
+            models.Index(fields=["is_promoted_global", "status"], name="partner_org_app_global_idx"),
         ]
 
     def __str__(self) -> str:
         return f"{self.name} ({self.partner_id})"
+
+
+class PartnerOrganizationAppTab(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    app = models.ForeignKey(
+        PartnerOrganizationApp,
+        on_delete=models.CASCADE,
+        related_name="tabs",
+    )
+    title = models.CharField(max_length=120)
+    slug = models.SlugField(max_length=120)
+    description = models.TextField(blank=True)
+    icon = models.CharField(max_length=128, blank=True)
+    order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    visible_to = models.JSONField(default=default_app_visibility, blank=True)
+    config = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_organization_app_tab"
+        ordering = ["order", "title"]
+        unique_together = [("app", "slug")]
+        indexes = [
+            models.Index(fields=["app", "order"], name="partner_org_tab_app_order_idx"),
+            models.Index(fields=["app", "is_active"], name="partner_org_tab_app_active_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.app.name} / {self.title}"
+
+
+class PartnerOrganizationAppContentBlock(models.Model):
+    class BlockType(models.TextChoices):
+        TEXT = "text", "Text"
+        RICH_TEXT = "rich_text", "Rich text"
+        VIDEO = "video", "Video"
+        IMAGE = "image", "Image"
+        LINK = "link", "Link"
+        FILE = "file", "File"
+        EMBED = "embed", "Embed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tab = models.ForeignKey(
+        PartnerOrganizationAppTab,
+        on_delete=models.CASCADE,
+        related_name="content_blocks",
+    )
+    block_type = models.CharField(max_length=32, choices=BlockType.choices, default=BlockType.TEXT)
+    title = models.CharField(max_length=255, blank=True)
+    body = models.TextField(blank=True)
+    media_url = models.URLField(blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+    order = models.PositiveIntegerField(default=0)
+    status = models.CharField(
+        max_length=16,
+        choices=PartnerOrganizationAppStatus.choices,
+        default=PartnerOrganizationAppStatus.DRAFT,
+        db_index=True,
+    )
+    is_active = models.BooleanField(default=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_partner_app_blocks",
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_organization_app_content_block"
+        ordering = ["order", "created_at"]
+        indexes = [
+            models.Index(fields=["tab", "order"], name="partner_block_tab_order_idx"),
+            models.Index(fields=["tab", "status"], name="partner_block_tab_status_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return self.title or f"{self.block_type} block"
 
 
 class PartnerOrganizationAppAccessLog(models.Model):

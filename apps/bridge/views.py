@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from .models import BridgeAccount, BridgeThread, BridgeMessage, BridgeAutomation, BridgeAnalytics
 from .serializers import (
     BridgeAccountSerializer,
+    BridgeAccountCredentialSerializer,
     BridgeThreadSerializer,
     BridgeMessageSerializer,
     BridgeAutomationSerializer,
@@ -11,6 +12,7 @@ from .serializers import (
 )
 from .permissions import IsBridgeOwnerOrReadOnly
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import NotFound
 from django.shortcuts import get_object_or_404
 from .tasks import enqueue_outbound_message, process_inbound_message
 from django.db import transaction
@@ -107,8 +109,32 @@ class BridgeAccountViewSet(viewsets.ModelViewSet):
     Manage Bridge Accounts (external app credentials & metadata).
     """
     queryset = BridgeAccount.objects.all()
-    serializer_class = BridgeAccountSerializer
     permission_classes = [IsAuthenticated, IsBridgeOwnerOrReadOnly]
+
+    def get_serializer_class(self):
+        if self.action in {"create", "update", "partial_update"}:
+            return BridgeAccountCredentialSerializer
+        return BridgeAccountSerializer
+
+    def get_queryset(self):
+        return BridgeAccount.objects.filter(user_id=self.request.user.id, is_deleted=False)
+
+    def perform_create(self, serializer):
+        serializer.save(user_id=self.request.user.id)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        account = serializer.save(user_id=request.user.id)
+        return Response(BridgeAccountSerializer(account).data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        account = serializer.save(user_id=request.user.id)
+        return Response(BridgeAccountSerializer(account).data)
 
     @extend_schema(
         summary="Trigger sync for a Bridge Account",
@@ -148,6 +174,27 @@ class BridgeThreadViewSet(viewsets.ModelViewSet):
     queryset = BridgeThread.objects.all()
     serializer_class = BridgeThreadSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        accounts = BridgeAccount.objects.filter(user_id=self.request.user.id, is_deleted=False)
+        allowed_apps = accounts.values_list("external_app", flat=True)
+        linked_ids = accounts.values_list("id", flat=True)
+        return BridgeThread.objects.filter(
+            external_app__in=allowed_apps,
+            linked_thread_id__in=linked_ids,
+            is_deleted=False,
+        )
+
+    def perform_create(self, serializer):
+        external_app = serializer.validated_data.get("external_app")
+        account = BridgeAccount.objects.filter(
+            user_id=self.request.user.id,
+            external_app=external_app,
+            is_deleted=False,
+        ).first()
+        if not account:
+            raise NotFound("Bridge account not found.")
+        serializer.save(linked_thread_id=account.id)
 
     @extend_schema(
         summary="Archive a thread",
@@ -200,6 +247,14 @@ class BridgeMessageViewSet(viewsets.ModelViewSet):
     serializer_class = BridgeMessageSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        allowed_threads = BridgeThreadViewSet()
+        allowed_threads.request = self.request
+        return BridgeMessage.objects.select_related("bridge_thread").filter(
+            bridge_thread__in=allowed_threads.get_queryset(),
+            is_deleted=False,
+        )
+
     @extend_schema(
         summary="Create outbound message and enqueue sender",
         description="Creates a message record with direction=OUTBOUND. The system will enqueue the message for delivery to the external platform asynchronously.",
@@ -212,6 +267,11 @@ class BridgeMessageViewSet(viewsets.ModelViewSet):
         # When creating outbound message, enqueue sending to external provider
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        thread = serializer.validated_data.get("bridge_thread")
+        allowed_threads = BridgeThreadViewSet()
+        allowed_threads.request = self.request
+        if not allowed_threads.get_queryset().filter(pk=getattr(thread, "pk", None)).exists():
+            return Response({"detail": "Thread not found."}, status=status.HTTP_404_NOT_FOUND)
         msg = serializer.save()
         # enqueue async send (Celery)
         try:
@@ -241,6 +301,22 @@ class BridgeAutomationViewSet(viewsets.ModelViewSet):
     serializer_class = BridgeAutomationSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        allowed_threads = BridgeThreadViewSet()
+        allowed_threads.request = self.request
+        return BridgeAutomation.objects.filter(
+            bridge_thread__in=allowed_threads.get_queryset(),
+            is_deleted=False,
+        )
+
+    def perform_create(self, serializer):
+        thread = serializer.validated_data.get("bridge_thread")
+        allowed_threads = BridgeThreadViewSet()
+        allowed_threads.request = self.request
+        if not allowed_threads.get_queryset().filter(pk=getattr(thread, "pk", None)).exists():
+            raise NotFound("Thread not found.")
+        serializer.save()
+
 ####################################
 # BridgeAnalyticsViewSet
 ####################################
@@ -260,3 +336,10 @@ class BridgeAnalyticsViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = BridgeAnalytics.objects.all()
     serializer_class = BridgeAnalyticsSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return BridgeAnalytics.objects.filter(
+            bridge_account__user_id=self.request.user.id,
+            bridge_account__is_deleted=False,
+            is_deleted=False,
+        )

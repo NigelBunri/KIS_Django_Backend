@@ -29,6 +29,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 
 from drf_spectacular.utils import (
@@ -38,6 +39,8 @@ from drf_spectacular.utils import (
 # SimpleJWT
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from .jwt_auth import DeviceBoundJWTAuthentication, DeviceBoundJWTAuthenticationAllowPhoneLookup
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.settings import api_settings as jwt_api_settings
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
@@ -67,6 +70,7 @@ from .models import (
     UserContact,
     ApiToken,
 )
+from .security_events import log_security_event, record_failed_auth, request_meta
 
 from .serializers import (
     UserSerializer,
@@ -599,11 +603,23 @@ def issue_tokens_for_user(user: User, device_id: Optional[str] = None) -> dict:
     refresh = RefreshToken.for_user(user)
     if device_id:
         refresh["device_id"] = device_id
+        device = Device.objects.filter(user=user, device_id=str(device_id), revoked_at__isnull=True).first()
+        if device:
+            refresh["token_version"] = device.token_version
     return {
         "access": str(refresh.access_token),
         "refresh": str(refresh),
         "token_type": "Bearer",
     }
+
+
+def request_device_id(request) -> str:
+    return (
+        request.headers.get("X-Device-Id")
+        or request.headers.get("X-Device-ID")
+        or request.headers.get("X-DeviceId")
+        or ""
+    )
 
 def upsert_device(
     user: User,
@@ -612,6 +628,8 @@ def upsert_device(
     name: Optional[str],
     request,
 ) -> Device:
+    existing = Device.objects.filter(user=user, device_id=str(device_id)).first()
+    token_version = (existing.token_version + 1) if existing and existing.revoked_at else (existing.token_version if existing else 1)
     device, _ = Device.objects.update_or_create(
         user=user,
         device_id=str(device_id),
@@ -621,7 +639,28 @@ def upsert_device(
             "last_seen_at": timezone.now(),
             "last_ip": request.META.get("REMOTE_ADDR") if request else None,
             "user_agent": request.META.get("HTTP_USER_AGENT") if request else None,
+            "token_version": token_version,
+            "revoked_at": None,
+            "revoke_reason": "",
         },
+    )
+    return device
+
+
+def revoke_device_session(user: User, device: Device, *, reason: str, request=None) -> Device:
+    device.token_version = int(device.token_version or 1) + 1
+    device.revoked_at = timezone.now()
+    device.revoke_reason = reason[:120]
+    device.save(update_fields=["token_version", "revoked_at", "revoke_reason", "updated_at"])
+    E2EDeviceKey.objects.filter(user=user, device=device).delete()
+    E2EPreKey.objects.filter(user=user, device=device).delete()
+    log_security_event(
+        user,
+        "security.device.revoked",
+        request=request,
+        severity="warning",
+        device_id=device.device_id,
+        reason=reason,
     )
     return device
 
@@ -668,9 +707,9 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
     serializer_class = UserCreateSerializer
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_scope = "register"
 
     def create(self, request, *args, **kwargs):
-        print(request.data)
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         device_id = (request.data.get("device_id") or "").strip()
@@ -713,19 +752,46 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
 class LoginView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_scope = "login"
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data, context={"request": request})
-        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except DRFValidationError:
+            login_identifier = None
+            if hasattr(request, "data"):
+                login_identifier = (
+                    request.data.get("phone")
+                    or request.data.get("phone_number")
+                    or request.data.get("email")
+                )
+            record_failed_auth(
+                request,
+                identifier=login_identifier,
+            )
+            raise
         user = serializer.validated_data["user"]
         otp_code = (serializer.validated_data.get("otp_code") or "").strip()
         if TwoFactor.objects.filter(user=user, type="totp", enabled=True).exists():
             if not otp_code:
+                log_security_event(
+                    user,
+                    "security.auth.otp_required",
+                    request=request,
+                    severity="info",
+                    device_id=serializer.validated_data.get("device_id"),
+                )
                 return Response(
                     {"detail": "OTP required", "two_factor_required": True},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
             if not verify_totp(user, otp_code):
+                record_failed_auth(
+                    request,
+                    identifier=user.phone or user.email,
+                    reason="invalid_totp",
+                )
                 return Response(
                     {"detail": "Invalid OTP", "two_factor_required": True},
                     status=status.HTTP_401_UNAUTHORIZED,
@@ -736,9 +802,14 @@ class LoginView(APIView):
         upsert_device(user, device_id, device_platform, device_name, request)
         tokens = issue_tokens_for_user(user, device_id=device_id)  # should return {access, refresh} or similar
 
-        # Optional bookkeeping
-        AuditLog.log(actor=user, action="user.login",
-                     meta={"ip": request.META.get("REMOTE_ADDR")})
+        log_security_event(
+            user,
+            "security.auth.login_success",
+            request=request,
+            device_id=device_id,
+            device_platform=device_platform,
+        )
+        AuditLog.log(actor=user, action="user.login", meta=request_meta(request, device_id=device_id))
 
         return Response(
             {
@@ -809,8 +880,67 @@ class LogoutView(APIView):
                 token.blacklist()  # will no-op / raise if blacklist not configured
             except Exception:
                 pass
-        AuditLog.log(actor=request.user, action="user.logout", meta={})
+        current_device_id = request_device_id(request)
+        if current_device_id:
+            device = Device.objects.filter(user=request.user, device_id=str(current_device_id), revoked_at__isnull=True).first()
+            if device:
+                revoke_device_session(request.user, device, reason="logout", request=request)
+        AuditLog.log(actor=request.user, action="user.logout", meta=request_meta(request, device_id=current_device_id))
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@extend_schema(
+    summary="Refresh JWT with device-session checks",
+    request=serializers.Serializer,
+    responses={200: JWTTokensSerializer},
+    tags=["Auth"],
+)
+class DeviceBoundTokenRefreshView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_scope = "login"
+
+    def post(self, request):
+        refresh_value = (request.data or {}).get("refresh")
+        if not refresh_value:
+            return Response({"detail": "Refresh token is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            refresh = RefreshToken(refresh_value)
+        except TokenError:
+            record_failed_auth(request, reason="invalid_refresh")
+            return Response({"detail": "Token is invalid or expired."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        user_id = refresh.get(jwt_api_settings.USER_ID_CLAIM)
+        device_id = refresh.get("device_id")
+        token_version = refresh.get("token_version")
+        try:
+            user = User.objects.get(**{jwt_api_settings.USER_ID_FIELD: user_id})
+        except User.DoesNotExist:
+            record_failed_auth(request, reason="refresh_user_missing")
+            return Response({"detail": "Token is invalid or expired."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        device = Device.objects.filter(user=user, device_id=str(device_id or "")).first()
+        if not device or device.revoked_at:
+            record_failed_auth(request, identifier=user.phone or user.email, reason="refresh_device_revoked")
+            return Response({"detail": "Device session revoked."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        try:
+            token_version_matches = int(token_version) == int(device.token_version)
+        except (TypeError, ValueError):
+            token_version_matches = False
+        if not token_version_matches:
+            record_failed_auth(request, identifier=user.phone or user.email, reason="refresh_token_version_mismatch")
+            return Response({"detail": "Device session expired."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        Device.objects.filter(pk=device.pk).update(last_seen_at=timezone.now())
+        access = refresh.access_token
+        log_security_event(
+            user,
+            "security.auth.refresh_success",
+            request=request,
+            device_id=device.device_id,
+        )
+        return Response({"access": str(access), "refresh": str(refresh), "token_type": "Bearer"}, status=status.HTTP_200_OK)
 
 
 @extend_schema(
@@ -981,7 +1111,7 @@ class E2EEFetchBundleView(APIView):
         target = get_object_or_404(User, id=user_id)
         device_id = request.query_params.get("device_id")
 
-        device_qs = Device.objects.filter(user=target)
+        device_qs = Device.objects.filter(user=target, revoked_at__isnull=True)
         if device_id:
             device_qs = device_qs.filter(device_id=str(device_id))
         device = device_qs.order_by("-last_seen_at").first()
@@ -1023,6 +1153,8 @@ class E2EEFetchBundleView(APIView):
 
 
 def _serialize_e2ee_bundle_for_device(target: User, device: Device) -> Optional[dict]:
+    if getattr(device, "revoked_at", None):
+        return None
     key = E2EDeviceKey.objects.filter(user=target, device=device).first()
     if not key:
         return None
@@ -1066,7 +1198,7 @@ class E2EEFetchDeviceBundlesView(APIView):
 
     def get(self, request, user_id: str):
         target = get_object_or_404(User, id=user_id)
-        devices = Device.objects.filter(user=target).order_by("-last_seen_at")
+        devices = Device.objects.filter(user=target, revoked_at__isnull=True).order_by("-last_seen_at")
         bundles = []
         for device in devices:
             bundle = _serialize_e2ee_bundle_for_device(target, device)
@@ -1091,7 +1223,7 @@ class DeviceSessionsView(APIView):
 
     def get(self, request):
         devices = (
-            Device.objects.filter(user=request.user)
+            Device.objects.filter(user=request.user, revoked_at__isnull=True)
             .order_by("-last_seen_at", "-created_at")
         )
         serializer = DeviceSessionSerializer(devices, many=True, context={"request": request})
@@ -1107,20 +1239,13 @@ class DeviceSessionDetailView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def delete(self, request, device_id: str):
-        current_device_id = (
-            request.headers.get("X-Device-Id")
-            or request.headers.get("X-Device-ID")
-            or request.headers.get("X-DeviceId")
-            or ""
-        )
+        current_device_id = request_device_id(request)
         if str(device_id) == str(current_device_id):
             return Response({"detail": "Use logout to end the current device session."}, status=status.HTTP_400_BAD_REQUEST)
 
-        device = get_object_or_404(Device, user=request.user, device_id=str(device_id))
-        E2EDeviceKey.objects.filter(user=request.user, device=device).delete()
-        E2EPreKey.objects.filter(user=request.user, device=device).delete()
-        device.delete()
-        AuditLog.log(actor=request.user, action="device.revoked", meta={"device_id": device_id})
+        device = get_object_or_404(Device, user=request.user, device_id=str(device_id), revoked_at__isnull=True)
+        revoke_device_session(request.user, device, reason="user_device_revoke", request=request)
+        AuditLog.log(actor=request.user, action="device.revoked", meta=request_meta(request, device_id=device_id))
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 # -----------------------------

@@ -6,6 +6,7 @@ from rest_framework.test import APITestCase
 
 from apps.accounts.models import User
 
+from .internal_signing import sign_internal_request
 from .models import (
     BaseConversationRole,
     Conversation,
@@ -13,6 +14,11 @@ from .models import (
     ConversationRequestState,
     ConversationType,
 )
+
+
+def _signed_internal_headers(method: str, path: str, body=None, secret: str = "test-internal-token"):
+    headers = sign_internal_request(method, path, body, secret=secret)
+    return {f"HTTP_{key.upper().replace('-', '_')}": value for key, value in headers.items()}
 
 
 class ConversationUnreadContractTests(APITestCase):
@@ -62,9 +68,12 @@ class ConversationUnreadContractTests(APITestCase):
         self.assertIs(row["has_mention"], False)
 
     def test_internal_update_read_state_advances_monotonically(self):
-        url = reverse("conversation-update-read-state", kwargs={"pk": self.conversation.id})
+        url = f"/api/v1/conversations/{self.conversation.id}/update-read-state/"
 
-        with patch.dict(os.environ, {"DJANGO_INTERNAL_TOKEN": "test-internal-token"}):
+        with patch.dict(
+            os.environ,
+            {"DJANGO_INTERNAL_TOKEN": "test-internal-token", "INTERNAL_SIGNATURE_REQUIRED": "0"},
+        ):
             res = self.client.patch(
                 url,
                 {
@@ -93,6 +102,49 @@ class ConversationUnreadContractTests(APITestCase):
             member.refresh_from_db()
             self.assertEqual(member.last_read_seq, 8)
 
+    def test_strict_internal_auth_accepts_signed_request_and_rejects_replay(self):
+        url = f"/api/v1/conversations/{self.conversation.id}/update-read-state/"
+        payload = {
+            "user_id": str(self.user.id),
+            "last_read_seq": 9,
+        }
+        headers = _signed_internal_headers("PATCH", url, payload)
+
+        with patch.dict(
+            os.environ,
+            {
+                "DJANGO_INTERNAL_TOKEN": "test-internal-token",
+                "INTERNAL_SIGNATURE_REQUIRED": "1",
+            },
+        ):
+            res = self.client.patch(url, payload, format="json", **headers)
+            self.assertEqual(res.status_code, 200)
+
+            replay = self.client.patch(url, payload, format="json", **headers)
+            self.assertEqual(replay.status_code, 403)
+
+    def test_strict_internal_auth_rejects_legacy_token_only_request(self):
+        url = f"/api/v1/conversations/{self.conversation.id}/update-read-state/"
+
+        with patch.dict(
+            os.environ,
+            {
+                "DJANGO_INTERNAL_TOKEN": "test-internal-token",
+                "INTERNAL_SIGNATURE_REQUIRED": "1",
+            },
+        ):
+            res = self.client.patch(
+                url,
+                {
+                    "user_id": self.user.id,
+                    "last_read_seq": 8,
+                },
+                format="json",
+                HTTP_X_INTERNAL_AUTH="test-internal-token",
+            )
+
+        self.assertEqual(res.status_code, 403)
+
     def test_pending_direct_recipient_cannot_send_via_ws_perms(self):
         self.conversation.request_state = ConversationRequestState.PENDING
         self.conversation.request_initiator = self.user
@@ -100,9 +152,12 @@ class ConversationUnreadContractTests(APITestCase):
         self.conversation.save(
             update_fields=["request_state", "request_initiator", "request_recipient"]
         )
-        url = reverse("conversation-ws-perms", kwargs={"pk": self.conversation.id})
+        url = f"/api/v1/conversations/{self.conversation.id}/ws-perms/"
 
-        with patch.dict(os.environ, {"DJANGO_INTERNAL_TOKEN": "test-internal-token"}):
+        with patch.dict(
+            os.environ,
+            {"DJANGO_INTERNAL_TOKEN": "test-internal-token", "INTERNAL_SIGNATURE_REQUIRED": "0"},
+        ):
             res = self.client.get(
                 url,
                 {"userId": str(self.peer.id)},

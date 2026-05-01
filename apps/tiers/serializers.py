@@ -8,7 +8,7 @@ from .models import (
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = '__all__'
+        exclude = ['password_hash']
         read_only_fields = ['id','created_at','updated_at']
 
 class OrganizationSerializer(serializers.ModelSerializer):

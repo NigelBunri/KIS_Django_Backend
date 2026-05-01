@@ -1,8 +1,7 @@
 
 from celery import shared_task
 from django.utils import timezone
-from . import models, services
-import time
+from . import firebase, models, services
 import random
 import logging
 
@@ -33,6 +32,36 @@ def process_notification_delivery(self, notification_id):
                 delivery.delivered_at = timezone.now()
                 delivery.save()
                 notif.mark_delivered()
+            elif delivery.channel == "PUSH":
+                tokens = models.NotificationDeviceToken.objects.filter(
+                    user_id=notif.user_id,
+                    enabled=True,
+                    is_deleted=False,
+                )
+                if not tokens.exists():
+                    delivery.status = "PENDING"
+                    delivery.last_error = "No active push token registered for this user."
+                    delivery.save(update_fields=["status", "last_error", "updated_at"])
+                    continue
+
+                sent = False
+                errors = []
+                for token in tokens:
+                    ok, result = firebase.send_push(token.push_token, notif)
+                    if ok:
+                        sent = True
+                    else:
+                        errors.append(result)
+                if sent:
+                    delivery.status = "SENT"
+                    delivery.delivered_at = timezone.now()
+                    delivery.last_error = ""
+                    delivery.save()
+                    notif.mark_delivered()
+                else:
+                    delivery.status = "PENDING"
+                    delivery.last_error = "; ".join(errors[:3]) or "Push provider delivery failed."
+                    delivery.save(update_fields=["status", "last_error", "updated_at"])
             elif delivery.channel == "WEBHOOK":
                 # call webhook endpoint (placeholder)
                 # In production, sign payload, handle retries, and verify responses

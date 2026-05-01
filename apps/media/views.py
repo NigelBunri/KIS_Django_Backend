@@ -1,15 +1,20 @@
 # media/views.py
+import os
 import uuid
+from urllib.parse import quote
 
 from django.conf import settings
+from django.core import signing
 from django.core.files.storage import default_storage
+from django.http import FileResponse
+from django.utils.text import get_valid_filename
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.shortcuts import get_object_or_404
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from apps.accounts.jwt_auth import DeviceBoundJWTAuthentication
 
 from .models import MediaAsset, MediaVariant, ProcessingJob, MediaMetrics
@@ -18,6 +23,126 @@ from .serializers import (
     MediaAssetSerializer, MediaVariantSerializer, ProcessingJobSerializer, MediaMetricsSerializer
 )
 from .permissions import IsOwnerOrReadOnly
+
+MAX_UPLOAD_BYTES = int(os.environ.get("UPLOAD_MAX_BYTES", str(50 * 1024 * 1024)))
+MEDIA_SIGNED_URL_TTL_SECONDS = int(os.environ.get("MEDIA_SIGNED_URL_TTL_SECONDS", "300"))
+UPLOAD_SCAN_REQUIRED = str(os.environ.get("UPLOAD_SCAN_REQUIRED", "0")).strip().lower() in {"1", "true", "yes"}
+PRIVATE_VISIBILITY_VALUES = {"private", "restricted", "owner", "authenticated", "tenant"}
+PUBLIC_VISIBILITY_VALUES = {"public", "published", "open"}
+BLOCKED_UPLOAD_EXTENSIONS = {
+    ".apk",
+    ".app",
+    ".bat",
+    ".bin",
+    ".cmd",
+    ".com",
+    ".dll",
+    ".dmg",
+    ".exe",
+    ".js",
+    ".mjs",
+    ".msi",
+    ".ps1",
+    ".scr",
+    ".sh",
+    ".vbs",
+}
+ALLOWED_UPLOAD_MIME_PREFIXES = ("image/", "video/", "audio/", "text/")
+ALLOWED_UPLOAD_MIME_TYPES = {
+    "application/json",
+    "application/octet-stream",
+    "application/pdf",
+    "application/msword",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/zip",
+}
+
+
+def _is_allowed_upload_mime(mime_type: str | None) -> bool:
+    normalized = str(mime_type or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized in ALLOWED_UPLOAD_MIME_TYPES or normalized.startswith(ALLOWED_UPLOAD_MIME_PREFIXES)
+
+
+def _validate_upload_file(upload):
+    filename = str(upload.name or "upload")
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in BLOCKED_UPLOAD_EXTENSIONS:
+        raise ValidationError({"detail": "This file type is not allowed."})
+    if upload.size and upload.size > MAX_UPLOAD_BYTES:
+        raise ValidationError({"detail": "File too large."})
+    if not _is_allowed_upload_mime(upload.content_type):
+        raise ValidationError({"detail": "This MIME type is not allowed."})
+
+
+def _payload_visibility(payload) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    value = payload.get("visibility") or payload.get("access") or payload.get("privacy")
+    return str(value or "").strip().lower()
+
+
+def _asset_is_private(asset: MediaAsset) -> bool:
+    payloads = [asset.storage or {}, asset.metadata or {}, asset.security or {}]
+    for payload in payloads:
+        visibility = _payload_visibility(payload)
+        if visibility in PRIVATE_VISIBILITY_VALUES:
+            return True
+        if payload.get("private") is True:
+            return True
+        if payload.get("public") is False:
+            return True
+
+    policy = getattr(asset, "access_policy", None)
+    rules = getattr(policy, "rules", None) if policy else None
+    if isinstance(rules, dict):
+        visibility = _payload_visibility(rules)
+        if visibility in PRIVATE_VISIBILITY_VALUES:
+            return True
+        if rules.get("private") is True or rules.get("public") is False:
+            return True
+    return False
+
+
+def _public_media_queryset(qs):
+    """Legacy ready media remains public unless an explicit private marker exists."""
+    public_ids = [
+        asset.id
+        for asset in qs.filter(status="ready")
+        if not _asset_is_private(asset)
+    ]
+    return qs.filter(id__in=public_ids)
+
+
+def _user_can_access_asset(user, asset: MediaAsset) -> bool:
+    if not _asset_is_private(asset):
+        return asset.status == "ready" or bool(user and user.is_authenticated and user == asset.owner)
+    if not user or not user.is_authenticated:
+        return False
+    return bool(user.is_staff or asset.owner_id == user.id)
+
+
+def _sign_media_asset(asset: MediaAsset) -> str:
+    signer = signing.TimestampSigner(salt="kis-media-download")
+    return signer.sign(str(asset.id))
+
+
+def _token_allows_asset(token: str | None, asset: MediaAsset) -> bool:
+    if not token:
+        return False
+    signer = signing.TimestampSigner(salt="kis-media-download")
+    try:
+        value = signer.unsign(token, max_age=MEDIA_SIGNED_URL_TTL_SECONDS)
+    except signing.BadSignature:
+        return False
+    except signing.SignatureExpired:
+        return False
+    return str(value) == str(asset.id)
 
 # --- Swagger / OpenAPI compatibility shim (drf-yasg first, then drf-spectacular) ---
 try:
@@ -96,6 +221,16 @@ class MediaAssetViewSet(viewsets.ModelViewSet):
     serializer_class = MediaAssetSerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsOwnerOrReadOnly]
 
+    def get_queryset(self):
+        qs = MediaAsset.objects.select_related("owner").filter(is_deleted=False)
+        user = self.request.user
+        if user.is_authenticated:
+            if user.is_staff:
+                return qs
+            public_qs = _public_media_queryset(qs)
+            return (qs.filter(owner=user) | public_qs).distinct()
+        return _public_media_queryset(qs)
+
     def perform_create(self, serializer):
         from apps.accounts.tiers import get_user_tier_features
 
@@ -168,10 +303,52 @@ class MediaAssetViewSet(viewsets.ModelViewSet):
         metrics.add_view(minutes=minutes)
         return Response(MediaMetricsSerializer(metrics).data)
 
+    @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
+    def sign(self, request, pk=None):
+        asset = get_object_or_404(MediaAsset.objects.filter(is_deleted=False), pk=pk)
+        if not _user_can_access_asset(request.user, asset):
+            raise PermissionDenied("You do not have access to this media asset.")
+
+        token = _sign_media_asset(asset)
+        path = f"/api/v1/assets/{asset.id}/download/?token={quote(token)}"
+        return Response(
+            {
+                "signed_url": request.build_absolute_uri(path),
+                "expires_in": MEDIA_SIGNED_URL_TTL_SECONDS,
+                "private": _asset_is_private(asset),
+            }
+        )
+
+    @action(detail=True, methods=["get"], permission_classes=[permissions.AllowAny])
+    def download(self, request, pk=None):
+        asset = get_object_or_404(MediaAsset.objects.filter(is_deleted=False), pk=pk)
+        if not _user_can_access_asset(request.user, asset):
+            token = request.query_params.get("token")
+            if not _token_allows_asset(token, asset):
+                raise PermissionDenied("A valid signed media URL is required.")
+
+        if not asset.bucket_key:
+            raise NotFound("Media file is not available.")
+        try:
+            handle = default_storage.open(asset.bucket_key, "rb")
+        except Exception:
+            raise NotFound("Media file is not available.")
+
+        response = FileResponse(handle, content_type=asset.mime_type or "application/octet-stream")
+        response["Cache-Control"] = "private, max-age=0, no-store"
+        return response
+
 class ProcessingJobViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = ProcessingJob.objects.select_related("asset").all()
+    queryset = ProcessingJob.objects.select_related("asset", "asset__owner").all()
     serializer_class = ProcessingJobSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = ProcessingJob.objects.select_related("asset", "asset__owner").filter(is_deleted=False)
+        user = self.request.user
+        if user.is_staff:
+            return qs
+        return qs.filter(asset__owner=user)
 
 
 def _guess_attachment_kind(mime_type: str | None) -> str:
@@ -193,6 +370,7 @@ class UploadFileView(APIView):
     parser_classes = [MultiPartParser, FormParser]
     permission_classes = [permissions.IsAuthenticated]
     authentication_classes = [DeviceBoundJWTAuthentication]
+    throttle_scope = "upload"
 
     def initial(self, request, *args, **kwargs):
         device_id = request.GET.get("device_id")
@@ -204,22 +382,31 @@ class UploadFileView(APIView):
         upload = request.FILES.get("file")
         if not upload:
             return Response({"detail": "A file is required."}, status=status.HTTP_400_BAD_REQUEST)
+        _validate_upload_file(upload)
 
         identifier = uuid.uuid4().hex
-        filename = upload.name or "upload"
+        filename = get_valid_filename(upload.name or "upload") or "upload"
         relative_path = f"uploads/{identifier}/{filename}"
         saved_path = default_storage.save(relative_path, upload)
         sanitized_path = saved_path.replace("\\", "/")
         media_root_url = settings.MEDIA_URL.rstrip("/")
         public_url = request.build_absolute_uri(f"{media_root_url}/{sanitized_path.lstrip('/')}")
+        visibility = str(request.data.get("visibility") or "private").strip().lower()
+        is_public_upload = visibility in PUBLIC_VISIBILITY_VALUES
+        scan_status = "pending" if UPLOAD_SCAN_REQUIRED else "not_configured"
 
         attachment = {
             "id": identifier,
-            "url": public_url,
+            "url": public_url if (settings.DEBUG or is_public_upload) else "",
+            "localUrl": public_url if settings.DEBUG else "",
             "originalName": filename,
             "mimeType": upload.content_type or "",
             "size": upload.size,
             "kind": _guess_attachment_kind(upload.content_type),
+            "visibility": "public" if is_public_upload else "private",
+            "private": not is_public_upload,
+            "scanStatus": scan_status,
+            "quarantined": UPLOAD_SCAN_REQUIRED,
         }
 
         return Response({"attachment": attachment}, status=status.HTTP_201_CREATED)

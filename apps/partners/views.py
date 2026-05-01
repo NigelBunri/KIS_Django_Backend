@@ -10,7 +10,7 @@ from django.utils.dateparse import parse_datetime
 from django.utils import timezone
 
 from rest_framework import viewsets, status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -49,6 +49,9 @@ from apps.partners.models import (
     PartnerSetting,
     PartnerOrganizationProfile,
     PartnerOrganizationApp,
+    PartnerOrganizationAppStatus,
+    PartnerOrganizationAppTab,
+    PartnerOrganizationAppContentBlock,
     PartnerOrganizationAppType,
     PartnerOrganizationAppAccessLog,
     PartnerProfileLink,
@@ -84,6 +87,8 @@ from apps.partners.serializers import (
     PartnerJobPostSerializer,
     PartnerOnboardingProgressSerializer,
     PartnerOrganizationAppAccessLogSerializer,
+    PartnerOrganizationAppContentBlockSerializer,
+    PartnerOrganizationAppTabSerializer,
     PartnerPostSerializer,
     PartnerPostCreateSerializer,
     PartnerPostCommentSerializer,
@@ -108,6 +113,7 @@ from apps.partners.serializers import (
     PartnerModerationActionSerializer,
     PartnerMemberDirectoryEntrySerializer,
 )
+from apps.partners.seed import KCAN_PARTNER_SLUG, LEGACY_DEFAULT_PARTNER_SLUGS
 from apps.moderation.models import UserBlock
 from apps.accounts.feature_gate import require_feature
 from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
@@ -241,6 +247,11 @@ class PartnerViewSet(viewsets.ModelViewSet):
     queryset = Partner.objects.select_related("owner", "main_conversation")
     http_method_names = ["get", "post", "put", "patch", "delete", "head", "options"]
 
+    def get_permissions(self):
+        if self.action == "global_organization_apps":
+            return [AllowAny()]
+        return super().get_permissions()
+
     def get_serializer_class(self):
         if self.action == "list":
             return PartnerListSerializer
@@ -328,6 +339,14 @@ class PartnerViewSet(viewsets.ModelViewSet):
 
     def _user_can_manage_organization_apps(self, partner: Partner, user) -> bool:
         return partner_user_can_manage(partner, user)
+
+    def _user_can_promote_global_apps(self, partner: Partner, user) -> bool:
+        return bool(
+            user
+            and user.is_authenticated
+            and partner.slug == KCAN_PARTNER_SLUG
+            and (user.is_staff or self._user_can_manage_organization_apps(partner, user))
+        )
 
     def _require_permission(self, partner: Partner, user, codename: str) -> None:
         if self._user_can_manage_partner(partner, user):
@@ -1847,16 +1866,19 @@ class PartnerViewSet(viewsets.ModelViewSet):
         if not self._user_can_access_partner(partner, request.user):
             raise PermissionDenied("Not allowed to view organization apps.")
 
-        DEFAULT_ORGANIZATION_PARTNER_SLUG = "cc"
-        if partner.slug == DEFAULT_ORGANIZATION_PARTNER_SLUG:
+        if partner.slug in LEGACY_DEFAULT_PARTNER_SLUGS:
             ensure_default_organization_app(
                 partner,
                 app_type=PartnerOrganizationAppType.BIBLE,
                 defaults={
-                    "name": "Bible App",
-                    "description": "Bible experience maintained by CC.",
+                    "name": "KCAN Bible",
+                    "slug": "bible",
+                    "description": "Official KCAN Bible experience managed by the default partner account.",
                     "module": "partner.bible",
-                    "metadata": {"internal": True, "immutable": True},
+                    "metadata": {"internal": True, "immutable": True, "owner": "kcan"},
+                    "status": PartnerOrganizationAppStatus.PUBLISHED,
+                    "is_promoted_global": True,
+                    "promoted_order": 20,
                     "is_active": True,
                 },
             )
@@ -1875,7 +1897,14 @@ class PartnerViewSet(viewsets.ModelViewSet):
                     {"errors": serializer.errors},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            app = PartnerOrganizationApp.objects.create(partner=partner, **serializer.validated_data)
+            app_data = dict(serializer.validated_data)
+            if app_data.get("type") == PartnerOrganizationAppType.BIBLE and partner.slug != KCAN_PARTNER_SLUG:
+                raise PermissionDenied("The official Bible app is reserved for KCAN.")
+            app_data.pop("is_promoted_global", None)
+            app_data.pop("promoted_order", None)
+            if app_data.get("status") == PartnerOrganizationAppStatus.PUBLISHED and not app_data.get("published_at"):
+                app_data["published_at"] = timezone.now()
+            app = PartnerOrganizationApp.objects.create(partner=partner, **app_data)
             logger.info(
                 "Created organization app %s for partner %s",
                 app.id,
@@ -1898,6 +1927,21 @@ class PartnerViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+    @action(detail=False, methods=["get"], url_path="organization-apps/global")
+    def global_organization_apps(self, request):
+        apps = (
+            PartnerOrganizationApp.objects.filter(
+                is_active=True,
+                is_promoted_global=True,
+                status=PartnerOrganizationAppStatus.PUBLISHED,
+            )
+            .select_related("partner")
+            .prefetch_related("tabs__content_blocks")
+            .order_by("promoted_order", "order", "name")
+        )
+        serializer = PartnerOrganizationAppSerializer(apps, many=True, context={"request": request})
+        return Response({"apps": serializer.data}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get", "post"], url_path="server-categories")
     def server_categories(self, request, pk=None):
@@ -2003,6 +2047,90 @@ class PartnerViewSet(viewsets.ModelViewSet):
 
     @action(
         detail=True,
+        methods=["get", "post"],
+        url_path="organization-apps/(?P<app_id>[^/.]+)/tabs",
+    )
+    def organization_app_tabs(self, request, pk=None, app_id=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to access organization app tabs.")
+        app = partner.organization_apps.filter(id=app_id).first()
+        if not app:
+            raise ValidationError({"app_id": "Invalid organization app ID."})
+
+        if request.method == "POST":
+            if not self._user_can_manage_organization_apps(partner, request.user):
+                raise PermissionDenied("Not allowed to manage organization app tabs.")
+            serializer = PartnerOrganizationAppTabSerializer(data={**request.data, "app": app.id}, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            tab = serializer.save(app=app)
+            return Response({"tab": PartnerOrganizationAppTabSerializer(tab, context={"request": request}).data}, status=status.HTTP_201_CREATED)
+
+        tabs = app.tabs.filter(is_active=True).order_by("order", "title")
+        if not self._user_can_manage_organization_apps(partner, request.user):
+            roles = get_partner_user_roles(partner, request.user)
+            tabs = [tab for tab in tabs if set(tab.visible_to or []).intersection(roles)]
+        serializer = PartnerOrganizationAppTabSerializer(tabs, many=True, context={"request": request})
+        return Response({"tabs": serializer.data}, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="organization-apps/(?P<app_id>[^/.]+)/tabs/(?P<tab_id>[^/.]+)/blocks",
+    )
+    def organization_app_tab_blocks(self, request, pk=None, app_id=None, tab_id=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to access organization app content.")
+        tab = PartnerOrganizationAppTab.objects.filter(id=tab_id, app_id=app_id, app__partner=partner).first()
+        if not tab:
+            raise ValidationError({"tab_id": "Invalid organization app tab ID."})
+
+        if request.method == "POST":
+            if not self._user_can_manage_organization_apps(partner, request.user):
+                raise PermissionDenied("Not allowed to manage organization app content.")
+            serializer = PartnerOrganizationAppContentBlockSerializer(
+                data={**request.data, "tab": tab.id},
+                context={"request": request},
+            )
+            serializer.is_valid(raise_exception=True)
+            block = serializer.save(tab=tab, created_by=request.user)
+            if block.status == PartnerOrganizationAppStatus.PUBLISHED and not block.published_at:
+                block.published_at = timezone.now()
+                block.save(update_fields=["published_at", "updated_at"])
+            return Response(
+                {"block": PartnerOrganizationAppContentBlockSerializer(block, context={"request": request}).data},
+                status=status.HTTP_201_CREATED,
+            )
+
+        blocks = tab.content_blocks.filter(is_active=True).order_by("order", "created_at")
+        if not self._user_can_manage_organization_apps(partner, request.user):
+            blocks = blocks.filter(status=PartnerOrganizationAppStatus.PUBLISHED)
+        serializer = PartnerOrganizationAppContentBlockSerializer(blocks, many=True, context={"request": request})
+        return Response({"blocks": serializer.data}, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["patch"],
+        url_path="organization-apps/(?P<app_id>[^/.]+)/promote",
+    )
+    def organization_app_promote(self, request, pk=None, app_id=None):
+        partner = self.get_object()
+        if not self._user_can_promote_global_apps(partner, request.user):
+            raise PermissionDenied("Only KCAN/platform admins can promote apps into the main app navigation.")
+        app = partner.organization_apps.filter(id=app_id).first()
+        if not app:
+            raise ValidationError({"app_id": "Invalid organization app ID."})
+        app.is_promoted_global = bool(request.data.get("is_promoted_global", True))
+        app.promoted_order = int(request.data.get("promoted_order", app.promoted_order or 0))
+        app.status = request.data.get("status", app.status)
+        if app.status == PartnerOrganizationAppStatus.PUBLISHED and not app.published_at:
+            app.published_at = timezone.now()
+        app.save(update_fields=["is_promoted_global", "promoted_order", "status", "published_at", "updated_at"])
+        return Response({"app": PartnerOrganizationAppSerializer(app, context={"request": request}).data}, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
         methods=["patch", "delete"],
         url_path="organization-apps/(?P<app_id>[^/.]+)",
     )
@@ -2021,7 +2149,13 @@ class PartnerViewSet(viewsets.ModelViewSet):
 
         serializer = PartnerOrganizationAppSerializer(app, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        app_data = dict(serializer.validated_data)
+        app_data.pop("is_promoted_global", None)
+        app_data.pop("promoted_order", None)
+        instance = serializer.save(**app_data)
+        if instance.status == PartnerOrganizationAppStatus.PUBLISHED and not instance.published_at:
+            instance.published_at = timezone.now()
+            instance.save(update_fields=["published_at", "updated_at"])
         return Response({"app": serializer.data}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["patch"], url_path="settings")

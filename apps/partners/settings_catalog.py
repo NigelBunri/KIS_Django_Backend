@@ -21,7 +21,7 @@ PARTNER_SETTINGS_SECTIONS: List[Dict] = [
         "description": "Manage the custom KIS app, Bible experience, and external integrations for your org.",
         "features": [
             {"key": "org_apps_catalog", "title": "App catalog", "description": "List and manage organization apps.", "access": ["owner", "admin", "manager"]},
-            {"key": "org_apps_bible", "title": "Bible app", "description": "Configure the bible experience that CC maintains.", "access": ["owner", "admin", "manager"]},
+            {"key": "org_apps_bible", "title": "Bible app", "description": "Configure the bible experience that KCAN maintains.", "access": ["owner", "admin", "manager"]},
         ],
     },
     {

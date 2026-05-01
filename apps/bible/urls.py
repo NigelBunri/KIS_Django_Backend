@@ -3,11 +3,18 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     TranslationListView,
+    BibleTranslationMetadataViewSet,
     BookListView,
     ChapterListView,
     ReaderView,
+    ParallelReaderView,
     VerseSearchView,
     DailyDevotionalView,
+    BibleDailyPassageViewSet,
+    BibleMeditationPostViewSet,
+    BiblePrayerMonthViewSet,
+    BiblePrayerDayViewSet,
+    BibleContentAuditLogViewSet,
     MeditationTopicViewSet,
     MeditationScheduleViewSet,
     MeditationEntryViewSet,
@@ -20,6 +27,7 @@ from .views import (
     ReadingPlanViewSet,
     ReadingPlanEnrollmentViewSet,
     ReadingHistoryViewSet,
+    BibleReadingPlanEventViewSet,
     BibleBookmarkViewSet,
     BibleNoteViewSet,
     BibleHighlightViewSet,
@@ -61,7 +69,13 @@ from .views import (
 app_name = "bible"
 
 router = DefaultRouter()
+router.register("bible/translation-registry", BibleTranslationMetadataViewSet, basename="bible-translation-registry")
 router.register("bible/topics", MeditationTopicViewSet, basename="bible-topics")
+router.register("bible/daily-passages", BibleDailyPassageViewSet, basename="bible-daily-passages")
+router.register("bible/meditation-posts", BibleMeditationPostViewSet, basename="bible-meditation-posts")
+router.register("bible/prayer-months", BiblePrayerMonthViewSet, basename="bible-prayer-months")
+router.register("bible/prayer-days", BiblePrayerDayViewSet, basename="bible-prayer-days")
+router.register("bible/content-audit", BibleContentAuditLogViewSet, basename="bible-content-audit")
 router.register("bible/schedules", MeditationScheduleViewSet, basename="bible-schedules")
 router.register("bible/meditations", MeditationEntryViewSet, basename="bible-meditations")
 router.register("bible/prayers", PrayerRequestViewSet, basename="bible-prayers")
@@ -98,6 +112,7 @@ router.register("bible/credentials", BibleCourseCredentialViewSet, basename="bib
 router.register("bible/plans", ReadingPlanViewSet, basename="bible-plans")
 router.register("bible/plan-enrollments", ReadingPlanEnrollmentViewSet, basename="bible-plan-enrollments")
 router.register("bible/history", ReadingHistoryViewSet, basename="bible-history")
+router.register("bible/reading-events", BibleReadingPlanEventViewSet, basename="bible-reading-events")
 router.register("bible/bookmarks", BibleBookmarkViewSet, basename="bible-bookmarks")
 router.register("bible/notes", BibleNoteViewSet, basename="bible-notes")
 router.register("bible/highlights", BibleHighlightViewSet, basename="bible-highlights")
@@ -110,6 +125,7 @@ urlpatterns = [
     path("bible/books/", BookListView.as_view(), name="bible-books"),
     path("bible/chapters/", ChapterListView.as_view(), name="bible-chapters"),
     path("bible/reader/", ReaderView.as_view(), name="bible-reader"),
+    path("bible/reader/parallel/", ParallelReaderView.as_view(), name="bible-reader-parallel"),
     path("bible/search/", VerseSearchView.as_view(), name="bible-search"),
     path("bible/daily/", DailyDevotionalView.as_view(), name="bible-daily"),
     path("bible/courses/<int:pk>/react/", BibleCourseReactionView.as_view(), name="bible-course-react"),

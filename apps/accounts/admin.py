@@ -11,6 +11,7 @@ from .models import (
     AccountTier,
     Subscription,
     Session,
+    Device,
     UsageQuota,
     AuditLog,
     ApiToken,
@@ -151,7 +152,7 @@ class ProfileAdmin(admin.ModelAdmin):
 @admin.register(ApiToken)
 class ApiTokenAdmin(admin.ModelAdmin):
     list_display = ('id', 'user_email', 'name', 'expires_at', 'last_used_at', 'last_used_ip', 'is_deleted')
-    search_fields = ('user__email', 'name', 'token_hash')
+    search_fields = ('user__email', 'user__phone', 'name')
     readonly_fields = ('token_hash', 'created_at', 'updated_at', 'last_used_at', 'last_used_ip')
     list_filter = ('is_deleted', 'created_via')
     actions = ['revoke_tokens']
@@ -193,6 +194,54 @@ class SessionAdmin(admin.ModelAdmin):
 
     def user_email(self, obj):
         return obj.user.email if obj.user else None
+
+
+@admin.register(Device)
+class DeviceAdmin(admin.ModelAdmin):
+    list_display = (
+        'user_email',
+        'device_id',
+        'platform',
+        'name',
+        'last_ip',
+        'last_seen_at',
+        'token_version',
+        'revoked_at',
+        'revoke_reason',
+    )
+    search_fields = ('user__email', 'user__phone', 'device_id', 'name', 'last_ip')
+    list_filter = ('platform', 'revoked_at')
+    readonly_fields = (
+        'created_at',
+        'updated_at',
+        'last_seen_at',
+        'last_ip',
+        'user_agent',
+        'token_version',
+        'revoked_at',
+        'revoke_reason',
+    )
+    actions = ['revoke_devices']
+
+    def user_email(self, obj):
+        return obj.user.email if obj.user else None
+
+    def revoke_devices(self, request, queryset):
+        now = timezone.now()
+        updated = 0
+        for device in queryset.filter(revoked_at__isnull=True):
+            device.token_version = int(device.token_version or 1) + 1
+            device.revoked_at = now
+            device.revoke_reason = 'admin_revoke'
+            device.save(update_fields=['token_version', 'revoked_at', 'revoke_reason', 'updated_at'])
+            AuditLog.log(
+                actor=getattr(device, 'user', None),
+                action='security.device.revoked',
+                meta={'device_id': device.device_id, 'reason': 'admin_revoke', 'admin_id': str(request.user.id)},
+            )
+            updated += 1
+        self.message_user(request, f"Revoked {updated} devices")
+    revoke_devices.short_description = 'Revoke selected devices'
 
 @admin.register(UsageQuota)
 class UsageQuotaAdmin(admin.ModelAdmin):
@@ -269,7 +318,13 @@ admin.site.register(GDPRRequest)
 # Audit log - read-only
 @admin.register(AuditLog)
 class AuditLogAdmin(admin.ModelAdmin):
-    list_display = ('actor_id', 'action', 'created_at')
+    list_display = ('actor_id', 'action', 'severity', 'ip_address', 'created_at')
     readonly_fields = ('actor_id', 'action', 'meta', 'created_at', 'updated_at')
     search_fields = ('action',)
+    list_filter = ('action', 'created_at')
 
+    def severity(self, obj):
+        return (obj.meta or {}).get('severity', '')
+
+    def ip_address(self, obj):
+        return (obj.meta or {}).get('ip', '')

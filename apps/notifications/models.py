@@ -41,6 +41,7 @@ class NotificationTemplate(BaseEntity):
 class Notification(BaseEntity):
     CHANNEL_CHOICES = [
         ("IN_APP", "In-App"),
+        ("PUSH", "Push"),
         ("EMAIL", "Email"),
         ("SMS", "SMS"),
         ("WEBHOOK", "Webhook"),
@@ -114,6 +115,25 @@ class NotificationRule(BaseEntity):
     schedule_json = models.JSONField(default=dict, blank=True)  # e.g. "quiet_hours": {start: '22:00', end: '07:00'}
     channels_json = models.JSONField(default=list, blank=True)  # preferred channels order
     enabled = models.BooleanField(default=True)
+
+
+class NotificationDeviceToken(BaseEntity):
+    user_id = models.UUIDField(db_index=True)
+    device_id = models.CharField(max_length=128, db_index=True)
+    platform = models.CharField(max_length=40, blank=True)
+    push_token = models.TextField()
+    token_type = models.CharField(max_length=20, default="fcm")
+    apns_token = models.TextField(blank=True)
+    enabled = models.BooleanField(default=True)
+    last_seen_at = models.DateTimeField(default=timezone.now)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        unique_together = ("user_id", "device_id", "push_token")
+        indexes = [
+            models.Index(fields=["user_id", "enabled"]),
+            models.Index(fields=["device_id"]),
+        ]
 
 
 class NotificationDelivery(BaseEntity):

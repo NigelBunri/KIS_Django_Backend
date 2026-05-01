@@ -303,7 +303,7 @@ def build_certificate_pdf(
     *,
     user_name: str,
     course_title: str,
-    partner_name: str = "Christian Community (KIS)",
+    partner_name: str = "KCAN, Kingdom Citizens & Ambassadors Network",
     brand_color: Optional[str] = None,
     logo_url: Optional[str] = None,  # kept for API compatibility; not used in PDF (images are local assets)
     issued_on: Optional[date_type] = None,

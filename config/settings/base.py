@@ -44,6 +44,11 @@ def _env_csv(name: str, default: str = "") -> list[str]:
     return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
+def _env_throttle_rate(name: str, *, dev_default: str, prod_default: str) -> str:
+    default = dev_default if DEBUG else prod_default
+    return os.environ.get(name, default).strip() or default
+
+
 def _is_weak_secret(value: str | None) -> bool:
     if not value:
         return True
@@ -99,6 +104,19 @@ FLW_SECRET_KEY = os.environ.get("FLW_SECRET_KEY", "")
 FLW_WEBHOOK_SECRET = os.environ.get("FLW_WEBHOOK_SECRET", "")
 FLW_REDIRECT_URL = os.environ.get("FLW_REDIRECT_URL", "https://kis.app/payments/complete")
 PAYMENTS_MOCK = os.environ.get("PAYMENTS_MOCK", "False").lower() in ("1", "true", "yes")
+
+# Notifications / Firebase Cloud Messaging
+NOTIFICATIONS_PUSH_PROVIDER = os.environ.get("NOTIFICATIONS_PUSH_PROVIDER", "firebase")
+FIREBASE_APP_NAME = os.environ.get("FIREBASE_APP_NAME", "kis-backend")
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
+FIREBASE_CREDENTIALS_FILE = os.environ.get("FIREBASE_CREDENTIALS_FILE", "")
+FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON", "")
+# Legacy FCM server-key fallback kept for older deployments while Firebase Admin is rolled out.
+FCM_SERVER_KEY = os.environ.get("FCM_SERVER_KEY", os.environ.get("FIREBASE_SERVER_KEY", ""))
+FIREBASE_SERVER_KEY = os.environ.get("FIREBASE_SERVER_KEY", "")
+
+# Debug-only OTP code logging. Keep false unless explicitly debugging locally.
+OTP_DEBUG_LOG_CODES = _env_bool("OTP_DEBUG_LOG_CODES", False)
 
 # Application definition
 INSTALLED_APPS = [
@@ -283,17 +301,25 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_CLASSES": (
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
+        "rest_framework.throttling.ScopedRateThrottle",
         "admin_control.security.throttles.AdminBurstThrottle",
         "admin_control.security.throttles.AdminSustainedThrottle",
     ),
     "DEFAULT_THROTTLE_RATES": {
-        "anon": "6000/min",
-        "user": "6000/min",
-        "admin_burst": "6000/min",
-        "admin_sustained": "6000/day",
-        "broadcast_profile_create": "6000/min",
-        "broadcast_profile_manage": "6000/min",
-        "broadcast_profile_attachment": "6000/min",
+        "anon": _env_throttle_rate("THROTTLE_ANON", dev_default="6000/min", prod_default="60/min"),
+        "user": _env_throttle_rate("THROTTLE_USER", dev_default="6000/min", prod_default="300/min"),
+        "admin_burst": _env_throttle_rate("THROTTLE_ADMIN_BURST", dev_default="6000/min", prod_default="60/min"),
+        "admin_sustained": _env_throttle_rate("THROTTLE_ADMIN_SUSTAINED", dev_default="6000/day", prod_default="1000/day"),
+        "login": _env_throttle_rate("THROTTLE_LOGIN", dev_default="6000/min", prod_default="10/min"),
+        "register": _env_throttle_rate("THROTTLE_REGISTER", dev_default="6000/min", prod_default="5/min"),
+        "otp": _env_throttle_rate("THROTTLE_OTP", dev_default="6000/min", prod_default="5/min"),
+        "password_reset": _env_throttle_rate("THROTTLE_PASSWORD_RESET", dev_default="6000/min", prod_default="5/min"),
+        "upload": _env_throttle_rate("THROTTLE_UPLOAD", dev_default="6000/min", prod_default="30/min"),
+        "search": _env_throttle_rate("THROTTLE_SEARCH", dev_default="6000/min", prod_default="60/min"),
+        "messaging": _env_throttle_rate("THROTTLE_MESSAGING", dev_default="6000/min", prod_default="120/min"),
+        "broadcast_profile_create": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_CREATE", dev_default="6000/min", prod_default="10/min"),
+        "broadcast_profile_manage": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_MANAGE", dev_default="6000/min", prod_default="60/min"),
+        "broadcast_profile_attachment": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_ATTACHMENT", dev_default="6000/min", prod_default="30/min"),
     },
 }
 
@@ -380,11 +406,18 @@ NEST_API_BASE_URL = API_BASE_URL
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {
+        "sensitive_data": {"()": "common.security_redaction.SensitiveDataFilter"},
+    },
     "formatters": {
         "simple": {"format": "%(levelname)s %(asctime)s %(name)s %(message)s"},
     },
     "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "simple"},
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+            "filters": ["sensitive_data"],
+        },
     },
     "root": {"handlers": ["console"], "level": os.environ.get("LOG_LEVEL", "DEBUG")},
 }

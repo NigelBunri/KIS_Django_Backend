@@ -7,7 +7,12 @@ from .models import (
     BibleVerse,
     BibleAudio,
     BibleAudioSegment,
+    BibleTranslationMetadata,
     DailyDevotional,
+    BibleDailyPassage,
+    BibleMeditationPost,
+    BiblePrayerMonth,
+    BiblePrayerDay,
     PrayerRequest,
     MeditationTopic,
     MeditationSchedule,
@@ -18,12 +23,14 @@ from .models import (
     ReadingPlanItem,
     ReadingPlanEnrollment,
     ReadingHistory,
+    BibleReadingPlanEvent,
     BibleBookmark,
     BibleNote,
     BibleHighlight,
     MemoryVerse,
     BiblePreference,
     BibleCrossReference,
+    BibleContentAuditLog,
     BibleCourse,
     BibleCourseModule,
     BibleLesson,
@@ -61,9 +68,86 @@ from .models import (
 
 
 class BibleTranslationSerializer(serializers.ModelSerializer):
+    metadata_status = serializers.CharField(source="metadata.validation_status", read_only=True)
+    copyright_status = serializers.CharField(source="metadata.copyright_status", read_only=True)
+    is_public = serializers.BooleanField(source="metadata.is_public", read_only=True)
+    is_licensed = serializers.BooleanField(source="metadata.is_licensed", read_only=True)
+
     class Meta:
         model = BibleTranslation
-        fields = ["id", "code", "name", "language", "sort_order", "is_active"]
+        fields = [
+            "id",
+            "code",
+            "name",
+            "language",
+            "sort_order",
+            "is_active",
+            "metadata_status",
+            "copyright_status",
+            "is_public",
+            "is_licensed",
+        ]
+
+
+class BibleTranslationMetadataSerializer(serializers.ModelSerializer):
+    translation_name = serializers.CharField(source="translation.name", read_only=True)
+    can_be_public = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = BibleTranslationMetadata
+        fields = [
+            "id",
+            "translation",
+            "translation_name",
+            "code",
+            "language",
+            "display_language",
+            "abbreviation",
+            "full_name",
+            "source_path",
+            "source_filename",
+            "source_hash",
+            "copyright_status",
+            "license_notes",
+            "rights_holder",
+            "license_review_status",
+            "license_reviewed_by",
+            "license_reviewed_at",
+            "is_licensed",
+            "is_public",
+            "import_enabled",
+            "validation_status",
+            "validation_errors",
+            "book_count",
+            "chapter_count",
+            "verse_count",
+            "last_scanned_at",
+            "last_imported_at",
+            "created_at",
+            "updated_at",
+            "can_be_public",
+        ]
+        read_only_fields = [
+            "translation",
+            "translation_name",
+            "code",
+            "language",
+            "source_path",
+            "source_filename",
+            "source_hash",
+            "license_reviewed_by",
+            "license_reviewed_at",
+            "validation_status",
+            "validation_errors",
+            "book_count",
+            "chapter_count",
+            "verse_count",
+            "last_scanned_at",
+            "last_imported_at",
+            "created_at",
+            "updated_at",
+            "can_be_public",
+        ]
 
 
 class BibleBookSerializer(serializers.ModelSerializer):
@@ -110,6 +194,102 @@ class DailyDevotionalSerializer(serializers.ModelSerializer):
     class Meta:
         model = DailyDevotional
         fields = ["id", "date", "translation", "passage_ref", "title", "content", "prayer_text"]
+
+
+class BibleDailyPassageSerializer(serializers.ModelSerializer):
+    partner_name = serializers.CharField(source="partner.name", read_only=True)
+    translation_detail = BibleTranslationSerializer(source="translation", read_only=True)
+
+    class Meta:
+        model = BibleDailyPassage
+        fields = [
+            "id",
+            "partner",
+            "partner_name",
+            "date",
+            "language",
+            "translation",
+            "translation_detail",
+            "title",
+            "passage_ref",
+            "scripture_refs",
+            "exhortation",
+            "prayer_text",
+            "status",
+            "published_at",
+            "created_by",
+            "reviewed_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["partner", "created_by", "reviewed_by", "created_at", "updated_at"]
+
+
+class BibleMeditationPostSerializer(serializers.ModelSerializer):
+    partner_name = serializers.CharField(source="partner.name", read_only=True)
+
+    class Meta:
+        model = BibleMeditationPost
+        fields = [
+            "id",
+            "partner",
+            "partner_name",
+            "content_type",
+            "title",
+            "body",
+            "video_url",
+            "thumbnail_url",
+            "scripture_refs",
+            "tags",
+            "language",
+            "status",
+            "published_at",
+            "created_by",
+            "reviewed_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["partner", "created_by", "reviewed_by", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        content_type = attrs.get("content_type") or getattr(self.instance, "content_type", "message")
+        if content_type == "video" and not attrs.get("video_url") and not getattr(self.instance, "video_url", ""):
+            raise serializers.ValidationError({"video_url": "Video meditations require a video URL."})
+        if content_type == "message" and not attrs.get("body") and not getattr(self.instance, "body", ""):
+            raise serializers.ValidationError({"body": "Message meditations require body text."})
+        return attrs
+
+
+class BiblePrayerDaySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BiblePrayerDay
+        fields = ["id", "prayer_month", "day", "prayer_points", "exhortation", "scripture_refs"]
+
+
+class BiblePrayerMonthSerializer(serializers.ModelSerializer):
+    partner_name = serializers.CharField(source="partner.name", read_only=True)
+    days = BiblePrayerDaySerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BiblePrayerMonth
+        fields = [
+            "id",
+            "partner",
+            "partner_name",
+            "year",
+            "month",
+            "language",
+            "title",
+            "theme",
+            "status",
+            "published_at",
+            "created_by",
+            "reviewed_by",
+            "created_at",
+            "updated_at",
+            "days",
+        ]
+        read_only_fields = ["partner", "created_by", "reviewed_by", "created_at", "updated_at"]
 
 
 class PrayerRequestSerializer(serializers.ModelSerializer):
@@ -198,6 +378,51 @@ class ReadingHistorySerializer(serializers.ModelSerializer):
         read_only_fields = ["updated_at"]
 
 
+class BibleReadingPlanEventSerializer(serializers.ModelSerializer):
+    verse_refs = serializers.SerializerMethodField()
+    chapter_refs = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BibleReadingPlanEvent
+        fields = [
+            "id",
+            "translation",
+            "passage_ref",
+            "chapters",
+            "chapter_refs",
+            "verses",
+            "verse_refs",
+            "start_at",
+            "end_at",
+            "recurrence",
+            "reminder_offsets",
+            "reminder_channels",
+            "status",
+            "source",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def validate(self, attrs):
+        passage_ref = attrs.get("passage_ref") or getattr(self.instance, "passage_ref", "")
+        if not passage_ref:
+            raise serializers.ValidationError({"passage_ref": "A selected Bible passage is required."})
+        return attrs
+
+    def get_verse_refs(self, obj):
+        return [
+            f"{verse.chapter.book.name} {verse.chapter.number}:{verse.number}"
+            for verse in obj.verses.select_related("chapter", "chapter__book").all()
+        ]
+
+    def get_chapter_refs(self, obj):
+        return [
+            f"{chapter.book.name} {chapter.number}"
+            for chapter in obj.chapters.select_related("book").all()
+        ]
+
+
 class BibleBookmarkSerializer(serializers.ModelSerializer):
     verse_text = serializers.CharField(source="verse.text", read_only=True)
     verse_ref = serializers.SerializerMethodField()
@@ -212,17 +437,30 @@ class BibleBookmarkSerializer(serializers.ModelSerializer):
 
 
 class BibleNoteSerializer(serializers.ModelSerializer):
+    verse_text = serializers.CharField(source="verse.text", read_only=True)
+    verse_ref = serializers.SerializerMethodField()
+
     class Meta:
         model = BibleNote
-        fields = ["id", "verse", "text", "created_at", "updated_at"]
+        fields = ["id", "verse", "verse_text", "verse_ref", "text", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
+
+    def get_verse_ref(self, obj):
+        return f"{obj.verse.chapter.book.name} {obj.verse.chapter.number}:{obj.verse.number}"
 
 
 class BibleHighlightSerializer(serializers.ModelSerializer):
+    verse_text = serializers.CharField(source="verse.text", read_only=True)
+    verse_ref = serializers.SerializerMethodField()
+    translation = serializers.IntegerField(source="verse.translation_id", read_only=True)
+
     class Meta:
         model = BibleHighlight
-        fields = ["id", "verse", "color", "created_at"]
+        fields = ["id", "verse", "verse_text", "verse_ref", "translation", "color", "created_at"]
         read_only_fields = ["created_at"]
+
+    def get_verse_ref(self, obj):
+        return f"{obj.verse.chapter.book.name} {obj.verse.chapter.number}:{obj.verse.number}"
 
 
 class MemoryVerseSerializer(serializers.ModelSerializer):
@@ -260,6 +498,16 @@ class BibleCrossReferenceSerializer(serializers.ModelSerializer):
 
     def get_related_ref(self, obj):
         return f"{obj.related_verse.chapter.book.name} {obj.related_verse.chapter.number}:{obj.related_verse.number}"
+
+
+class BibleContentAuditLogSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source="user.display_name", read_only=True)
+    partner_name = serializers.CharField(source="partner.name", read_only=True)
+
+    class Meta:
+        model = BibleContentAuditLog
+        fields = ["id", "partner", "partner_name", "user", "user_name", "action", "target_type", "target_id", "metadata", "created_at"]
+        read_only_fields = fields
 
 
 class BibleCourseModuleSerializer(serializers.ModelSerializer):

@@ -41,16 +41,28 @@ Security & authenticity recommended next steps:
 from datetime import timedelta
 import uuid
 from django.db import models
-from django.db.models import JSONField
+from django.db.models import JSONField as DjangoJSONField
 from django.conf import settings
 from django.utils import timezone
 from django.utils.text import slugify
-from django.contrib.postgres.fields import ArrayField
 from django.core.exceptions import ValidationError
 from apps.billing.models import WalletTransaction
 from common.media_urls import normalize_image_payload
 
 from .constants import KIS_COIN_CODE
+
+
+class JSONField(DjangoJSONField):
+    """Accept JSON values that the database driver has already decoded."""
+
+    def from_db_value(self, value, expression, connection):
+        if value is None or isinstance(value, (dict, list, int, float, bool)):
+            return value
+        return super().from_db_value(value, expression, connection)
+
+    def deconstruct(self):
+        name, path, args, kwargs = super().deconstruct()
+        return name, "django.db.models.JSONField", args, kwargs
 
 
 class BaseEntity(models.Model):
@@ -220,11 +232,11 @@ class ShopService(BaseEntity):
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=255)
     short_summary = models.CharField(max_length=320, blank=True, default='')
-    tags = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    tags = JSONField(default=list, blank=True)
     description = models.TextField(blank=True, default='')
     pricing_model = models.CharField(max_length=32, blank=True, default='standard')
     service_type = models.CharField(max_length=64, blank=True, default='Appointment')
-    delivery_modes = ArrayField(models.CharField(max_length=32), default=list, blank=True)
+    delivery_modes = JSONField(default=list, blank=True)
     visibility = models.CharField(max_length=16, choices=VISIBILITY_CHOICES, default='draft')
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='draft')
     featured = models.BooleanField(default=False)
@@ -243,9 +255,9 @@ class ShopService(BaseEntity):
     )
     availability = JSONField(default=dict, blank=True)
     availability_rules = JSONField(default=list, blank=True)
-    blackout_dates = ArrayField(models.DateField(), default=list, blank=True)
-    coverage = ArrayField(models.CharField(max_length=128), default=list, blank=True)
-    remote_regions = ArrayField(models.CharField(max_length=128), default=list, blank=True)
+    blackout_dates = JSONField(default=list, blank=True)
+    coverage = JSONField(default=list, blank=True)
+    remote_regions = JSONField(default=list, blank=True)
     remote_meeting_link = models.CharField(max_length=512, blank=True, default='')
     address_line1 = models.CharField(max_length=255, blank=True, default='')
     address_line2 = models.CharField(max_length=255, blank=True, default='')
@@ -665,8 +677,8 @@ class Product(BaseEntity):
     catalog_categories = models.ManyToManyField('CatalogCategory', blank=True, related_name='products')
 
     # Flexible Data
-    attributes = models.JSONField(default=dict, blank=True)
-    variants = models.JSONField(default=list, blank=True)
+    attributes = JSONField(default=dict, blank=True)
+    variants = JSONField(default=list, blank=True)
 
     # Status & Visibility
     is_active = models.BooleanField(default=True)

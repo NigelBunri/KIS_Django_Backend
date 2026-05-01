@@ -53,6 +53,7 @@ import json
 from common.media_urls import absolutize_backend_media
 
 from apps.commerce.serializers import ProductSerializer, ServiceBookingSerializer
+from apps.moderation.models import UserBlock
 from apps.partners.models import Partner, PartnerPost, PartnerMembership, PartnerMembershipStatus
 from apps.broadcasts.models import (
     BroadcastFeature,
@@ -299,7 +300,7 @@ def _fetch_channel_messages(
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
-        "X-Internal-Auth": token,
+        **sign_internal_request("POST", url, payload, secret=token),
     }
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
@@ -6486,6 +6487,19 @@ class BroadcastFeedView(APIView):
             for value in ((getattr(request.user, "preferences", {}) or {}).get("hidden_broadcast_ids") or [])
             if str(value).strip()
         }
+        muted_author_ids = {
+            str(value).strip()
+            for value in UserBlock.objects.filter(blocker=request.user).values_list(
+                "blocked_id",
+                flat=True,
+            )
+            if str(value).strip()
+        }
+
+        def _is_muted_author(raw_user_id: Any) -> bool:
+            user_id = str(raw_user_id or "").strip()
+            return bool(user_id and user_id in muted_author_ids)
+
         saved_ids = {
             str(value).strip()
             for value in ((getattr(request.user, "preferences", {}) or {}).get("saved_broadcast_ids") or [])
@@ -6498,6 +6512,8 @@ class BroadcastFeedView(APIView):
         )
         if hidden_ids:
             broadcast_items_qs = broadcast_items_qs.exclude(id__in=list(hidden_ids))
+        if muted_author_ids:
+            broadcast_items_qs = broadcast_items_qs.exclude(broadcasted_by_id__in=list(muted_author_ids))
         if resolved_sources:
             broadcast_items_qs = broadcast_items_qs.filter(source_type__in=resolved_sources)
         else:
@@ -6699,6 +6715,8 @@ class BroadcastFeedView(APIView):
             text_doc = msg.get("textDoc") or build_plain_text_document(text_value)
             text_plain = msg.get("textPlain") or text_value
             text_preview = msg.get("textPreview") or text_plain[:200]
+            if _is_muted_author(msg.get("senderId")):
+                continue
             channel_items.append(
                 {
                     "id": str(item.id),
@@ -6757,6 +6775,8 @@ class BroadcastFeedView(APIView):
         for item in community_broadcasts:
             post = community_post_map.get(str(item.source_id))
             if not post:
+                continue
+            if _is_muted_author(post.author_id):
                 continue
             is_member = str(post.community_id) in community_members
             text_plain = post.text_plain or ""
@@ -6821,6 +6841,8 @@ class BroadcastFeedView(APIView):
         for item in partner_broadcasts:
             post = partner_post_map.get(str(item.source_id))
             if not post:
+                continue
+            if _is_muted_author(post.author_id):
                 continue
             partner = partner_map.get(str(post.partner_id))
             if not partner:
@@ -6887,6 +6909,8 @@ class BroadcastFeedView(APIView):
             if not product:
                 continue
             shop = product.shop
+            if shop and _is_muted_author(shop.owner_id):
+                continue
             text_plain = product.name or ""
             membership_discount_pct = getattr(shop, 'membership_discount_pct', 10) if shop else 10
             viewer_is_member = False
@@ -6979,6 +7003,8 @@ class BroadcastFeedView(APIView):
                 if not service:
                     continue
                 shop = service.shop
+                if shop and _is_muted_author(shop.owner_id):
+                    continue
                 text_plain = service.name or ""
                 membership_discount_pct = getattr(shop, 'membership_discount_pct', 10) if shop else 10
                 viewer_is_member = False
@@ -7148,6 +7174,8 @@ class BroadcastFeedView(APIView):
                         **author_payload,
                         **entry_author_from_user,
                     }
+            if _is_muted_author(author_payload.get("id")):
+                continue
 
             health_card = metadata.get("health_card") if isinstance(metadata.get("health_card"), dict) else {}
             if health_card:
@@ -7197,6 +7225,7 @@ class BroadcastFeedView(APIView):
                 healthcare_items.append(
                     {
                         "id": str(item.id),
+                        "broadcasted_by_id": str(item.broadcasted_by_id) if item.broadcasted_by_id else None,
                         "source_type": "healthcare",
                         "source_id": str(entry.get("id") or item.source_id),
                         "title": service_name,
@@ -7225,6 +7254,7 @@ class BroadcastFeedView(APIView):
             profile_items.append(
                 {
                     "id": str(item.id),
+                    "broadcasted_by_id": str(item.broadcasted_by_id) if item.broadcasted_by_id else None,
                     "source_type": "broadcast_profile",
                     "source_id": str(entry.get("id") or item.source_id),
                     "title": entry.get("title") or profile_name,
@@ -13235,3 +13265,4 @@ class ProfileManagementView(APIView):
         profiles[profile_key] = updated
         _save_user_profiles(request.user, profiles)
         return Response({'profile': updated}, status=status.HTTP_200_OK)
+from apps.chat.internal_signing import sign_internal_request

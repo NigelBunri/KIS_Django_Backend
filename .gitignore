@@ -5,3 +5,14 @@ static/
 logs/
 *.log
 *.log.*
+
+# Local secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+*.sqlite3
+test_db.sqlite3

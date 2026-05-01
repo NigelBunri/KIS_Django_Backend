@@ -8,6 +8,8 @@ from apps.partners.models import (
     PartnerOnboardingProgress,
     PartnerModerationAction,
     PartnerOrganizationApp,
+    PartnerOrganizationAppTab,
+    PartnerOrganizationAppContentBlock,
     PartnerServerCategory,
     PartnerChannelPermissionOverwrite,
 )
@@ -41,11 +43,13 @@ class PartnerOrganizationAppAdmin(admin.ModelAdmin):
         "partner",
         "name",
         "type",
+        "status",
+        "is_promoted_global",
         "is_active",
         "order",
         "created_at",
     )
-    list_filter = ("partner", "type", "is_active")
+    list_filter = ("partner", "type", "status", "is_promoted_global", "is_active")
     search_fields = ("partner__name", "name", "slug", "module")
     raw_id_fields = ("partner",)
     readonly_fields = ("created_at", "updated_at")
@@ -64,6 +68,10 @@ class PartnerOrganizationAppAdmin(admin.ModelAdmin):
                     "icon",
                     "badge_label",
                     "visible_to",
+                    "status",
+                    "is_promoted_global",
+                    "promoted_order",
+                    "published_at",
                     "group",
                     "order",
                     "is_active",
@@ -72,6 +80,24 @@ class PartnerOrganizationAppAdmin(admin.ModelAdmin):
         ),
         ("Advanced", {"classes": ("collapse",), "fields": ("config", "metadata", "created_at", "updated_at")}),
     )
+
+
+@admin.register(PartnerOrganizationAppTab)
+class PartnerOrganizationAppTabAdmin(admin.ModelAdmin):
+    list_display = ("app", "title", "slug", "order", "is_active", "created_at")
+    list_filter = ("app__partner", "is_active")
+    search_fields = ("app__name", "title", "slug")
+    raw_id_fields = ("app",)
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(PartnerOrganizationAppContentBlock)
+class PartnerOrganizationAppContentBlockAdmin(admin.ModelAdmin):
+    list_display = ("tab", "title", "block_type", "status", "order", "is_active", "created_at")
+    list_filter = ("tab__app__partner", "block_type", "status", "is_active")
+    search_fields = ("tab__title", "title", "body")
+    raw_id_fields = ("tab", "created_by")
+    readonly_fields = ("created_at", "updated_at")
 
 
 @admin.register(PartnerServerCategory)

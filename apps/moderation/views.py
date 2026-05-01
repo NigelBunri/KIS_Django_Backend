@@ -4,7 +4,7 @@ from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from . import models, serializers
@@ -19,6 +19,8 @@ class FlagViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = models.Flag.objects.all().order_by("-created_at")
+        if not self.request.user.is_staff:
+            qs = qs.filter(reporter_id=self.request.user.id)
         status_filter = (self.request.query_params.get("status") or "").strip().upper()
         target_type = (self.request.query_params.get("target_type") or "").strip().upper()
         severity = (self.request.query_params.get("severity") or "").strip().upper()
@@ -39,6 +41,8 @@ class FlagViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=["post"])
     def review(self, request, pk=None):
+        if not request.user.is_staff:
+            return Response({"detail": "Moderator access required."}, status=status.HTTP_403_FORBIDDEN)
         flag = self.get_object()
         flag.status = "REVIEWED"
         flag.reviewed_at = timezone.now()
@@ -58,6 +62,8 @@ class FlagViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=["post"])
     def resolve(self, request, pk=None):
+        if not request.user.is_staff:
+            return Response({"detail": "Moderator access required."}, status=status.HTTP_403_FORBIDDEN)
         flag = self.get_object()
         flag.status = "ACTIONED"
         flag.resolved_at = timezone.now()
@@ -72,9 +78,14 @@ class FlagViewSet(viewsets.ModelViewSet):
         return Response(serializers.FlagSerializer(flag).data)
 
     def perform_create(self, serializer):
+        source = serializer.validated_data.get("source") or "USER"
+        reporter_id = serializer.validated_data.get("reporter_id") or self.request.user.id
+        if not self.request.user.is_staff:
+            source = "USER"
+            reporter_id = self.request.user.id
         flag = serializer.save(
-            source=serializer.validated_data.get("source") or "USER",
-            reporter_id=serializer.validated_data.get("reporter_id") or self.request.user.id,
+            source=source,
+            reporter_id=reporter_id,
         )
         models.AuditLog.objects.create(
             actor_id=self.request.user.id,
@@ -105,7 +116,7 @@ class FlagViewSet(viewsets.ModelViewSet):
 class ModerationActionViewSet(viewsets.ModelViewSet):
     queryset = models.ModerationAction.objects.all()
     serializer_class = serializers.ModerationActionSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAdminUser]
 
 
 # -------------------------
@@ -114,7 +125,7 @@ class ModerationActionViewSet(viewsets.ModelViewSet):
 class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.AuditLog.objects.all().order_by("-created_at")
     serializer_class = serializers.AuditLogSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAdminUser]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -136,7 +147,7 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
 class UserReputationViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.UserReputation.objects.all()
     serializer_class = serializers.UserReputationSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAdminUser]
 
 
 # -------------------------
@@ -145,7 +156,7 @@ class UserReputationViewSet(viewsets.ReadOnlyModelViewSet):
 class ModerationRuleViewSet(viewsets.ModelViewSet):
     queryset = models.ModerationRule.objects.all()
     serializer_class = serializers.ModerationRuleSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAdminUser]
 
 
 # -------------------------
@@ -154,7 +165,7 @@ class ModerationRuleViewSet(viewsets.ModelViewSet):
 class SafetyAlertViewSet(viewsets.ModelViewSet):
     queryset = models.SafetyAlert.objects.all()
     serializer_class = serializers.SafetyAlertSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAdminUser]
 
     @swagger_auto_schema(
         operation_description="Acknowledge a safety alert.",
@@ -172,6 +183,31 @@ class UserBlockViewSet(viewsets.ModelViewSet):
     queryset = models.UserBlock.objects.all()
     serializer_class = serializers.UserBlockSerializer
     permission_classes = [IsAuthenticated]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        blocked = serializer.validated_data["blocked"]
+        reason = serializer.validated_data.get("reason", "")
+        block, created = models.UserBlock.objects.get_or_create(
+            blocker=request.user,
+            blocked=blocked,
+            defaults={"reason": reason},
+        )
+        if not created and reason and block.reason != reason:
+            block.reason = reason
+            block.save(update_fields=["reason", "updated_at"])
+        if created:
+            models.AuditLog.objects.create(
+                actor_id=request.user.id,
+                action="moderation.user_block.create",
+                target_type="USER",
+                target_id=block.blocked_id,
+                metadata={"block_id": str(block.id)},
+            )
+        data = self.get_serializer(block).data
+        response_status = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        return Response(data, status=response_status)
 
     def perform_create(self, serializer):
         block = serializer.save(blocker=self.request.user)

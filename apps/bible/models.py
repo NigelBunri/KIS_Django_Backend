@@ -17,6 +17,104 @@ class BibleTranslation(models.Model):
         return self.name
 
 
+class BibleTranslationCopyrightStatus(models.TextChoices):
+    PUBLIC_DOMAIN = "public_domain", "Public domain"
+    LICENSED = "licensed", "Licensed"
+    RESTRICTED = "restricted", "Restricted"
+    UNKNOWN = "unknown", "Unknown"
+
+
+class BibleTranslationValidationStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    VALID = "valid", "Valid"
+    WARNING = "warning", "Warning"
+    ERROR = "error", "Error"
+
+
+class BibleTranslationLicenseReviewStatus(models.TextChoices):
+    PENDING = "pending", "Pending human review"
+    NOT_REQUIRED = "not_required", "Not required"
+    APPROVED = "approved", "Approved"
+    REJECTED = "rejected", "Rejected"
+
+
+class BibleTranslationMetadata(models.Model):
+    translation = models.OneToOneField(
+        BibleTranslation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="metadata",
+    )
+    code = models.CharField(max_length=20, unique=True)
+    language = models.CharField(max_length=20)
+    display_language = models.CharField(max_length=80, blank=True)
+    abbreviation = models.CharField(max_length=40, blank=True)
+    full_name = models.CharField(max_length=200)
+    source_path = models.CharField(max_length=500)
+    source_filename = models.CharField(max_length=255)
+    source_hash = models.CharField(max_length=64, blank=True)
+    copyright_status = models.CharField(
+        max_length=30,
+        choices=BibleTranslationCopyrightStatus.choices,
+        default=BibleTranslationCopyrightStatus.UNKNOWN,
+    )
+    license_notes = models.TextField(blank=True)
+    rights_holder = models.CharField(max_length=200, blank=True)
+    license_review_status = models.CharField(
+        max_length=30,
+        choices=BibleTranslationLicenseReviewStatus.choices,
+        default=BibleTranslationLicenseReviewStatus.PENDING,
+    )
+    license_reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reviewed_bible_translation_licenses",
+    )
+    license_reviewed_at = models.DateTimeField(null=True, blank=True)
+    is_licensed = models.BooleanField(default=False)
+    is_public = models.BooleanField(default=False)
+    import_enabled = models.BooleanField(default=False)
+    validation_status = models.CharField(
+        max_length=20,
+        choices=BibleTranslationValidationStatus.choices,
+        default=BibleTranslationValidationStatus.PENDING,
+    )
+    validation_errors = models.JSONField(default=list, blank=True)
+    book_count = models.PositiveIntegerField(default=0)
+    chapter_count = models.PositiveIntegerField(default=0)
+    verse_count = models.PositiveIntegerField(default=0)
+    last_scanned_at = models.DateTimeField(null=True, blank=True)
+    last_imported_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["language", "full_name"]
+        indexes = [
+            models.Index(fields=["language", "is_public"]),
+            models.Index(fields=["copyright_status", "is_licensed"]),
+            models.Index(fields=["validation_status"]),
+        ]
+
+    @property
+    def can_be_public(self) -> bool:
+        license_review_ok = (
+            self.copyright_status == BibleTranslationCopyrightStatus.PUBLIC_DOMAIN
+            or self.license_review_status == BibleTranslationLicenseReviewStatus.APPROVED
+            or self.license_review_status == BibleTranslationLicenseReviewStatus.NOT_REQUIRED
+        )
+        return self.is_public and self.is_licensed and license_review_ok and self.validation_status in {
+            BibleTranslationValidationStatus.VALID,
+            BibleTranslationValidationStatus.WARNING,
+        }
+
+    def __str__(self) -> str:
+        return f"{self.full_name} ({self.language})"
+
+
 class BibleBook(models.Model):
     TESTAMENT_CHOICES = (
         ("OT", "Old Testament"),
@@ -99,6 +197,110 @@ class DailyDevotional(models.Model):
 
     def __str__(self) -> str:
         return f"{self.date} - {self.title}"
+
+
+class BiblePublishStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    REVIEW = "review", "In review"
+    SCHEDULED = "scheduled", "Scheduled"
+    PUBLISHED = "published", "Published"
+    ARCHIVED = "archived", "Archived"
+
+
+class BibleDailyPassage(models.Model):
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="daily_bible_passages")
+    date = models.DateField()
+    language = models.CharField(max_length=20, default="en")
+    translation = models.ForeignKey(
+        BibleTranslation, on_delete=models.SET_NULL, null=True, blank=True, related_name="daily_passages"
+    )
+    title = models.CharField(max_length=200)
+    passage_ref = models.CharField(max_length=120)
+    scripture_refs = models.JSONField(default=list, blank=True)
+    exhortation = models.TextField(blank=True)
+    prayer_text = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=BiblePublishStatus.choices, default=BiblePublishStatus.DRAFT)
+    published_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="created_daily_passages"
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="reviewed_daily_passages"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-date", "-created_at"]
+        unique_together = ("partner", "date", "language")
+
+
+class BibleMeditationPost(models.Model):
+    CONTENT_TYPES = (
+        ("message", "Message"),
+        ("video", "Video"),
+    )
+
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="bible_meditation_posts")
+    content_type = models.CharField(max_length=20, choices=CONTENT_TYPES, default="message")
+    title = models.CharField(max_length=200)
+    body = models.TextField(blank=True)
+    video_url = models.URLField(blank=True)
+    thumbnail_url = models.URLField(blank=True)
+    scripture_refs = models.JSONField(default=list, blank=True)
+    tags = models.JSONField(default=list, blank=True)
+    language = models.CharField(max_length=20, default="en")
+    status = models.CharField(max_length=20, choices=BiblePublishStatus.choices, default=BiblePublishStatus.DRAFT)
+    published_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="created_meditation_posts"
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="reviewed_meditation_posts"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-published_at", "-created_at"]
+
+
+class BiblePrayerMonth(models.Model):
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="bible_prayer_months")
+    year = models.PositiveIntegerField()
+    month = models.PositiveIntegerField()
+    language = models.CharField(max_length=20, default="en")
+    title = models.CharField(max_length=200)
+    theme = models.CharField(max_length=200, blank=True)
+    status = models.CharField(max_length=20, choices=BiblePublishStatus.choices, default=BiblePublishStatus.DRAFT)
+    published_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="created_prayer_months"
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="reviewed_prayer_months"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-year", "-month"]
+        unique_together = ("partner", "year", "month", "language")
+
+    def __str__(self) -> str:
+        return f"{self.title} ({self.year}-{self.month:02d})"
+
+
+class BiblePrayerDay(models.Model):
+    prayer_month = models.ForeignKey(BiblePrayerMonth, on_delete=models.CASCADE, related_name="days")
+    day = models.PositiveIntegerField()
+    prayer_points = models.JSONField(default=list, blank=True)
+    exhortation = models.TextField(blank=True)
+    scripture_refs = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ["day"]
+        unique_together = ("prayer_month", "day")
 
 
 class PrayerRequest(models.Model):
@@ -225,6 +427,43 @@ class ReadingHistory(models.Model):
         ordering = ["-updated_at"]
 
 
+class BibleReadingPlanEvent(models.Model):
+    STATUS_CHOICES = (
+        ("scheduled", "Scheduled"),
+        ("completed", "Completed"),
+        ("missed", "Missed"),
+        ("cancelled", "Cancelled"),
+    )
+    RECURRENCE_CHOICES = (
+        ("none", "None"),
+        ("daily", "Daily"),
+        ("weekly", "Weekly"),
+        ("monthly", "Monthly"),
+    )
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="bible_reading_events")
+    translation = models.ForeignKey(BibleTranslation, on_delete=models.SET_NULL, null=True, blank=True)
+    passage_ref = models.CharField(max_length=160)
+    chapters = models.ManyToManyField(BibleChapter, blank=True, related_name="planned_reading_events")
+    verses = models.ManyToManyField(BibleVerse, blank=True, related_name="planned_reading_events")
+    start_at = models.DateTimeField()
+    end_at = models.DateTimeField(null=True, blank=True)
+    recurrence = models.CharField(max_length=20, choices=RECURRENCE_CHOICES, default="none")
+    reminder_offsets = models.JSONField(default=list, blank=True)
+    reminder_channels = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="scheduled")
+    source = models.CharField(max_length=40, default="reader")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["start_at"]
+        indexes = [
+            models.Index(fields=["user", "start_at"]),
+            models.Index(fields=["user", "status"]),
+        ]
+
+
 class BibleBookmark(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="bible_bookmarks")
     verse = models.ForeignKey(BibleVerse, on_delete=models.CASCADE, related_name="bookmarked_by")
@@ -275,6 +514,23 @@ class BibleCrossReference(models.Model):
 
     class Meta:
         unique_together = ("verse", "related_verse")
+
+
+class BibleContentAuditLog(models.Model):
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="bible_content_audit_logs")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    action = models.CharField(max_length=64)
+    target_type = models.CharField(max_length=80)
+    target_id = models.CharField(max_length=80)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["partner", "created_at"]),
+            models.Index(fields=["target_type", "target_id"]),
+        ]
 
 
 class BibleCourse(models.Model):

@@ -863,6 +863,8 @@ class DeviceSessionSerializer(serializers.ModelSerializer):
             "user_agent",
             "last_ip",
             "last_seen_at",
+            "revoked_at",
+            "revoke_reason",
             "has_e2ee_keys",
             "current",
             "created_at",

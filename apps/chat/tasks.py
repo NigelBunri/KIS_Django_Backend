@@ -5,6 +5,8 @@ import urllib.request
 from celery import shared_task
 from django.conf import settings
 
+from .internal_signing import sign_internal_request
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,7 +21,7 @@ def _post_to_nest(path: str, payload: dict) -> None:
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
-        "X-Internal-Auth": token,
+        **sign_internal_request("POST", url, payload, secret=token),
     }
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=3) as resp:

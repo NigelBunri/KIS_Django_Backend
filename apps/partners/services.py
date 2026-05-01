@@ -226,6 +226,10 @@ def ensure_default_organization_app(
         "order": defaults.get("order", 0),
         "badge_label": defaults.get("badge_label", ""),
         "is_active": defaults.get("is_active", True),
+        "status": defaults.get("status", "published"),
+        "is_promoted_global": defaults.get("is_promoted_global", False),
+        "promoted_order": defaults.get("promoted_order", 0),
+        "published_at": defaults.get("published_at", timezone.now()),
         "metadata": defaults.get("metadata", {"internal": True}),
         "config": defaults.get("config", {}),
     }
@@ -235,6 +239,15 @@ def ensure_default_organization_app(
         type=app_type,
         defaults=default_data,
     )
+    update_fields = []
+    for key, value in default_data.items():
+        if getattr(app, key, None) in ("", None, {}, []) or key in {"name", "slug", "description", "module", "is_active"}:
+            if getattr(app, key, None) != value:
+                setattr(app, key, value)
+                update_fields.append(key)
+    if update_fields:
+        update_fields.append("updated_at")
+        app.save(update_fields=update_fields)
     return app
 
 

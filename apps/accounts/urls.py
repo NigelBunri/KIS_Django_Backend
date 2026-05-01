@@ -18,6 +18,7 @@ from .views import (
     E2EEFetchDeviceBundlesView,
     DeviceSessionsView,
     DeviceSessionDetailView,
+    DeviceBoundTokenRefreshView,
     UserSkillViewSet,
     UserViewSet,
     ProfileViewSet,
@@ -34,8 +35,6 @@ from .views import (
 
 # Optional: SimpleJWT endpoints (convenience here too)
 from rest_framework_simplejwt.views import (
-    TokenObtainPairView,   # username/password -> {access, refresh}
-    TokenRefreshView,      # {refresh} -> {access}
     TokenVerifyView,       # {token} -> {} if valid
 )
 
@@ -78,8 +77,8 @@ urlpatterns = [
     path("auth/devices/<str:device_id>/", DeviceSessionDetailView.as_view(), name="auth-device-detail"),
 
     # Optional: direct SimpleJWT endpoints (tooling-friendly)
-    path("auth/jwt/create/",  TokenObtainPairView.as_view(), name="jwt-create"),
-    path("auth/jwt/refresh/", TokenRefreshView.as_view(),   name="jwt-refresh"),
+    path("auth/jwt/create/",  LoginView.as_view(), name="jwt-create"),
+    path("auth/jwt/refresh/", DeviceBoundTokenRefreshView.as_view(), name="jwt-refresh"),
     path("auth/jwt/verify/",  TokenVerifyView.as_view(),    name="jwt-verify"),
     path("contacts/check", CheckContact.as_view(), name="check_contact"),
     path("users/check-contacts/", CheckContact.as_view(), name="check_contact_legacy"),

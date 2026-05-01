@@ -1,5 +1,4 @@
 from django.db import migrations, models
-import django.contrib.postgres.fields
 
 
 class Migration(migrations.Migration):
@@ -47,12 +46,12 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name='product',
             name='available_sizes',
-            field=django.contrib.postgres.fields.ArrayField(base_field=models.CharField(max_length=64), blank=True, default=list, size=None),
+            field=models.JSONField(blank=True, default=list),
         ),
         migrations.AddField(
             model_name='product',
             name='available_colors',
-            field=django.contrib.postgres.fields.ArrayField(base_field=models.CharField(max_length=64), blank=True, default=list, size=None),
+            field=models.JSONField(blank=True, default=list),
         ),
         migrations.AddField(
             model_name='product',

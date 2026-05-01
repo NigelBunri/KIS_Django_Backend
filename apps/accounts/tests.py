@@ -14,6 +14,7 @@ from .models import (
     User,
     UserContact,
 )
+from .views import issue_tokens_for_user
 
 
 class AccountsDeviceSessionTests(APITestCase):
@@ -62,7 +63,7 @@ class AccountsDeviceSessionTests(APITestCase):
         self.assertFalse(other["current"])
         self.assertTrue(other["has_e2ee_keys"])
 
-    def test_revoking_other_device_removes_device_and_keys(self):
+    def test_revoking_other_device_marks_device_revoked_and_removes_keys(self):
         E2EDeviceKey.objects.create(
             user=self.user,
             device=self.other_device,
@@ -82,7 +83,9 @@ class AccountsDeviceSessionTests(APITestCase):
         response = self.client.delete(reverse("auth-device-detail", kwargs={"device_id": "dev_other"}))
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Device.objects.filter(user=self.user, device_id="dev_other").exists())
+        self.other_device.refresh_from_db()
+        self.assertIsNotNone(self.other_device.revoked_at)
+        self.assertEqual(self.other_device.revoke_reason, "user_device_revoke")
         self.assertFalse(E2EDeviceKey.objects.filter(user=self.user, device=self.other_device).exists())
         self.assertFalse(E2EPreKey.objects.filter(user=self.user, device=self.other_device).exists())
 
@@ -91,6 +94,17 @@ class AccountsDeviceSessionTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue(Device.objects.filter(user=self.user, device_id="dev_current").exists())
+
+    def test_revoked_device_refresh_token_is_rejected(self):
+        tokens = issue_tokens_for_user(self.user, device_id="dev_other")
+
+        response = self.client.delete(reverse("auth-device-detail", kwargs={"device_id": "dev_other"}))
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        refresh_response = self.client.post(reverse("jwt-refresh"), {"refresh": tokens["refresh"]}, format="json")
+
+        self.assertEqual(refresh_response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(refresh_response.data["detail"], "Device session revoked.")
 
 
 class AccountsE2EEBundleTests(APITestCase):

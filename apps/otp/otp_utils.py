@@ -1,8 +1,10 @@
 # app/otp_utils.py
-import os, hmac, hashlib, random
+import os, hmac, hashlib, random, logging
 from datetime import timedelta
 from django.utils import timezone
 from django.conf import settings
+
+logger = logging.getLogger(__name__)
 
 def generate_otp(length: int = 6) -> str:
     digits = "0123456789"
@@ -23,7 +25,7 @@ def expires_in(seconds: int = 5 * 60):
 def send_sms_infobip(phone: str, text: str) -> None:
     """
     Replace this with your actual Infobip/Twilio client call.
-    In dev we still call the provider, but we also print to console.
+    Never print the OTP body; production logs are often retained and exported.
     """
-    print(f"[DEV OTP] Sending to {phone}: {text}")  # <-- visible in console
+    logger.info("OTP SMS queued via Infobip-compatible provider.")
     # real_sms_client.send(phone, text)  # implement for your provider

@@ -15,6 +15,20 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
 if _is_weak_secret(SECRET_KEY):
     raise ImproperlyConfigured("SECRET_KEY must be set to a strong value in production.")
 
+JWT_SECRET = os.environ.get("JWT_SECRET", "").strip()
+if _is_weak_secret(JWT_SECRET):
+    raise ImproperlyConfigured("JWT_SECRET must be set to a strong value in production.")
+
+DJANGO_INTERNAL_TOKEN = os.environ.get("DJANGO_INTERNAL_TOKEN", "").strip()
+if _is_weak_secret(DJANGO_INTERNAL_TOKEN) or DJANGO_INTERNAL_TOKEN in {"dev-internal-secret", "internal-token-testing-2026-secure"}:
+    raise ImproperlyConfigured("DJANGO_INTERNAL_TOKEN must be set to a strong non-development value in production.")
+
+if os.environ.get("ALLOW_ALL_HOSTS", "").strip().lower() in ("1", "true", "yes", "on"):
+    raise ImproperlyConfigured("ALLOW_ALL_HOSTS must not be enabled in production.")
+
+if os.environ.get("OTP_DEBUG_LOG_CODES", "").strip().lower() in ("1", "true", "yes", "on"):
+    raise ImproperlyConfigured("OTP_DEBUG_LOG_CODES must not be enabled in production.")
+
 # Database from DATABASE_URL env var.
 DATABASES["default"] = dj_database_url.parse(os.environ["DATABASE_URL"], conn_max_age=600)
 

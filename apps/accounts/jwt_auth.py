@@ -39,6 +39,17 @@ class DeviceBoundJWTAuthentication(JWTAuthentication):
         device = Device.objects.filter(user=user, device_id=str(token_device_id)).first()
         if not device:
             raise AuthenticationFailed("Device session revoked")
+        if device.revoked_at:
+            raise AuthenticationFailed("Device session revoked")
+
+        token_version = validated_token.get("token_version")
+        if token_version is not None:
+            try:
+                token_version_matches = int(token_version) == int(device.token_version)
+            except (TypeError, ValueError):
+                token_version_matches = False
+            if not token_version_matches:
+                raise AuthenticationFailed("Device session expired")
 
         Device.objects.filter(pk=device.pk).update(last_seen_at=timezone.now())
 

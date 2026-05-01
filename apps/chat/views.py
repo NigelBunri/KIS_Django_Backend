@@ -71,7 +71,7 @@ def _extract_phone_participants(raw_data) -> list[str]:
     for p in participants:
         if p is None:
             continue
-        s = str(p).strip()
+        s = User.objects.normalize_phone(str(p).strip())
         if s:
             phones.append(s)
 
@@ -116,17 +116,13 @@ def _resolve_peer_user(request_user: User, raw_data: dict) -> User:
     """
     peer_user_id = raw_data.get("peer_user_id")
     if peer_user_id is not None:
-        try:
-            peer_id = int(peer_user_id)
-        except Exception:
-            raise ValidationError({"peer_user_id": "peer_user_id must be an integer"})
-
-        if peer_id == request_user.id:
+        peer_id = str(peer_user_id).strip()
+        if peer_id == str(request_user.id):
             raise ValidationError({"peer_user_id": "Cannot create a direct chat with yourself."})
 
         try:
             return User.objects.get(id=peer_id)
-        except User.DoesNotExist:
+        except (User.DoesNotExist, ValueError, TypeError):
             raise ValidationError({"peer_user_id": "Peer user does not exist."})
 
     phones = _extract_phone_participants(raw_data)
@@ -158,6 +154,16 @@ class ConversationViewSet(viewsets.ModelViewSet):
     - update-last-message: internal endpoint called by Nest
     """
     permission_classes = [IsAuthenticated]
+
+    def get_throttles(self):
+        action = getattr(self, "action", None)
+        if action in {"search", "participant_search"}:
+            self.throttle_scope = "search"
+        elif action in {"create", "direct", "accept_request", "reject_request"}:
+            self.throttle_scope = "messaging"
+        else:
+            self.throttle_scope = None
+        return super().get_throttles()
 
     # ------------------------------------------------------------------
     # Query / serializers

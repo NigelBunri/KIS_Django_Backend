@@ -15,6 +15,7 @@ from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import ValidationError
 
 from .models import (
     BibleTranslation,
@@ -22,7 +23,13 @@ from .models import (
     BibleChapter,
     BibleVerse,
     BibleAudio,
+    BibleTranslationMetadata,
+    BibleTranslationLicenseReviewStatus,
     DailyDevotional,
+    BibleDailyPassage,
+    BibleMeditationPost,
+    BiblePrayerMonth,
+    BiblePrayerDay,
     PrayerRequest,
     MeditationTopic,
     MeditationSchedule,
@@ -30,12 +37,14 @@ from .models import (
     ReadingPlan,
     ReadingPlanEnrollment,
     ReadingHistory,
+    BibleReadingPlanEvent,
     BibleBookmark,
     BibleNote,
     BibleHighlight,
     MemoryVerse,
     BiblePreference,
     BibleCrossReference,
+    BibleContentAuditLog,
     BibleCourse,
     BibleCourseModule,
     BibleLesson,
@@ -72,11 +81,16 @@ from .models import (
 )
 from .serializers import (
     BibleTranslationSerializer,
+    BibleTranslationMetadataSerializer,
     BibleBookSerializer,
     BibleChapterSerializer,
     BibleVerseSerializer,
     BibleAudioSerializer,
     DailyDevotionalSerializer,
+    BibleDailyPassageSerializer,
+    BibleMeditationPostSerializer,
+    BiblePrayerMonthSerializer,
+    BiblePrayerDaySerializer,
     PrayerRequestSerializer,
     MeditationTopicSerializer,
     MeditationScheduleSerializer,
@@ -84,12 +98,14 @@ from .serializers import (
     ReadingPlanSerializer,
     ReadingPlanEnrollmentSerializer,
     ReadingHistorySerializer,
+    BibleReadingPlanEventSerializer,
     BibleBookmarkSerializer,
     BibleNoteSerializer,
     BibleHighlightSerializer,
     MemoryVerseSerializer,
     BiblePreferenceSerializer,
     BibleCrossReferenceSerializer,
+    BibleContentAuditLogSerializer,
     BibleCourseSerializer,
     BibleCourseModuleSerializer,
     BibleLessonSerializer,
@@ -125,30 +141,183 @@ from .serializers import (
     BibleCourseCredentialSerializer,
 )
 from .certificates import build_certificate_pdf, ensure_certificate_file, build_certificate_url
+from .importers import scan_bible_translation_registry
+from .reader import PassageReferenceError, parse_passage_reference
 from apps.partners.models import Partner, PartnerMembership, PartnerMembershipStatus, PartnerOrganizationProfile
+from apps.partners.seed import KCAN_PARTNER_NAME, KCAN_PARTNER_SLUG, LEGACY_DEFAULT_PARTNER_SLUGS
 from apps.chat.models import ConversationMember, BaseConversationRole
 from apps.billing.services import record_ledger, get_credit_account
 
 
 class TranslationListView(generics.ListAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     serializer_class = BibleTranslationSerializer
+    pagination_class = None
 
     def get_queryset(self):
-        return BibleTranslation.objects.filter(is_active=True).order_by("sort_order")
+        return public_translation_queryset()
+
+
+def public_translation_queryset():
+    return (
+        BibleTranslation.objects.filter(
+            is_active=True,
+            metadata__is_public=True,
+            metadata__is_licensed=True,
+            metadata__validation_status__in=["valid", "warning"],
+        )
+        .select_related("metadata")
+        .order_by("sort_order")
+    )
+
+
+def get_public_translation(identifier=None):
+    qs = public_translation_queryset()
+    if identifier:
+        lookup = models.Q(code__iexact=identifier)
+        if str(identifier).isdigit():
+            lookup |= models.Q(id=int(identifier))
+        translation = qs.filter(lookup).first()
+        if not translation:
+            raise ValidationError({"translation": "Translation is not available for public reading."})
+        return translation
+    translation = qs.first()
+    if not translation:
+        raise ValidationError({"translation": "No public licensed Bible translation is available."})
+    return translation
+
+
+def _chapter_navigation(chapter: BibleChapter):
+    previous_chapter = (
+        BibleChapter.objects.filter(book=chapter.book, number__lt=chapter.number).order_by("-number").first()
+    )
+    if not previous_chapter:
+        previous_book = BibleBook.objects.filter(order__lt=chapter.book.order).order_by("-order").first()
+        if previous_book:
+            previous_chapter = BibleChapter.objects.filter(book=previous_book).order_by("-number").first()
+    next_chapter = BibleChapter.objects.filter(book=chapter.book, number__gt=chapter.number).order_by("number").first()
+    if not next_chapter:
+        next_book = BibleBook.objects.filter(order__gt=chapter.book.order).order_by("order").first()
+        if next_book:
+            next_chapter = BibleChapter.objects.filter(book=next_book).order_by("number").first()
+    return {
+        "previous": BibleChapterSerializer(previous_chapter).data if previous_chapter else None,
+        "next": BibleChapterSerializer(next_chapter).data if next_chapter else None,
+    }
+
+
+def _verses_for_passage(translation: BibleTranslation, chapter: BibleChapter, start_verse=None, end_verse=None):
+    qs = BibleVerse.objects.filter(translation=translation, chapter=chapter).select_related("chapter", "chapter__book")
+    if start_verse:
+        qs = qs.filter(number__gte=start_verse)
+    if end_verse:
+        qs = qs.filter(number__lte=end_verse)
+    return qs.order_by("number")
+
+
+def _build_reader_payload(translation: BibleTranslation, chapter: BibleChapter, verses, reference: str):
+    audio = (
+        BibleAudio.objects.filter(translation=translation, chapter=chapter)
+        .prefetch_related("segments")
+        .first()
+    )
+    return {
+        "translation": BibleTranslationSerializer(translation).data,
+        "book": BibleBookSerializer(chapter.book).data,
+        "chapter": BibleChapterSerializer(chapter).data,
+        "reference": reference,
+        "navigation": _chapter_navigation(chapter),
+        "verses": BibleVerseSerializer(verses, many=True).data,
+        "audio": BibleAudioSerializer(audio).data if audio else None,
+    }
+
+
+class BibleTranslationMetadataViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    serializer_class = BibleTranslationMetadataSerializer
+
+    def get_queryset(self):
+        qs = BibleTranslationMetadata.objects.select_related("translation").all()
+        if not can_manage_kcan_content(self.request.user):
+            qs = qs.filter(is_public=True, is_licensed=True, validation_status__in=["valid", "warning"])
+        language = self.request.query_params.get("language")
+        status_filter = self.request.query_params.get("validation_status")
+        copyright_status = self.request.query_params.get("copyright_status")
+        public = self.request.query_params.get("public")
+        if language:
+            qs = qs.filter(language__iexact=language)
+        if status_filter:
+            qs = qs.filter(validation_status=status_filter)
+        if copyright_status:
+            qs = qs.filter(copyright_status=copyright_status)
+        if public is not None:
+            qs = qs.filter(is_public=str(public).lower() in {"1", "true", "yes"})
+        return qs.order_by("language", "full_name")
+
+    def _require_admin(self):
+        require_manage_kcan_content(self.request.user)
+
+    def perform_create(self, serializer):
+        self._require_admin()
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._require_admin()
+        old_instance = self.get_object()
+        requested_public = serializer.validated_data.get("is_public", old_instance.is_public)
+        requested_licensed = serializer.validated_data.get("is_licensed", old_instance.is_licensed)
+        requested_review = serializer.validated_data.get("license_review_status", old_instance.license_review_status)
+        if requested_public and requested_licensed and requested_review == BibleTranslationLicenseReviewStatus.PENDING:
+            raise ValidationError(
+                {
+                    "license_review_status": (
+                        "Approve the human license review before making a non-public-domain translation public."
+                    )
+                }
+            )
+        if (
+            requested_review != old_instance.license_review_status
+            and requested_review
+            in {
+                BibleTranslationLicenseReviewStatus.APPROVED,
+                BibleTranslationLicenseReviewStatus.REJECTED,
+                BibleTranslationLicenseReviewStatus.NOT_REQUIRED,
+            }
+        ):
+            serializer.validated_data["license_reviewed_by"] = self.request.user
+            serializer.validated_data["license_reviewed_at"] = timezone.now()
+        instance = serializer.save()
+        if instance.translation_id:
+            instance.translation.is_active = instance.can_be_public
+            instance.translation.save(update_fields=["is_active"])
+
+    def perform_destroy(self, instance):
+        self._require_admin()
+        instance.delete()
+
+    @action(detail=False, methods=["post"], url_path="scan")
+    def scan(self, request):
+        self._require_admin()
+        languages = request.data.get("languages")
+        translations = request.data.get("translations")
+        scanned = scan_bible_translation_registry(languages=languages, translations=translations)
+        serializer = self.get_serializer(scanned, many=True)
+        return Response({"count": len(scanned), "results": serializer.data}, status=status.HTTP_200_OK)
 
 
 class BookListView(generics.ListAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     serializer_class = BibleBookSerializer
+    pagination_class = None
 
     def get_queryset(self):
         return BibleBook.objects.all().order_by("order")
 
 
 class ChapterListView(generics.ListAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     serializer_class = BibleChapterSerializer
+    pagination_class = None
 
     def get_queryset(self):
         book_id = self.request.query_params.get("book")
@@ -159,72 +328,313 @@ class ChapterListView(generics.ListAPIView):
 
 
 class ReaderView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def get(self, request):
         translation_code = request.query_params.get("translation")
+        reference = request.query_params.get("reference")
         book_code = request.query_params.get("book")
         chapter_number = request.query_params.get("chapter")
 
-        translation = None
-        if translation_code:
-            translation = BibleTranslation.objects.filter(code__iexact=translation_code).first()
-        if not translation:
-            translation = BibleTranslation.objects.filter(is_active=True).order_by("sort_order").first()
+        translation = get_public_translation(translation_code)
+        start_verse = request.query_params.get("start_verse")
+        end_verse = request.query_params.get("end_verse")
+
+        if reference:
+            try:
+                parsed = parse_passage_reference(reference)
+            except PassageReferenceError as exc:
+                return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            chapter = BibleChapter.objects.filter(book=parsed.book, number=parsed.chapter).first()
+            if not chapter:
+                return Response({"detail": "Chapter not found."}, status=status.HTTP_404_NOT_FOUND)
+            verses = _verses_for_passage(translation, chapter, parsed.start_verse, parsed.end_verse)
+            return Response(_build_reader_payload(translation, chapter, verses, parsed.display_ref))
 
         book = None
         if book_code:
-            book = BibleBook.objects.filter(code__iexact=book_code).first()
+            book = BibleBook.objects.filter(models.Q(code__iexact=book_code) | models.Q(name__iexact=book_code)).first()
         if not book:
             book = BibleBook.objects.order_by("order").first()
-
         if not book:
             return Response({"detail": "No books available"}, status=status.HTTP_404_NOT_FOUND)
-
-        chapter_number = int(chapter_number or 1)
+        try:
+            chapter_number = int(chapter_number or 1)
+        except (TypeError, ValueError):
+            return Response({"detail": "Chapter must be a number."}, status=status.HTTP_400_BAD_REQUEST)
         chapter = BibleChapter.objects.filter(book=book, number=chapter_number).first()
         if not chapter:
             chapter = BibleChapter.objects.filter(book=book).order_by("number").first()
+        if not chapter:
+            return Response({"detail": "Chapter not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        verses = BibleVerse.objects.filter(translation=translation, chapter=chapter).order_by("number")
-        audio = (
-            BibleAudio.objects.filter(translation=translation, chapter=chapter)
-            .prefetch_related("segments")
-            .first()
-        )
+        try:
+            start_verse = int(start_verse) if start_verse else None
+            end_verse = int(end_verse) if end_verse else start_verse
+        except (TypeError, ValueError):
+            return Response({"detail": "Verse range must be numeric."}, status=status.HTTP_400_BAD_REQUEST)
+        verses = _verses_for_passage(translation, chapter, start_verse, end_verse)
+        if start_verse:
+            reference_label = f"{book.name} {chapter.number}:{start_verse}"
+            if end_verse and end_verse != start_verse:
+                reference_label = f"{reference_label}-{end_verse}"
+        else:
+            reference_label = f"{book.name} {chapter.number}"
 
+        return Response(_build_reader_payload(translation, chapter, verses, reference_label))
+
+
+class ParallelReaderView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        reference = request.query_params.get("reference")
+        if not reference:
+            return Response({"detail": "Reference is required."}, status=status.HTTP_400_BAD_REQUEST)
+        translation_codes = [
+            item.strip()
+            for item in (request.query_params.get("translations") or "").split(",")
+            if item.strip()
+        ]
+        if not translation_codes:
+            default_translation = get_public_translation()
+            translation_codes = [default_translation.code]
+        try:
+            parsed = parse_passage_reference(reference)
+        except PassageReferenceError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        chapter = BibleChapter.objects.filter(book=parsed.book, number=parsed.chapter).first()
+        if not chapter:
+            return Response({"detail": "Chapter not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        payload = []
+        for code in translation_codes:
+            translation = get_public_translation(code)
+            verses = _verses_for_passage(translation, chapter, parsed.start_verse, parsed.end_verse)
+            payload.append(
+                {
+                    "translation": BibleTranslationSerializer(translation).data,
+                    "verses": BibleVerseSerializer(verses, many=True).data,
+                }
+            )
         return Response(
             {
-                "translation": BibleTranslationSerializer(translation).data if translation else None,
-                "book": BibleBookSerializer(book).data,
-                "chapter": BibleChapterSerializer(chapter).data if chapter else None,
-                "verses": BibleVerseSerializer(verses, many=True).data,
-                "audio": BibleAudioSerializer(audio).data if audio else None,
-            }
+                "reference": parsed.display_ref,
+                "book": BibleBookSerializer(parsed.book).data,
+                "chapter": BibleChapterSerializer(chapter).data,
+                "navigation": _chapter_navigation(chapter),
+                "translations": payload,
+            },
+            status=status.HTTP_200_OK,
         )
 
 
 class VerseSearchView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def get(self, request):
         query = request.query_params.get("q", "").strip()
         translation_id = request.query_params.get("translation")
         if not query:
             return Response({"results": []})
-        qs = BibleVerse.objects.select_related("chapter", "chapter__book")
+        public_translation_ids = public_translation_queryset().values_list("id", flat=True)
+        qs = BibleVerse.objects.filter(translation_id__in=public_translation_ids).select_related("chapter", "chapter__book")
         if translation_id:
-            qs = qs.filter(translation_id=translation_id)
+            translation = get_public_translation(translation_id)
+            qs = qs.filter(translation=translation)
         qs = qs.filter(text__icontains=query)[:50]
         return Response({"results": BibleVerseSerializer(qs, many=True).data})
 
 
+def get_kcan_partner():
+    return Partner.objects.filter(slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).first()
+
+
+def can_manage_kcan_content(user) -> bool:
+    partner = get_kcan_partner()
+    return bool(partner and can_manage_partner_courses(user, partner))
+
+
+def require_manage_kcan_content(user):
+    partner = get_kcan_partner()
+    if not partner:
+        raise PermissionDenied("KCAN partner is not configured.")
+    if not can_manage_partner_courses(user, partner):
+        raise PermissionDenied("Only KCAN admins can manage official Bible content.")
+    return partner
+
+
+def _mark_published_if_needed(instance):
+    if getattr(instance, "status", None) == "published" and not getattr(instance, "published_at", None):
+        instance.published_at = timezone.now()
+        instance.save(update_fields=["published_at"])
+
+
+def _log_bible_content_action(partner, user, action: str, target):
+    BibleContentAuditLog.objects.create(
+        partner=partner,
+        user=user if getattr(user, "is_authenticated", False) else None,
+        action=action,
+        target_type=target.__class__.__name__,
+        target_id=str(target.pk),
+        metadata={"status": getattr(target, "status", None)},
+    )
+
+
+class KCANPublishedContentMixin:
+    permission_classes = [AllowAny]
+
+    def _base_queryset(self):
+        raise NotImplementedError
+
+    def get_queryset(self):
+        qs = self._base_queryset()
+        if can_manage_kcan_content(self.request.user):
+            return qs
+        return qs.filter(status="published")
+
+    def perform_create(self, serializer):
+        partner = require_manage_kcan_content(self.request.user)
+        instance = serializer.save(partner=partner, created_by=self.request.user)
+        _mark_published_if_needed(instance)
+        _log_bible_content_action(partner, self.request.user, "create", instance)
+
+    def perform_update(self, serializer):
+        partner = require_manage_kcan_content(self.request.user)
+        instance = serializer.save()
+        _mark_published_if_needed(instance)
+        _log_bible_content_action(partner, self.request.user, "update", instance)
+
+    def perform_destroy(self, instance):
+        partner = require_manage_kcan_content(self.request.user)
+        _log_bible_content_action(partner, self.request.user, "delete", instance)
+        instance.delete()
+
+
 class DailyDevotionalView(generics.ListAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     serializer_class = DailyDevotionalSerializer
 
     def get_queryset(self):
         return DailyDevotional.objects.all().order_by("-date")
+
+
+class BibleDailyPassageViewSet(KCANPublishedContentMixin, viewsets.ModelViewSet):
+    serializer_class = BibleDailyPassageSerializer
+
+    def _base_queryset(self):
+        qs = BibleDailyPassage.objects.filter(partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).select_related(
+            "partner", "translation", "created_by", "reviewed_by"
+        )
+        language = self.request.query_params.get("language")
+        if language:
+            qs = qs.filter(language__iexact=language)
+        return qs.order_by("-date", "-created_at")
+
+    @action(detail=False, methods=["get"], url_path="today")
+    def today(self, request):
+        language = request.query_params.get("language", "en")
+        today = timezone.localdate()
+        qs = self.get_queryset().filter(date=today, language__iexact=language)
+        passage = qs.first()
+        if not passage and language.lower() != "en":
+            passage = self.get_queryset().filter(date=today, language__iexact="en").first()
+        if not passage:
+            return Response({"detail": "No daily passage published for today."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(self.get_serializer(passage).data, status=status.HTTP_200_OK)
+
+
+class BibleMeditationPostViewSet(KCANPublishedContentMixin, viewsets.ModelViewSet):
+    serializer_class = BibleMeditationPostSerializer
+
+    def _base_queryset(self):
+        qs = BibleMeditationPost.objects.filter(partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).select_related(
+            "partner", "created_by", "reviewed_by"
+        )
+        language = self.request.query_params.get("language")
+        content_type = self.request.query_params.get("content_type")
+        if language:
+            qs = qs.filter(language__iexact=language)
+        if content_type:
+            qs = qs.filter(content_type=content_type)
+        return qs.order_by("-published_at", "-created_at")
+
+
+class BiblePrayerMonthViewSet(KCANPublishedContentMixin, viewsets.ModelViewSet):
+    serializer_class = BiblePrayerMonthSerializer
+
+    def _base_queryset(self):
+        qs = (
+            BiblePrayerMonth.objects.filter(partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS)
+            .select_related("partner", "created_by", "reviewed_by")
+            .prefetch_related("days")
+        )
+        year = self.request.query_params.get("year")
+        month = self.request.query_params.get("month")
+        language = self.request.query_params.get("language")
+        if year:
+            qs = qs.filter(year=year)
+        if month:
+            qs = qs.filter(month=month)
+        if language:
+            qs = qs.filter(language__iexact=language)
+        return qs.order_by("-year", "-month")
+
+    @action(detail=False, methods=["get"], url_path="current")
+    def current(self, request):
+        today = timezone.localdate()
+        language = request.query_params.get("language", "en")
+        month = self.get_queryset().filter(year=today.year, month=today.month, language__iexact=language).first()
+        if not month and language.lower() != "en":
+            month = self.get_queryset().filter(year=today.year, month=today.month, language__iexact="en").first()
+        if not month:
+            return Response({"detail": "No prayer calendar published for the current month."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(self.get_serializer(month).data, status=status.HTTP_200_OK)
+
+
+class BiblePrayerDayViewSet(viewsets.ModelViewSet):
+    permission_classes = [AllowAny]
+    serializer_class = BiblePrayerDaySerializer
+
+    def get_queryset(self):
+        qs = BiblePrayerDay.objects.filter(prayer_month__partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).select_related(
+            "prayer_month", "prayer_month__partner"
+        )
+        prayer_month_id = self.request.query_params.get("prayer_month")
+        if prayer_month_id:
+            qs = qs.filter(prayer_month_id=prayer_month_id)
+        if not can_manage_kcan_content(self.request.user):
+            qs = qs.filter(prayer_month__status="published")
+        return qs.order_by("day")
+
+    def perform_create(self, serializer):
+        prayer_month = serializer.validated_data.get("prayer_month")
+        require_manage_kcan_content(self.request.user)
+        if prayer_month.partner.slug not in LEGACY_DEFAULT_PARTNER_SLUGS:
+            raise PermissionDenied("Prayer calendar days must belong to KCAN.")
+        instance = serializer.save()
+        _log_bible_content_action(prayer_month.partner, self.request.user, "create_day", instance)
+
+    def perform_update(self, serializer):
+        require_manage_kcan_content(self.request.user)
+        instance = serializer.save()
+        _log_bible_content_action(instance.prayer_month.partner, self.request.user, "update_day", instance)
+
+    def perform_destroy(self, instance):
+        require_manage_kcan_content(self.request.user)
+        _log_bible_content_action(instance.prayer_month.partner, self.request.user, "delete_day", instance)
+        instance.delete()
+
+
+class BibleContentAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated]
+    serializer_class = BibleContentAuditLogSerializer
+
+    def get_queryset(self):
+        require_manage_kcan_content(self.request.user)
+        return BibleContentAuditLog.objects.filter(partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).select_related(
+            "partner", "user"
+        )
 
 
 class MeditationTopicViewSet(viewsets.ReadOnlyModelViewSet):
@@ -296,12 +706,86 @@ class ReadingHistoryViewSet(viewsets.ModelViewSet):
         serializer.save(user=self.request.user)
 
 
+class BibleReadingPlanEventViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    serializer_class = BibleReadingPlanEventSerializer
+
+    def get_queryset(self):
+        qs = (
+            BibleReadingPlanEvent.objects.filter(user=self.request.user)
+            .select_related("translation")
+            .prefetch_related("chapters", "verses")
+        )
+        date_from = self.request.query_params.get("date_from")
+        date_to = self.request.query_params.get("date_to")
+        status_filter = self.request.query_params.get("status")
+        if date_from:
+            qs = qs.filter(start_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(start_at__date__lte=date_to)
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs.order_by("start_at")
+
+    def perform_create(self, serializer):
+        translation = serializer.validated_data.get("translation")
+        if translation:
+            get_public_translation(translation.code)
+        serializer.save(user=self.request.user)
+
+    @action(detail=False, methods=["post"], url_path="from-selection")
+    def from_selection(self, request):
+        translation = get_public_translation(request.data.get("translation"))
+        verse_ids = request.data.get("verses") or []
+        chapter_ids = request.data.get("chapters") or []
+        if not verse_ids and not chapter_ids:
+            return Response({"detail": "Select at least one verse or chapter."}, status=status.HTTP_400_BAD_REQUEST)
+
+        verses = BibleVerse.objects.filter(id__in=verse_ids, translation=translation).select_related("chapter", "chapter__book")
+        chapters = BibleChapter.objects.filter(id__in=chapter_ids).select_related("book")
+        if verse_ids and verses.count() != len(set(verse_ids)):
+            return Response({"detail": "One or more selected verses are not available for this translation."}, status=status.HTTP_400_BAD_REQUEST)
+        if chapter_ids and chapters.count() != len(set(chapter_ids)):
+            return Response({"detail": "One or more selected chapters were not found."}, status=status.HTTP_400_BAD_REQUEST)
+
+        refs = [
+            f"{verse.chapter.book.name} {verse.chapter.number}:{verse.number}"
+            for verse in verses.order_by("chapter__book__order", "chapter__number", "number")
+        ] + [
+            f"{chapter.book.name} {chapter.number}"
+            for chapter in chapters.order_by("book__order", "number")
+        ]
+        data = {
+            "translation": translation.id,
+            "passage_ref": request.data.get("passage_ref") or ", ".join(refs),
+            "start_at": request.data.get("start_at"),
+            "end_at": request.data.get("end_at"),
+            "recurrence": request.data.get("recurrence", "none"),
+            "reminder_offsets": request.data.get("reminder_offsets", []),
+            "reminder_channels": request.data.get("reminder_channels", []),
+            "source": request.data.get("source", "reader"),
+        }
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        event = serializer.save(user=request.user)
+        event.verses.set(verses)
+        event.chapters.set(chapters)
+        return Response(self.get_serializer(event).data, status=status.HTTP_201_CREATED)
+
+
 class BibleBookmarkViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = BibleBookmarkSerializer
 
     def get_queryset(self):
-        return BibleBookmark.objects.filter(user=self.request.user)
+        qs = BibleBookmark.objects.filter(user=self.request.user).select_related("verse", "verse__chapter", "verse__chapter__book")
+        book = self.request.query_params.get("book")
+        translation = self.request.query_params.get("translation")
+        if book:
+            qs = qs.filter(verse__chapter__book__code__iexact=book)
+        if translation:
+            qs = qs.filter(verse__translation=get_public_translation(translation))
+        return qs.order_by("-created_at")
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
@@ -312,7 +796,17 @@ class BibleNoteViewSet(viewsets.ModelViewSet):
     serializer_class = BibleNoteSerializer
 
     def get_queryset(self):
-        return BibleNote.objects.filter(user=self.request.user)
+        qs = BibleNote.objects.filter(user=self.request.user).select_related("verse", "verse__chapter", "verse__chapter__book")
+        book = self.request.query_params.get("book")
+        translation = self.request.query_params.get("translation")
+        query = self.request.query_params.get("q")
+        if book:
+            qs = qs.filter(verse__chapter__book__code__iexact=book)
+        if translation:
+            qs = qs.filter(verse__translation=get_public_translation(translation))
+        if query:
+            qs = qs.filter(text__icontains=query)
+        return qs.order_by("-updated_at")
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
@@ -323,7 +817,27 @@ class BibleHighlightViewSet(viewsets.ModelViewSet):
     serializer_class = BibleHighlightSerializer
 
     def get_queryset(self):
-        return BibleHighlight.objects.filter(user=self.request.user)
+        qs = BibleHighlight.objects.filter(user=self.request.user).select_related("verse", "verse__chapter", "verse__chapter__book")
+        color = self.request.query_params.get("color")
+        book = self.request.query_params.get("book")
+        translation = self.request.query_params.get("translation")
+        if color:
+            qs = qs.filter(color__iexact=color)
+        if book:
+            qs = qs.filter(verse__chapter__book__code__iexact=book)
+        if translation:
+            qs = qs.filter(verse__translation=get_public_translation(translation))
+        return qs.order_by("-created_at")
+
+    @action(detail=False, methods=["get"], url_path="colors")
+    def colors(self, request):
+        colors = (
+            BibleHighlight.objects.filter(user=request.user)
+            .values("color")
+            .annotate(count=models.Count("id"))
+            .order_by("color")
+        )
+        return Response(list(colors), status=status.HTTP_200_OK)
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
@@ -349,6 +863,16 @@ class BiblePreferenceViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
+
+    @action(detail=False, methods=["get", "patch"], url_path="current")
+    def current(self, request):
+        preference, _ = BiblePreference.objects.get_or_create(user=request.user)
+        if request.method.lower() == "patch":
+            serializer = self.get_serializer(preference, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(self.get_serializer(preference).data, status=status.HTTP_200_OK)
 
 
 class BibleCrossReferenceViewSet(viewsets.ModelViewSet):
@@ -385,7 +909,7 @@ class BibleStatsView(APIView):
 
 
 def can_manage_partner_courses(user, partner: Partner) -> bool:
-    if not partner:
+    if not partner or not getattr(user, "is_authenticated", False):
         return False
     if partner.owner_id == user.id:
         return True
@@ -434,7 +958,7 @@ def require_manage_course(user, course: BibleCourse):
 
 
 class BibleCourseViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     serializer_class = BibleCourseSerializer
 
     def get_queryset(self):
@@ -446,14 +970,14 @@ class BibleCourseViewSet(viewsets.ModelViewSet):
             "partner__organization_profile",
         )
         if scope == "bible":
-            qs = qs.filter(is_bible_course=True, partner__name__icontains="Christian Community")
+            qs = qs.filter(is_bible_course=True, partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS)
         elif scope == "partner":
             qs = qs.filter(is_bible_course=False)
         partner = None
         if partner_id:
             partner = Partner.objects.filter(id=partner_id).first()
         elif scope == "partner":
-            partner = Partner.objects.filter(name__icontains="Christian Community").first()
+            partner = get_kcan_partner()
         if partner:
             if scope == "partner":
                 membership = PartnerMembership.objects.filter(partner=partner, user=self.request.user).first()
@@ -476,8 +1000,8 @@ class BibleCourseViewSet(viewsets.ModelViewSet):
         partner_id = self.request.data.get("partner")
         partner = Partner.objects.filter(id=partner_id).first() if partner_id else None
         is_bible_course = bool(self.request.data.get("is_bible_course"))
-        if is_bible_course and partner and "christian community" not in (partner.name or "").lower():
-            raise PermissionDenied("Bible courses are reserved for the CC partner.")
+        if is_bible_course and partner and partner.slug != KCAN_PARTNER_SLUG:
+            raise PermissionDenied("Bible courses are reserved for the KCAN partner.")
         if partner and not can_manage_partner_courses(self.request.user, partner):
             raise PermissionDenied("You do not have permission to create courses for this partner.")
         is_public = self.request.data.get("is_public")
@@ -492,9 +1016,11 @@ class BibleCourseViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            return [AllowAny()]
         if self.action == "certificate":
             return [AllowAny()]
-        return super().get_permissions()
+        return [IsAuthenticated()]
 
     def get_authenticators(self):
         if getattr(self, "action", None) == "certificate":
@@ -523,7 +1049,7 @@ class BibleCourseViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Course is not completed.")
         user_name = user.display_name or user.phone or user.email or "Member"
         partner_profile = None
-        partner_name = "Christian Community (KIS)"
+        partner_name = KCAN_PARTNER_NAME
         brand_color = None
         logo_url = None
         if course.partner_id:
@@ -582,7 +1108,7 @@ class BibleCourseViewSet(viewsets.ModelViewSet):
 
 
 class BibleCourseModuleViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     serializer_class = BibleCourseModuleSerializer
 
     def get_queryset(self):
@@ -592,6 +1118,11 @@ class BibleCourseModuleViewSet(viewsets.ModelViewSet):
             qs = qs.filter(course_id=course_id)
         return qs.order_by("order")
 
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            return [AllowAny()]
+        return [IsAuthenticated()]
+
     def perform_create(self, serializer):
         course = serializer.validated_data.get("course")
         if course and course.partner and not can_manage_partner_courses(self.request.user, course.partner):
@@ -600,7 +1131,7 @@ class BibleCourseModuleViewSet(viewsets.ModelViewSet):
 
 
 class BibleLessonViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     serializer_class = BibleLessonSerializer
 
     def get_queryset(self):
@@ -609,6 +1140,11 @@ class BibleLessonViewSet(viewsets.ModelViewSet):
         if course_id:
             qs = qs.filter(course_id=course_id)
         return qs.order_by("order")
+
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            return [AllowAny()]
+        return [IsAuthenticated()]
 
     def perform_create(self, serializer):
         course = serializer.validated_data.get("course")

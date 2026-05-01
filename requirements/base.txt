@@ -28,6 +28,7 @@ djangorestframework==3.16.1
 djangorestframework_simplejwt==5.5.1
 drf-spectacular==0.28.0
 drf-yasg==1.21.11
+firebase-admin==6.6.0
 groq==1.0.0
 gunicorn==25.3.0
 h11==0.16.0

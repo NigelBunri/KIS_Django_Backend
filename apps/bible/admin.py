@@ -2,12 +2,17 @@ from django.contrib import admin
 
 from .models import (
     BibleTranslation,
+    BibleTranslationMetadata,
     BibleBook,
     BibleChapter,
     BibleVerse,
     BibleAudio,
     BibleAudioSegment,
     DailyDevotional,
+    BibleDailyPassage,
+    BibleMeditationPost,
+    BiblePrayerMonth,
+    BiblePrayerDay,
     PrayerRequest,
     MeditationTopic,
     MeditationSchedule,
@@ -18,12 +23,14 @@ from .models import (
     ReadingPlanItem,
     ReadingPlanEnrollment,
     ReadingHistory,
+    BibleReadingPlanEvent,
     BibleBookmark,
     BibleNote,
     BibleHighlight,
     MemoryVerse,
     BiblePreference,
     BibleCrossReference,
+    BibleContentAuditLog,
     BibleCourse,
     BibleCourseModule,
     BibleLesson,
@@ -32,12 +39,17 @@ from .models import (
 )
 
 admin.site.register(BibleTranslation)
+admin.site.register(BibleTranslationMetadata)
 admin.site.register(BibleBook)
 admin.site.register(BibleChapter)
 admin.site.register(BibleVerse)
 admin.site.register(BibleAudio)
 admin.site.register(BibleAudioSegment)
 admin.site.register(DailyDevotional)
+admin.site.register(BibleDailyPassage)
+admin.site.register(BibleMeditationPost)
+admin.site.register(BiblePrayerMonth)
+admin.site.register(BiblePrayerDay)
 admin.site.register(PrayerRequest)
 admin.site.register(MeditationTopic)
 admin.site.register(MeditationSchedule)
@@ -48,12 +60,14 @@ admin.site.register(ReadingPlan)
 admin.site.register(ReadingPlanItem)
 admin.site.register(ReadingPlanEnrollment)
 admin.site.register(ReadingHistory)
+admin.site.register(BibleReadingPlanEvent)
 admin.site.register(BibleBookmark)
 admin.site.register(BibleNote)
 admin.site.register(BibleHighlight)
 admin.site.register(MemoryVerse)
 admin.site.register(BiblePreference)
 admin.site.register(BibleCrossReference)
+admin.site.register(BibleContentAuditLog)
 admin.site.register(BibleCourse)
 admin.site.register(BibleCourseModule)
 admin.site.register(BibleLesson)

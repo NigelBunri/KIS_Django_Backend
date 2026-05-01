@@ -1,12 +1,12 @@
 
-from django.utils import timezone
 from django.db import transaction
 from . import models
-from django.conf import settings
 import datetime
 import logging
 
 logger = logging.getLogger(__name__)
+
+MANDATORY_DELIVERY_CHANNELS = ("IN_APP", "PUSH")
 
 
 def should_suppress(user_id, notification_type, context=None):
@@ -32,14 +32,40 @@ def should_suppress(user_id, notification_type, context=None):
     return False
 
 
+def _normalize_channels(channel=None, preferred_channels=None) -> list[str]:
+    channels: list[str] = []
+    for required in MANDATORY_DELIVERY_CHANNELS:
+        if required not in channels:
+            channels.append(required)
+    for candidate in preferred_channels or []:
+        normalized = str(candidate or "").strip().upper()
+        if normalized and normalized not in channels:
+            channels.append(normalized)
+    normalized_channel = str(channel or "").strip().upper()
+    if normalized_channel and normalized_channel not in channels:
+        channels.append(normalized_channel)
+    return channels
+
+
+def ensure_notification_deliveries(notification: models.Notification, channels=None):
+    """Ensure the central in-app notification has its required delivery rows."""
+    existing = set(notification.deliveries.values_list("channel", flat=True))
+    for ch in _normalize_channels(notification.channel, channels):
+        if ch not in existing:
+            models.NotificationDelivery.objects.create(notification=notification, channel=ch)
+            existing.add(ch)
+
+
 @transaction.atomic
 def create_notification(user_id, type, template_key=None, context=None, channel=None, priority="MEDIUM", dedup_key=None, **kwargs):
     """Create a notification and schedule deliveries. Deduplication key avoids duplicates."""
     # dedupe
     if dedup_key:
-        existing = models.Notification.objects.filter(user_id=user_id, dedup_key=dedup_key, is_read=False, is_deleted=False)
+        existing = models.Notification.objects.filter(user_id=user_id, dedup_key=dedup_key, is_deleted=False)
         if existing.exists():
-            return existing.first()
+            notif = existing.first()
+            ensure_notification_deliveries(notif, kwargs.get("channels"))
+            return notif
 
     title = kwargs.get("title")
     body = kwargs.get("body")
@@ -61,7 +87,7 @@ def create_notification(user_id, type, template_key=None, context=None, channel=
         body=body or "",
         target_type=kwargs.get("target_type"),
         target_id=kwargs.get("target_id"),
-        channel=channel or (template.default_channel if template else "IN_APP"),
+        channel="IN_APP",
         priority=priority,
         actions_json=kwargs.get("actions_json", []),
         personalization_score=kwargs.get("personalization_score", 0.0),
@@ -73,21 +99,23 @@ def create_notification(user_id, type, template_key=None, context=None, channel=
         dedup_key=dedup_key,
     )
 
-    # Create initial delivery record(s). Channel preferences might produce multiple.
-    channels = [notif.channel]
-    # apply user rules to override channels
+    # Create delivery records. Every in-app notification also gets a related push delivery.
+    preferred_channels = []
     rules = models.NotificationRule.objects.filter(user_id=user_id, enabled=True)
     if rules.exists():
         preferred = rules.first().channels_json or []
         if preferred:
-            channels = preferred
+            preferred_channels = preferred
 
-    for ch in channels:
-        models.NotificationDelivery.objects.create(notification=notif, channel=ch)
+    requested_channels = kwargs.get("channels") or preferred_channels or [channel or (template.default_channel if template else None)]
+    ensure_notification_deliveries(notif, requested_channels)
 
     # Immediately schedule a worker to process deliveries (or enqueue Celery task in prod)
     from .tasks import process_notification_delivery
 
-    process_notification_delivery.delay(str(notif.id))
+    try:
+        process_notification_delivery.delay(str(notif.id))
+    except Exception:
+        logger.exception("Unable to enqueue notification delivery for %s", notif.id)
 
     return notif

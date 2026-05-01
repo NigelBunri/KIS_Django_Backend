@@ -436,11 +436,15 @@ class Device(BaseEntity):
     user_agent = models.TextField(null=True, blank=True)
     last_ip = models.GenericIPAddressField(null=True, blank=True)
     last_seen_at = models.DateTimeField(default=timezone.now)
+    token_version = models.PositiveIntegerField(default=1)
+    revoked_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    revoke_reason = models.CharField(max_length=120, blank=True, default="")
 
     class Meta:
         indexes = [
             models.Index(fields=["user", "last_seen_at"]),
             models.Index(fields=["user", "device_id"]),
+            models.Index(fields=["user", "revoked_at"]),
         ]
 
 

@@ -29,6 +29,17 @@ MAX_ATTEMPTS = 5
 ALLOWED_PURPOSES = {"register", "login", "reset"}
 ALLOWED_CHANNELS = {"sms"}
 
+
+def _masked_phone(phone: str) -> str:
+    text = str(phone or "")
+    if len(text) <= 4:
+        return "****"
+    return f"{text[:3]}***{text[-2:]}"
+
+
+def _debug_otp_logging_enabled() -> bool:
+    return bool(settings.DEBUG and getattr(settings, "OTP_DEBUG_LOG_CODES", False))
+
 def generate_otp(length: int = OTP_LENGTH) -> str:
     import string, secrets
     return ''.join(secrets.choice(string.digits) for _ in range(length))
@@ -40,7 +51,7 @@ def make_code_hash(phone: str, purpose: str, code: str) -> str:
 
 def send_sms_via_provider(phone: str, body: str) -> None:
     try:
-        logger.info("SMS queued to %s: %s", phone, body)
+        logger.info("SMS OTP queued to %s", _masked_phone(phone))
     except Exception as e:
         logger.warning("SMS send failed (dev non-fatal): %s", e)
 
@@ -58,6 +69,7 @@ def normalize_phone_input(phone: str, country: str = "CM") -> str:
 class OtpInitiateView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
+    throttle_scope = "otp"
 
     def post(self, request):
         country = (request.data.get("country") or "CM").strip().upper()
@@ -90,8 +102,10 @@ class OtpInitiateView(APIView):
         PhoneOTP.objects.filter(phone=phone, purpose=purpose, expires_at__gt=now).delete()
         PhoneOTP.objects.create(phone=phone, purpose=purpose, code_hash=code_hash, expires_at=expires_at, attempts=0)
 
-        print(f"[DEV] OTP for {phone} ({purpose}): {code}")
-        logger.warning("[DEV] OTP for %s (%s): %s", phone, purpose, code)
+        if _debug_otp_logging_enabled():
+            logger.warning("[DEV ONLY] OTP generated for %s (%s): %s", _masked_phone(phone), purpose, code)
+        else:
+            logger.info("OTP generated for %s (%s)", _masked_phone(phone), purpose)
 
         try:
             send_sms_via_provider(phone, f"Your verification code is {code}. It expires in 5 minutes.")
@@ -108,6 +122,7 @@ class OtpVerifyView(APIView):
     """
     authentication_classes = []
     permission_classes = [AllowAny]
+    throttle_scope = "otp"
 
     def post(self, request):
         country = (request.data.get("country") or "CM").strip().upper()
@@ -174,6 +189,7 @@ class OtpVerifyView(APIView):
 class PasswordResetInitiateView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
+    throttle_scope = "password_reset"
 
     def post(self, request):
         country = (request.data.get("country") or "CM").strip().upper()
@@ -205,8 +221,10 @@ class PasswordResetInitiateView(APIView):
         PhoneOTP.objects.filter(phone=phone, purpose=purpose, expires_at__gt=now).delete()
         PhoneOTP.objects.create(phone=phone, purpose=purpose, code_hash=code_hash, expires_at=expires_at, attempts=0)
 
-        print(f"[DEV] OTP for {phone} ({purpose}): {code}")
-        logger.warning("[DEV] OTP for %s (%s): %s", phone, purpose, code)
+        if _debug_otp_logging_enabled():
+            logger.warning("[DEV ONLY] OTP generated for %s (%s): %s", _masked_phone(phone), purpose, code)
+        else:
+            logger.info("OTP generated for %s (%s)", _masked_phone(phone), purpose)
 
         try:
             send_sms_via_provider(phone, f"Your password reset code is {code}. It expires in 5 minutes.")
@@ -224,6 +242,7 @@ class PasswordResetView(APIView):
     """
     authentication_classes = []
     permission_classes = [AllowAny]
+    throttle_scope = "password_reset"
 
     def post(self, request):
         country = (request.data.get("country") or "CM").strip().upper()
