@@ -5,16 +5,21 @@ import json
 import uuid
 
 from django.contrib.auth import get_user_model
+from django.db.models.signals import post_save
 from django.http import QueryDict
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
+from unittest.mock import patch
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
 
+from apps.billing.direct_payments import reconcile_direct_payment_callback
+from apps.billing.models import DirectPaymentAuditEvent, DirectPaymentIntent
 from apps.billing.services import get_wallet_account
 from .category_catalog import ensure_catalog_categories
-from .services import place_marketplace_order, satisfy_marketplace_order
+from .services import mark_provider_completed, place_marketplace_order, satisfy_marketplace_order
 from .availability import DAY_KEYS, normalize_availability_payload
 from .models import (
     CatalogCategory,
@@ -31,9 +36,25 @@ from .models import (
     ShopServiceImage,
     ShopTeamMember,
     ShopRole,
+    ShopVerificationRequest,
 )
-from .serializers import ProductSerializer, ShopServiceSerializer
+from .serializers import (
+    MarketplaceOrderSerializer,
+    ProductSerializer,
+    ShopSerializer,
+    ShopServiceSerializer,
+    ShopVerificationRequestSerializer,
+)
 from apps.broadcasts.models import BroadcastItem, BroadcastSourceType
+from apps.verification.constants import VerificationBadgeCode, VerificationSubjectType
+from apps.verification.models import VerificationBadge
+from apps.verification.services import current_shop_verification_status, sync_shop_verification_request
+from .signals import on_product_save
+
+
+def disable_product_recommendation_signal(test_case):
+    post_save.disconnect(on_product_save, sender=Product)
+    test_case.addCleanup(post_save.connect, on_product_save, sender=Product)
 
 
 class CommerceSmokeTests(TestCase):
@@ -47,8 +68,203 @@ class CommerceSmokeTests(TestCase):
         self.assertEqual(p.shop, self.shop)
 
 
+class ShopVerificationMigrationTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5550000100', username='shop_verify_owner', password='pass', country='NG')
+        self.staff = User.objects.create_user(phone='5550000101', username='shop_verify_staff', password='pass', country='NG')
+        self.staff.is_staff = True
+        self.staff.save(update_fields=['is_staff'])
+        self.shop = Shop.objects.create(owner=self.owner, name='Verify Shop', slug='verify-shop')
+
+    def test_shop_request_sync_creates_central_case_without_public_document_url(self):
+        request = ShopVerificationRequest.objects.create(
+            shop=self.shop,
+            requested_by=self.owner,
+            documents=[
+                {
+                    'type': 'BUSINESS_REG',
+                    'url': 'https://example.com/public-document.pdf',
+                    'private_media_id': 'private-doc-001',
+                }
+            ],
+        )
+
+        case = sync_shop_verification_request(verification_request=request, actor=self.owner)
+
+        self.assertIsNotNone(case)
+        self.assertEqual(case.subject.subject_type, VerificationSubjectType.SHOP)
+        self.assertEqual(case.provider, 'commerce')
+        self.assertEqual(case.evidence_metadata['documents'][0]['private_media_id'], 'private-doc-001')
+        self.assertNotIn('url', case.evidence_metadata['documents'][0])
+
+    def test_approved_shop_request_issues_central_badges_and_syncs_legacy_fields(self):
+        request = ShopVerificationRequest.objects.create(shop=self.shop, requested_by=self.owner, documents=[])
+        request.status = 'APPROVED'
+        request.processed_at = timezone.now()
+        request.save(update_fields=['status', 'processed_at'])
+
+        sync_shop_verification_request(verification_request=request, actor=self.staff)
+        self.shop.refresh_from_db()
+
+        self.assertTrue(self.shop.is_verified)
+        self.assertEqual(self.shop.verification_status, 'VERIFIED')
+        self.assertIn('verified-shop', self.shop.trust_badges)
+        codes = set(
+            VerificationBadge.objects.filter(
+                subject__subject_type=VerificationSubjectType.SHOP,
+                subject__subject_id=self.shop.id,
+            ).values_list('code', flat=True)
+        )
+        self.assertIn(VerificationBadgeCode.VERIFIED_SHOP, codes)
+        self.assertIn(VerificationBadgeCode.TRUSTED_MERCHANT, codes)
+        self.assertTrue(current_shop_verification_status(self.shop)['verified'])
+
+    def test_shop_serializer_exposes_public_verification_summary(self):
+        request = ShopVerificationRequest.objects.create(shop=self.shop, requested_by=self.owner, status='APPROVED')
+        sync_shop_verification_request(verification_request=request, actor=self.staff)
+
+        data = ShopSerializer(self.shop).data
+
+        self.assertIn('verification_summary', data)
+        self.assertTrue(data['verification_summary']['verified'])
+
+    def test_shop_verification_serializer_rejects_raw_document_payload(self):
+        serializer = ShopVerificationRequestSerializer(
+            data={
+                'shop': str(self.shop.id),
+                'requested_by': str(self.owner.id),
+                'documents': [{'type': 'BUSINESS_REG', 'document_base64': 'data:image/png;base64,abc123'}],
+            }
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('documents', serializer.errors)
+
+
+class MarketplaceUsdCheckoutTests(TestCase):
+    def setUp(self):
+        disable_product_recommendation_signal(self)
+        User = get_user_model()
+        self.provider = User.objects.create_user(phone='5555551100', username='provider_usd', password='secret', country='NG')
+        self.buyer = User.objects.create_user(phone='5555552200', username='buyer_usd', password='secret', country='NG')
+        self.shop = Shop.objects.create(owner=self.provider, name='USD Provider Shop', slug='usd-provider-shop')
+        self.product = Product.objects.create(
+            shop=self.shop,
+            sku='MP-USD-001',
+            name='USD Marketplace Product',
+            price=Decimal('10.00'),
+            sale_price=Decimal('10.00'),
+            stock_qty=10,
+            currency='USD',
+        )
+        buyer_wallet = get_wallet_account(self.buyer)
+        buyer_wallet.balance_cents = 50_000
+        buyer_wallet.save(update_fields=['balance_cents'])
+
+    def test_default_marketplace_order_is_usd_provider_pending_without_wallet_lock(self):
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+        )
+
+        buyer_wallet = get_wallet_account(self.buyer)
+        buyer_wallet.refresh_from_db()
+
+        self.assertEqual(order.currency, 'USD')
+        self.assertEqual(order.total_amount, Decimal('10'))
+        self.assertIsNone(order.buyer_debit_transaction_id)
+        self.assertEqual(order.metadata['payment_status'], 'pending')
+        self.assertEqual(order.metadata['payment_provider'], 'flutterwave')
+        self.assertTrue(order.metadata['payment_required'])
+        self.assertEqual(buyer_wallet.balance_cents, 50_000)
+        self.assertEqual(buyer_wallet.locked_cents, 0)
+
+        data = MarketplaceOrderSerializer(order).data
+        self.assertEqual(data['total_usd_label'], '$10.00')
+        self.assertEqual(data['currency_label'], 'USD')
+        self.assertEqual(data['payment_status'], 'pending')
+        self.assertEqual(data['payment_provider'], 'flutterwave')
+        self.assertIsNotNone(data['payment_intent_id'])
+
+        intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
+        self.assertEqual(intent.target_type, DirectPaymentIntent.TARGET_MARKETPLACE_ORDER)
+        self.assertEqual(intent.target_id, order.id)
+        self.assertEqual(intent.amount_cents, 1000)
+        self.assertEqual(intent.status, DirectPaymentIntent.STATUS_PENDING)
+        self.assertEqual(intent.payment_url, '')
+
+    def test_wallet_marketplace_checkout_is_disabled_by_default(self):
+        with self.assertRaises(ValidationError) as ctx:
+            place_marketplace_order(
+                buyer=self.buyer,
+                shop_id=self.shop.id,
+                items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+                metadata={'payment_method': 'wallet'},
+            )
+
+        self.assertIn('Commerce wallet/KIS Coin checkout is disabled', str(ctx.exception.detail))
+
+    def test_provider_pending_marketplace_order_cannot_be_completed_or_satisfied(self):
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+        )
+
+        with self.assertRaises(ValidationError):
+            mark_provider_completed(order)
+        with self.assertRaises(ValidationError):
+            satisfy_marketplace_order(order)
+
+    @patch('apps.commerce.services._schedule_marketplace_order_auto_satisfaction')
+    def test_flutterwave_callback_marks_marketplace_order_paid_idempotently(self, schedule_mock):
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+        )
+        intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
+        payload = {'data': {'tx_ref': intent.tx_ref, 'status': 'successful', 'id': 'flw-test-001'}}
+
+        ok, result, paid_intent = reconcile_direct_payment_callback(payload=payload, signature='')
+        self.assertTrue(ok)
+        self.assertEqual(result, 'paid')
+        self.assertEqual(paid_intent.status, DirectPaymentIntent.STATUS_PAID)
+        order.refresh_from_db()
+        self.assertEqual(order.metadata['payment_status'], 'paid')
+        self.assertEqual(order.metadata['provider_transaction_id'], 'flw-test-001')
+
+        mark_provider_completed(order)
+        order.refresh_from_db()
+        self.assertEqual(order.status, MarketplaceOrderStatus.AWAITING_SATISFACTION)
+        schedule_mock.assert_called_once()
+
+        ok, result, _paid_intent = reconcile_direct_payment_callback(payload=payload, signature='')
+        self.assertTrue(ok)
+        self.assertEqual(result, 'paid')
+        self.assertEqual(DirectPaymentAuditEvent.objects.filter(intent=intent, event='callback.paid').count(), 1)
+
+    def test_historical_kisc_marketplace_order_uses_safe_compatibility_label(self):
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+        )
+        order.currency = 'KISC'
+        order.metadata = {'payment_status': 'paid', 'legacy_wallet_checkout': True}
+        order.save(update_fields=['currency', 'metadata'])
+
+        data = MarketplaceOrderSerializer(order).data
+
+        self.assertEqual(data['currency_label'], 'Historical promotional-credit order')
+
+
+@override_settings(KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED=True)
 class MarketplaceOrderSettlementTests(TestCase):
     def setUp(self):
+        disable_product_recommendation_signal(self)
         User = get_user_model()
         self.provider = User.objects.create_user(phone='5555551000', username='provider', password='secret', country='NG')
         self.buyer = User.objects.create_user(phone='5555552000', username='buyer', password='secret', country='NG')
@@ -76,6 +292,7 @@ class MarketplaceOrderSettlementTests(TestCase):
                     'unit_price_cents': 1_000,
                 }
             ],
+            metadata={'payment_method': 'wallet'},
         )
 
         buyer_wallet = get_wallet_account(self.buyer)
@@ -115,6 +332,7 @@ class MarketplaceOrderSettlementTests(TestCase):
                     'unit_price_cents': 1_000_000,
                 }
             ],
+            metadata={'payment_method': 'wallet'},
         )
 
         buyer_wallet = get_wallet_account(self.buyer)
@@ -156,7 +374,7 @@ class ServiceBookingMoneyNormalizationTests(APITestCase):
         wallet.save(update_fields=['balance_cents'])
         self.client.force_authenticate(user=self.customer)
 
-    def test_frontend_major_kisc_booking_price_normalizes_to_wallet_cents(self):
+    def test_usd_booking_creates_pending_provider_payment_without_wallet_lock(self):
         scheduled_at = timezone.now() + timedelta(days=2)
         response = self.client.post(
             '/api/v1/commerce/service-bookings/',
@@ -171,10 +389,33 @@ class ServiceBookingMoneyNormalizationTests(APITestCase):
         wallet = get_wallet_account(self.customer)
         wallet.refresh_from_db()
 
-        self.assertEqual(booking.price_cents, 1_000_000)
-        self.assertEqual(booking.deposit_cents, 1_000_000)
-        self.assertEqual(wallet.balance_cents, 1_000_000)
-        self.assertEqual(wallet.locked_cents, 1_000_000)
+        self.assertEqual(booking.price_cents, 10_000)
+        self.assertEqual(booking.deposit_cents, 10_000)
+        self.assertEqual(wallet.balance_cents, 2_000_000)
+        self.assertEqual(wallet.locked_cents, 0)
+        payment = ServiceBookingPayment.objects.get(booking=booking)
+        self.assertEqual(payment.currency, 'USD')
+        self.assertEqual(payment.payment_method, 'flutterwave')
+        self.assertEqual(payment.payment_status, ServiceBookingPayment.STATUS_PENDING)
+        intent = DirectPaymentIntent.objects.get(id=booking.metadata['direct_payment_intent_id'])
+        self.assertEqual(intent.target_type, DirectPaymentIntent.TARGET_SERVICE_BOOKING_PAYMENT)
+        self.assertEqual(intent.target_id, payment.id)
+        self.assertEqual(payment.transaction_reference, intent.tx_ref)
+
+    def test_service_booking_wallet_checkout_is_disabled_by_default(self):
+        scheduled_at = timezone.now() + timedelta(days=2)
+        response = self.client.post(
+            '/api/v1/commerce/service-bookings/',
+            {
+                'service_id': str(self.service.id),
+                'scheduled_at': scheduled_at.isoformat(),
+                'payment_method': 'wallet',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertEqual(response.data['code'], 'legacy_commerce_wallet_checkout_disabled')
 
 
 class ShopLandingPageSystemTests(APITestCase):

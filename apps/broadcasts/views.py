@@ -1,4 +1,6 @@
 import logging
+import hashlib
+import secrets
 import os
 import re
 import subprocess
@@ -12,7 +14,7 @@ import requests
 
 from django.apps import apps as django_apps
 from django.conf import settings
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.db.models import Q
 from django.http import FileResponse, Http404, HttpResponse
 from django.shortcuts import get_object_or_404
@@ -20,8 +22,8 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.parsers import FormParser, MultiPartParser
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
@@ -53,25 +55,47 @@ import json
 from common.media_urls import absolutize_backend_media
 
 from apps.commerce.serializers import ProductSerializer, ServiceBookingSerializer
-from apps.moderation.models import UserBlock
+from apps.moderation.models import AuditLog as ModerationAuditLog, Flag as ModerationFlag, UserBlock
+from apps.notifications.realtime import notify_main_tab_badges_updated
 from apps.partners.models import Partner, PartnerPost, PartnerMembership, PartnerMembershipStatus
 from apps.broadcasts.feed_entry_store import (
     append_feed_entry,
+    archive_channel_content_for_feed_entry,
+    _asset_payload_from_attachment,
+    broadcast_item_payload_from_channel_content,
     delete_feed_entry,
     get_feed_entries,
     replace_feed_entry,
     resolve_feed_entry,
+    sync_channel_content_from_feed_entry,
 )
 from apps.broadcasts.models import (
+    BroadcastChannel,
+    BroadcastChannelRole,
+    BroadcastChannelSubscription,
     BroadcastFeature,
     BroadcastFeatureFlag,
     BroadcastFeedProfile,
+    BroadcastPlaylistItem,
     BroadcastHealthProfile,
     BroadcastHealthInstitution,
     BroadcastHealthInstitutionMember,
     BroadcastHealthInstitutionService,
     BroadcastItem,
     BroadcastMarketProfile,
+    BroadcastPlaylist,
+    ChannelAnalyticsDailyRollup,
+    ChannelContent,
+    ChannelContentAsset,
+    ChannelContentEmbed,
+    ChannelEmbedPolicy,
+    ChannelLiveStream,
+    ChannelContentComment,
+    ChannelContentReaction,
+    ChannelContentSave,
+    ChannelModerationRecord,
+    ChannelWatchHistory,
+    ChannelContentType,
     BroadcastEngagementEvent,
     BroadcastEngagementEventType,
     BroadcastReaction,
@@ -139,9 +163,21 @@ from apps.broadcasts.health_engine_policy import (
     should_drop_service_after_medium_cleanup,
 )
 from apps.broadcasts.serializers import (
+    BroadcastChannelDetailSerializer,
+    BroadcastChannelSummarySerializer,
+    BroadcastChannelSubscriptionSerializer,
     BroadcastFeatureSerializer,
     BroadcastFeatureStatusSerializer,
+    BroadcastPlaylistSerializer,
     BroadcastVideoSerializer,
+    ChannelAnalyticsDailyRollupSerializer,
+    ChannelContentAssetSerializer,
+    BroadcastPlaylistItemSerializer,
+    ChannelContentCommentSerializer,
+    ChannelContentDetailSerializer,
+    ChannelContentListSerializer,
+    ChannelModerationRecordSerializer,
+    ChannelLiveStreamSerializer,
     BroadcastLessonSerializer,
     EducationInstitutionAssessmentOptionSerializer,
     EducationInstitutionAssessmentQuestionSerializer,
@@ -165,6 +201,18 @@ from apps.broadcasts.serializers import (
     EducationProfileSerializer,
     MediumSerializer,
     ServiceSerializer,
+)
+from apps.verification.constants import VerificationSubjectType
+from apps.verification.models import VerificationCase
+from apps.verification.serializers import (
+    EducationInstitutionVerificationReviewSerializer,
+    EducationInstitutionVerificationStartSerializer,
+)
+from apps.verification.services import (
+    current_education_institution_verification_status,
+    review_education_institution_case,
+    serialize_case_status,
+    start_education_institution_verification_case,
 )
 from apps.broadcasts.media_utils import (
     THUMBNAIL_SUBDIRECTORY,
@@ -4448,11 +4496,41 @@ def _save_user_profiles(user, profiles):
     user.preferences = prefs
     user.save(update_fields=["preferences"])
 
-def _delete_user_broadcast(user, entery_id):
-    braodcast_item = BroadcastItem.objects.filter(source_id = entery_id, broadcasted_by = user)
-    if braodcast_item:
-        return braodcast_item.delete()
-    return
+def _write_broadcast_moderation_audit(
+    *,
+    actor: User,
+    action: str,
+    item: BroadcastItem | None = None,
+    target_id: Any | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        resolved_target_id = target_id or (item.id if item else None)
+        if not resolved_target_id:
+            return
+        payload = dict(metadata or {})
+        if item is not None:
+            payload.setdefault("source_type", item.source_type)
+            payload.setdefault("source_id", str(item.source_id))
+            payload.setdefault("broadcasted_by_id", str(item.broadcasted_by_id) if item.broadcasted_by_id else "")
+        ModerationAuditLog.objects.create(
+            actor_id=actor.id,
+            action=action,
+            target_type="POST",
+            target_id=resolved_target_id,
+            metadata=payload,
+        )
+    except Exception:
+        logger.exception("[broadcasts] failed to write moderation audit action=%s", action)
+
+
+def _delete_user_broadcast(user, entry_id):
+    updated = BroadcastItem.objects.filter(
+        source_id=entry_id,
+        broadcasted_by=user,
+        is_deleted=False,
+    ).update(is_deleted=True, expires_at=timezone.now())
+    return updated
 
 
 def _store_upload(file_obj, user=None) -> tuple[str, int]:
@@ -6626,6 +6704,9 @@ class BroadcastFeedView(APIView):
             "market_service": BroadcastSourceType.MARKET_SERVICE,
             "market_all": [BroadcastSourceType.MARKET_PRODUCT, BroadcastSourceType.MARKET_SERVICE],
             "broadcast_feed_entry": BroadcastSourceType.BROADCAST_FEED_ENTRY,
+            "broadcast_channel": BroadcastSourceType.BROADCAST_CHANNEL,
+            "channel_content": BroadcastSourceType.CHANNEL_CONTENT,
+            "channel": [BroadcastSourceType.BROADCAST_CHANNEL, BroadcastSourceType.CHANNEL_CONTENT, BroadcastSourceType.CHANNEL_MESSAGE],
             "education": BroadcastSourceType.EDUCATION_BROADCAST,
             "education_broadcast": BroadcastSourceType.EDUCATION_BROADCAST,
             "healthcare": BroadcastSourceType.COMMUNITY_POST,  # ensure fallback
@@ -6852,6 +6933,14 @@ class BroadcastFeedView(APIView):
             item for item in broadcast_items
             if item.source_type == BroadcastSourceType.BROADCAST_FEED_ENTRY and _include_source(BroadcastSourceType.BROADCAST_FEED_ENTRY)
         ]
+        promoted_channel_broadcasts = [
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.BROADCAST_CHANNEL and _include_source(BroadcastSourceType.BROADCAST_CHANNEL)
+        ]
+        channel_content_broadcasts = [
+            item for item in broadcast_items
+            if item.source_type == BroadcastSourceType.CHANNEL_CONTENT and _include_source(BroadcastSourceType.CHANNEL_CONTENT)
+        ]
 
         channel_conversation_ids = list({str(item.conversation_id) for item in channel_broadcasts if item.conversation_id})
         channel_map = {}
@@ -6933,6 +7022,110 @@ class BroadcastFeedView(APIView):
                     },
                 }
             )
+
+        promoted_channel_items = []
+        if promoted_channel_broadcasts:
+            promoted_channel_ids = [item.source_id for item in promoted_channel_broadcasts]
+            promoted_channels = BroadcastChannel.objects.filter(id__in=promoted_channel_ids, is_deleted=False, is_public=True)
+            promoted_channel_map = {str(channel.id): channel for channel in promoted_channels}
+            for item in promoted_channel_broadcasts:
+                promoted_channel = promoted_channel_map.get(str(item.source_id))
+                if not promoted_channel:
+                    continue
+                summary_text = promoted_channel.description or f"Explore @{promoted_channel.handle} on KIS Channels."
+                attachments = []
+                if promoted_channel.banner_url:
+                    attachments.append({"url": promoted_channel.banner_url, "media_type": "image"})
+                elif promoted_channel.avatar_url:
+                    attachments.append({"url": promoted_channel.avatar_url, "media_type": "image"})
+                promoted_channel_items.append(
+                    {
+                        "id": str(item.id),
+                        "source_type": "broadcast_channel",
+                        "source_id": str(promoted_channel.id),
+                        "title": promoted_channel.display_name,
+                        "text": summary_text,
+                        "text_doc": summary_text,
+                        "text_plain": summary_text,
+                        "text_preview": summary_text[:200],
+                        "attachments": attachments,
+                        "created_at": promoted_channel.created_at.isoformat() if promoted_channel.created_at else item.created_at.isoformat(),
+                        "broadcasted_at": item.broadcasted_at.isoformat(),
+                        "expires_at": item.expires_at.isoformat(),
+                        "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
+                        "reaction_count": reaction_counts.get(item.id, 0),
+                        "viewer_reaction": viewer_reactions.get(item.id),
+                        "source": {
+                            "type": "broadcast_channel",
+                            "id": str(promoted_channel.id),
+                            "name": promoted_channel.display_name,
+                            "handle": promoted_channel.handle,
+                            "avatar_url": promoted_channel.avatar_url,
+                            "banner_url": promoted_channel.banner_url,
+                            "subscriber_count": promoted_channel.subscriber_count,
+                            "content_count": promoted_channel.content_count,
+                            "allow_subscribe": True,
+                            "can_open": True,
+                        },
+                    }
+                )
+
+        channel_content_items = []
+        if channel_content_broadcasts:
+            channel_content_ids = [item.source_id for item in channel_content_broadcasts]
+            contents = (
+                ChannelContent.objects.select_related("channel")
+                .prefetch_related("assets")
+                .filter(
+                    id__in=channel_content_ids,
+                    is_deleted=False,
+                    status=ChannelContent.Status.PUBLISHED,
+                    visibility=ChannelContent.Visibility.PUBLIC,
+                    channel__is_deleted=False,
+                    channel__is_public=True,
+                )
+            )
+            content_map = {str(content.id): content for content in contents}
+            for item in channel_content_broadcasts:
+                content = content_map.get(str(item.source_id))
+                if not content:
+                    continue
+                payload = broadcast_item_payload_from_channel_content(content)
+                attachments = payload.get("attachments") or []
+                if not attachments and payload.get("attachment"):
+                    attachments = [payload.get("attachment")]
+                text_plain = payload.get("text_plain") or payload.get("summary") or ""
+                channel_content_items.append(
+                    {
+                        "id": str(item.id),
+                        "source_type": "channel_content",
+                        "source_id": str(content.id),
+                        "channel_content_id": str(content.id),
+                        "title": payload.get("title") or content.channel.display_name,
+                        "text": text_plain,
+                        "text_doc": payload.get("text_doc") or text_plain,
+                        "text_plain": text_plain,
+                        "text_preview": payload.get("text_preview") or text_plain[:200],
+                        "attachments": attachments,
+                        "poll": (content.metadata or {}).get("poll"),
+                        "event": (content.metadata or {}).get("event"),
+                        "link": (content.metadata or {}).get("link"),
+                        "composer_type": (content.metadata or {}).get("composer_type"),
+                        "created_at": content.created_at.isoformat() if content.created_at else item.created_at.isoformat(),
+                        "broadcasted_at": item.broadcasted_at.isoformat(),
+                        "expires_at": item.expires_at.isoformat(),
+                        "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
+                        "reaction_count": reaction_counts.get(item.id, 0),
+                        "viewer_reaction": viewer_reactions.get(item.id),
+                        "source": {
+                            "type": "channel_content",
+                            "id": str(content.channel_id),
+                            "name": content.channel.display_name,
+                            "handle": content.channel.handle,
+                            "can_open": True,
+                        },
+                    }
+                )
 
         community_post_ids = [item.source_id for item in community_broadcasts]
         community_posts = []
@@ -7626,6 +7819,8 @@ class BroadcastFeedView(APIView):
             + community_items
             + partner_items
             + market_items
+            + promoted_channel_items
+            + channel_content_items
             + profile_items
             + healthcare_items
             + education_profile_items
@@ -7945,8 +8140,67 @@ class BroadcastHideView(APIView):
             prefs["hidden_broadcast_ids"] = hidden_ids
             request.user.preferences = prefs
             request.user.save(update_fields=["preferences"])
+        _write_broadcast_moderation_audit(
+            actor=request.user,
+            action="broadcast.hide",
+            item=item,
+            metadata={"hidden_for_user_id": str(request.user.id)},
+        )
 
         return Response({"hidden": True, "broadcast_id": item_id}, status=status.HTTP_200_OK)
+
+
+class BroadcastReportView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk=None):
+        try:
+            item = BroadcastItem.objects.get(id=pk, is_deleted=False)
+        except BroadcastItem.DoesNotExist:
+            return Response({"detail": "Broadcast item not found."}, status=404)
+
+        reason = str(request.data.get("reason") or request.data.get("details") or "").strip()
+        category = str(request.data.get("category") or request.data.get("type") or "broadcast_feed").strip()
+        severity = str(request.data.get("severity") or "MEDIUM").strip().upper()
+        valid_severities = {choice[0] for choice in ModerationFlag.SEVERITY}
+        if severity not in valid_severities:
+            severity = "MEDIUM"
+        if not reason:
+            raise ValidationError({"reason": "A report reason is required."})
+
+        flag = ModerationFlag.objects.create(
+            source="USER",
+            target_type="POST",
+            target_id=item.id,
+            reporter_id=request.user.id,
+            reason=reason,
+            severity=severity,
+            escalation_level="MODERATOR",
+            tags={
+                "surface": "broadcast_feed",
+                "category": category[:64],
+                "source_type": item.source_type,
+                "source_id": str(item.source_id),
+            },
+        )
+        _write_broadcast_moderation_audit(
+            actor=request.user,
+            action="broadcast.report",
+            item=item,
+            metadata={
+                "flag_id": str(flag.id),
+                "severity": severity,
+                "category": category[:64],
+            },
+        )
+        return Response(
+            {
+                "reported": True,
+                "flag_id": str(flag.id),
+                "status": flag.status,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class BroadcastFeatureListView(APIView):
@@ -8385,6 +8639,75 @@ class EducationInstitutionDetailView(APIView):
             raise PermissionDenied("You do not have permission to delete this institution.")
         institution.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class EducationInstitutionVerificationStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, institution_id: str):
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        return Response(
+            current_education_institution_verification_status(institution),
+            status=status.HTTP_200_OK,
+        )
+
+
+class EducationInstitutionVerificationStartView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, institution_id: str):
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+        serializer = EducationInstitutionVerificationStartSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        case = start_education_institution_verification_case(
+            institution=institution,
+            actor=request.user,
+            provider=serializer.validated_data.get("provider") or "",
+            evidence_metadata=serializer.validated_data.get("evidence_metadata") or {},
+        )
+        return Response(
+            {
+                "case": serialize_case_status(case),
+                "status": current_education_institution_verification_status(institution),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class EducationInstitutionVerificationReviewView(APIView):
+    permission_classes = [IsAdminUser]
+
+    @transaction.atomic
+    def post(self, request, institution_id: str, case_id: str):
+        institution = get_object_or_404(EducationInstitution, id=institution_id)
+        case = VerificationCase.objects.select_related("subject").filter(
+            id=case_id,
+            subject__subject_type=VerificationSubjectType.EDUCATION_INSTITUTION,
+            subject__subject_id=institution.id,
+        ).first()
+        if not case:
+            raise ValidationError({"case_id": "Invalid education institution verification case."})
+        serializer = EducationInstitutionVerificationReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        case, badges = review_education_institution_case(
+            case=case,
+            actor=request.user,
+            action=serializer.validated_data["action"],
+            notes=serializer.validated_data.get("notes", ""),
+            badge_codes=serializer.validated_data.get("badge_codes") or None,
+        )
+        return Response(
+            {
+                "case": serialize_case_status(case),
+                "badges": [
+                    {"code": badge.code, "label": badge.label, "level": badge.level}
+                    for badge in badges
+                ],
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class EducationInstitutionDashboardView(APIView):
@@ -8914,6 +9237,7 @@ class EducationInstitutionProgramDetailView(APIView):
     def get(self, request, institution_id: str, program_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
         program = _get_institution_program_or_404(institution, program_id)
+        print( _build_program_detail_payload(institution, program, request))
         return Response(
             _build_program_detail_payload(institution, program, request),
             status=status.HTTP_200_OK,
@@ -9784,7 +10108,7 @@ class EducationInstitutionEventListView(APIView):
         return Response({"event": serializer.data}, status=status.HTTP_201_CREATED)
 
 
-class EducationInstitutionEventDetailView(APIView):
+class  EducationInstitutionEventDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, institution_id: str, event_id: str):
@@ -12027,6 +12351,14 @@ def _normalize_feed_entry(request, entry: dict[str, Any] | None) -> dict[str, An
     normalized_attachments = _normalize_feed_attachments(request, normalized)
     normalized["attachments"] = normalized_attachments
     normalized["attachment"] = normalized_attachments[0] if normalized_attachments else None
+    entry_id = str(normalized.get("id") or "").strip()
+    if entry_id and not normalized.get("channel_content_id"):
+        try:
+            content = ChannelContent.objects.only("id").filter(legacy_feed_entry_id=entry_id).first()
+        except (TypeError, ValueError):
+            content = None
+        if content:
+            normalized["channel_content_id"] = str(content.id)
 
     return normalized
 
@@ -12136,6 +12468,10 @@ def _sync_broadcast_feed_entry_snapshot(user, profile: dict | None, entry: dict 
     if not item:
         return None
 
+    content = sync_channel_content_from_feed_entry(user, profile, entry, broadcast_item=item)
+    if content:
+        entry = {**entry, "channel_content_id": str(content.id)}
+
     item.metadata = {
         "entry": entry,
         "profile_id": str((profile or {}).get("id") or "main"),
@@ -12146,8 +12482,10 @@ def _sync_broadcast_feed_entry_snapshot(user, profile: dict | None, entry: dict 
             "display_name": str(user.display_name or user.username or user.phone or "KIS user"),
             "avatar_url": avatar_url,
             "bio": str(getattr(profile_row, "bio", "") or "").strip() if profile_row is not None else "",
-        },
+            },
     }
+    if content:
+        item.metadata["channel_content_id"] = str(content.id)
     item.save(update_fields=["metadata", "updated_at"])
     return item
 
@@ -12167,6 +12505,1485 @@ def _bootstrap_broadcast_feed_profile(user, profiles: dict[str, Any]) -> dict[st
     }
     profiles['broadcast_feed'] = bootstrapped
     return bootstrapped
+
+
+def _resolve_channel_lookup(handle_or_id: str, *, include_private: bool = False) -> BroadcastChannel:
+    value = str(handle_or_id or "").strip().lstrip("@")
+    query = BroadcastChannel.objects.select_related("owner_user").filter(is_deleted=False)
+    if not include_private:
+        query = query.filter(is_public=True)
+    try:
+        lookup_id = uuid.UUID(value)
+    except (TypeError, ValueError):
+        lookup_id = None
+    if lookup_id:
+        try:
+            return query.get(id=lookup_id)
+        except BroadcastChannel.DoesNotExist:
+            pass
+    return get_object_or_404(query, handle__iexact=value)
+
+
+def _user_channel_role(user, channel: BroadcastChannel) -> str:
+    if not getattr(user, "is_authenticated", False):
+        return ""
+    if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
+        return "staff"
+    if channel.owner_user_id and str(channel.owner_user_id) == str(getattr(user, "id", "")):
+        return BroadcastChannelRole.Role.OWNER
+    return (
+        BroadcastChannelRole.objects.filter(channel=channel, user=user)
+        .order_by("created_at")
+        .values_list("role", flat=True)
+        .first()
+        or ""
+    )
+
+
+def _user_can_manage_channel(user, channel: BroadcastChannel) -> bool:
+    return _user_channel_role(user, channel) in {
+        "staff",
+        BroadcastChannelRole.Role.OWNER,
+        BroadcastChannelRole.Role.MANAGER,
+    }
+
+
+def _user_can_edit_content(user, content: ChannelContent) -> bool:
+    return _user_channel_role(user, content.channel) in {
+        "staff",
+        BroadcastChannelRole.Role.OWNER,
+        BroadcastChannelRole.Role.MANAGER,
+        BroadcastChannelRole.Role.EDITOR,
+    }
+
+
+def _channel_broadcast_metadata(channel: BroadcastChannel) -> dict[str, Any]:
+    return {
+        "channel_id": str(channel.id),
+        "handle": channel.handle,
+        "display_name": channel.display_name,
+        "description": channel.description,
+        "avatar_url": channel.avatar_url,
+        "banner_url": channel.banner_url,
+        "category": channel.category,
+        "subscriber_count": int(channel.subscriber_count or 0),
+        "content_count": int(channel.content_count or 0),
+    }
+
+
+def _broadcast_channel_for_feed(channel: BroadcastChannel, user) -> BroadcastItem:
+    item, _ = BroadcastItem.objects.update_or_create(
+        source_type=BroadcastSourceType.BROADCAST_CHANNEL,
+        source_id=str(channel.id),
+        defaults={
+            "metadata": _channel_broadcast_metadata(channel),
+            "broadcasted_by": user,
+            "broadcasted_at": timezone.now(),
+            "expires_at": timezone.now() + timedelta(days=10),
+            "is_deleted": False,
+        },
+    )
+    return item
+
+
+def _unbroadcast_channel_for_feed(channel: BroadcastChannel) -> int:
+    return BroadcastItem.objects.filter(
+        source_type=BroadcastSourceType.BROADCAST_CHANNEL,
+        source_id=str(channel.id),
+        is_deleted=False,
+    ).update(is_deleted=True, expires_at=timezone.now())
+
+
+def _broadcast_channel_content_for_feed(content: ChannelContent, user) -> BroadcastItem:
+    metadata = broadcast_item_payload_from_channel_content(content)
+    item, _ = BroadcastItem.objects.update_or_create(
+        source_type=BroadcastSourceType.CHANNEL_CONTENT,
+        source_id=str(content.id),
+        defaults={
+            "metadata": metadata,
+            "broadcasted_by": user,
+            "broadcasted_at": timezone.now(),
+            "expires_at": timezone.now() + timedelta(days=10),
+            "is_deleted": False,
+        },
+    )
+    content.legacy_broadcast_item = item
+    content.save(update_fields=["legacy_broadcast_item", "updated_at"])
+    return item
+
+
+def _unbroadcast_channel_content_for_feed(content: ChannelContent) -> int:
+    updated = BroadcastItem.objects.filter(
+        Q(id=content.legacy_broadcast_item_id) |
+        Q(source_type=BroadcastSourceType.CHANNEL_CONTENT, source_id=str(content.id)),
+        is_deleted=False,
+    ).update(is_deleted=True, expires_at=timezone.now())
+    if content.legacy_broadcast_item_id:
+        content.legacy_broadcast_item = None
+        content.save(update_fields=["legacy_broadcast_item", "updated_at"])
+    return updated
+
+
+def _user_can_view_content(user, content: ChannelContent) -> bool:
+    if content.is_deleted:
+        return False
+    if content.visibility == ChannelContent.Visibility.PUBLIC and content.status == ChannelContent.Status.PUBLISHED:
+        return content.channel.is_public and not content.channel.is_deleted
+    return _user_can_edit_content(user, content)
+
+
+def _safe_channel_handle_from_value(value: object) -> str:
+    candidate = str(value or "").strip().lstrip("@").lower()
+    candidate = re.sub(r"[^a-z0-9_-]+", "-", candidate).strip("-_")
+    return candidate[:80]
+
+
+def _content_type_from_request(value: object) -> str:
+    raw = str(value or ChannelContentType.TEXT).strip().lower()
+    if raw == "post":
+        raw = ChannelContentType.TEXT
+    if raw in ChannelContentType.values:
+        return raw
+    return ChannelContentType.TEXT
+
+
+def _content_datetime_from_request(value: object):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if timezone.is_naive(parsed):
+            return timezone.make_aware(parsed, timezone.get_current_timezone())
+        return parsed
+    except (TypeError, ValueError):
+        raise ValidationError({"scheduled_at": "Invalid date/time."})
+
+
+def _live_stream_provider() -> str:
+    return str(getattr(settings, "LIVE_STREAM_PROVIDER", os.getenv("LIVE_STREAM_PROVIDER", "disabled")) or "disabled").strip().lower()
+
+
+def _live_provider_sandbox_enabled() -> bool:
+    value = getattr(settings, "LIVE_STREAM_PROVIDER_SANDBOX_ENABLED", os.getenv("LIVE_STREAM_PROVIDER_SANDBOX_ENABLED", "False"))
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_live_dev_payload(channel_id, stream_id) -> dict[str, str]:
+    if _live_stream_provider() != "disabled" and not _live_provider_sandbox_enabled():
+        return {}
+    base = str(getattr(settings, "LIVE_STREAM_DEV_BASE_URL", os.getenv("LIVE_STREAM_DEV_BASE_URL", "rtmp://localhost/live"))).rstrip("/")
+    playback = str(getattr(settings, "LIVE_STREAM_DEV_PLAYBACK_BASE_URL", os.getenv("LIVE_STREAM_DEV_PLAYBACK_BASE_URL", "https://localhost/live"))).rstrip("/")
+    return {
+        "provider": "disabled",
+        "provider_stream_id": str(stream_id),
+        "ingest_url": f"{base}/{channel_id}",
+        "playback_url": f"{playback}/{stream_id}.m3u8",
+    }
+
+
+def _hash_stream_key(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _embeds_enabled() -> bool:
+    value = getattr(settings, "KIS_EMBEDS_ENABLED", os.getenv("KIS_EMBEDS_ENABLED", "False"))
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _embed_public_base_url(request=None) -> str:
+    configured = str(getattr(settings, "KIS_PUBLIC_EMBED_BASE_URL", os.getenv("KIS_PUBLIC_EMBED_BASE_URL", "")) or "").strip().rstrip("/")
+    if configured:
+        return configured
+    if request is not None:
+        return request.build_absolute_uri("/").rstrip("/")
+    return ""
+
+
+def _embed_signing_secret() -> str:
+    return str(getattr(settings, "KIS_EMBED_SIGNING_SECRET", os.getenv("KIS_EMBED_SIGNING_SECRET", "")) or "").strip()
+
+
+def _embed_token_hash(token: str) -> str:
+    secret = _embed_signing_secret()
+    return hashlib.sha256(f"{secret}:{token}".encode("utf-8")).hexdigest()
+
+
+def _request_domain(request) -> str:
+    origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+    parsed = urlparse(origin)
+    return (parsed.hostname or "").lower()
+
+
+def _domain_matches(domain: str, patterns: list) -> bool:
+    if not domain:
+        return False
+    for raw in patterns or []:
+        pattern = str(raw or "").strip().lower()
+        if not pattern:
+            continue
+        if pattern == "*" or domain == pattern or domain.endswith(f".{pattern}"):
+            return True
+    return False
+
+
+def _first_public_asset(content: ChannelContent) -> dict:
+    asset = content.assets.order_by("sort_order", "created_at").first()
+    if not asset:
+        return {}
+    return {
+        "asset_type": asset.asset_type,
+        "url": asset.url,
+        "thumbnail_url": asset.thumbnail_url,
+        "mime_type": asset.mime_type,
+        "caption": asset.caption,
+        "width": asset.width,
+        "height": asset.height,
+        "duration_seconds": asset.duration_seconds,
+    }
+
+
+def _check_embed_access(request, content: ChannelContent):
+    if not _embeds_enabled():
+        raise Http404
+    policy, _ = ChannelEmbedPolicy.objects.get_or_create(channel=content.channel)
+    if not policy.allow_embeds:
+        raise PermissionDenied("Embeds are disabled for this channel.")
+    domain = _request_domain(request)
+    if domain and _domain_matches(domain, policy.blocked_domains):
+        raise PermissionDenied("This domain is not allowed to embed this content.")
+    if policy.allowed_domains and not _domain_matches(domain, policy.allowed_domains):
+        raise PermissionDenied("This domain is not allowed to embed this content.")
+    is_public = (
+        content.visibility == ChannelContent.Visibility.PUBLIC
+        and content.status == ChannelContent.Status.PUBLISHED
+        and content.channel.is_public
+        and not content.is_deleted
+    )
+    token = str(request.query_params.get("token") or request.headers.get("X-KIS-Embed-Token") or "").strip()
+    requires_token = policy.require_signed_token or not is_public
+    if requires_token:
+        if not token:
+            raise PermissionDenied("A valid embed token is required.")
+        token_hash = _embed_token_hash(token)
+        query = ChannelContentEmbed.objects.filter(content=content, token_hash=token_hash, is_active=True)
+        query = query.filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
+        if domain:
+            query = query.filter(Q(domain="") | Q(domain__iexact=domain))
+        if not query.exists():
+            raise PermissionDenied("Invalid or expired embed token.")
+    elif not is_public:
+        raise Http404
+    return policy, domain
+
+
+def _embed_content_payload(request, content: ChannelContent, *, oembed: bool = False) -> dict:
+    base_url = _embed_public_base_url(request)
+    token = str(request.query_params.get("token") or "").strip()
+    token_query = f"?token={token}" if token else ""
+    embed_src = f"{base_url}/embed/content/{content.id}{token_query}"
+    thumbnail = content.thumbnail_url or ""
+    asset = _first_public_asset(content)
+    if not thumbnail:
+        thumbnail = asset.get("thumbnail_url") or asset.get("url") or ""
+    if oembed:
+        return {
+            "type": "video" if content.content_type in {ChannelContentType.VIDEO, ChannelContentType.SHORT_VIDEO, ChannelContentType.LIVE_STREAM, ChannelContentType.REPLAY} else "rich",
+            "version": "1.0",
+            "provider_name": "KIS",
+            "provider_url": base_url,
+            "title": content.title or content.text_plain[:80] or "KIS content",
+            "author_name": content.channel.display_name,
+            "author_url": f"{base_url}/channels/{content.channel.handle}",
+            "thumbnail_url": thumbnail,
+            "width": asset.get("width") or 560,
+            "height": asset.get("height") or 315,
+            "html": (
+                f'<iframe src="{embed_src}" width="560" height="315" '
+                'frameborder="0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>'
+            ),
+        }
+    return {
+        "id": str(content.id),
+        "title": content.title or content.text_plain[:80] or "KIS content",
+        "description": content.description[:500],
+        "content_type": content.content_type,
+        "channel": BroadcastChannelSummarySerializer(content.channel, context={"request": request}).data,
+        "thumbnail_url": thumbnail,
+        "asset": asset,
+        "text_plain_preview": content.text_plain[:500],
+        "published_at": content.published_at.isoformat() if content.published_at else None,
+        "dimensions": {"width": asset.get("width") or 560, "height": asset.get("height") or 315},
+        "embed_url": embed_src,
+        "embed_html": (
+            f'<iframe src="{embed_src}" width="560" height="315" '
+            'frameborder="0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>'
+        ),
+    }
+
+
+def _record_embed_impression(request, content: ChannelContent, domain: str):
+    if not content.legacy_broadcast_item_id or not getattr(request.user, "is_authenticated", False):
+        return
+    window = timezone.now().strftime("%Y%m%d%H")
+    BroadcastEngagementEvent.objects.get_or_create(
+        broadcast_item_id=content.legacy_broadcast_item_id,
+        user=request.user,
+        event_type=BroadcastEngagementEventType.IMPRESSION,
+        window_key=f"embed:{domain or 'unknown'}:{window}",
+        defaults={"platform": "embed", "metadata": {"domain": domain}},
+    )
+
+
+def _channel_content_counts(content: ChannelContent) -> dict:
+    stats = content.stats if isinstance(content.stats, dict) else {}
+    return {
+        "views": int(stats.get("views") or 0),
+        "shares": int(stats.get("shares") or 0),
+        "comments": int(stats.get("comments") or 0),
+        "reactions": int(stats.get("reactions") or 0),
+        "saves": int(stats.get("saves") or 0),
+    }
+
+
+def _set_channel_content_count(content_id, key: str, value: int):
+    content = ChannelContent.objects.only("id", "stats").filter(id=content_id).first()
+    if not content:
+        return {}
+    stats = content.stats if isinstance(content.stats, dict) else {}
+    stats[key] = max(int(value), 0)
+    ChannelContent.objects.filter(id=content_id).update(stats=stats)
+    return stats
+
+
+def _sync_channel_content_counts(content: ChannelContent) -> dict:
+    stats = content.stats if isinstance(content.stats, dict) else {}
+    stats.update(
+        {
+            "reactions": ChannelContentReaction.objects.filter(content=content).count(),
+            "comments": ChannelContentComment.objects.filter(content=content, is_deleted=False).count(),
+            "saves": ChannelContentSave.objects.filter(content=content).count(),
+        }
+    )
+    ChannelContent.objects.filter(id=content.id).update(stats=stats)
+    return stats
+
+
+def _increment_channel_content_count(content: ChannelContent, key: str) -> dict:
+    stats = content.stats if isinstance(content.stats, dict) else {}
+    stats[key] = int(stats.get(key) or 0) + 1
+    ChannelContent.objects.filter(id=content.id).update(stats=stats)
+    return stats
+
+
+def _request_ip(request) -> str:
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:45]
+    return str(request.META.get("REMOTE_ADDR") or "")[:45]
+
+
+def _channel_audit(request, *, action: str, target_type: str, target_id, metadata: dict | None = None):
+    user = getattr(request, "user", None)
+    if not getattr(user, "is_authenticated", False):
+        return None
+    try:
+        return ModerationAuditLog.objects.create(
+            actor_id=user.id,
+            action=action,
+            target_type=target_type.upper()[:32],
+            target_id=target_id,
+            metadata=metadata or {},
+            ip_address=_request_ip(request) or None,
+            device_info=str(request.META.get("HTTP_USER_AGENT") or "")[:500],
+        )
+    except Exception:
+        logger.exception("Unable to create channel audit event action=%s target=%s", action, target_id)
+        return None
+
+
+def _notify_channel_subscribers(channel: BroadcastChannel, *, notification_type: str, title: str, body: str, target_type: str, target_id):
+    try:
+        from apps.notifications import services as notification_services
+    except Exception:
+        return 0
+    subscriptions = (
+        BroadcastChannelSubscription.objects
+        .filter(channel=channel)
+        .exclude(notifications=BroadcastChannelSubscription.NotificationLevel.NONE)
+        .values_list("user_id", "notifications")
+    )
+    count = 0
+    for user_id, level in subscriptions[:500]:
+        try:
+            notification_services.create_notification(
+                user_id=user_id,
+                type=notification_type,
+                title=title[:400],
+                body=body[:1000],
+                target_type=target_type,
+                target_id=target_id,
+                priority="MEDIUM" if level == BroadcastChannelSubscription.NotificationLevel.PERSONALIZED else "HIGH",
+                dedup_key=f"{notification_type}:{target_id}:{user_id}",
+                context={
+                    "channel_id": str(channel.id),
+                    "channel_handle": channel.handle,
+                    "channel_name": channel.display_name,
+                },
+            )
+            count += 1
+        except Exception:
+            logger.exception("Unable to notify channel subscriber channel=%s user=%s", channel.id, user_id)
+    return count
+
+
+def _target_from_moderation_request(request, channel_id=None):
+    target_type = str(request.data.get("target_type") or request.query_params.get("target_type") or "channel").strip().lower()
+    target_id = request.data.get("target_id") or request.query_params.get("target_id") or channel_id
+    if target_type == ChannelModerationRecord.TargetType.CHANNEL:
+        channel = get_object_or_404(BroadcastChannel, id=target_id, is_deleted=False)
+        return channel, None, None, channel.id, target_type
+    if target_type == ChannelModerationRecord.TargetType.CONTENT:
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=target_id, is_deleted=False)
+        return content.channel, content, None, content.id, target_type
+    if target_type == ChannelModerationRecord.TargetType.COMMENT:
+        comment = get_object_or_404(ChannelContentComment.objects.select_related("content__channel"), id=target_id, is_deleted=False)
+        return comment.content.channel, comment.content, comment, comment.id, target_type
+    raise ValidationError({"target_type": "Expected channel, content, or comment."})
+
+
+class BroadcastChannelListCreateView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        mine = str(request.query_params.get("mine") or request.query_params.get("owned") or "").strip().lower()
+        if mine in {"1", "true", "yes", "me"}:
+            if not getattr(request.user, "is_authenticated", False):
+                return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
+            query = BroadcastChannel.objects.filter(
+                is_deleted=False,
+            ).filter(
+                Q(owner_user=request.user) | Q(roles__user=request.user)
+            ).distinct().order_by("-updated_at", "-created_at")
+        else:
+            query = BroadcastChannel.objects.filter(is_public=True, is_deleted=False).order_by("-subscriber_count", "-created_at")
+        q = str(request.query_params.get("q") or "").strip()
+        if q:
+            query = query.filter(Q(handle__icontains=q) | Q(display_name__icontains=q) | Q(description__icontains=q))
+        owner_type = str(request.query_params.get("owner_type") or "").strip()
+        if owner_type:
+            query = query.filter(owner_type=owner_type)
+        category = str(request.query_params.get("category") or "").strip()
+        if category:
+            query = query.filter(category__iexact=category)
+        limit = min(max(int(request.query_params.get("limit") or 25), 1), 100)
+        offset = max(int(request.query_params.get("offset") or request.query_params.get("cursor") or 0), 0)
+        rows = list(query[offset : offset + limit + 1])
+        next_offset = offset + limit if len(rows) > limit else None
+        serializer = BroadcastChannelSummarySerializer(rows[:limit], many=True, context={"request": request})
+        return Response({"results": serializer.data, "next_cursor": str(next_offset) if next_offset is not None else None})
+
+    def post(self, request):
+        if not getattr(request.user, "is_authenticated", False):
+            return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
+        owner_type = str(request.data.get("owner_type") or BroadcastChannel.OwnerType.USER).strip().lower()
+        if owner_type != BroadcastChannel.OwnerType.USER:
+            raise ValidationError({"owner_type": "Organization channel creation will be connected in a later phase."})
+        handle = _safe_channel_handle_from_value(request.data.get("handle"))
+        if not handle:
+            raise ValidationError({"handle": "A public channel handle is required."})
+        display_name = str(request.data.get("display_name") or request.data.get("name") or "").strip()
+        if not display_name:
+            raise ValidationError({"display_name": "Display name is required."})
+        if BroadcastChannel.objects.filter(handle__iexact=handle).exists():
+            raise ValidationError({"handle": "This channel handle is already in use."})
+        try:
+            channel = BroadcastChannel.objects.create(
+                owner_type=BroadcastChannel.OwnerType.USER,
+                owner_id=request.user.id,
+                owner_user=request.user,
+                handle=handle,
+                display_name=display_name[:140],
+                description=str(request.data.get("description") or "").strip(),
+                avatar_url=str(request.data.get("avatar_url") or "").strip(),
+                banner_url=str(request.data.get("banner_url") or "").strip(),
+                country=str(request.data.get("country") or getattr(request.user, "country", "") or "").strip()[:8],
+                language=str(request.data.get("language") or "").strip()[:16],
+                category=str(request.data.get("category") or "").strip()[:64],
+                links=request.data.get("links") if isinstance(request.data.get("links"), list) else [],
+                branding=request.data.get("branding") if isinstance(request.data.get("branding"), dict) else {},
+                is_public=bool(request.data.get("is_public", True)),
+            )
+        except IntegrityError:
+            raise ValidationError({"handle": "This channel handle is already in use."})
+        BroadcastChannelRole.objects.get_or_create(channel=channel, user=request.user, role=BroadcastChannelRole.Role.OWNER)
+        return Response(BroadcastChannelDetailSerializer(channel, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class BroadcastChannelDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, handle_or_id: str):
+        channel = _resolve_channel_lookup(handle_or_id, include_private=getattr(request.user, "is_authenticated", False))
+        if not channel.is_public and not _user_can_manage_channel(request.user, channel):
+            raise Http404
+        return Response(BroadcastChannelDetailSerializer(channel, context={"request": request}).data)
+
+    def patch(self, request, handle_or_id: str):
+        channel = _resolve_channel_lookup(handle_or_id, include_private=True)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot manage this channel.")
+        for field in ["display_name", "description", "avatar_url", "banner_url", "country", "language", "category"]:
+            if field in request.data:
+                setattr(channel, field, str(request.data.get(field) or "").strip())
+        if "handle" in request.data:
+            handle = _safe_channel_handle_from_value(request.data.get("handle"))
+            if not handle:
+                raise ValidationError({"handle": "A public channel handle is required."})
+            if BroadcastChannel.objects.exclude(id=channel.id).filter(handle__iexact=handle).exists():
+                raise ValidationError({"handle": "This channel handle is already in use."})
+            channel.handle = handle
+        for json_field in ["links", "branding", "settings"]:
+            if json_field in request.data:
+                value = request.data.get(json_field)
+                if json_field == "links" and not isinstance(value, list):
+                    raise ValidationError({json_field: "Expected a list."})
+                if json_field in {"branding", "settings"} and not isinstance(value, dict):
+                    raise ValidationError({json_field: "Expected an object."})
+                setattr(channel, json_field, value)
+        if "is_public" in request.data:
+            channel.is_public = bool(request.data.get("is_public"))
+        channel.save()
+        return Response(BroadcastChannelDetailSerializer(channel, context={"request": request}).data)
+
+
+class BroadcastChannelBroadcastView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot broadcast this channel.")
+        item = _broadcast_channel_for_feed(channel, request.user)
+        _channel_audit(
+            request,
+            action="channel.broadcast",
+            target_type="channel",
+            target_id=channel.id,
+            metadata={"broadcast_id": str(item.id)},
+        )
+        data = BroadcastChannelDetailSerializer(channel, context={"request": request}).data
+        data["broadcast_id"] = str(item.id)
+        data["is_broadcast"] = True
+        return Response(data, status=status.HTTP_200_OK)
+
+    def delete(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot stop broadcasting this channel.")
+        removed = _unbroadcast_channel_for_feed(channel)
+        _channel_audit(
+            request,
+            action="channel.unbroadcast",
+            target_type="channel",
+            target_id=channel.id,
+            metadata={"removed": int(removed or 0)},
+        )
+        data = BroadcastChannelDetailSerializer(channel, context={"request": request}).data
+        data["is_broadcast"] = False
+        data["broadcast_id"] = ""
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class BroadcastChannelSubscribeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False, is_public=True)
+        subscription, created = BroadcastChannelSubscription.objects.get_or_create(
+            channel=channel,
+            user=request.user,
+            defaults={"notifications": request.data.get("notifications") or BroadcastChannelSubscription.NotificationLevel.PERSONALIZED},
+        )
+        if not created and request.data.get("notifications"):
+            subscription.notifications = request.data.get("notifications")
+            subscription.save(update_fields=["notifications", "updated_at"])
+        if created:
+            BroadcastChannel.objects.filter(id=channel.id).update(subscriber_count=models.F("subscriber_count") + 1)
+            channel.refresh_from_db(fields=["subscriber_count"])
+            _channel_audit(request, action="channel.subscribe", target_type="channel", target_id=channel.id, metadata={"notifications": subscription.notifications})
+        notify_main_tab_badges_updated(
+            [str(request.user.id)],
+            source="broadcast",
+            reason="channel_subscription_updated",
+            extra={"channel_id": str(channel.id), "subscribed": True},
+        )
+        return Response(BroadcastChannelSubscriptionSerializer(subscription, context={"request": request}).data)
+
+    def delete(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        deleted, _ = BroadcastChannelSubscription.objects.filter(channel=channel, user=request.user).delete()
+        if deleted:
+            BroadcastChannel.objects.filter(id=channel.id, subscriber_count__gt=0).update(subscriber_count=models.F("subscriber_count") - 1)
+            notify_main_tab_badges_updated(
+                [str(request.user.id)],
+                source="broadcast",
+                reason="channel_subscription_updated",
+                extra={"channel_id": str(channel.id), "subscribed": False},
+            )
+        return Response({"subscribed": False}, status=status.HTTP_200_OK)
+
+
+class BroadcastChannelSubscriptionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        subscription = get_object_or_404(BroadcastChannelSubscription, channel=channel, user=request.user)
+        notifications = str(request.data.get("notifications") or "").strip()
+        if notifications not in BroadcastChannelSubscription.NotificationLevel.values:
+            raise ValidationError({"notifications": "Invalid notification level."})
+        subscription.notifications = notifications
+        subscription.save(update_fields=["notifications", "updated_at"])
+        notify_main_tab_badges_updated(
+            [str(request.user.id)],
+            source="broadcast",
+            reason="channel_subscription_updated",
+            extra={"channel_id": str(channel.id), "notifications": notifications},
+        )
+        return Response(BroadcastChannelSubscriptionSerializer(subscription, context={"request": request}).data)
+
+
+class BroadcastChannelContentListCreateView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        can_manage = _user_can_manage_channel(request.user, channel)
+        if not channel.is_public and not can_manage:
+            raise Http404
+        query = ChannelContent.objects.select_related("channel").filter(channel=channel, is_deleted=False)
+        if not can_manage:
+            query = query.filter(visibility=ChannelContent.Visibility.PUBLIC, status=ChannelContent.Status.PUBLISHED)
+        status_filter = str(request.query_params.get("status") or "").strip()
+        if status_filter and can_manage:
+            query = query.filter(status=status_filter)
+        type_filter = str(request.query_params.get("type") or "").strip()
+        if type_filter:
+            if type_filter == "post":
+                query = query.filter(content_type__in=[ChannelContentType.TEXT, ChannelContentType.RICH_TEXT])
+            else:
+                query = query.filter(content_type=type_filter)
+        q = str(request.query_params.get("q") or "").strip()
+        if q:
+            query = query.filter(Q(title__icontains=q) | Q(description__icontains=q) | Q(text_plain__icontains=q))
+        query = query.order_by("-published_at", "-created_at")
+        limit = min(max(int(request.query_params.get("limit") or 25), 1), 100)
+        offset = max(int(request.query_params.get("offset") or request.query_params.get("cursor") or 0), 0)
+        rows = list(query[offset : offset + limit + 1])
+        next_offset = offset + limit if len(rows) > limit else None
+        serializer = ChannelContentListSerializer(rows[:limit], many=True, context={"request": request})
+        return Response({"results": serializer.data, "next_cursor": str(next_offset) if next_offset is not None else None})
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=channel)):
+            raise PermissionDenied("You cannot create content for this channel.")
+        content = ChannelContent.objects.create(
+            channel=channel,
+            content_type=_content_type_from_request(request.data.get("content_type") or request.data.get("type")),
+            title=str(request.data.get("title") or "").strip()[:220],
+            description=str(request.data.get("description") or request.data.get("summary") or "").strip(),
+            text_plain=str(request.data.get("text_plain") or request.data.get("textPlain") or "").strip(),
+            text_doc=(
+                request.data.get("text_doc")
+                if isinstance(request.data.get("text_doc"), dict)
+                else request.data.get("text")
+                if isinstance(request.data.get("text"), dict)
+                else {}
+            ),
+            thumbnail_url=str(
+                request.data.get("thumbnail_url")
+                or request.data.get("thumbnailUrl")
+                or request.data.get("thumbnail")
+                or ""
+            ).strip(),
+            visibility=str(request.data.get("visibility") or ChannelContent.Visibility.PRIVATE).strip().lower(),
+            status=str(request.data.get("status") or ChannelContent.Status.DRAFT).strip().lower(),
+            scheduled_at=_content_datetime_from_request(request.data.get("scheduled_at")),
+            duration_seconds=int(request.data.get("duration_seconds") or 0) or None,
+            metadata={
+                **(request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {}),
+                "playlist_ids": request.data.get("playlist_ids") if isinstance(request.data.get("playlist_ids"), list) else [],
+                "captions": request.data.get("captions") if isinstance(request.data.get("captions"), (list, dict, str)) else None,
+                "embed_allowed": bool(request.data.get("embed_allowed", request.data.get("embedAllowed", False))),
+                "composer_type": str(request.data.get("composerType") or request.data.get("composer_type") or "").strip(),
+            },
+            created_by=request.user,
+        )
+        raw_attachments = request.data.get("attachments")
+        if isinstance(raw_attachments, list):
+            for index, attachment in enumerate(raw_attachments):
+                if isinstance(attachment, dict):
+                    ChannelContentAsset.objects.create(
+                        content=content,
+                        **_asset_payload_from_attachment(attachment, index),
+                    )
+        BroadcastChannel.objects.filter(id=channel.id).update(content_count=models.F("content_count") + 1)
+        return Response(ChannelContentDetailSerializer(content, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelContentDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        return Response(ChannelContentDetailSerializer(content, context={"request": request}).data)
+
+    def patch(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, content):
+            raise PermissionDenied("You cannot edit this content.")
+        for field in ["title", "description", "text_plain", "thumbnail_url", "visibility", "status"]:
+            if field in request.data:
+                setattr(content, field, str(request.data.get(field) or "").strip())
+        if "content_type" in request.data or "type" in request.data:
+            content.content_type = _content_type_from_request(request.data.get("content_type") or request.data.get("type"))
+        if "text_doc" in request.data:
+            value = request.data.get("text_doc")
+            if not isinstance(value, dict):
+                raise ValidationError({"text_doc": "Expected an object."})
+            content.text_doc = value
+        if "metadata" in request.data:
+            value = request.data.get("metadata")
+            if not isinstance(value, dict):
+                raise ValidationError({"metadata": "Expected an object."})
+            content.metadata = value
+        if "scheduled_at" in request.data:
+            content.scheduled_at = _content_datetime_from_request(request.data.get("scheduled_at"))
+        content.save()
+        return Response(ChannelContentDetailSerializer(content, context={"request": request}).data)
+
+    def delete(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, content):
+            raise PermissionDenied("You cannot delete this content.")
+        content.status = ChannelContent.Status.ARCHIVED
+        content.visibility = ChannelContent.Visibility.PRIVATE
+        content.is_deleted = True
+        content.save(update_fields=["status", "visibility", "is_deleted", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ChannelContentPublishView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, content):
+            raise PermissionDenied("You cannot publish this content.")
+        content.status = ChannelContent.Status.PUBLISHED
+        content.visibility = request.data.get("visibility") or content.visibility or ChannelContent.Visibility.PUBLIC
+        content.published_at = timezone.now()
+        content.save(update_fields=["status", "visibility", "published_at", "updated_at"])
+        _channel_audit(request, action="channel_content.publish", target_type="content", target_id=content.id, metadata={"channel_id": str(content.channel_id)})
+        _notify_channel_subscribers(
+            content.channel,
+            notification_type="CHANNEL_CONTENT_PUBLISHED",
+            title=content.title or content.channel.display_name,
+            body=f"{content.channel.display_name} published new content.",
+            target_type="channel_content",
+            target_id=content.id,
+        )
+        return Response(ChannelContentDetailSerializer(content, context={"request": request}).data)
+
+
+class ChannelContentUnpublishView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, content):
+            raise PermissionDenied("You cannot unpublish this content.")
+        content.status = ChannelContent.Status.DRAFT
+        content.visibility = ChannelContent.Visibility.PRIVATE
+        content.save(update_fields=["status", "visibility", "updated_at"])
+        _channel_audit(request, action="channel_content.unpublish", target_type="content", target_id=content.id, metadata={"channel_id": str(content.channel_id)})
+        return Response(ChannelContentDetailSerializer(content, context={"request": request}).data)
+
+
+class ChannelContentBroadcastView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, content):
+            raise PermissionDenied("You cannot broadcast this content.")
+        if content.status != ChannelContent.Status.PUBLISHED:
+            content.status = ChannelContent.Status.PUBLISHED
+            content.visibility = ChannelContent.Visibility.PUBLIC
+            content.published_at = content.published_at or timezone.now()
+            content.save(update_fields=["status", "visibility", "published_at", "updated_at"])
+        item = _broadcast_channel_content_for_feed(content, request.user)
+        _channel_audit(
+            request,
+            action="channel_content.broadcast",
+            target_type="content",
+            target_id=content.id,
+            metadata={"channel_id": str(content.channel_id), "broadcast_id": str(item.id)},
+        )
+        data = ChannelContentDetailSerializer(content, context={"request": request}).data
+        data["broadcast_id"] = str(item.id)
+        data["is_broadcast"] = True
+        return Response(data, status=status.HTTP_200_OK)
+
+    def delete(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, content):
+            raise PermissionDenied("You cannot stop broadcasting this content.")
+        removed = _unbroadcast_channel_content_for_feed(content)
+        _channel_audit(
+            request,
+            action="channel_content.unbroadcast",
+            target_type="content",
+            target_id=content.id,
+            metadata={"channel_id": str(content.channel_id), "removed": int(removed or 0)},
+        )
+        data = ChannelContentDetailSerializer(content, context={"request": request}).data
+        data["is_broadcast"] = False
+        data["broadcast_id"] = ""
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class ChannelContentScheduleView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, content):
+            raise PermissionDenied("You cannot schedule this content.")
+        scheduled_at = _content_datetime_from_request(request.data.get("scheduled_at"))
+        if not scheduled_at:
+            raise ValidationError({"scheduled_at": "scheduled_at is required."})
+        content.status = ChannelContent.Status.SCHEDULED
+        content.scheduled_at = scheduled_at
+        content.save(update_fields=["status", "scheduled_at", "updated_at"])
+        return Response(ChannelContentDetailSerializer(content, context={"request": request}).data)
+
+
+class ChannelContentAssetUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser, FormParser, MultiPartParser]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, content):
+            raise PermissionDenied("You cannot add assets to this content.")
+        payload = {
+            "asset_type": str(request.data.get("asset_type") or request.data.get("media_type") or "document").strip()[:32],
+            "url": str(request.data.get("url") or "").strip(),
+            "storage_path": str(request.data.get("storage_path") or request.data.get("path") or "").strip(),
+            "mime_type": str(request.data.get("mime_type") or request.data.get("mimeType") or "").strip()[:128],
+            "thumbnail_url": str(request.data.get("thumbnail_url") or request.data.get("thumbUrl") or "").strip(),
+            "caption": str(request.data.get("caption") or "").strip(),
+            "sort_order": int(request.data.get("sort_order") or content.assets.count()),
+            "processing_status": str(request.data.get("processing_status") or "ready").strip()[:24],
+            "metadata": request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
+        }
+        if "attachment" in request.data and isinstance(request.data.get("attachment"), dict):
+            payload.update(_asset_payload_from_attachment(request.data["attachment"], payload["sort_order"]))
+        asset = ChannelContentAsset.objects.create(content=content, **payload)
+        return Response(ChannelContentAssetSerializer(asset).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelLiveStreamListCreateView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        can_manage = _user_can_manage_channel(request.user, channel)
+        if not channel.is_public and not can_manage:
+            raise Http404
+        query = ChannelLiveStream.objects.select_related("channel", "content").filter(channel=channel)
+        if not can_manage:
+            query = query.exclude(status__in=[ChannelLiveStream.Status.CANCELLED, ChannelLiveStream.Status.FAILED])
+        status_filter = str(request.query_params.get("status") or "").strip()
+        if status_filter:
+            query = query.filter(status=status_filter)
+        rows = query.order_by("-scheduled_start_at", "-created_at")[:50]
+        return Response({"results": ChannelLiveStreamSerializer(rows, many=True, context={"request": request}).data})
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=channel)):
+            raise PermissionDenied("You cannot schedule live streams for this channel.")
+        title = str(request.data.get("title") or "").strip()
+        if not title:
+            raise ValidationError({"title": "A live stream title is required."})
+        scheduled_at = _content_datetime_from_request(
+            request.data.get("scheduled_start_at") or request.data.get("scheduledStartAt") or request.data.get("scheduled_at")
+        )
+        stream_uuid = uuid.uuid4()
+        dev_payload = _safe_live_dev_payload(channel.id, stream_uuid)
+        stream_key = f"{channel.id}:{stream_uuid}:{uuid.uuid4()}"
+        live = ChannelLiveStream.objects.create(
+            channel=channel,
+            title=title[:220],
+            description=str(request.data.get("description") or "").strip(),
+            scheduled_start_at=scheduled_at,
+            provider=dev_payload.get("provider") or _live_stream_provider(),
+            provider_stream_id=dev_payload.get("provider_stream_id") or str(stream_uuid),
+            ingest_url=dev_payload.get("ingest_url", ""),
+            stream_key_hash=_hash_stream_key(stream_key),
+            playback_url=dev_payload.get("playback_url", ""),
+            thumbnail_url=str(request.data.get("thumbnail_url") or request.data.get("thumbnailUrl") or "").strip(),
+            metadata={
+                "provider_calls_enabled": _live_provider_sandbox_enabled(),
+                "raw_stream_key_returned": False,
+                **(request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {}),
+            },
+            created_by=request.user,
+        )
+        content = ChannelContent.objects.create(
+            channel=channel,
+            content_type=ChannelContentType.LIVE_STREAM,
+            title=live.title,
+            description=live.description,
+            thumbnail_url=live.thumbnail_url,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            status=ChannelContent.Status.SCHEDULED,
+            scheduled_at=live.scheduled_start_at,
+            metadata={"live_stream_id": str(live.id)},
+            created_by=request.user,
+        )
+        live.content = content
+        live.save(update_fields=["content", "updated_at"])
+        return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelLiveStreamDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, stream_id):
+        live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
+        if not live.channel.is_public and not _user_can_manage_channel(request.user, live.channel):
+            raise Http404
+        return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
+
+
+class ChannelLiveStreamStartView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, stream_id):
+        live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
+            raise PermissionDenied("You cannot start this live stream.")
+        if _live_stream_provider() != "disabled" and not _live_provider_sandbox_enabled():
+            raise ValidationError({"provider": "Live provider calls are disabled until staging/provider approval."})
+        live.status = ChannelLiveStream.Status.LIVE
+        live.started_at = live.started_at or timezone.now()
+        live.save(update_fields=["status", "started_at", "updated_at"])
+        if live.content_id:
+            ChannelContent.objects.filter(id=live.content_id).update(status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC, published_at=timezone.now())
+        _channel_audit(request, action="channel_live.start", target_type="channel", target_id=live.channel_id, metadata={"stream_id": str(live.id), "content_id": str(live.content_id or "")})
+        _notify_channel_subscribers(
+            live.channel,
+            notification_type="CHANNEL_LIVE_STARTED",
+            title=f"{live.channel.display_name} is live",
+            body=live.title,
+            target_type="channel_live_stream",
+            target_id=live.id,
+        )
+        return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
+
+
+class ChannelLiveStreamEndView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, stream_id):
+        live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
+            raise PermissionDenied("You cannot end this live stream.")
+        live.status = ChannelLiveStream.Status.ENDED
+        live.ended_at = live.ended_at or timezone.now()
+        live.replay_url = str(request.data.get("replay_url") or request.data.get("replayUrl") or live.replay_url or "").strip()
+        live.save(update_fields=["status", "ended_at", "replay_url", "updated_at"])
+        return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
+
+
+class ChannelLiveStreamWebhookView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, provider):
+        configured_secret = str(getattr(settings, "LIVE_STREAM_WEBHOOK_SECRET", os.getenv("LIVE_STREAM_WEBHOOK_SECRET", "")) or "")
+        supplied = request.headers.get("X-Live-Webhook-Secret") or request.headers.get("X-KIS-Live-Secret") or ""
+        if configured_secret and supplied != configured_secret:
+            return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
+        provider_stream_id = str(request.data.get("provider_stream_id") or request.data.get("stream_id") or "").strip()
+        status_value = str(request.data.get("status") or "").strip().lower()
+        live = ChannelLiveStream.objects.filter(provider=str(provider).strip().lower(), provider_stream_id=provider_stream_id).first()
+        if not live:
+            return Response({"matched": False}, status=status.HTTP_202_ACCEPTED)
+        if status_value in ChannelLiveStream.Status.values:
+            live.status = status_value
+        live.viewer_count = int(request.data.get("viewer_count") or live.viewer_count or 0)
+        live.peak_viewer_count = max(live.peak_viewer_count, live.viewer_count)
+        live.metadata = {**(live.metadata or {}), "last_webhook": {"provider": provider, "status": status_value}}
+        live.save(update_fields=["status", "viewer_count", "peak_viewer_count", "metadata", "updated_at"])
+        return Response({"matched": True, "id": str(live.id), "status": live.status})
+
+
+class ChannelContentEmbedPublicView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(
+            ChannelContent.objects.select_related("channel").prefetch_related("assets"),
+            id=content_id,
+            is_deleted=False,
+        )
+        _, domain = _check_embed_access(request, content)
+        _record_embed_impression(request, content, domain)
+        return Response(_embed_content_payload(request, content))
+
+
+class ChannelContentOEmbedView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(
+            ChannelContent.objects.select_related("channel").prefetch_related("assets"),
+            id=content_id,
+            is_deleted=False,
+        )
+        _, domain = _check_embed_access(request, content)
+        _record_embed_impression(request, content, domain)
+        return Response(_embed_content_payload(request, content, oembed=True))
+
+
+class ChannelContentEmbedTokenView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, content.channel):
+            raise PermissionDenied("You cannot create embed tokens for this content.")
+        if not _embeds_enabled():
+            raise ValidationError({"embeds": "Embeds are disabled until QA approves launch."})
+        domain = str(request.data.get("domain") or "").strip().lower()
+        expires_at = _content_datetime_from_request(request.data.get("expires_at") or request.data.get("expiresAt"))
+        token = secrets.token_urlsafe(32)
+        record = ChannelContentEmbed.objects.create(
+            content=content,
+            domain=domain,
+            token_hash=_embed_token_hash(token),
+            expires_at=expires_at,
+            created_by=request.user,
+        )
+        base_url = _embed_public_base_url(request)
+        return Response(
+            {
+                "id": str(record.id),
+                "content_id": str(content.id),
+                "domain": record.domain,
+                "token": token,
+                "expires_at": record.expires_at,
+                "embed_url": f"{base_url}/embed/content/{content.id}?token={token}",
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class ChannelContentReactView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        reaction = str(request.data.get("reaction") or "like").strip().lower()[:32] or "like"
+        obj, created = ChannelContentReaction.objects.update_or_create(
+            content=content,
+            user=request.user,
+            defaults={"reaction": reaction},
+        )
+        stats = _sync_channel_content_counts(content)
+        return Response({"reacted": True, "created": created, "reaction": obj.reaction, "engagement_counts": _channel_content_counts(ChannelContent(id=content.id, stats=stats))})
+
+    def delete(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        deleted, _ = ChannelContentReaction.objects.filter(content=content, user=request.user).delete()
+        stats = _sync_channel_content_counts(content)
+        return Response({"reacted": False, "deleted": bool(deleted), "engagement_counts": _channel_content_counts(ChannelContent(id=content.id, stats=stats))})
+
+
+class ChannelContentSaveView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        _, created = ChannelContentSave.objects.get_or_create(content=content, user=request.user)
+        stats = _sync_channel_content_counts(content)
+        return Response({"saved": True, "created": created, "engagement_counts": _channel_content_counts(ChannelContent(id=content.id, stats=stats))})
+
+    def delete(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        deleted, _ = ChannelContentSave.objects.filter(content=content, user=request.user).delete()
+        stats = _sync_channel_content_counts(content)
+        return Response({"saved": False, "deleted": bool(deleted), "engagement_counts": _channel_content_counts(ChannelContent(id=content.id, stats=stats))})
+
+
+class ChannelContentShareView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        completed = request.data.get("completed")
+        if completed is False or str(completed).lower() == "false":
+            return Response({"counted": False, "engagement_counts": _channel_content_counts(content)})
+        stats = _increment_channel_content_count(content, "shares")
+        return Response({"counted": True, "engagement_counts": _channel_content_counts(ChannelContent(id=content.id, stats=stats))})
+
+
+class ChannelContentViewEventView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        stats = _increment_channel_content_count(content, "views")
+        if getattr(request.user, "is_authenticated", False):
+            progress = int(request.data.get("progress_seconds") or request.data.get("progressSeconds") or 0)
+            completed = bool(request.data.get("completed", False))
+            ChannelWatchHistory.objects.update_or_create(
+                content=content,
+                user=request.user,
+                defaults={
+                    "progress_seconds": max(progress, 0),
+                    "completed": completed,
+                    "last_viewed_at": timezone.now(),
+                    "metadata": request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
+                },
+            )
+            notify_main_tab_badges_updated(
+                [str(request.user.id)],
+                source="broadcast",
+                reason="channel_content_viewed",
+                extra={"channel_id": str(content.channel_id), "content_id": str(content.id)},
+            )
+        return Response({"viewed": True, "engagement_counts": _channel_content_counts(ChannelContent(id=content.id, stats=stats))})
+
+
+class ChannelContentCommentsView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        rows = ChannelContentComment.objects.select_related("user").filter(content=content, is_deleted=False, parent__isnull=True).order_by("-created_at")[:50]
+        return Response({"results": ChannelContentCommentSerializer(rows, many=True, context={"request": request}).data})
+
+    def post(self, request, content_id):
+        if not getattr(request.user, "is_authenticated", False):
+            return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        channel_settings = content.channel.settings if isinstance(content.channel.settings, dict) else {}
+        if channel_settings.get("comments_restricted") and not _user_can_manage_channel(request.user, content.channel):
+            raise PermissionDenied("Comments are restricted for this channel.")
+        body = str(request.data.get("body") or request.data.get("text") or "").strip()
+        if not body:
+            raise ValidationError({"body": "Comment body is required."})
+        parent = None
+        parent_id = request.data.get("parent")
+        if parent_id:
+            parent = get_object_or_404(ChannelContentComment, id=parent_id, content=content, is_deleted=False)
+        comment = ChannelContentComment.objects.create(content=content, user=request.user, body=body[:2000], parent=parent)
+        stats = _sync_channel_content_counts(content)
+        data = ChannelContentCommentSerializer(comment, context={"request": request}).data
+        data["engagement_counts"] = _channel_content_counts(ChannelContent(id=content.id, stats=stats))
+        return Response(data, status=status.HTTP_201_CREATED)
+
+
+class BroadcastChannelReportView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        reason = str(request.data.get("reason") or request.data.get("message") or "Reported by viewer").strip()[:1000]
+        reporter = request.user if getattr(request.user, "is_authenticated", False) else None
+        record = ChannelModerationRecord.objects.create(
+            channel=channel,
+            target_type=ChannelModerationRecord.TargetType.CHANNEL,
+            target_id=channel.id,
+            reporter=reporter,
+            reason=reason,
+            metadata={"source": "channel_report"},
+        )
+        try:
+            ModerationFlag.objects.create(
+                source="USER" if reporter else "SYSTEM",
+                target_type="CHANNEL",
+                target_id=channel.id,
+                reporter_id=getattr(reporter, "id", None),
+                reason=reason,
+                severity="MEDIUM",
+                tags={"channel_moderation_record_id": str(record.id)},
+            )
+        except Exception:
+            logger.exception("Unable to mirror channel report into moderation flags")
+        _channel_audit(request, action="channel.report", target_type="channel", target_id=channel.id, metadata={"record_id": str(record.id)})
+        return Response({"reported": True, "id": str(record.id)}, status=status.HTTP_201_CREATED)
+
+
+class ChannelContentReportView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        reason = str(request.data.get("reason") or request.data.get("message") or "Reported by viewer").strip()[:1000]
+        reporter = request.user if getattr(request.user, "is_authenticated", False) else None
+        record = ChannelModerationRecord.objects.create(
+            channel=content.channel,
+            content=content,
+            target_type=ChannelModerationRecord.TargetType.CONTENT,
+            target_id=content.id,
+            reporter=reporter,
+            reason=reason,
+            metadata={"source": "content_report"},
+        )
+        try:
+            ModerationFlag.objects.create(
+                source="USER" if reporter else "SYSTEM",
+                target_type="POST",
+                target_id=content.id,
+                reporter_id=getattr(reporter, "id", None),
+                reason=reason,
+                severity="MEDIUM",
+                tags={"channel_moderation_record_id": str(record.id), "channel_id": str(content.channel_id)},
+            )
+        except Exception:
+            logger.exception("Unable to mirror channel content report into moderation flags")
+        _channel_audit(request, action="channel_content.report", target_type="content", target_id=content.id, metadata={"record_id": str(record.id)})
+        return Response({"reported": True, "id": str(record.id)}, status=status.HTTP_201_CREATED)
+
+
+class ChannelContentCommentModerationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, comment_id):
+        comment = get_object_or_404(ChannelContentComment.objects.select_related("content__channel"), id=comment_id, is_deleted=False)
+        if not (_user_can_manage_channel(request.user, comment.content.channel) or comment.user_id == getattr(request.user, "id", None)):
+            raise PermissionDenied("You cannot remove this comment.")
+        comment.is_deleted = True
+        comment.save(update_fields=["is_deleted", "updated_at"])
+        stats = _sync_channel_content_counts(comment.content)
+        ChannelModerationRecord.objects.create(
+            channel=comment.content.channel,
+            content=comment.content,
+            comment=comment,
+            target_type=ChannelModerationRecord.TargetType.COMMENT,
+            target_id=comment.id,
+            actor=request.user,
+            status=ChannelModerationRecord.Status.ACTIONED,
+            action=ChannelModerationRecord.Action.REMOVE,
+            reason="Comment removed",
+            resolved_at=timezone.now(),
+        )
+        _channel_audit(request, action="channel_comment.remove", target_type="comment", target_id=comment.id, metadata={"content_id": str(comment.content_id)})
+        return Response({"removed": True, "engagement_counts": _channel_content_counts(ChannelContent(id=comment.content_id, stats=stats))})
+
+    def post(self, request, comment_id):
+        comment = get_object_or_404(ChannelContentComment.objects.select_related("content__channel"), id=comment_id, is_deleted=False)
+        reason = str(request.data.get("reason") or "Reported by viewer").strip()[:1000]
+        record = ChannelModerationRecord.objects.create(
+            channel=comment.content.channel,
+            content=comment.content,
+            comment=comment,
+            target_type=ChannelModerationRecord.TargetType.COMMENT,
+            target_id=comment.id,
+            reporter=request.user,
+            reason=reason,
+            metadata={"source": "comment_report"},
+        )
+        try:
+            ModerationFlag.objects.create(
+                source="USER",
+                target_type="COMMENT",
+                target_id=comment.id,
+                reporter_id=request.user.id,
+                reason=reason,
+                severity="MEDIUM",
+                tags={"channel_moderation_record_id": str(record.id), "content_id": str(comment.content_id)},
+            )
+        except Exception:
+            logger.exception("Unable to mirror channel comment report into moderation flags")
+        _channel_audit(request, action="channel_comment.report", target_type="comment", target_id=comment.id, metadata={"record_id": str(record.id)})
+        return Response({"reported": True, "id": str(record.id)}, status=status.HTTP_201_CREATED)
+
+
+class BroadcastChannelModerationQueueView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot view this moderation queue.")
+        query = ChannelModerationRecord.objects.select_related("channel", "content", "comment", "reporter", "actor").filter(channel=channel)
+        status_filter = str(request.query_params.get("status") or "").strip().lower()
+        if status_filter:
+            query = query.filter(status=status_filter)
+        rows = query.order_by("-created_at")[:100]
+        return Response({"results": ChannelModerationRecordSerializer(rows, many=True, context={"request": request}).data})
+
+
+class ChannelModerationActionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, record_id):
+        record = get_object_or_404(ChannelModerationRecord.objects.select_related("channel", "content", "comment"), id=record_id)
+        if not _user_can_manage_channel(request.user, record.channel):
+            raise PermissionDenied("You cannot moderate this channel.")
+        action = str(request.data.get("action") or ChannelModerationRecord.Action.KEEP).strip().lower()
+        if action not in {choice[0] for choice in ChannelModerationRecord.Action.choices}:
+            raise ValidationError({"action": "Unknown moderation action."})
+        notes = str(request.data.get("notes") or "").strip()[:2000]
+        if action == ChannelModerationRecord.Action.REMOVE:
+            if record.comment_id:
+                ChannelContentComment.objects.filter(id=record.comment_id).update(is_deleted=True)
+                if record.content:
+                    _sync_channel_content_counts(record.content)
+            elif record.content_id:
+                ChannelContent.objects.filter(id=record.content_id).update(is_deleted=True, status=ChannelContent.Status.ARCHIVED, visibility=ChannelContent.Visibility.PRIVATE)
+        elif action == ChannelModerationRecord.Action.HIDE and record.content_id:
+            ChannelContent.objects.filter(id=record.content_id).update(visibility=ChannelContent.Visibility.PRIVATE)
+        elif action == ChannelModerationRecord.Action.RESTRICT_COMMENTS:
+            settings_payload = record.channel.settings if isinstance(record.channel.settings, dict) else {}
+            settings_payload["comments_restricted"] = True
+            BroadcastChannel.objects.filter(id=record.channel_id).update(settings=settings_payload)
+        record.action = action
+        record.status = ChannelModerationRecord.Status.DISMISSED if action == ChannelModerationRecord.Action.KEEP else ChannelModerationRecord.Status.ACTIONED
+        record.actor = request.user
+        record.notes = notes
+        record.resolved_at = timezone.now()
+        record.save(update_fields=["action", "status", "actor", "notes", "resolved_at", "updated_at"])
+        _channel_audit(request, action=f"channel_moderation.{action}", target_type=record.target_type, target_id=record.target_id, metadata={"record_id": str(record.id)})
+        return Response(ChannelModerationRecordSerializer(record, context={"request": request}).data)
+
+
+class BroadcastChannelAnalyticsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot view analytics for this channel.")
+        today = timezone.localdate()
+        content_query = ChannelContent.objects.filter(channel=channel, is_deleted=False)
+        history = ChannelWatchHistory.objects.filter(content__channel=channel)
+        summary = {
+            "subscribers": channel.subscriber_count,
+            "content_count": content_query.count(),
+            "published_count": content_query.filter(status=ChannelContent.Status.PUBLISHED).count(),
+            "views": history.count(),
+            "unique_viewers": history.values("user_id").distinct().count(),
+            "watch_time_seconds": sum(row.progress_seconds for row in history.only("progress_seconds")[:10000]),
+            "reactions": ChannelContentReaction.objects.filter(content__channel=channel).count(),
+            "comments": ChannelContentComment.objects.filter(content__channel=channel, is_deleted=False).count(),
+            "saves": ChannelContentSave.objects.filter(content__channel=channel).count(),
+            "shares": sum(int((content.stats or {}).get("shares") or 0) for content in content_query.only("stats")[:10000]),
+        }
+        rollup, _ = ChannelAnalyticsDailyRollup.objects.update_or_create(
+            channel=channel,
+            content=None,
+            date=today,
+            defaults={
+                "views": summary["views"],
+                "unique_viewers": summary["unique_viewers"],
+                "watch_time_seconds": summary["watch_time_seconds"],
+                "shares": summary["shares"],
+                "saves": summary["saves"],
+                "comments": summary["comments"],
+                "reactions": summary["reactions"],
+                "metadata": {"generated": "on_read"},
+            },
+        )
+        top_content = content_query.order_by("-updated_at")[:10]
+        return Response(
+            {
+                "summary": summary,
+                "rollups": ChannelAnalyticsDailyRollupSerializer([rollup], many=True).data,
+                "top_content": ChannelContentListSerializer(top_content, many=True, context={"request": request}).data,
+            }
+        )
+
+
+class BroadcastPlaylistItemView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, playlist_id):
+        playlist = get_object_or_404(BroadcastPlaylist.objects.select_related("channel"), id=playlist_id)
+        if not _user_can_manage_channel(request.user, playlist.channel):
+            raise PermissionDenied("You cannot manage this playlist.")
+        content = get_object_or_404(ChannelContent, id=request.data.get("content_id"), channel=playlist.channel, is_deleted=False)
+        item, _ = BroadcastPlaylistItem.objects.get_or_create(
+            playlist=playlist,
+            content=content,
+            defaults={"sort_order": int(request.data.get("sort_order") or playlist.items.count())},
+        )
+        return Response(BroadcastPlaylistItemSerializer(item, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class BroadcastPlaylistItemDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, playlist_id, content_id):
+        playlist = get_object_or_404(BroadcastPlaylist.objects.select_related("channel"), id=playlist_id)
+        if not _user_can_manage_channel(request.user, playlist.channel):
+            raise PermissionDenied("You cannot manage this playlist.")
+        deleted, _ = BroadcastPlaylistItem.objects.filter(playlist=playlist, content_id=content_id).delete()
+        return Response({"removed": bool(deleted)})
+
+
+class BroadcastPlaylistListCreateView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        can_manage = _user_can_manage_channel(request.user, channel)
+        if not channel.is_public and not can_manage:
+            raise Http404
+        query = BroadcastPlaylist.objects.filter(channel=channel)
+        if not can_manage:
+            query = query.filter(visibility=BroadcastPlaylist.Visibility.PUBLIC)
+        serializer = BroadcastPlaylistSerializer(query.order_by("sort_order", "-created_at"), many=True, context={"request": request})
+        return Response({"results": serializer.data})
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot manage playlists for this channel.")
+        playlist = BroadcastPlaylist.objects.create(
+            channel=channel,
+            title=str(request.data.get("title") or "").strip()[:160],
+            description=str(request.data.get("description") or "").strip(),
+            visibility=str(request.data.get("visibility") or BroadcastPlaylist.Visibility.PUBLIC).strip().lower(),
+            sort_order=int(request.data.get("sort_order") or 0),
+            metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
+        )
+        return Response(BroadcastPlaylistSerializer(playlist, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
 class BroadcastFeedEntriesView(APIView):
@@ -12374,8 +14191,15 @@ class BroadcastFeedEntryDetailView(APIView):
         profile['updated_at'] = timezone.now().isoformat()
         resolved['profile'] = profile
         resolved['profiles']['broadcast_feed'] = resolved['profile']
-        _delete_user_broadcast(request.user, entry_id)
+        removed_count = _delete_user_broadcast(request.user, entry_id)
+        archive_channel_content_for_feed_entry(request.user, entry_id, hard_deleted=True)
         _save_user_profiles(request.user, resolved['profiles'])
+        _write_broadcast_moderation_audit(
+            actor=request.user,
+            action="broadcast.feed_entry.delete",
+            target_id=entry_id,
+            metadata={"removed_live_broadcast_count": removed_count},
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -12518,8 +14342,15 @@ class BroadcastFeedEntryBroadcastView(APIView):
             source_id=str(entry.get('id')),
             broadcasted_by=request.user,
             is_deleted=False,
-        ).update(is_deleted=True)
+        ).update(is_deleted=True, expires_at=timezone.now())
+        archive_channel_content_for_feed_entry(request.user, entry_id, hard_deleted=False)
         _save_user_profiles(request.user, resolved['profiles'])
+        _write_broadcast_moderation_audit(
+            actor=request.user,
+            action="broadcast.feed_entry.unbroadcast",
+            target_id=entry_id,
+            metadata={"source_type": BroadcastSourceType.BROADCAST_FEED_ENTRY},
+        )
         normalized_entry = _normalize_feed_entry(request, entry_updated)
         normalized_feeds = [
             normalized_feed

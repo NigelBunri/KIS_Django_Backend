@@ -28,6 +28,9 @@ from .views import (
     EmergencyDispatchTrackingView,
     HealthInstitutionDetailView,
     HealthInstitutionListCreateView,
+    HealthInstitutionVerificationReviewView,
+    HealthInstitutionVerificationStartView,
+    HealthInstitutionVerificationStatusView,
     HealthServiceListCreateView,
     HomeLogisticsSessionDetailView,
     HomeLogisticsSessionEndView,
@@ -84,6 +87,21 @@ urlpatterns = [
         "health-ops/institutions/<str:institution_id>/",
         HealthInstitutionDetailView.as_view(),
         name="health-ops-institution-detail",
+    ),
+    path(
+        "health-ops/institutions/<str:institution_id>/verification-status/",
+        HealthInstitutionVerificationStatusView.as_view(),
+        name="health-ops-institution-verification-status",
+    ),
+    path(
+        "health-ops/institutions/<str:institution_id>/verification/start/",
+        HealthInstitutionVerificationStartView.as_view(),
+        name="health-ops-institution-verification-start",
+    ),
+    path(
+        "health-ops/institutions/<str:institution_id>/verification/cases/<uuid:case_id>/review/",
+        HealthInstitutionVerificationReviewView.as_view(),
+        name="health-ops-institution-verification-review",
     ),
     path(
         "health-ops/institutions/<str:institution_id>/services/",

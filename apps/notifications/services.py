@@ -1,12 +1,22 @@
 
 from django.db import transaction
+from django.utils import timezone
 from . import models
+from .realtime import notify_main_tab_badges_updated
 import datetime
 import logging
 
 logger = logging.getLogger(__name__)
 
 MANDATORY_DELIVERY_CHANNELS = ("IN_APP", "PUSH")
+
+BADGE_SOURCE_TOKENS: dict[str, tuple[str, ...]] = {
+    "bible": ("bible", "reading", "meditation", "devotional"),
+    "broadcast": ("broadcast", "channel", "course", "lesson", "product", "market", "shop", "event", "education", "health", "institution"),
+    "partners": ("partner", "community", "partner_group", "group_message"),
+    "messages": ("message", "chat", "conversation"),
+    "profile": ("profile", "account", "verification", "general"),
+}
 
 
 def should_suppress(user_id, notification_type, context=None):
@@ -47,6 +57,43 @@ def _normalize_channels(channel=None, preferred_channels=None) -> list[str]:
     return channels
 
 
+def infer_badge_source(notification_type=None, target_type=None, context=None, explicit_source=None) -> str:
+    """Infer a stable main-tab badge source from existing notification fields."""
+    context = context or {}
+    source = str(explicit_source or context.get("source") or context.get("badge_source") or "").strip().lower()
+    if source:
+        aliases = {
+            "education": "broadcast",
+            "health": "broadcast",
+            "market": "broadcast",
+            "shop": "broadcast",
+            "product": "broadcast",
+            "service": "broadcast",
+            "community": "partners",
+            "partner_group": "partners",
+            "account": "profile",
+            "verification": "profile",
+        }
+        return aliases.get(source, source)
+
+    haystack = f"{notification_type or ''} {target_type or ''} ".lower()
+    haystack += " ".join(str(value).lower() for value in context.values() if isinstance(value, (str, int, float)))
+    for badge_source, tokens in BADGE_SOURCE_TOKENS.items():
+        if any(token in haystack for token in tokens):
+            return badge_source
+    return "profile"
+
+
+def normalize_notification_context(notification_type=None, target_type=None, context=None, source=None) -> dict:
+    context_data = dict(context or {})
+    badge_source = infer_badge_source(notification_type=notification_type, target_type=target_type, context=context_data, explicit_source=source)
+    context_data.setdefault("source", badge_source)
+    context_data.setdefault("badge_source", badge_source)
+    if target_type:
+        context_data.setdefault("target_type", str(target_type))
+    return context_data
+
+
 def ensure_notification_deliveries(notification: models.Notification, channels=None):
     """Ensure the central in-app notification has its required delivery rows."""
     existing = set(notification.deliveries.values_list("channel", flat=True))
@@ -59,6 +106,13 @@ def ensure_notification_deliveries(notification: models.Notification, channels=N
 @transaction.atomic
 def create_notification(user_id, type, template_key=None, context=None, channel=None, priority="MEDIUM", dedup_key=None, **kwargs):
     """Create a notification and schedule deliveries. Deduplication key avoids duplicates."""
+    context_data = normalize_notification_context(
+        notification_type=type,
+        target_type=kwargs.get("target_type"),
+        context=context,
+        source=kwargs.get("source"),
+    )
+
     # dedupe
     if dedup_key:
         existing = models.Notification.objects.filter(user_id=user_id, dedup_key=dedup_key, is_deleted=False)
@@ -73,7 +127,7 @@ def create_notification(user_id, type, template_key=None, context=None, channel=
     if template_key:
         try:
             template = models.NotificationTemplate.objects.get(key=template_key)
-            t, b = template.render(context or {})
+            t, b = template.render(context_data)
             title = title or t
             body = body or b
         except models.NotificationTemplate.DoesNotExist:
@@ -95,7 +149,7 @@ def create_notification(user_id, type, template_key=None, context=None, channel=
         reward_points=kwargs.get("reward_points"),
         is_snoozed=kwargs.get("is_snoozed", False),
         snoozed_until=kwargs.get("snoozed_until"),
-        context_data=context or {},
+        context_data=context_data,
         dedup_key=dedup_key,
     )
 
@@ -117,5 +171,12 @@ def create_notification(user_id, type, template_key=None, context=None, channel=
         process_notification_delivery.delay(str(notif.id))
     except Exception:
         logger.exception("Unable to enqueue notification delivery for %s", notif.id)
+
+    notify_main_tab_badges_updated(
+        [str(user_id)],
+        source="notifications",
+        reason="created",
+        extra={"notification_id": str(notif.id), "type": str(type or "")},
+    )
 
     return notif

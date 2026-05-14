@@ -15,7 +15,6 @@ from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import serializers
 from .availability import normalize_availability_payload, derive_availability_rules_from_payload
-from .constants import KIS_COIN_CODE
 from common.media_urls import absolutize_backend_media, normalize_image_payload
 from .models import (
     Shop,
@@ -56,6 +55,20 @@ from .models import (
 AVAILABILITY_RULE_SCOPES = {'year', 'month', 'week', 'day'}
 TIME_PATTERN = re.compile(r'^([01]?\d|2[0-3]):([0-5]\d)$')
 logger = logging.getLogger(__name__)
+
+
+def _usd_label_from_cents(value: int | None) -> str:
+    cents = int(value or 0)
+    return f"${(Decimal(cents) / Decimal('100')).quantize(Decimal('0.01'))}"
+
+
+def _commerce_currency_label(currency: object, metadata: dict | None = None) -> str:
+    code = str(currency or '').strip().upper()
+    if code == 'USD':
+        return 'USD'
+    if code in {'KISC', 'KIS'}:
+        return 'Historical promotional-credit order'
+    return code or 'USD'
 
 
 def normalize_availability_rules_value(value):
@@ -509,6 +522,7 @@ class LandingVisibilityField(serializers.BooleanField):
 class ShopSerializer(serializers.ModelSerializer):
     image_file = serializers.ImageField(required=False, allow_null=True)
     image_url = serializers.SerializerMethodField()
+    verification_summary = serializers.SerializerMethodField()
     employee_slots = serializers.IntegerField(min_value=1, default=1)
     team_members = serializers.SerializerMethodField()
     landing_page = LandingPageField(required=False, allow_null=True)
@@ -532,12 +546,18 @@ class ShopSerializer(serializers.ModelSerializer):
             'is_verified',
             'verification_status',
             'trust_badges',
+            'verification_summary',
             'image_url',
             'slug',
         )
 
     def get_image_url(self, obj):
         return absolutize_backend_media(obj.image_url, request=self.context.get('request'))
+
+    def get_verification_summary(self, obj):
+        from apps.verification.services import current_shop_verification_status
+
+        return current_shop_verification_status(obj)
 
     def get_team_members(self, obj):
         members = getattr(obj, 'team_members', None)
@@ -686,10 +706,30 @@ class ShopSerializer(serializers.ModelSerializer):
 
 
 class ShopVerificationRequestSerializer(serializers.ModelSerializer):
+    verification_case_id = serializers.SerializerMethodField()
+    verification_summary = serializers.SerializerMethodField()
+
     class Meta:
         model = ShopVerificationRequest
         fields = '__all__'
-        read_only_fields = ('status', 'risk_score', 'processed_at')
+        read_only_fields = ('status', 'risk_score', 'processed_at', 'verification_case_id', 'verification_summary')
+
+    def validate_documents(self, value):
+        from apps.verification.serializers import validate_private_evidence_metadata
+
+        validate_private_evidence_metadata({"documents": value or []})
+        return value or []
+
+    def get_verification_case_id(self, obj):
+        from apps.verification.services import find_shop_verification_case
+
+        case = find_shop_verification_case(obj)
+        return str(case.id) if case else None
+
+    def get_verification_summary(self, obj):
+        from apps.verification.services import current_shop_verification_status
+
+        return current_shop_verification_status(obj.shop)
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -741,6 +781,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
     is_broadcasted = serializers.SerializerMethodField()
     broadcast_item_id = serializers.SerializerMethodField()
+    currency_display = serializers.SerializerMethodField()
 
     brand = serializers.CharField(required=False, allow_blank=True)
     condition = serializers.CharField(required=False, allow_blank=True)
@@ -803,7 +844,11 @@ class ProductSerializer(serializers.ModelSerializer):
             'image_url',
             'is_broadcasted',
             'broadcast_item_id',
+            'currency_display',
         )
+
+    def get_currency_display(self, obj):
+        return 'USD'
 
     def get_image_url(self, obj):
         request = self.context.get('request')
@@ -828,6 +873,8 @@ class ProductSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
+        data['currency'] = 'USD'
+        data['currency_display'] = 'USD'
         attributes = getattr(instance, "attributes", None)
         if not isinstance(attributes, dict):
             return data
@@ -916,7 +963,7 @@ class ProductSerializer(serializers.ModelSerializer):
             attrs["_catalog_categories"] = catalog_categories
             attrs = self._hydrate_extended_attributes(attrs)
 
-            attrs["currency"] = KIS_COIN_CODE
+            attrs["currency"] = "USD"
 
             sanitized_attributes = self._sanitize_attributes(attrs.get("attributes"))
             attrs["attributes"] = self._serialize_json_value(sanitized_attributes)
@@ -1168,9 +1215,9 @@ class ProductSerializer(serializers.ModelSerializer):
 
     def validate_currency(self, value):
         normalized = str(value or '').strip().upper()
-        if normalized and normalized != KIS_COIN_CODE:
-            raise serializers.ValidationError(f"Currency must be {KIS_COIN_CODE}.")
-        return KIS_COIN_CODE
+        if normalized and normalized != "USD":
+            raise serializers.ValidationError("Currency must be USD.")
+        return "USD"
 
     def create(self, validated_data):
         gallery_images = validated_data.pop("images", None)
@@ -1545,6 +1592,7 @@ class ShopServiceSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
+        data['currency'] = 'USD'
         data['availability'] = normalize_availability_payload(getattr(instance, 'availability', {}))
         if not self._user_can_view_remote_link(instance):
             data.pop('remote_meeting_link', None)
@@ -1653,14 +1701,27 @@ class ServiceRatingSerializer(serializers.ModelSerializer):
 
 
 class ServiceBookingPaymentSerializer(serializers.ModelSerializer):
+    amount_usd_label = serializers.SerializerMethodField()
+    payment_provider = serializers.SerializerMethodField()
+    payment_required = serializers.SerializerMethodField()
+    payment_intent_id = serializers.SerializerMethodField()
+    payment_url = serializers.SerializerMethodField()
+    currency_label = serializers.SerializerMethodField()
+
     class Meta:
         model = ServiceBookingPayment
         fields = (
             'id',
             'booking',
             'amount_cents',
+            'amount_usd_label',
             'currency',
+            'currency_label',
             'payment_method',
+            'payment_provider',
+            'payment_required',
+            'payment_intent_id',
+            'payment_url',
             'payment_status',
             'paid_at',
             'transaction_reference',
@@ -1670,6 +1731,27 @@ class ServiceBookingPaymentSerializer(serializers.ModelSerializer):
             'updated_at',
         )
         read_only_fields = fields
+
+    def get_amount_usd_label(self, obj):
+        return _usd_label_from_cents(obj.amount_cents)
+
+    def get_payment_provider(self, obj):
+        method = str(obj.payment_method or '').strip().lower()
+        return 'legacy_wallet' if method in {'wallet', 'kisc', 'kis_wallet'} else (method or 'flutterwave')
+
+    def get_payment_required(self, obj):
+        return str(obj.payment_status or '').strip().lower() == ServiceBookingPayment.STATUS_PENDING
+
+    def get_payment_intent_id(self, obj):
+        metadata = getattr(getattr(obj, 'booking', None), 'metadata', None)
+        return str((metadata or {}).get('direct_payment_intent_id') or '') or None
+
+    def get_payment_url(self, obj):
+        metadata = getattr(getattr(obj, 'booking', None), 'metadata', None)
+        return str((metadata or {}).get('payment_url') or '') or None
+
+    def get_currency_label(self, obj):
+        return _commerce_currency_label(obj.currency)
 
 
 class ServiceBookingSerializer(serializers.ModelSerializer):
@@ -1692,6 +1774,9 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
     remote_meeting_link = serializers.CharField(read_only=True)
     payment = serializers.SerializerMethodField()
     metadata = serializers.JSONField(read_only=True)
+    price_usd_label = serializers.SerializerMethodField()
+    deposit_usd_label = serializers.SerializerMethodField()
+    balance_usd_label = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceBooking
@@ -1709,8 +1794,11 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'schedule_label',
             'status',
             'price_cents',
+            'price_usd_label',
             'deposit_cents',
+            'deposit_usd_label',
             'balance_cents',
+            'balance_usd_label',
             'instructions',
             'metadata',
             'payment_tx_ref',
@@ -1722,6 +1810,9 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'escrow_id',
             'payment_status',
             'payment',
+            'price_usd_label',
+            'deposit_usd_label',
+            'balance_usd_label',
             'provider_completed_at',
             'payer_satisfied_at',
             'satisfaction_deadline',
@@ -1767,6 +1858,15 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'phone': getattr(user, 'phone', None),
             'email': getattr(user, 'email', None),
         }
+
+    def get_price_usd_label(self, obj):
+        return _usd_label_from_cents(obj.price_cents)
+
+    def get_deposit_usd_label(self, obj):
+        return _usd_label_from_cents(obj.deposit_cents)
+
+    def get_balance_usd_label(self, obj):
+        return _usd_label_from_cents(obj.balance_cents)
 
     def get_provider_details(self, obj):
         provider = obj.provider_user
@@ -2227,6 +2327,14 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
     items = MarketplaceOrderItemSerializer(many=True, read_only=True)
     buyer_info = serializers.SerializerMethodField()
     shop_info = serializers.SerializerMethodField()
+    total_amount_cents = serializers.SerializerMethodField()
+    total_usd_label = serializers.SerializerMethodField()
+    currency_label = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    payment_provider = serializers.SerializerMethodField()
+    payment_required = serializers.SerializerMethodField()
+    payment_intent_id = serializers.SerializerMethodField()
+    payment_url = serializers.SerializerMethodField()
 
     class Meta:
         model = MarketplaceOrder
@@ -2237,8 +2345,16 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
             'shop',
             'shop_info',
             'total_amount',
+            'total_amount_cents',
+            'total_usd_label',
             'currency',
+            'currency_label',
             'status',
+            'payment_status',
+            'payment_provider',
+            'payment_required',
+            'payment_intent_id',
+            'payment_url',
             'metadata',
             'items',
             'created_at',
@@ -2265,6 +2381,40 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
             'slug': shop.slug,
         }
 
+    def get_total_amount_cents(self, obj):
+        try:
+            return int((Decimal(str(obj.total_amount or 0)) * Decimal('100')).quantize(Decimal('1')))
+        except Exception:
+            return 0
+
+    def get_total_usd_label(self, obj):
+        return _usd_label_from_cents(self.get_total_amount_cents(obj))
+
+    def get_currency_label(self, obj):
+        return _commerce_currency_label(obj.currency, obj.metadata if isinstance(obj.metadata, dict) else {})
+
+    def get_payment_status(self, obj):
+        meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(meta.get('payment_status') or ('paid' if obj.buyer_debit_transaction_id else 'pending'))
+
+    def get_payment_provider(self, obj):
+        meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(meta.get('payment_provider') or meta.get('payment_method') or ('legacy_wallet' if obj.buyer_debit_transaction_id else 'flutterwave'))
+
+    def get_payment_required(self, obj):
+        meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+        if 'payment_required' in meta:
+            return bool(meta.get('payment_required'))
+        return not bool(obj.buyer_debit_transaction_id)
+
+    def get_payment_intent_id(self, obj):
+        meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(meta.get('direct_payment_intent_id') or '') or None
+
+    def get_payment_url(self, obj):
+        meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(meta.get('payment_url') or '') or None
+
 
 class MarketplaceOrderItemCreateSerializer(serializers.Serializer):
     product_id = serializers.UUIDField()
@@ -2279,6 +2429,7 @@ class MarketplaceOrderCreateSerializer(serializers.Serializer):
     shop_id = serializers.UUIDField()
     items = MarketplaceOrderItemCreateSerializer(many=True)
     metadata = serializers.JSONField(required=False)
+    payment_method = serializers.CharField(required=False, allow_blank=True)
 
 
 class MarketplaceComplaintSerializer(serializers.ModelSerializer):

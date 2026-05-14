@@ -10,6 +10,15 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 
+def _public_currency_label(value) -> str:
+    code = str(value or '').strip().upper()
+    if code == 'USD':
+        return 'USD'
+    if code in {'KISC', 'KIS'}:
+        return 'Historical promotional credits'
+    return code or 'USD'
+
+
 def _draw_wave_gold(c, page_w, page_h):
     gold1 = colors.Color(0.93, 0.79, 0.47)
     gold2 = colors.Color(0.78, 0.61, 0.30)
@@ -81,6 +90,7 @@ def render_marketplace_receipt_pdf(order):
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     page_w, page_h = letter
+    currency_label = _public_currency_label(getattr(order, 'currency', 'USD'))
 
     _draw_watercolor(c, page_w, page_h)
     _draw_wave_gold(c, page_w, page_h)
@@ -88,7 +98,7 @@ def render_marketplace_receipt_pdf(order):
 
     c.setFillColor(colors.HexColor('#1E1E1E'))
     c.setFont('Helvetica-Bold', 20)
-    c.drawString(60, page_h - 90, 'KISC Marketplace Receipt')
+    c.drawString(60, page_h - 90, 'Marketplace Receipt')
     c.setFont('Helvetica', 11)
     buyer_label = getattr(order.buyer, 'get_full_name', None)
     if callable(buyer_label):
@@ -99,7 +109,7 @@ def render_marketplace_receipt_pdf(order):
     c.drawString(60, page_h - 131, f'Buyer: {buyer_label}')
     c.drawString(60, page_h - 147, f'Provider: {order.shop.name}')
     c.drawString(60, page_h - 163, f'Status: {order.get_status_display()}')
-    c.drawString(60, page_h - 179, f'Total: {order.total_amount:.2f} {order.currency or "KISC"}')
+    c.drawString(60, page_h - 179, f'Total: {order.total_amount:.2f} {currency_label}')
 
     c.setStrokeColor(colors.HexColor('#D8D8D8'))
     c.line(60, page_h - 190, page_w - 60, page_h - 190)
@@ -133,7 +143,7 @@ def render_marketplace_receipt_pdf(order):
     subtotal = Decimal(order.total_amount or 0)
     c.setFont('Helvetica-Bold', 13)
     c.drawString(60, y, 'Subtotal')
-    c.drawRightString(page_w - 60, y, f'{subtotal:.2f} {order.currency or "KISC"}')
+    c.drawRightString(page_w - 60, y, f'{subtotal:.2f} {currency_label}')
     y -= 18
 
     tax = Decimal('0.00')
@@ -143,7 +153,7 @@ def render_marketplace_receipt_pdf(order):
 
     c.setFont('Helvetica-Bold', 14)
     c.drawString(60, y, 'Grand Total')
-    c.drawRightString(page_w - 60, y, f'{(subtotal + tax):.2f} {order.currency or "KISC"}')
+    c.drawRightString(page_w - 60, y, f'{(subtotal + tax):.2f} {currency_label}')
 
     c.setFont('Helvetica', 10)
     timestamp = order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else 'N/A'

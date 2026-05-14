@@ -45,6 +45,11 @@ provider paths, owners, and non-secret command output here.
 | React Native runtime QA executed                 | Device/simulator checklist evidence                           | Checklist exists                                                    | Evidence needed                               |
 | Nest Firebase/Google `uuid` risk reviewed        | Reachability, controls, owner, expiry                         | Risk documented; no safe forced major override applied              | Evidence needed                               |
 | Alerting routes configured                       | Alert test evidence                                           | Runbooks define escalation placeholders                             | Evidence needed                               |
+| Verification provider sandbox evidence          | Dojah/Sumsub/Smile ID sandbox runbook outputs                 | Runbook exists in `VERIFICATION_PROVIDER_SANDBOX_RUNBOOK.md`        | Evidence needed                               |
+| Verification webhook signature replay passed    | Safe replay output without secrets                            | Local checker command exists                                        | Evidence needed                               |
+| Verification staff review QA passed             | Staff queue, audit, badge issue/revoke proof                  | Staff APIs exist; QA checklist exists                               | Evidence needed                               |
+| Verification badge display QA passed            | Profile/shop/partner/health/education screenshots             | Frontend badge UI exists                                            | Evidence needed                               |
+| Verification private media evidence passed      | Private media deny/allow proof for evidence references        | Checklist exists                                                    | Evidence needed                               |
 
 ## Phase 16 Launch Evidence Register
 
@@ -178,6 +183,7 @@ Django:
 python3 manage.py check
 python3 manage.py verify_deployment_security --target-production --strict
 python3 manage.py makemigrations --check --dry-run
+python3 manage.py verification_provider_readiness
 python3 scripts/security/verify_ops_readiness.py
 ```
 
@@ -217,3 +223,4 @@ Do not launch if any of these are unresolved:
 - critical/high dependency advisories are unreviewed;
 - React Native `ci:launch` fails;
 - production verifiers fail for non-local reasons.
+- verification provider sandbox/replay evidence is missing while live verification is enabled.

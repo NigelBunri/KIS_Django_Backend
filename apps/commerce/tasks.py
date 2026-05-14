@@ -21,6 +21,7 @@ from .services import (
     build_recommendations,
     satisfy_marketplace_order,
 )
+from apps.verification.services import sync_shop_verification_request
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ def enqueue_shop_verification(self, request_id):
     req = ShopVerificationRequest.objects.get(id=request_id)
     req.status = 'IN_REVIEW'
     req.save()
+    sync_shop_verification_request(verification_request=req)
     try:
         result = run_shop_verification_checks(req)
         req.status = result.get('status', 'APPROVED')
@@ -39,13 +41,20 @@ def enqueue_shop_verification(self, request_id):
         if req.status == 'APPROVED':
             shop = req.shop
             shop.is_verified = True
+            shop.verification_status = 'VERIFIED'
             tb = list(set(shop.trust_badges + result.get('badges', [])))
+            tb = list(set(tb + ['kyc', 'verified-shop']))
             shop.trust_badges = tb
-            shop.save()
+            shop.save(update_fields=['is_verified', 'verification_status', 'trust_badges', 'updated_at'])
+        elif req.status == 'REJECTED' and not req.shop.is_verified:
+            req.shop.verification_status = 'REJECTED'
+            req.shop.save(update_fields=['verification_status', 'updated_at'])
+        sync_shop_verification_request(verification_request=req)
         return result
     except Exception as exc:
         req.status = 'ERROR'
         req.save()
+        sync_shop_verification_request(verification_request=req)
         raise self.retry(exc=exc, countdown=10)
 
 

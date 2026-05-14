@@ -137,6 +137,7 @@ class ProfileSerializer(serializers.ModelSerializer):
     user = serializers.PrimaryKeyRelatedField(read_only=True)
     avatar_url = serializers.SerializerMethodField()
     cover_url = serializers.SerializerMethodField()
+    verification_summary = serializers.SerializerMethodField()
     avatar_file = serializers.ImageField(write_only=True, required=False, allow_null=True)
     cover_file = serializers.ImageField(write_only=True, required=False, allow_null=True)
 
@@ -149,6 +150,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             "cover_url",
             "avatar_file",
             "cover_file",
+            "verification_summary",
             "headline",
             "bio",
             "industry",
@@ -173,6 +175,12 @@ class ProfileSerializer(serializers.ModelSerializer):
             url = obj.cover_file.url
             return request.build_absolute_uri(url) if request else url
         return absolutize_backend_media(obj.cover_url, request=self.context.get("request")) or None
+
+    def get_verification_summary(self, obj: Profile) -> dict:
+        from apps.verification.constants import VerificationSubjectType
+        from apps.verification.services import verification_summary
+
+        return verification_summary(VerificationSubjectType.USER, obj.user_id)
 
     def validate_avatar_url(self, value):
         return normalize_image_payload(value)
@@ -450,6 +458,7 @@ class ProfileShowcaseSerializer(serializers.ModelSerializer):
 # -------------------------------------------------------------------
 class UserSerializer(serializers.ModelSerializer):
     profile = ProfileSerializer(read_only=True)
+    verification_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -498,6 +507,12 @@ class UserSerializer(serializers.ModelSerializer):
                 attrs["phone_number"] = None
 
         return attrs
+
+    def get_verification_summary(self, obj: User) -> dict:
+        from apps.verification.constants import VerificationSubjectType
+        from apps.verification.services import verification_summary
+
+        return verification_summary(VerificationSubjectType.USER, obj.id)
 
 
 class UserCreateSerializer(serializers.ModelSerializer):

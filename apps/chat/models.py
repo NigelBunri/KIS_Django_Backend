@@ -253,6 +253,16 @@ class ConversationMember(models.Model):
     )
 
     is_muted = models.BooleanField(default=False)
+    is_pinned = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Per-user chat-list pin state.",
+    )
+    is_hidden = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Per-user delete-for-me state. Hidden memberships are omitted from the main chat list.",
+    )
     is_blocked = models.BooleanField(
         default=False,
         help_text="If true, user shouldn't receive messages from this conversation.",
@@ -280,6 +290,8 @@ class ConversationMember(models.Model):
             models.Index(fields=['conversation', 'base_role']),
             models.Index(fields=['user', 'notification_level']),
             models.Index(fields=['conversation', 'last_read_seq']),
+            models.Index(fields=['user', 'is_pinned']),
+            models.Index(fields=['user', 'is_hidden']),
         ]
 
     def __str__(self) -> str:

@@ -138,6 +138,15 @@ from apps.partners.services import (
     get_partner_organization_apps_for_user,
     filter_partner_channels_for_user,
 )
+from apps.verification.constants import VerificationSubjectType
+from apps.verification.models import VerificationCase
+from apps.verification.serializers import PartnerVerificationReviewSerializer, PartnerVerificationStartSerializer
+from apps.verification.services import (
+    current_partner_verification_status,
+    review_partner_case,
+    serialize_case_status,
+    start_partner_verification_case,
+)
 
 import logging
 
@@ -275,6 +284,8 @@ class PartnerViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         base_qs = Partner.objects.select_related("owner", "main_conversation")
+        if user.is_staff:
+            return base_qs
         if self.action in {"apply", "subscribe"}:
             return base_qs.filter(is_active=True)
 
@@ -2285,6 +2296,79 @@ class PartnerViewSet(viewsets.ModelViewSet):
             request=request,
         )
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="verification-status")
+    def verification_status(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view partner verification status.")
+        return Response(current_partner_verification_status(partner), status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="verification/start")
+    def verification_start(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.settings.manage")
+        serializer = PartnerVerificationStartSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        case = start_partner_verification_case(
+            partner=partner,
+            actor=request.user,
+            provider=serializer.validated_data.get("provider") or "",
+            evidence_metadata=serializer.validated_data.get("evidence_metadata") or {},
+        )
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.verification.start",
+            target_type="verification_case",
+            target_id=str(case.id) if case else "",
+            request=request,
+        )
+        return Response(
+            {
+                "case": serialize_case_status(case),
+                "status": current_partner_verification_status(partner),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="verification/cases/(?P<case_id>[^/.]+)/review")
+    def verification_review(self, request, pk=None, case_id=None):
+        partner = self.get_object()
+        if not request.user.is_staff:
+            raise PermissionDenied("Only staff reviewers can review partner verification cases.")
+        case = VerificationCase.objects.select_related("subject").filter(
+            id=case_id,
+            subject__subject_type=VerificationSubjectType.PARTNER,
+            subject__subject_id=partner.id,
+        ).first()
+        if not case:
+            raise ValidationError({"case_id": "Invalid partner verification case."})
+        serializer = PartnerVerificationReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        case, badges = review_partner_case(
+            case=case,
+            actor=request.user,
+            action=serializer.validated_data["action"],
+            notes=serializer.validated_data.get("notes", ""),
+            badge_codes=serializer.validated_data.get("badge_codes") or None,
+        )
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.verification.review",
+            target_type="verification_case",
+            target_id=str(case.id),
+            metadata={"review_action": serializer.validated_data["action"], "badge_codes": [badge.code for badge in badges]},
+            request=request,
+        )
+        return Response(
+            {
+                "case": serialize_case_status(case),
+                "badges": [{"code": badge.code, "label": badge.label, "level": badge.level} for badge in badges],
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["get"], url_path="public-hub")
     def public_hub(self, request, pk=None):

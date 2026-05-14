@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 from datetime import timedelta
 
+from django.conf import settings
 from django.db import models, transaction
 from django.utils import timezone
 
@@ -257,6 +258,8 @@ def refund_locked_booking_funds(
 
 
 def convert_cash_to_credits(user: User, amount_cents: int) -> ConversionResult:
+    if not getattr(settings, "KIS_LEGACY_CASH_CREDIT_CONVERSION_ENABLED", False):
+        raise ValueError("Cash-to-credit conversion is disabled. KIS promotional credits cannot be bought or converted from wallet value.")
     if amount_cents <= 0:
         raise ValueError("Amount must be greater than 0.")
     credits = cents_to_credits(amount_cents)
@@ -278,6 +281,8 @@ def convert_cash_to_credits(user: User, amount_cents: int) -> ConversionResult:
 
 
 def convert_credits_to_cash(user: User, credits: int) -> ConversionResult:
+    if not getattr(settings, "KIS_LEGACY_CASH_CREDIT_CONVERSION_ENABLED", False):
+        raise ValueError("Credit-to-cash conversion is disabled. KIS promotional credits are not redeemable for cash.")
     if credits <= 0:
         raise ValueError("Credits must be greater than 0.")
     amount_cents = credits_to_cents(credits)
@@ -326,6 +331,8 @@ def transfer_balance(
     amount_cents: int = 0,
     credits: int = 0,
 ) -> Tuple[WalletLedgerEntry, WalletLedgerEntry]:
+    if not getattr(settings, "KIS_LEGACY_WALLET_TRANSFER_ENABLED", False):
+        raise ValueError("Peer-to-peer wallet and promotional-credit transfers are disabled.")
     if amount_cents <= 0 and credits <= 0:
         raise ValueError("Amount or credits must be greater than 0.")
     if sender.id == recipient.id:

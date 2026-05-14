@@ -21,13 +21,13 @@ import logging
 from apps.accounts.tiers import get_user_tier, get_feature_limit, normalize_limit_value
 from apps.notifications import services as notification_services
 from apps.billing.documents import build_booking_receipt_urls
+from apps.billing.direct_payments import create_direct_payment_intent
 from apps.billing.services import lock_wallet_funds_for_booking, release_locked_booking_funds, refund_locked_booking_funds
-from apps.core.money import frontend_kisc_major_to_usd_cents, parse_decimal_amount
+from apps.core.money import parse_decimal_amount
 
 from .availability import format_date_key, get_day_key, normalize_availability_payload
 from .category_catalog import ensure_catalog_categories
 from .documents import render_marketplace_receipt_pdf
-from .constants import KIS_COIN_CODE
 from .models import (
     Shop,
     ShopVerificationRequest,
@@ -68,6 +68,8 @@ from .services import (
     create_marketplace_complaint_from_data,
     _provider_can_manage_shop,
 )
+from apps.verification.serializers import validate_private_evidence_metadata
+from apps.verification.services import sync_shop_verification_request
 from .serializers import (
     ShopSerializer,
     ShopVerificationRequestSerializer,
@@ -114,7 +116,19 @@ def _decimal_from_value(value):
 
 
 def _to_cents(amount: Decimal) -> int:
-    return int(frontend_kisc_major_to_usd_cents(amount) or 0)
+    return int((amount * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _commerce_wallet_checkout_enabled() -> bool:
+    return bool(getattr(settings, "KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED", False))
+
+
+def _commerce_default_payment_provider() -> str:
+    return str(getattr(settings, "KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER", "flutterwave") or "flutterwave").strip().lower()
+
+
+def _is_legacy_wallet_method(value: object) -> bool:
+    return str(value or "").strip().lower() in {"wallet", "kisc", "kis_wallet", "wallet_balance"}
 
 
 def _resolve_service_package_option(service, package_name):
@@ -238,7 +252,7 @@ def _record_booking_receipt(booking, amount_cents, transaction_reference, phase)
     return ServiceBookingReceipt.objects.create(
         booking=booking,
         amount_cents=amount_cents,
-        currency=KIS_COIN_CODE,
+        currency="USD",
         transaction_reference=transaction_reference or "",
         phase=phase,
     )
@@ -684,7 +698,12 @@ class ShopViewSet(viewsets.ModelViewSet):
     def request_verification(self, request, pk=None):
         shop = self.get_object()
         data = request.data
-        svr = ShopVerificationRequest.objects.create(shop=shop, requested_by=request.user, documents=data.get('documents', []))
+        documents = data.get('documents', [])
+        validate_private_evidence_metadata({"documents": documents})
+        svr = ShopVerificationRequest.objects.create(shop=shop, requested_by=request.user, documents=documents)
+        shop.verification_status = 'PENDING'
+        shop.save(update_fields=['verification_status', 'updated_at'])
+        sync_shop_verification_request(verification_request=svr, actor=request.user)
         enqueue_shop_verification.delay(str(svr.id))
         return Response({'status': 'verification_requested', 'id': svr.id})
 
@@ -713,20 +732,29 @@ class ShopVerificationRequestViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=['post'])
     def review(self, request, pk=None):
+        if not request.user.is_staff:
+            raise PermissionDenied("Only staff reviewers can review shop verification requests.")
         req = self.get_object()
         action_name = request.data.get('action')
         notes = request.data.get('notes', '')
         if action_name == 'approve':
             req.status = 'APPROVED'
             req.shop.is_verified = True
-            req.shop.trust_badges = list(set(req.shop.trust_badges + ['kyc']))
-            req.shop.save()
+            req.shop.verification_status = 'VERIFIED'
+            req.shop.trust_badges = sorted(set((req.shop.trust_badges or []) + ['kyc', 'verified-shop']))
+            req.shop.save(update_fields=['is_verified', 'verification_status', 'trust_badges', 'updated_at'])
         elif action_name == 'reject':
             req.status = 'REJECTED'
+            if not req.shop.is_verified:
+                req.shop.verification_status = 'REJECTED'
+                req.shop.save(update_fields=['verification_status', 'updated_at'])
+        else:
+            raise ValidationError({'action': 'Use approve or reject.'})
         req.reviewer_notes = notes
         req.processed_at = timezone.now()
         req.save()
-        return Response({'status': 'reviewed', 'new_status': req.status})
+        case = sync_shop_verification_request(verification_request=req, actor=request.user, notes=notes)
+        return Response({'status': 'reviewed', 'new_status': req.status, 'verification_case_id': str(case.id) if case else None})
 
 
 @class_doc_decorator('Products')
@@ -1383,8 +1411,28 @@ class ServiceBookingViewSet(
 
         tx_ref = str(uuid.uuid4())
         wallet_locked = False
+        requested_payment_method = (
+            serializer.validated_data.get("payment_method")
+            or request.data.get("payment_method")
+            or request.data.get("paymentMethod")
+            or _commerce_default_payment_provider()
+        )
+        requested_payment_method = str(requested_payment_method or _commerce_default_payment_provider()).strip().lower()
+        if _is_legacy_wallet_method(requested_payment_method) and not _commerce_wallet_checkout_enabled():
+            return Response(
+                {
+                    "detail": "Commerce wallet/KIS Coin checkout is disabled. Use USD checkout with Flutterwave or another configured payment provider.",
+                    "code": "legacy_commerce_wallet_checkout_disabled",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         try:
-            if not skip_payment and deposit_cents > 0:
+            if (
+                not skip_payment
+                and deposit_cents > 0
+                and _is_legacy_wallet_method(requested_payment_method)
+                and _commerce_wallet_checkout_enabled()
+            ):
                 lock_wallet_funds_for_booking(
                     user=request.user,
                     amount_cents=_wallet_amount(deposit_cents),
@@ -1416,7 +1464,13 @@ class ServiceBookingViewSet(
                     instructions=instructions or "",
                     payment_tx_ref=tx_ref,
                     remote_meeting_link=service.remote_meeting_link or "",
-                    metadata=booking_metadata,
+                    metadata={
+                        **booking_metadata,
+                        "currency": "USD",
+                        "payment_method": requested_payment_method,
+                        "payment_provider": requested_payment_method,
+                        "payment_required": bool(not skip_payment and deposit_cents > 0),
+                    },
                 )
                 if wallet_locked:
                     ServiceBookingEscrow.objects.create(
@@ -1430,6 +1484,7 @@ class ServiceBookingViewSet(
                     ServiceBookingPayment.objects.create(
                         booking=booking,
                         amount_cents=deposit_cents,
+                        currency="USD",
                         payment_method="wallet",
                         payment_status=ServiceBookingPayment.STATUS_PAID,
                         paid_at=timezone.now(),
@@ -1442,6 +1497,31 @@ class ServiceBookingViewSet(
                             tx_ref,
                             ServiceBookingReceipt.PHASE_DEPOSIT,
                         )
+                elif not skip_payment and deposit_cents > 0:
+                    payment = ServiceBookingPayment.objects.create(
+                        booking=booking,
+                        amount_cents=deposit_cents,
+                        currency="USD",
+                        payment_method=requested_payment_method,
+                        payment_status=ServiceBookingPayment.STATUS_PENDING,
+                        transaction_reference=tx_ref,
+                        notes="USD provider checkout pending.",
+                    )
+                    intent = create_direct_payment_intent(
+                        user=request.user,
+                        target_type="service_booking_payment",
+                        target_id=payment.id,
+                        provider=requested_payment_method,
+                        metadata={"source": "service_booking_deposit", "booking_id": str(booking.id)},
+                    )
+                    booking.metadata = {
+                        **(booking.metadata or {}),
+                        "payment_reference": intent.tx_ref,
+                        "direct_payment_intent_id": str(intent.id),
+                        "payment_url": intent.payment_url,
+                    }
+                    booking.payment_tx_ref = intent.tx_ref
+                    booking.save(update_fields=["payment_tx_ref", "metadata"])
         except Exception as exc:
             logger.error(
                 "ServiceBook/create failed user=%s service=%s error=%s",
@@ -1709,23 +1789,38 @@ class ServiceBookingViewSet(
             return Response({"detail": "There is no remaining amount to pay."}, status=status.HTTP_400_BAD_REQUEST)
 
         tx_ref = str(uuid.uuid4())
-        try:
-            lock_wallet_funds_for_booking(
-                user=request.user,
-                amount_cents=_wallet_amount(remaining),
-                reference=tx_ref,
-                meta={"service_id": str(booking.service_id), "phase": "remaining"},
+        requested_payment_method = str(
+            request.data.get("payment_method")
+            or request.data.get("paymentMethod")
+            or _commerce_default_payment_provider()
+        ).strip().lower()
+        legacy_wallet_payment = _is_legacy_wallet_method(requested_payment_method)
+        if legacy_wallet_payment and not _commerce_wallet_checkout_enabled():
+            return Response(
+                {
+                    "detail": "Commerce wallet/KIS Coin checkout is disabled. Use USD checkout with Flutterwave or another configured payment provider.",
+                    "code": "legacy_commerce_wallet_checkout_disabled",
+                },
+                status=status.HTTP_403_FORBIDDEN,
             )
-        except ValueError as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        if legacy_wallet_payment and _commerce_wallet_checkout_enabled():
+            try:
+                lock_wallet_funds_for_booking(
+                    user=request.user,
+                    amount_cents=_wallet_amount(remaining),
+                    reference=tx_ref,
+                    meta={"service_id": str(booking.service_id), "phase": "remaining"},
+                )
+            except ValueError as exc:
+                return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             with transaction.atomic():
                 escrow = getattr(booking, "escrow", None)
-                if escrow:
+                if legacy_wallet_payment and escrow:
                     escrow.amount_cents += remaining
                     escrow.save(update_fields=["amount_cents"])
-                else:
+                elif legacy_wallet_payment:
                     ServiceBookingEscrow.objects.create(
                         booking=booking,
                         payer=booking.user,
@@ -1735,29 +1830,61 @@ class ServiceBookingViewSet(
                         payment_reference=tx_ref,
                     )
                 payment = getattr(booking, "payment", None)
+                direct_intent = None
                 if payment:
                     payment.amount_cents += remaining
                     transaction_ref = payment.transaction_reference or ""
                     payment.transaction_reference = (
                         f"{transaction_ref},{tx_ref}" if transaction_ref else tx_ref
                     )
-                    payment.payment_status = ServiceBookingPayment.STATUS_PAID
-                    payment.paid_at = timezone.now()
-                    payment.save(update_fields=["amount_cents", "transaction_reference", "payment_status", "paid_at"])
+                    payment.currency = "USD"
+                    payment.payment_method = "wallet" if legacy_wallet_payment else requested_payment_method
+                    payment.payment_status = ServiceBookingPayment.STATUS_PAID if legacy_wallet_payment else ServiceBookingPayment.STATUS_PENDING
+                    payment.paid_at = timezone.now() if legacy_wallet_payment else None
+                    payment.notes = "" if legacy_wallet_payment else "USD provider checkout pending."
+                    payment.save(update_fields=["amount_cents", "currency", "payment_method", "transaction_reference", "payment_status", "paid_at", "notes"])
                 else:
-                    ServiceBookingPayment.objects.create(
+                    payment = ServiceBookingPayment.objects.create(
                         booking=booking,
                         amount_cents=remaining,
-                        payment_method="wallet",
-                        payment_status=ServiceBookingPayment.STATUS_PAID,
-                        paid_at=timezone.now(),
+                        currency="USD",
+                        payment_method="wallet" if legacy_wallet_payment else requested_payment_method,
+                        payment_status=ServiceBookingPayment.STATUS_PAID if legacy_wallet_payment else ServiceBookingPayment.STATUS_PENDING,
+                        paid_at=timezone.now() if legacy_wallet_payment else None,
                         transaction_reference=tx_ref,
+                        notes="" if legacy_wallet_payment else "USD provider checkout pending.",
                     )
-                booking.deposit_cents = (booking.deposit_cents or 0) + remaining
-                booking.balance_cents = 0
-                booking.payment_tx_ref = tx_ref
-                booking.save(update_fields=["deposit_cents", "balance_cents", "payment_tx_ref"])
-                if remaining > 0:
+                if not legacy_wallet_payment:
+                    direct_intent = create_direct_payment_intent(
+                        user=request.user,
+                        target_type="service_booking_payment",
+                        target_id=payment.id,
+                        provider=requested_payment_method,
+                        metadata={"source": "service_booking_remaining", "booking_id": str(booking.id)},
+                    )
+                    payment.transaction_reference = direct_intent.tx_ref
+                    payment.save(update_fields=["transaction_reference", "updated_at"])
+                if legacy_wallet_payment:
+                    booking.deposit_cents = (booking.deposit_cents or 0) + remaining
+                    booking.balance_cents = 0
+                booking.payment_tx_ref = direct_intent.tx_ref if direct_intent else tx_ref
+                booking.metadata = {
+                    **(booking.metadata or {}),
+                    "remaining_payment_method": requested_payment_method,
+                    "remaining_payment_provider": requested_payment_method,
+                    "remaining_payment_required": not legacy_wallet_payment,
+                    **(
+                        {
+                            "payment_reference": direct_intent.tx_ref,
+                            "direct_payment_intent_id": str(direct_intent.id),
+                            "payment_url": direct_intent.payment_url,
+                        }
+                        if direct_intent
+                        else {}
+                    ),
+                }
+                booking.save(update_fields=["deposit_cents", "balance_cents", "payment_tx_ref", "metadata"])
+                if legacy_wallet_payment and remaining > 0:
                     _record_booking_receipt(
                         booking,
                         remaining,
@@ -1772,14 +1899,18 @@ class ServiceBookingViewSet(
                 str(exc),
                 exc_info=True,
             )
-            refund_locked_booking_funds(
-                payer=request.user,
-                amount_cents=_wallet_amount(remaining),
-                reference=tx_ref,
-            )
+            if legacy_wallet_payment:
+                refund_locked_booking_funds(
+                    payer=request.user,
+                    amount_cents=_wallet_amount(remaining),
+                    reference=tx_ref,
+                )
             raise ValidationError({"detail": "Unable to complete the remaining payment."})
 
-        return Response({"status": "remaining_paid"}, status=status.HTTP_200_OK)
+        return Response(
+            {"status": "remaining_paid" if legacy_wallet_payment else "payment_pending", "payment_method": requested_payment_method},
+            status=status.HTTP_200_OK,
+        )
 
 
 @class_doc_decorator('Service Booking Complaints')
@@ -1813,6 +1944,11 @@ class ServiceBookingPaymentSatisfyView(APIView):
         booking = payment.booking
         if booking.user_id != request.user.id:
             raise PermissionDenied("Only the payer can mark a payment as satisfied.")
+        if str(payment.payment_status or "").lower() != ServiceBookingPayment.STATUS_PAID:
+            return Response(
+                {"detail": "Payment must be paid before satisfaction can be confirmed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         escrow = getattr(booking, "escrow", None)
         amount = escrow.amount_cents if escrow else booking.deposit_cents or 0
         if escrow and escrow.status == ServiceBookingEscrow.STATUS_RELEASED:
@@ -1887,6 +2023,8 @@ class MarketplaceOrderViewSet(
         validated = serializer.validated_data
         metadata = dict(validated.get('metadata') or {})
         metadata.setdefault('source', 'product_details')
+        if validated.get('payment_method'):
+            metadata['payment_method'] = validated.get('payment_method')
         try:
             order = place_marketplace_order(
                 buyer=request.user,

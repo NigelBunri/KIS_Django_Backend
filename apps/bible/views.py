@@ -16,6 +16,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.exceptions import ValidationError
+from apps.notifications.realtime import notify_main_tab_badges_updated
 
 from .models import (
     BibleTranslation,
@@ -731,7 +732,32 @@ class BibleReadingPlanEventViewSet(viewsets.ModelViewSet):
         translation = serializer.validated_data.get("translation")
         if translation:
             get_public_translation(translation.code)
-        serializer.save(user=self.request.user)
+        event = serializer.save(user=self.request.user)
+        notify_main_tab_badges_updated(
+            [str(self.request.user.id)],
+            source="bible",
+            reason="reading_event_created",
+            extra={"reading_event_id": str(event.id)},
+        )
+
+    def perform_update(self, serializer):
+        event = serializer.save()
+        notify_main_tab_badges_updated(
+            [str(self.request.user.id)],
+            source="bible",
+            reason="reading_event_updated",
+            extra={"reading_event_id": str(event.id)},
+        )
+
+    def perform_destroy(self, instance):
+        event_id = str(instance.id)
+        instance.delete()
+        notify_main_tab_badges_updated(
+            [str(self.request.user.id)],
+            source="bible",
+            reason="reading_event_deleted",
+            extra={"reading_event_id": event_id},
+        )
 
     @action(detail=False, methods=["post"], url_path="from-selection")
     def from_selection(self, request):
@@ -770,6 +796,12 @@ class BibleReadingPlanEventViewSet(viewsets.ModelViewSet):
         event = serializer.save(user=request.user)
         event.verses.set(verses)
         event.chapters.set(chapters)
+        notify_main_tab_badges_updated(
+            [str(request.user.id)],
+            source="bible",
+            reason="reading_event_created",
+            extra={"reading_event_id": str(event.id), "source": "from_selection"},
+        )
         return Response(self.get_serializer(event).data, status=status.HTTP_201_CREATED)
 
 

@@ -75,6 +75,7 @@ class PartnerListSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSer
     deactivated_at = serializers.DateTimeField(read_only=True)
     grace_expires_at = serializers.DateTimeField(read_only=True)
     can_reactivate = serializers.SerializerMethodField()
+    verification_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = Partner
@@ -88,6 +89,7 @@ class PartnerListSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSer
             "deactivated_at",
             "grace_expires_at",
             "can_reactivate",
+            "verification_summary",
             "main_conversation_id",
             "member_role",
             "created_at",
@@ -115,6 +117,11 @@ class PartnerListSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSer
             return False
         return obj.deactivation_source != Partner.DeactivationSource.SYSTEM
 
+    def get_verification_summary(self, obj):
+        from apps.verification.services import current_partner_verification_status
+
+        return current_partner_verification_status(obj)
+
 
 class PartnerJoinConfigSerializer(serializers.ModelSerializer):
     class Meta:
@@ -139,6 +146,7 @@ class PartnerDiscoverSerializer(PartnerImageUrlSerializerMixin, serializers.Mode
     join_config = PartnerJoinConfigSerializer(read_only=True)
     membership_status = serializers.SerializerMethodField()
     application_status = serializers.SerializerMethodField()
+    verification_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = Partner
@@ -153,6 +161,7 @@ class PartnerDiscoverSerializer(PartnerImageUrlSerializerMixin, serializers.Mode
             "join_config",
             "membership_status",
             "application_status",
+            "verification_summary",
             "created_at",
             "updated_at",
         ]
@@ -173,6 +182,11 @@ class PartnerDiscoverSerializer(PartnerImageUrlSerializerMixin, serializers.Mode
         application = PartnerApplication.objects.filter(partner=obj, user=user).order_by("-created_at").first()
         return application.status if application else None
 
+    def get_verification_summary(self, obj):
+        from apps.verification.services import current_partner_verification_status
+
+        return current_partner_verification_status(obj)
+
 
 class PartnerDetailSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSerializer):
     main_conversation_id = serializers.UUIDField(
@@ -181,6 +195,7 @@ class PartnerDetailSerializer(PartnerImageUrlSerializerMixin, serializers.ModelS
     )
     admins = serializers.SerializerMethodField()
     member_role = serializers.SerializerMethodField()
+    verification_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = Partner
@@ -198,6 +213,7 @@ class PartnerDetailSerializer(PartnerImageUrlSerializerMixin, serializers.ModelS
             "main_conversation_id",
             "admins",
             "member_role",
+            "verification_summary",
             "created_at",
             "updated_at",
         ]
@@ -252,6 +268,11 @@ class PartnerDetailSerializer(PartnerImageUrlSerializerMixin, serializers.ModelS
             left_at__isnull=True,
         ).first()
         return member.base_role if member else None
+
+    def get_verification_summary(self, obj):
+        from apps.verification.services import current_partner_verification_status
+
+        return current_partner_verification_status(obj)
 
 
 class PartnerCreateSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSerializer):
@@ -1021,6 +1042,8 @@ class PartnerSettingSerializer(serializers.ModelSerializer):
 
 
 class PartnerOrganizationProfileSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSerializer):
+    verification_summary = serializers.SerializerMethodField()
+
     class Meta:
         model = PartnerOrganizationProfile
         fields = [
@@ -1041,10 +1064,16 @@ class PartnerOrganizationProfileSerializer(PartnerImageUrlSerializerMixin, seria
             "brand_colors",
             "social_links",
             "public_fields",
+            "verification_summary",
             "updated_by",
             "updated_at",
         ]
         read_only_fields = ["partner", "updated_by", "updated_at"]
+
+    def get_verification_summary(self, obj):
+        from apps.verification.services import current_partner_verification_status
+
+        return current_partner_verification_status(obj.partner)
 
 
 class PartnerOrganizationAppSerializer(serializers.ModelSerializer):

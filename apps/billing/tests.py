@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -12,11 +13,14 @@ from rest_framework.test import APIClient
 
 from apps.accounts.models import AccountTier, Subscription
 from apps.billing.models import WalletLedgerEntry, WalletTransaction
+from apps.billing.serializers import WalletAccountSerializer, WalletLedgerEntrySerializer
 from apps.billing.services import get_credit_account, get_wallet_account, transfer_balance, upgrade_with_credits
 from apps.billing.views import _parse_frontend_money_to_cents
 
 
 User = get_user_model()
+BACKEND_BILLING_ROOT = Path(__file__).resolve().parent
+REACT_NATIVE_ROOT = Path("/Users/nigel/dev/KIS")
 
 
 def _api_url(route_name: str) -> str:
@@ -47,6 +51,7 @@ class BillingWalletFlowTests(TestCase):
             phone_number="677000111",
         )
 
+    @override_settings(KIS_LEGACY_WALLET_TRANSFER_ENABLED=True)
     def test_transfer_service_moves_value_one_way(self):
         sender_wallet = get_wallet_account(self.sender)
         sender_wallet.balance_cents = 10_000
@@ -68,6 +73,7 @@ class BillingWalletFlowTests(TestCase):
         self.assertEqual(inbound.kind, "transfer_in")
         self.assertEqual(inbound.amount_cents, 2_500)
 
+    @override_settings(KIS_LEGACY_WALLET_TRANSFER_ENABLED=True)
     def test_transfer_endpoint_accepts_local_phone_without_country_code(self):
         sender_wallet = get_wallet_account(self.sender)
         sender_wallet.balance_cents = 5_000
@@ -103,6 +109,116 @@ class BillingWalletFlowTests(TestCase):
     def test_amount_cents_passthrough_stays_unchanged(self):
         self.assertEqual(_parse_frontend_money_to_cents({"amount_cents": 1250}), 1250)
 
+    def test_transfer_endpoint_disabled_by_default(self):
+        self.client.force_authenticate(self.sender)
+        res = self.client.post(
+            _api_url("wallet-transfer"),
+            {
+                "recipient_id": str(self.recipient.id),
+                "amount_cents": 500,
+            },
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res.data.get("code"), "legacy_financial_flow_disabled")
+        self.assertEqual(WalletLedgerEntry.objects.filter(kind__in=["transfer_in", "transfer_out"]).count(), 0)
+
+    def test_deposit_endpoint_disabled_by_default(self):
+        self.client.force_authenticate(self.sender)
+        res = self.client.post(
+            _api_url("wallet-deposit"),
+            {"amount_cents": 1000, "provider": "flutterwave"},
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res.data.get("code"), "legacy_financial_flow_disabled")
+        self.assertEqual(WalletTransaction.objects.filter(meta__intent="wallet_topup").count(), 0)
+
+    def test_cash_credit_conversion_endpoint_disabled_by_default(self):
+        self.client.force_authenticate(self.sender)
+        res = self.client.post(
+            _api_url("wallet-convert"),
+            {"direction": "cash_to_credits", "amount_cents": 1000},
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res.data.get("code"), "legacy_financial_flow_disabled")
+
+    def test_wallet_serializer_reframes_legacy_kisc_fields_as_promotional_credits(self):
+        wallet = get_wallet_account(self.sender)
+        wallet.balance_cents = 10_000
+        wallet.save(update_fields=["balance_cents", "updated_at"])
+
+        data = WalletAccountSerializer(wallet).data
+
+        self.assertEqual(data["balance_kisc_label"], "1.00 promotional credits")
+        self.assertEqual(data["promotional_credit_label"], "1.00 promotional credits")
+        self.assertIsNone(data["balance_usd_label"])
+        self.assertFalse(data["can_buy_promotional_credits"])
+        self.assertFalse(data["can_transfer_promotional_credits"])
+        self.assertFalse(data["can_convert_promotional_credits_to_cash"])
+        serialized = str(dict(data))
+        self.assertNotIn("KISC", serialized)
+        self.assertNotIn("KIS Coin", serialized)
+
+    def test_ledger_serializer_exposes_promotional_credit_labels_without_exchange_copy(self):
+        entry = WalletLedgerEntry.objects.create(
+            user=self.sender,
+            kind="promo",
+            amount_cents=0,
+            credits_delta=25,
+            balance_after_cents=0,
+            credits_after=25,
+            reference="promo:PHASE2",
+        )
+
+        data = WalletLedgerEntrySerializer(entry).data
+
+        self.assertEqual(data["amount_promotional_credit_label"], "0.00 promotional credits")
+        self.assertEqual(data["credits_delta_label"], "+25 promotional credits")
+        serialized = str(dict(data))
+        self.assertNotIn("KISC", serialized)
+        self.assertNotIn("KIS Coin", serialized)
+
+    def test_phase2_public_wallet_copy_does_not_reintroduce_exchange_or_transfer_language(self):
+        backend_files = [
+            BACKEND_BILLING_ROOT / "serializers.py",
+            BACKEND_BILLING_ROOT / "promotional_credits.py",
+        ]
+        frontend_files = [
+            REACT_NATIVE_ROOT / "src/screens/tabs/profile-screen/WalletModal.tsx",
+            REACT_NATIVE_ROOT / "src/screens/tabs/profile/useProfileController.ts",
+            REACT_NATIVE_ROOT / "src/screens/tabs/ProfileScreen.tsx",
+            REACT_NATIVE_ROOT / "src/screens/tabs/profile/profile/sheets/UpgradeSheet.tsx",
+            REACT_NATIVE_ROOT / "src/screens/tabs/profile/components/dashboard/ProfileDashboardBlocks.tsx",
+        ]
+        files = backend_files + [path for path in frontend_files if path.exists()]
+        disallowed = [
+            "1 KISC",
+            "Add KIS Coins",
+            "Send KIS Coins",
+            "Manage your KIS Coin wallet",
+            "KIS Coin confirmation",
+            "Not enough KIS Coins",
+            "Verify the recipient first before sending KIS Coins",
+        ]
+
+        matches: list[str] = []
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            for needle in disallowed:
+                if needle in text:
+                    matches.append(f"{path}: {needle}")
+
+        self.assertEqual(matches, [])
+
+    @override_settings(KIS_LEGACY_WALLET_TRANSFER_ENABLED=True)
     def test_transfer_endpoint_rejects_self_transfer(self):
         self.client.force_authenticate(self.sender)
         res = self.client.post(
@@ -118,6 +234,7 @@ class BillingWalletFlowTests(TestCase):
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(res.data.get("detail"), "You cannot transfer to your own account.")
 
+    @override_settings(KIS_LEGACY_WALLET_TRANSFER_ENABLED=True)
     def test_transfer_endpoint_rejects_unverified_phone(self):
         self.client.force_authenticate(self.sender)
         res = self.client.post(
@@ -232,7 +349,7 @@ class CheckContactApiTests(TestCase):
         self.assertEqual(str(res.data.get("userId")), str(self.target.id))
 
 
-@override_settings(SECURE_SSL_REDIRECT=False)
+@override_settings(SECURE_SSL_REDIRECT=False, KIS_LEGACY_WALLET_TRANSFER_ENABLED=True)
 class WalletTransferPayloadValidationTests(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -563,6 +680,29 @@ class WalletUpgradeApiTests(TestCase):
         self.assertIsNotNone(active)
         self.assertEqual(active.tier_id, tier.id)
 
+    def test_upgrade_endpoint_rejects_wallet_payment_by_default(self):
+        tier, _ = AccountTier.objects.get_or_create(
+            name="Phase5 Pro Wallet Disabled",
+            defaults={"price_cents": 100},
+        )
+        tier.price_cents = 100
+        tier.save(update_fields=["price_cents", "updated_at"])
+
+        wallet = get_wallet_account(self.user)
+        wallet.balance_cents = 500
+        wallet.save(update_fields=["balance_cents", "updated_at"])
+
+        res = self.client.post(
+            _api_url("wallet-upgrade"),
+            {"tier": str(tier.id), "payment_method": "kisc"},
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res.data.get("code"), "legacy_financial_flow_disabled")
+        self.assertFalse(Subscription.objects.filter(user=self.user, status="active").exists())
+
     def test_upgrade_endpoint_rejects_same_or_lower_tier(self):
         current_tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Business Current",
@@ -716,7 +856,7 @@ class WalletUpgradeApiTests(TestCase):
         self.assertEqual(tx.meta.get("intent"), "tier_upgrade")
 
 
-@override_settings(SECURE_SSL_REDIRECT=False)
+@override_settings(SECURE_SSL_REDIRECT=False, KIS_LEGACY_WALLET_TRANSFER_ENABLED=True)
 class WalletHistoryManagementApiTests(TestCase):
     def setUp(self):
         self.client = APIClient()

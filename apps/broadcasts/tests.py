@@ -1,17 +1,38 @@
 import json
 import tempfile
+import uuid
+from io import StringIO
 from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.contrib import admin
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
+from django.db import IntegrityError, transaction
 from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from apps.accounts.models import Profile
+from apps.billing.direct_payments import reconcile_direct_payment_callback
+from apps.billing.models import DirectPaymentIntent
 from apps.broadcasts.models import (
+    BroadcastChannel,
+    BroadcastChannelRole,
+    BroadcastChannelSubscription,
+    BroadcastPlaylist,
+    ChannelContent,
+    ChannelContentAsset,
+    ChannelContentEmbed,
+    ChannelContentComment,
+    ChannelAnalyticsDailyRollup,
+    ChannelEmbedPolicy,
+    ChannelContentReaction,
+    ChannelContentSave,
+    ChannelModerationRecord,
     BroadcastFeedProfile,
     BroadcastEngagementEvent,
     BroadcastItem,
+    BroadcastPlaylist,
     BroadcastMarketProfile,
     BroadcastSourceType,
     BroadcastVideo,
@@ -19,6 +40,15 @@ from apps.broadcasts.models import (
     EducationInstitutionBroadcast,
     EducationInstitutionEvent,
 )
+from apps.broadcasts.serializers import BroadcastChannelDetailSerializer, BroadcastChannelSummarySerializer
+from apps.verification.constants import VerificationBadgeCode, VerificationSubjectType
+from apps.verification.models import VerificationBadge, VerificationCase
+from apps.verification.services import (
+    current_education_institution_verification_status,
+    review_education_institution_case,
+    start_education_institution_verification_case,
+)
+from apps.moderation.models import AuditLog as ModerationAuditLog, Flag as ModerationFlag
 from apps.broadcasts.feed_entry_store import (
     append_feed_entry,
     delete_feed_entry,
@@ -121,6 +151,743 @@ class BroadcastFeedPaginationHelperTests(SimpleTestCase):
         self.assertEqual(_decode_feed_cursor('20'), 20)
         self.assertEqual(_decode_feed_cursor('-10'), 0)
         self.assertEqual(_decode_feed_cursor('not-a-cursor'), 0)
+
+
+class BroadcastChannelModelTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            phone='5557000001',
+            username='channel_owner',
+            password='secret',
+            country='NG',
+        )
+        self.viewer = User.objects.create_user(
+            phone='5557000002',
+            username='channel_viewer',
+            password='secret',
+            country='NG',
+        )
+
+    def _create_channel(self, **overrides):
+        payload = {
+            'owner_type': BroadcastChannel.OwnerType.USER,
+            'owner_id': self.user.id,
+            'owner_user': self.user,
+            'handle': 'kis-channel',
+            'display_name': 'KIS Channel',
+            'description': 'Public creator home',
+            'settings': {'private_email': 'owner@example.com', 'default_tab': 'home'},
+        }
+        payload.update(overrides)
+        return BroadcastChannel.objects.create(**payload)
+
+    def test_channel_handle_uniqueness_is_enforced_case_insensitively(self):
+        self._create_channel(handle='kis-channel')
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._create_channel(handle='KIS-CHANNEL')
+
+    def test_subscription_uniqueness_is_enforced(self):
+        channel = self._create_channel()
+        BroadcastChannelSubscription.objects.create(channel=channel, user=self.viewer)
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                BroadcastChannelSubscription.objects.create(channel=channel, user=self.viewer)
+
+    def test_public_serializer_hides_private_owner_details(self):
+        channel = self._create_channel()
+        BroadcastPlaylist.objects.create(channel=channel, title='Launch playlist')
+        BroadcastChannelSubscription.objects.create(channel=channel, user=self.viewer)
+
+        summary = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+        detail = BroadcastChannelDetailSerializer(channel, context={'user': self.viewer}).data
+
+        self.assertNotIn('owner_id', summary)
+        self.assertNotIn('owner_user', summary)
+        self.assertNotIn('private_email', detail.get('settings') or {})
+        self.assertTrue(summary['is_subscribed'])
+        self.assertEqual(summary['viewer_role'], '')
+
+    def test_staff_admin_can_inspect_channel_records(self):
+        channel = self._create_channel()
+        self.assertIn(BroadcastChannel, admin.site._registry)
+        self.assertIn(BroadcastChannelSubscription, admin.site._registry)
+        self.assertIn(BroadcastPlaylist, admin.site._registry)
+
+        detail = BroadcastChannelDetailSerializer(channel, context={'user': self.user}).data
+        self.assertNotIn('owner_id', detail)
+        self.assertNotIn('owner_user', detail)
+
+
+class ChannelContentCompatibilityTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            phone='5557100001',
+            username='channel_content_owner',
+            password='secret',
+            country='NG',
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def _create_feed_entry(self, title='Launch Feed'):
+        response = self.client.post(
+            '/api/v1/broadcasts/profiles/feeds/',
+            {
+                'title': title,
+                'summary': 'A normalized content bridge test',
+                'media_type': 'text',
+                'text_plain': 'Bridge body',
+                'text_doc': json.dumps({'blocks': [{'text': 'Bridge body'}]}),
+            },
+            format='multipart',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return response
+
+    def test_creating_feed_entry_still_returns_old_feed_payload_without_content_row(self):
+        response = self._create_feed_entry()
+        feed = response.data.get('feed') or {}
+
+        self.assertIn('feed', response.data)
+        self.assertIn('feeds', response.data)
+        self.assertEqual(feed.get('title'), 'Launch Feed')
+        self.assertFalse(ChannelContent.objects.exists())
+
+    def test_broadcasting_feed_entry_creates_channel_content_and_keeps_old_payload(self):
+        create_response = self._create_feed_entry()
+        entry_id = create_response.data['feed']['id']
+
+        response = self.client.post(f'/api/v1/broadcasts/profiles/feeds/{entry_id}/broadcast/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        feed = response.data.get('feed') or {}
+        self.assertEqual(feed.get('id'), entry_id)
+        self.assertTrue(feed.get('channel_content_id'))
+        content = ChannelContent.objects.get(legacy_feed_entry_id=entry_id)
+        self.assertEqual(content.title, 'Launch Feed')
+        self.assertEqual(content.status, ChannelContent.Status.PUBLISHED)
+        self.assertEqual(content.created_by, self.user)
+        self.assertEqual(str(content.id), feed.get('channel_content_id'))
+
+    def test_editing_broadcast_feed_entry_updates_channel_content(self):
+        create_response = self._create_feed_entry()
+        entry_id = create_response.data['feed']['id']
+        self.client.post(f'/api/v1/broadcasts/profiles/feeds/{entry_id}/broadcast/')
+
+        response = self.client.patch(
+            f'/api/v1/broadcasts/profiles/feeds/{entry_id}/',
+            {
+                'title': 'Updated Launch Feed',
+                'summary': 'Updated summary',
+                'media_type': 'text',
+                'text_plain': 'Updated body',
+            },
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        content = ChannelContent.objects.get(legacy_feed_entry_id=entry_id)
+        self.assertEqual(content.title, 'Updated Launch Feed')
+        self.assertEqual(content.description, 'Updated summary')
+        self.assertEqual(content.text_plain, 'Updated body')
+
+    def test_delete_and_unbroadcast_archive_channel_content_without_hard_delete_row_removal(self):
+        create_response = self._create_feed_entry()
+        entry_id = create_response.data['feed']['id']
+        self.client.post(f'/api/v1/broadcasts/profiles/feeds/{entry_id}/broadcast/')
+
+        unbroadcast = self.client.delete(f'/api/v1/broadcasts/profiles/feeds/{entry_id}/unbroadcast/')
+        self.assertEqual(unbroadcast.status_code, status.HTTP_200_OK, unbroadcast.data)
+        content = ChannelContent.objects.get(legacy_feed_entry_id=entry_id)
+        self.assertEqual(content.status, ChannelContent.Status.ARCHIVED)
+        self.assertFalse(content.is_deleted)
+
+        delete_response = self.client.delete(f'/api/v1/broadcasts/profiles/feeds/{entry_id}/')
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+        content.refresh_from_db()
+        self.assertEqual(content.status, ChannelContent.Status.ARCHIVED)
+        self.assertTrue(content.is_deleted)
+
+
+class ChannelBackfillTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            phone='5557150001',
+            username='channel_backfill_owner',
+            password='secret',
+            country='NG',
+        )
+        self.entry_id = uuid.uuid4()
+        self.feed_profile = BroadcastFeedProfile.objects.create(
+            profile=self.user.profile,
+            payload={
+                'profile_name': 'Backfill Studio',
+                'feeds': [
+                    {
+                        'id': str(self.entry_id),
+                        'title': 'Backfill launch',
+                        'summary': 'Legacy feed summary',
+                        'media_type': 'image',
+                        'text_plain': 'Legacy feed body',
+                        'is_broadcast': True,
+                        'attachments': [
+                            {
+                                'media_type': 'image',
+                                'url': 'https://cdn.example.com/backfill.jpg',
+                                'thumbnail_url': 'https://cdn.example.com/backfill-thumb.jpg',
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        self.broadcast_item = BroadcastItem.objects.create(
+            source_type=BroadcastSourceType.BROADCAST_FEED_ENTRY,
+            source_id=str(self.entry_id),
+            broadcasted_by=self.user,
+            metadata={'title': 'Backfill launch'},
+        )
+
+    def test_backfill_dry_run_creates_nothing(self):
+        out = StringIO()
+        call_command('backfill_broadcast_channels', '--dry-run', '--limit', '20', stdout=out)
+
+        self.assertIn('mode=DRY-RUN', out.getvalue())
+        self.assertFalse(BroadcastChannel.objects.exists())
+        self.assertFalse(ChannelContent.objects.exists())
+
+    def test_backfill_apply_creates_channel_content_assets_and_links_broadcast_item(self):
+        out = StringIO()
+        call_command('backfill_broadcast_channels', '--apply', '--limit', '20', stdout=out)
+
+        self.assertIn('mode=APPLY', out.getvalue())
+        channel = BroadcastChannel.objects.get(owner_user=self.user)
+        content = ChannelContent.objects.get(channel=channel, legacy_feed_entry_id=self.entry_id)
+        self.assertEqual(content.title, 'Backfill launch')
+        self.assertEqual(content.status, ChannelContent.Status.PUBLISHED)
+        self.assertEqual(content.assets.count(), 1)
+        self.broadcast_item.refresh_from_db()
+        self.assertEqual(self.broadcast_item.metadata.get('channel_content_id'), str(content.id))
+
+    def test_backfill_apply_twice_is_idempotent_and_preserves_legacy_feed_api(self):
+        call_command('backfill_broadcast_channels', '--apply', '--limit', '20', stdout=StringIO())
+        call_command('backfill_broadcast_channels', '--apply', '--limit', '20', stdout=StringIO())
+
+        channel = BroadcastChannel.objects.get(owner_user=self.user)
+        self.assertEqual(ChannelContent.objects.filter(channel=channel, legacy_feed_entry_id=self.entry_id).count(), 1)
+        self.assertEqual(channel.contents.first().assets.count(), 1)
+
+        self.client.force_authenticate(user=self.user)
+        legacy_response = self.client.get('/api/v1/broadcasts/profiles/feeds/')
+        self.assertEqual(legacy_response.status_code, status.HTTP_200_OK, legacy_response.data)
+        self.assertEqual(legacy_response.data['feeds'][0]['id'], str(self.entry_id))
+        self.assertTrue(legacy_response.data['feeds'][0].get('channel_content_id'))
+
+        normalized_response = self.client.get(f'/api/v1/broadcasts/channels/{channel.id}/contents/')
+        self.assertEqual(normalized_response.status_code, status.HTTP_200_OK, normalized_response.data)
+        self.assertEqual(len(normalized_response.data['results']), 1)
+
+
+class BroadcastChannelApiTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5557200001',
+            username='api_channel_owner',
+            password='secret',
+            country='NG',
+        )
+        self.viewer = User.objects.create_user(
+            phone='5557200002',
+            username='api_channel_viewer',
+            password='secret',
+            country='NG',
+        )
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle='api-channel',
+            display_name='API Channel',
+            description='Public API channel',
+            is_public=True,
+        )
+        BroadcastChannelRole.objects.create(
+            channel=self.channel,
+            user=self.owner,
+            role=BroadcastChannelRole.Role.OWNER,
+        )
+
+    def test_anonymous_can_view_public_channel(self):
+        response = self.client.get('/api/v1/broadcasts/channels/api-channel/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data.get('handle'), 'api-channel')
+        self.assertNotIn('owner_id', response.data)
+
+    def test_anonymous_cannot_view_private_channel(self):
+        self.channel.is_public = False
+        self.channel.save(update_fields=['is_public'])
+
+        response = self.client.get(f'/api/v1/broadcasts/channels/{self.channel.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_user_can_create_own_channel_and_duplicate_handle_fails(self):
+        self.client.force_authenticate(user=self.viewer)
+        first = self.client.post(
+            '/api/v1/broadcasts/channels/',
+            {'handle': 'viewer-channel', 'display_name': 'Viewer Channel'},
+            format='json',
+        )
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+        self.assertTrue(BroadcastChannel.objects.filter(handle='viewer-channel', owner_user=self.viewer).exists())
+        created_id = first.data.get('id')
+        self.assertTrue(
+            BroadcastChannelRole.objects.filter(
+                channel_id=created_id,
+                user=self.viewer,
+                role=BroadcastChannelRole.Role.OWNER,
+            ).exists()
+        )
+
+        mine = self.client.get('/api/v1/broadcasts/channels/?mine=1')
+        self.assertEqual(mine.status_code, status.HTTP_200_OK, mine.data)
+        rows = mine.data.get('results', mine.data)
+        self.assertTrue(any(str(row.get('id')) == str(created_id) for row in rows))
+
+        second = self.client.post(
+            '/api/v1/broadcasts/channels/',
+            {'handle': 'VIEWER-channel', 'display_name': 'Duplicate'},
+            format='json',
+        )
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_non_manager_cannot_edit_channel_or_content(self):
+        content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='text',
+            title='Draft',
+            status=ChannelContent.Status.DRAFT,
+            visibility=ChannelContent.Visibility.PRIVATE,
+            created_by=self.owner,
+        )
+        self.client.force_authenticate(user=self.viewer)
+
+        channel_response = self.client.patch(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/',
+            {'display_name': 'Hijacked'},
+            format='json',
+        )
+        content_response = self.client.patch(
+            f'/api/v1/broadcasts/channel-contents/{content.id}/',
+            {'title': 'Hijacked'},
+            format='json',
+        )
+
+        self.assertEqual(channel_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(content_response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_subscribe_unsubscribe_changes_subscriber_count_idempotently(self):
+        self.client.force_authenticate(user=self.viewer)
+
+        first = self.client.post(f'/api/v1/broadcasts/channels/{self.channel.id}/subscribe/', {}, format='json')
+        second = self.client.post(f'/api/v1/broadcasts/channels/{self.channel.id}/subscribe/', {}, format='json')
+        self.channel.refresh_from_db()
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.assertEqual(self.channel.subscriber_count, 1)
+
+        bell = self.client.patch(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/subscription/',
+            {'notifications': 'all'},
+            format='json',
+        )
+        self.assertEqual(bell.status_code, status.HTTP_200_OK, bell.data)
+        self.assertEqual(bell.data.get('notifications'), 'all')
+
+        delete = self.client.delete(f'/api/v1/broadcasts/channels/{self.channel.id}/subscribe/')
+        repeat_delete = self.client.delete(f'/api/v1/broadcasts/channels/{self.channel.id}/subscribe/')
+        self.channel.refresh_from_db()
+        self.assertEqual(delete.status_code, status.HTTP_200_OK, delete.data)
+        self.assertEqual(repeat_delete.status_code, status.HTTP_200_OK, repeat_delete.data)
+        self.assertEqual(self.channel.subscriber_count, 0)
+
+    def test_public_content_list_excludes_drafts(self):
+        published = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='text',
+            title='Published',
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.owner,
+        )
+        draft = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='text',
+            title='Draft',
+            status=ChannelContent.Status.DRAFT,
+            visibility=ChannelContent.Visibility.PRIVATE,
+            created_by=self.owner,
+        )
+
+        response = self.client.get(f'/api/v1/broadcasts/channels/{self.channel.id}/contents/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        ids = {row.get('id') for row in response.data.get('results') or []}
+        self.assertIn(str(published.id), ids)
+        self.assertNotIn(str(draft.id), ids)
+
+    def test_owner_can_create_publish_asset_and_playlist(self):
+        self.client.force_authenticate(user=self.owner)
+        create = self.client.post(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/contents/',
+            {'content_type': 'text', 'title': 'Studio Draft', 'text_plain': 'Body'},
+            format='json',
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.data)
+        content_id = create.data.get('id')
+
+        asset = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{content_id}/assets/',
+            {'asset_type': 'image', 'url': 'https://example.com/image.jpg', 'caption': 'Cover'},
+            format='json',
+        )
+        self.assertEqual(asset.status_code, status.HTTP_201_CREATED, asset.data)
+
+        publish = self.client.post(f'/api/v1/broadcasts/channel-contents/{content_id}/publish/', {}, format='json')
+        self.assertEqual(publish.status_code, status.HTTP_200_OK, publish.data)
+        self.assertEqual(publish.data.get('status'), ChannelContent.Status.PUBLISHED)
+
+        playlist = self.client.post(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/playlists/',
+            {'title': 'Featured'},
+            format='json',
+        )
+        self.assertEqual(playlist.status_code, status.HTTP_201_CREATED, playlist.data)
+        self.assertTrue(BroadcastPlaylist.objects.filter(channel=self.channel, title='Featured').exists())
+
+    def test_owner_can_broadcast_and_unbroadcast_channel_idempotently(self):
+        self.client.force_authenticate(user=self.owner)
+
+        first = self.client.post(f'/api/v1/broadcasts/channels/{self.channel.id}/broadcast/', {}, format='json')
+        second = self.client.post(f'/api/v1/broadcasts/channels/{self.channel.id}/broadcast/', {}, format='json')
+
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.assertTrue(first.data.get('is_broadcast'))
+        self.assertEqual(
+            BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.BROADCAST_CHANNEL,
+                source_id=str(self.channel.id),
+                is_deleted=False,
+            ).count(),
+            1,
+        )
+
+        feed = self.client.get('/api/v1/broadcasts/?source_type=broadcast_channel')
+        self.assertEqual(feed.status_code, status.HTTP_200_OK, feed.data)
+        self.assertTrue(any(row.get('source_type') == 'broadcast_channel' for row in feed.data.get('results') or []))
+
+        delete = self.client.delete(f'/api/v1/broadcasts/channels/{self.channel.id}/broadcast/')
+        repeat_delete = self.client.delete(f'/api/v1/broadcasts/channels/{self.channel.id}/broadcast/')
+        self.assertEqual(delete.status_code, status.HTTP_200_OK, delete.data)
+        self.assertEqual(repeat_delete.status_code, status.HTTP_200_OK, repeat_delete.data)
+        self.assertFalse(delete.data.get('is_broadcast'))
+        self.assertFalse(
+            BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.BROADCAST_CHANNEL,
+                source_id=str(self.channel.id),
+                is_deleted=False,
+            ).exists()
+        )
+
+    def test_owner_can_broadcast_and_unbroadcast_channel_content_idempotently(self):
+        content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='text',
+            title='Promoted content',
+            text_plain='Channel content body',
+            status=ChannelContent.Status.DRAFT,
+            visibility=ChannelContent.Visibility.PRIVATE,
+            created_by=self.owner,
+        )
+        self.client.force_authenticate(user=self.owner)
+
+        first = self.client.post(f'/api/v1/broadcasts/channel-contents/{content.id}/broadcast/', {}, format='json')
+        second = self.client.post(f'/api/v1/broadcasts/channel-contents/{content.id}/broadcast/', {}, format='json')
+
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        content.refresh_from_db()
+        self.assertEqual(content.status, ChannelContent.Status.PUBLISHED)
+        self.assertEqual(content.visibility, ChannelContent.Visibility.PUBLIC)
+        self.assertTrue(first.data.get('is_broadcast'))
+        self.assertEqual(
+            BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.CHANNEL_CONTENT,
+                source_id=str(content.id),
+                is_deleted=False,
+            ).count(),
+            1,
+        )
+
+        feed = self.client.get('/api/v1/broadcasts/?source_type=channel_content')
+        self.assertEqual(feed.status_code, status.HTTP_200_OK, feed.data)
+        self.assertTrue(any(row.get('channel_content_id') == str(content.id) for row in feed.data.get('results') or []))
+
+        delete = self.client.delete(f'/api/v1/broadcasts/channel-contents/{content.id}/broadcast/')
+        repeat_delete = self.client.delete(f'/api/v1/broadcasts/channel-contents/{content.id}/broadcast/')
+        self.assertEqual(delete.status_code, status.HTTP_200_OK, delete.data)
+        self.assertEqual(repeat_delete.status_code, status.HTTP_200_OK, repeat_delete.data)
+        self.assertFalse(delete.data.get('is_broadcast'))
+        self.assertFalse(
+            BroadcastItem.objects.filter(
+                source_type=BroadcastSourceType.CHANNEL_CONTENT,
+                source_id=str(content.id),
+                is_deleted=False,
+            ).exists()
+        )
+
+    def test_non_manager_cannot_broadcast_channel_or_content(self):
+        content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='text',
+            title='Private',
+            status=ChannelContent.Status.DRAFT,
+            visibility=ChannelContent.Visibility.PRIVATE,
+            created_by=self.owner,
+        )
+        self.client.force_authenticate(user=self.viewer)
+
+        channel_response = self.client.post(f'/api/v1/broadcasts/channels/{self.channel.id}/broadcast/', {}, format='json')
+        content_response = self.client.post(f'/api/v1/broadcasts/channel-contents/{content.id}/broadcast/', {}, format='json')
+
+        self.assertEqual(channel_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(content_response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@override_settings(
+    KIS_EMBEDS_ENABLED=True,
+    KIS_PUBLIC_EMBED_BASE_URL='https://kis.example.com',
+    KIS_EMBED_SIGNING_SECRET='test-embed-secret',
+)
+class ChannelEmbedTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5557300001',
+            username='embed_owner',
+            password='secret',
+            country='NG',
+        )
+        self.viewer = User.objects.create_user(
+            phone='5557300002',
+            username='embed_viewer',
+            password='secret',
+            country='NG',
+        )
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle='embed-channel',
+            display_name='Embed Channel',
+            is_public=True,
+        )
+        BroadcastChannelRole.objects.create(
+            channel=self.channel,
+            user=self.owner,
+            role=BroadcastChannelRole.Role.OWNER,
+        )
+        self.content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='video',
+            title='Public embed',
+            description='Safe public description',
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            thumbnail_url='https://cdn.example.com/thumb.jpg',
+            metadata={'private_email': 'owner@example.com'},
+            created_by=self.owner,
+        )
+        ChannelContentAsset.objects.create(
+            content=self.content,
+            asset_type='video',
+            url='https://cdn.example.com/video.mp4',
+            storage_path='private/raw/video.mp4',
+            thumbnail_url='https://cdn.example.com/thumb.jpg',
+            mime_type='video/mp4',
+            width=1280,
+            height=720,
+        )
+
+    @override_settings(KIS_EMBEDS_ENABLED=False)
+    def test_embeds_are_disabled_by_default_flag(self):
+        response = self.client.get(f'/api/v1/broadcasts/embed/contents/{self.content.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_public_embed_response_excludes_private_metadata_and_storage_path(self):
+        response = self.client.get(
+            f'/api/v1/broadcasts/embed/contents/{self.content.id}/',
+            HTTP_ORIGIN='https://trusted.example.com',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data.get('title'), 'Public embed')
+        self.assertNotIn('metadata', response.data)
+        self.assertNotIn('storage_path', json.dumps(response.data))
+        self.assertNotIn('private_email', json.dumps(response.data))
+        self.assertIn('<iframe', response.data.get('embed_html') or '')
+
+    def test_oembed_returns_public_iframe_payload(self):
+        response = self.client.get(f'/api/v1/broadcasts/embed/contents/{self.content.id}/oembed/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data.get('version'), '1.0')
+        self.assertEqual(response.data.get('provider_name'), 'KIS')
+        self.assertIn(str(self.content.id), response.data.get('html') or '')
+
+    def test_blocked_domain_is_denied(self):
+        ChannelEmbedPolicy.objects.create(channel=self.channel, blocked_domains=['blocked.example.com'])
+
+        response = self.client.get(
+            f'/api/v1/broadcasts/embed/contents/{self.content.id}/',
+            HTTP_ORIGIN='https://blocked.example.com',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_private_content_requires_signed_token(self):
+        self.content.visibility = ChannelContent.Visibility.PRIVATE
+        self.content.status = ChannelContent.Status.DRAFT
+        self.content.save(update_fields=['visibility', 'status', 'updated_at'])
+        self.client.force_authenticate(user=self.owner)
+
+        denied = self.client.get(f'/api/v1/broadcasts/embed/contents/{self.content.id}/')
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        token_response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content.id}/embed-token/',
+            {'domain': 'trusted.example.com'},
+            format='json',
+        )
+        self.assertEqual(token_response.status_code, status.HTTP_201_CREATED, token_response.data)
+        self.assertTrue(ChannelContentEmbed.objects.filter(content=self.content, domain='trusted.example.com').exists())
+
+        token = token_response.data.get('token')
+        allowed = self.client.get(
+            f'/api/v1/broadcasts/embed/contents/{self.content.id}/?token={token}',
+            HTTP_ORIGIN='https://trusted.example.com',
+        )
+        self.assertEqual(allowed.status_code, status.HTTP_200_OK, allowed.data)
+
+
+class ChannelEngagementTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5557400001', username='engage_owner', password='secret', country='NG')
+        self.viewer = User.objects.create_user(phone='5557400002', username='engage_viewer', password='secret', country='NG')
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle='engage-channel',
+            display_name='Engage Channel',
+            is_public=True,
+        )
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.owner, role=BroadcastChannelRole.Role.OWNER)
+        self.content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='video',
+            title='Engage content',
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.owner,
+        )
+
+    def test_react_save_comment_share_and_view_update_counts(self):
+        self.client.force_authenticate(user=self.viewer)
+
+        react = self.client.post(f'/api/v1/broadcasts/channel-contents/{self.content.id}/react/', {'reaction': 'like'}, format='json')
+        save = self.client.post(f'/api/v1/broadcasts/channel-contents/{self.content.id}/save/', {}, format='json')
+        comment = self.client.post(f'/api/v1/broadcasts/channel-contents/{self.content.id}/comments/', {'body': 'Great upload'}, format='json')
+        share = self.client.post(f'/api/v1/broadcasts/channel-contents/{self.content.id}/share/', {'completed': True}, format='json')
+        view = self.client.post(f'/api/v1/broadcasts/channel-contents/{self.content.id}/view/', {'progress_seconds': 12}, format='json')
+
+        self.assertEqual(react.status_code, status.HTTP_200_OK, react.data)
+        self.assertEqual(save.status_code, status.HTTP_200_OK, save.data)
+        self.assertEqual(comment.status_code, status.HTTP_201_CREATED, comment.data)
+        self.assertEqual(share.status_code, status.HTTP_200_OK, share.data)
+        self.assertEqual(view.status_code, status.HTTP_200_OK, view.data)
+        self.assertTrue(ChannelContentReaction.objects.filter(content=self.content, user=self.viewer).exists())
+        self.assertTrue(ChannelContentSave.objects.filter(content=self.content, user=self.viewer).exists())
+        self.assertTrue(ChannelContentComment.objects.filter(content=self.content, user=self.viewer).exists())
+        self.content.refresh_from_db()
+        self.assertGreaterEqual(int(self.content.stats.get('views') or 0), 1)
+        self.assertGreaterEqual(int(self.content.stats.get('shares') or 0), 1)
+
+    def test_playlist_item_add_remove_requires_channel_manager(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='Featured')
+        self.client.force_authenticate(user=self.owner)
+
+        add = self.client.post(
+            f'/api/v1/broadcasts/playlists/{playlist.id}/items/',
+            {'content_id': str(self.content.id)},
+            format='json',
+        )
+        self.assertEqual(add.status_code, status.HTTP_201_CREATED, add.data)
+        self.assertEqual(playlist.items.count(), 1)
+
+        remove = self.client.delete(f'/api/v1/broadcasts/playlists/{playlist.id}/items/{self.content.id}/')
+        self.assertEqual(remove.status_code, status.HTTP_200_OK, remove.data)
+        self.assertEqual(playlist.items.count(), 0)
+
+    def test_channel_content_report_and_moderation_action_are_audited(self):
+        self.client.force_authenticate(user=self.viewer)
+        report = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content.id}/report/',
+            {'reason': 'Unsafe content'},
+            format='json',
+        )
+        self.assertEqual(report.status_code, status.HTTP_201_CREATED, report.data)
+        record = ChannelModerationRecord.objects.get(id=report.data['id'])
+        self.assertEqual(record.target_type, ChannelModerationRecord.TargetType.CONTENT)
+        self.assertTrue(ModerationFlag.objects.filter(target_id=self.content.id).exists())
+
+        self.client.force_authenticate(user=self.owner)
+        action = self.client.post(
+            f'/api/v1/broadcasts/channel-moderation/{record.id}/action/',
+            {'action': 'hide', 'notes': 'Hidden for review'},
+            format='json',
+        )
+        self.assertEqual(action.status_code, status.HTTP_200_OK, action.data)
+        record.refresh_from_db()
+        self.assertEqual(record.status, ChannelModerationRecord.Status.ACTIONED)
+        self.content.refresh_from_db()
+        self.assertEqual(self.content.visibility, ChannelContent.Visibility.PRIVATE)
+        self.assertTrue(ModerationAuditLog.objects.filter(action='channel_moderation.hide', target_id=record.target_id).exists())
+
+    def test_channel_analytics_endpoint_creates_rollup(self):
+        self.client.force_authenticate(user=self.viewer)
+        self.client.post(f'/api/v1/broadcasts/channel-contents/{self.content.id}/view/', {'progress_seconds': 23}, format='json')
+        self.client.post(f'/api/v1/broadcasts/channel-contents/{self.content.id}/comments/', {'body': 'Useful'}, format='json')
+
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.get(f'/api/v1/broadcasts/channels/{self.channel.id}/analytics/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIn('summary', response.data)
+        self.assertGreaterEqual(response.data['summary']['views'], 1)
+        self.assertTrue(ChannelAnalyticsDailyRollup.objects.filter(channel=self.channel, date=timezone.localdate()).exists())
 
 
 class BroadcastProfileManageTests(APITestCase):
@@ -267,6 +1034,42 @@ class BroadcastProfileManageTests(APITestCase):
         self.user.refresh_from_db()
         hidden_ids = self.user.preferences.get('hidden_broadcast_ids') or []
         self.assertEqual(hidden_ids.count(str(item.id)), 1)
+        self.assertTrue(
+            ModerationAuditLog.objects.filter(
+                action='broadcast.hide',
+                target_id=item.id,
+            ).exists()
+        )
+
+    def test_report_broadcast_creates_admin_visible_flag_and_audit_log(self):
+        item = BroadcastItem.objects.create(
+            source_type=BroadcastSourceType.BROADCAST_FEED_ENTRY,
+            source_id='feed-report-1',
+            broadcasted_by=self.user,
+            metadata={'entry': {'id': 'feed-report-1', 'title': 'Report me'}},
+        )
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/{item.id}/report/',
+            {'reason': 'Unsafe content', 'category': 'safety'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(response.data.get('reported'))
+        flag_id = response.data.get('flag_id')
+        self.assertTrue(flag_id)
+        flag = ModerationFlag.objects.get(id=flag_id)
+        self.assertEqual(flag.target_type, 'POST')
+        self.assertEqual(str(flag.target_id), str(item.id))
+        self.assertEqual(str(flag.reporter_id), str(self.user.id))
+        self.assertEqual((flag.tags or {}).get('surface'), 'broadcast_feed')
+        self.assertTrue(
+            ModerationAuditLog.objects.filter(
+                action='broadcast.report',
+                target_id=item.id,
+            ).exists()
+        )
 
     def test_save_broadcast_marks_viewer_saved_and_can_unsave(self):
         item = BroadcastItem.objects.create(
@@ -681,6 +1484,12 @@ class BroadcastProfileManageTests(APITestCase):
                 is_deleted=False,
             ).exists()
         )
+        self.assertTrue(
+            ModerationAuditLog.objects.filter(
+                action='broadcast.feed_entry.unbroadcast',
+                target_id=entry_id,
+            ).exists()
+        )
 
     def test_broadcast_feed_list_deduplicates_primary_attachment(self):
         duplicate_attachment = {
@@ -939,6 +1748,102 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         )
         self.client.force_authenticate(user=self.user)
 
+    def test_manager_can_start_education_verification_with_safe_metadata(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Verification Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution_id = create_response.data["institution"]["id"]
+
+        response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/verification/start/",
+            {
+                "provider": "sumsub",
+                "evidence_metadata": {
+                    "legal_registration": [{"private_media_id": "private-registration", "url": "https://example.com/reg.pdf"}],
+                    "accreditation": [{"private_media_id": "private-accreditation", "expires_at": "2028-12-31"}],
+                    "certificate_issuer_trust": [{"private_media_id": "private-issuer-proof"}],
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        case = VerificationCase.objects.get(id=response.data["case"]["id"])
+        self.assertEqual(case.subject.subject_type, VerificationSubjectType.EDUCATION_INSTITUTION)
+        self.assertEqual(case.evidence_metadata["legal_registration"][0]["private_media_id"], "private-registration")
+        self.assertNotIn("url", case.evidence_metadata["legal_registration"][0])
+
+    def test_education_verification_start_rejects_raw_document_payload(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Raw Payload Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution_id = create_response.data["institution"]["id"]
+
+        response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/verification/start/",
+            {"evidence_metadata": {"accreditation": [{"document_base64": "data:image/png;base64,abc123"}]}},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_staff_can_approve_education_case_and_issue_badges(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Accredited Academy"},
+            format="json",
+        )
+        institution = EducationInstitution.objects.get(id=create_response.data["institution"]["id"])
+        case = start_education_institution_verification_case(
+            institution=institution,
+            actor=self.user,
+            evidence_metadata={"accreditation": [{"private_media_id": "private-accreditation"}]},
+        )
+        User = get_user_model()
+        staff = User.objects.create_user(phone="5553034999", username="education_staff", password="secret", country="NG")
+        staff.is_staff = True
+        staff.save(update_fields=["is_staff"])
+        self.client.force_authenticate(user=staff)
+
+        response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution.id}/verification/cases/{case.id}/review/",
+            {"action": "approve"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        codes = set(
+            VerificationBadge.objects.filter(
+                subject__subject_type=VerificationSubjectType.EDUCATION_INSTITUTION,
+                subject__subject_id=institution.id,
+            ).values_list("code", flat=True)
+        )
+        self.assertIn(VerificationBadgeCode.VERIFIED_EDUCATION_INSTITUTION, codes)
+        self.assertIn(VerificationBadgeCode.ACCREDITED_EDUCATION, codes)
+        self.assertTrue(current_education_institution_verification_status(institution)["verified"])
+
+    def test_education_serializer_exposes_verification_summary(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Summary Academy"},
+            format="json",
+        )
+        institution_id = create_response.data["institution"]["id"]
+        institution = EducationInstitution.objects.get(id=institution_id)
+        case = start_education_institution_verification_case(institution=institution, actor=self.user, evidence_metadata={})
+        review_education_institution_case(case=case, actor=self.user, action="approve")
+
+        response = self.client.get(f"/api/v1/broadcasts/education/institutions/{institution_id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(response.data["institution"]["verification_summary"]["verified"])
+
     def test_institution_image_aliases_are_saved_and_returned(self):
         with override_settings(API_BASE_URL="http://10.112.162.99:8000", SITE_URL="http://10.112.162.99:8000"):
             response = self.client.post(
@@ -993,6 +1898,108 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
             response.data["broadcast"]["cover_image_url"],
             "http://10.112.162.99:8000/media/education/orientation.jpg",
         )
+
+    def test_education_paid_booking_defaults_to_usd_provider_pending(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "USD Provider Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution_id = create_response.data["institution"]["id"]
+        broadcast_response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
+            {
+                "broadcast_kind": "institution_notice",
+                "title": "Paid USD orientation",
+                "status": "published",
+                "priceAmount": "25.00",
+                "booking_enabled": True,
+            },
+            format="json",
+        )
+        self.assertEqual(broadcast_response.status_code, status.HTTP_201_CREATED, broadcast_response.data)
+        broadcast_id = broadcast_response.data["broadcast"]["id"]
+
+        booking_response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/{broadcast_id}/bookings/",
+            {"seat_count": 1},
+            format="json",
+        )
+        self.assertEqual(booking_response.status_code, status.HTTP_201_CREATED, booking_response.data)
+        booking = booking_response.data["booking"]
+        self.assertEqual(booking["amount_cents"], 2500)
+        self.assertEqual(booking["currency"], "USD")
+        self.assertTrue(booking["payment_required"])
+
+        payment_response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/{broadcast_id}/bookings/{booking['id']}/pay/",
+            {},
+            format="json",
+        )
+        self.assertEqual(payment_response.status_code, status.HTTP_200_OK, payment_response.data)
+        paid_booking = payment_response.data["booking"]
+        self.assertEqual(paid_booking["status"], "payment_pending")
+        self.assertEqual(paid_booking["currency"], "USD")
+        self.assertEqual(paid_booking["payment_provider"], "flutterwave")
+        self.assertEqual(paid_booking["payment_status"], "pending")
+        self.assertIsNotNone(paid_booking["payment_intent_id"])
+        self.assertIsNone(paid_booking["wallet_transaction_id"])
+
+        intent = DirectPaymentIntent.objects.get(id=paid_booking["payment_intent_id"])
+        self.assertEqual(intent.target_type, DirectPaymentIntent.TARGET_EDUCATION_BOOKING)
+        self.assertEqual(intent.amount_cents, 2500)
+
+        ok, result, _intent = reconcile_direct_payment_callback(
+            payload={"data": {"tx_ref": intent.tx_ref, "status": "successful", "id": "flw-education-001"}},
+            signature="",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(result, "paid")
+        refreshed = self.client.get(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/{broadcast_id}/bookings/{booking['id']}/",
+            format="json",
+        )
+        self.assertEqual(refreshed.status_code, status.HTTP_200_OK, refreshed.data)
+        self.assertEqual(refreshed.data["booking"]["payment_status"], "paid")
+        self.assertEqual(refreshed.data["booking"]["status"], "confirmed")
+
+    def test_education_wallet_checkout_is_disabled_by_default(self):
+        create_response = self.client.post(
+            "/api/v1/broadcasts/education/institutions/",
+            {"name": "Wallet Block Academy"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        institution_id = create_response.data["institution"]["id"]
+        broadcast_response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
+            {
+                "broadcast_kind": "institution_notice",
+                "title": "Paid blocked orientation",
+                "status": "published",
+                "priceAmount": "10.00",
+                "booking_enabled": True,
+            },
+            format="json",
+        )
+        self.assertEqual(broadcast_response.status_code, status.HTTP_201_CREATED, broadcast_response.data)
+        broadcast_id = broadcast_response.data["broadcast"]["id"]
+        booking_response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/{broadcast_id}/bookings/",
+            {},
+            format="json",
+        )
+        self.assertEqual(booking_response.status_code, status.HTTP_201_CREATED, booking_response.data)
+
+        payment_response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/{broadcast_id}/bookings/{booking_response.data['booking']['id']}/pay/",
+            {"payment_method": "wallet"},
+            format="json",
+        )
+
+        self.assertEqual(payment_response.status_code, status.HTTP_403_FORBIDDEN, payment_response.data)
+        self.assertEqual(payment_response.data["code"], "legacy_education_wallet_checkout_disabled")
 
     def test_education_broadcast_price_accepts_nested_price_object(self):
         create_response = self.client.post(

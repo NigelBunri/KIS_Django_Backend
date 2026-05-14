@@ -17,6 +17,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.broadcasts.models import BroadcastHealthInstitution
+from apps.verification.services import current_health_institution_verification_status
 
 from .models import (
     AnalyticsMetricType,
@@ -1351,6 +1352,7 @@ class HealthDashboardInstitutionListView(APIView):
         for institution, role, is_member, can_manage in _iter_accessible_broadcast_institutions(request.user):
             dashboard = _ensure_dashboard_row(institution)
             card = _serialize_institution_card(dashboard)
+            verification_summary = current_health_institution_verification_status(institution)
             results.append(
                 {
                     "institution_id": dashboard.institution_uid,
@@ -1363,6 +1365,8 @@ class HealthDashboardInstitutionListView(APIView):
                     "dashboard_id": str(dashboard.id),
                     "health_card": card,
                     "healthCard": card,
+                    "verification_summary": verification_summary,
+                    "verificationSummary": verification_summary,
                     "institution_name_clickable": bool(card.get("institutionNameClickable")),
                     "institutionNameClickable": bool(card.get("institutionNameClickable")),
                     "landing_page_url": card.get("landingPageUrl", ""),
@@ -1409,6 +1413,9 @@ class HealthDashboardInstitutionDetailView(APIView):
     def get(self, request, institution_id: str):
         _institution, dashboard, role, is_member, can_manage = self._resolve(request, institution_id)
         payload = _build_dashboard_schema(dashboard)
+        verification_summary = current_health_institution_verification_status(_institution)
+        payload["verification_summary"] = verification_summary
+        payload["verificationSummary"] = verification_summary
         payload["viewer"] = {
             "role": role,
             "is_member": is_member,

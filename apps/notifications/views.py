@@ -1,5 +1,8 @@
 # notifications/views.py
+import uuid
+
 from django.utils import timezone
+from django.db.models import Q
 from rest_framework import viewsets, status, serializers
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -10,7 +13,9 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
 from . import models, serializers as srl, services
+from .badge_counts import get_main_tab_badge_counts
 from .permissions import IsOwnerOrReadOnly
+from .realtime import notify_main_tab_badges_updated
 
 # -------------------------
 # Small request/response serializers for docs
@@ -30,6 +35,7 @@ class CreateNotificationRequestSerializer(serializers.Serializer):
     dedup_key = serializers.CharField(max_length=255, required=False, allow_null=True)
     title = serializers.CharField(required=False, allow_blank=True)
     body = serializers.CharField(required=False, allow_blank=True)
+    source = serializers.CharField(required=False, allow_blank=True)
     target_type = serializers.CharField(max_length=64, required=False, allow_blank=True)
     target_id = serializers.UUIDField(required=False, allow_null=True)
 
@@ -56,6 +62,19 @@ class MarkReadResponseSerializer(serializers.Serializer):
 
 class UnreadCountResponseSerializer(serializers.Serializer):
     unread_count = serializers.IntegerField()
+
+
+class MainTabBadgeCountsResponseSerializer(serializers.Serializer):
+    counts = serializers.DictField(child=serializers.IntegerField())
+    sources = serializers.DictField(child=serializers.CharField())
+    total = serializers.IntegerField()
+
+
+class MarkSourceReadRequestSerializer(serializers.Serializer):
+    source = serializers.CharField(required=False, allow_blank=True)
+    target_type = serializers.CharField(required=False, allow_blank=True)
+    target_id = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    types = serializers.ListField(child=serializers.CharField(), required=False)
 
 
 # -------------------------
@@ -96,6 +115,12 @@ class NotificationViewSet(viewsets.ModelViewSet):
         if not notif.is_deleted:
             notif.is_deleted = True
             notif.save(update_fields=["is_deleted", "updated_at"])
+            notify_main_tab_badges_updated(
+                [str(request.user.id)],
+                source="notifications",
+                reason="deleted",
+                extra={"notification_id": str(notif.id)},
+            )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     # ------------------------------------------
@@ -113,6 +138,12 @@ class NotificationViewSet(viewsets.ModelViewSet):
         """
         notif = self.get_object()
         notif.mark_read()
+        notify_main_tab_badges_updated(
+            [str(request.user.id)],
+            source="notifications",
+            reason="mark_read",
+            extra={"notification_id": str(notif.id)},
+        )
         resp = {"id": notif.id, "is_read": notif.is_read, "read_at": notif.read_at}
         return Response(MarkReadResponseSerializer(resp).data)
 
@@ -137,6 +168,13 @@ class NotificationViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         ids = serializer.validated_data.get("ids", [])
         updated = models.Notification.objects.filter(user_id=request.user.id, id__in=ids).update(is_read=True, read_at=timezone.now())
+        if updated:
+            notify_main_tab_badges_updated(
+                [str(request.user.id)],
+                source="notifications",
+                reason="bulk_mark_read",
+                extra={"updated": int(updated)},
+            )
         return Response({"updated": updated})
 
     @swagger_auto_schema(
@@ -153,6 +191,100 @@ class NotificationViewSet(viewsets.ModelViewSet):
             is_read=True,
             read_at=timezone.now(),
         )
+        if updated:
+            notify_main_tab_badges_updated(
+                [str(request.user.id)],
+                source="notifications",
+                reason="mark_all_read",
+                extra={"updated": int(updated)},
+        )
+        return Response({"updated": updated})
+
+    @swagger_auto_schema(
+        operation_id="notifications_mark_source_read",
+        operation_description=(
+            "Mark notifications read for a source/target group. Used by tab surfaces when content is opened "
+            "so backend-backed badge counts decrement immediately."
+        ),
+        request_body=MarkSourceReadRequestSerializer,
+        responses={200: openapi.Response("Updated count", schema=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={"updated": openapi.Schema(type=openapi.TYPE_INTEGER)}
+        ))},
+    )
+    @action(detail=False, methods=["post"], url_path="mark-source-read")
+    def mark_source_read(self, request):
+        serializer = MarkSourceReadRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        source = str(data.get("source") or "").strip().lower()
+        target_type = str(data.get("target_type") or "").strip()
+        target_id_raw = data.get("target_id")
+        target_id = None
+        if target_id_raw:
+            try:
+                target_id = uuid.UUID(str(target_id_raw))
+            except (TypeError, ValueError):
+                return Response({"updated": 0})
+        types = [str(value).strip() for value in data.get("types") or [] if str(value).strip()]
+
+        qs = models.Notification.objects.filter(user_id=request.user.id, is_deleted=False, is_read=False)
+        filters = []
+        if target_type:
+            target_aliases = {
+                "education_content": ("education_content", "course", "lesson", "education"),
+                "health_institution": ("health_institution", "health", "institution"),
+                "shop_service": ("shop_service", "service", "market_service"),
+                "shop": ("shop", "market_shop"),
+                "partner_community": ("partner_community", "community", "partner"),
+                "partner_group": ("partner_group", "community_group", "group"),
+            }.get(target_type.lower(), (target_type,))
+            target_query = Q()
+            for alias in target_aliases:
+                target_query |= Q(target_type__iexact=alias)
+            filters.append(target_query)
+        if target_id:
+            filters.append(Q(target_id=target_id))
+        if types:
+            filters.append(Q(type__in=types))
+        if source:
+            source_tokens = {
+                "bible": ("bible", "reading", "meditation", "devotional", "daily"),
+                "broadcast": ("broadcast", "channel", "course", "lesson", "product", "market", "shop", "event", "education", "health", "institution"),
+                "messages": ("message", "chat", "conversation"),
+                "partners": ("partner", "community"),
+                "profile": ("profile", "account", "verification", "general"),
+                "education": ("education", "course", "lesson", "school", "institution"),
+                "health": ("health", "medical", "appointment", "institution"),
+                "market": ("market", "shop", "product", "service", "order"),
+            }.get(source, (source,))
+            source_query = Q()
+            for token in source_tokens:
+                source_query |= (
+                    Q(type__icontains=token)
+                    | Q(title__icontains=token)
+                    | Q(body__icontains=token)
+                    | Q(target_type__icontains=token)
+                    | Q(context_data__source__iexact=token)
+                    | Q(context_data__badge_source__iexact=token)
+                )
+            filters.append(source_query)
+
+        if not filters:
+            return Response({"updated": 0})
+
+        combined = filters[0]
+        for query in filters[1:]:
+            combined &= query
+
+        updated = qs.filter(combined).update(is_read=True, read_at=timezone.now())
+        if updated:
+            notify_main_tab_badges_updated(
+                [str(request.user.id)],
+                source=source or target_type or "notifications",
+                reason="source_mark_read",
+                extra={"updated": int(updated), "target_type": target_type, "target_id": str(target_id or "")},
+            )
         return Response({"updated": updated})
 
     @swagger_auto_schema(
@@ -164,6 +296,16 @@ class NotificationViewSet(viewsets.ModelViewSet):
     def unread_count(self, request):
         count = models.Notification.objects.filter(user_id=request.user.id, is_deleted=False, is_read=False).count()
         return Response({"unread_count": count})
+
+    @swagger_auto_schema(
+        operation_id="notifications_main_tab_badge_counts",
+        operation_description="Return backend-backed unread badge counts for the main mobile bottom tabs.",
+        responses={200: MainTabBadgeCountsResponseSerializer()},
+    )
+    @action(detail=False, methods=["get"], url_path="main-tab-badge-counts")
+    def main_tab_badge_counts(self, request):
+        payload = get_main_tab_badge_counts(request.user).as_dict()
+        return Response(MainTabBadgeCountsResponseSerializer(payload).data)
 
     # ------------------------------------------
     # Create notification (internal service entrypoint)
@@ -200,6 +342,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
             dedup_key=payload.get("dedup_key"),
             title=payload.get("title"),
             body=payload.get("body"),
+            source=payload.get("source"),
             target_type=payload.get("target_type"),
             target_id=payload.get("target_id"),
         )

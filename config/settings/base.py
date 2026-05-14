@@ -103,7 +103,22 @@ FLW_PUBLIC_KEY = os.environ.get("FLW_PUBLIC_KEY", "")
 FLW_SECRET_KEY = os.environ.get("FLW_SECRET_KEY", "")
 FLW_WEBHOOK_SECRET = os.environ.get("FLW_WEBHOOK_SECRET", "")
 FLW_REDIRECT_URL = os.environ.get("FLW_REDIRECT_URL", "https://kis.app/payments/complete")
+KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED = _env_bool("KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED", False)
 PAYMENTS_MOCK = os.environ.get("PAYMENTS_MOCK", "False").lower() in ("1", "true", "yes")
+
+# Financial safety defaults. Keep these disabled unless a controlled legacy
+# migration or local-only test explicitly needs the old stored-value behavior.
+KIS_LEGACY_WALLET_DEPOSIT_ENABLED = _env_bool("KIS_LEGACY_WALLET_DEPOSIT_ENABLED", False)
+KIS_LEGACY_WALLET_TRANSFER_ENABLED = _env_bool("KIS_LEGACY_WALLET_TRANSFER_ENABLED", False)
+KIS_LEGACY_CASH_CREDIT_CONVERSION_ENABLED = _env_bool("KIS_LEGACY_CASH_CREDIT_CONVERSION_ENABLED", False)
+KIS_LEGACY_WALLET_UPGRADE_ENABLED = _env_bool("KIS_LEGACY_WALLET_UPGRADE_ENABLED", False)
+KIS_LEGACY_PROMO_CASH_BONUS_ENABLED = _env_bool("KIS_LEGACY_PROMO_CASH_BONUS_ENABLED", False)
+KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED = _env_bool("KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED", False)
+KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER = os.environ.get("KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER", "flutterwave").strip() or "flutterwave"
+KIS_LEGACY_EDUCATION_WALLET_CHECKOUT_ENABLED = _env_bool("KIS_LEGACY_EDUCATION_WALLET_CHECKOUT_ENABLED", False)
+KIS_EDUCATION_DEFAULT_PAYMENT_PROVIDER = os.environ.get("KIS_EDUCATION_DEFAULT_PAYMENT_PROVIDER", "flutterwave").strip() or "flutterwave"
+KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED = _env_bool("KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED", False)
+KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER = os.environ.get("KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER", "flutterwave").strip() or "flutterwave"
 
 # Notifications / Firebase Cloud Messaging
 NOTIFICATIONS_PUSH_PROVIDER = os.environ.get("NOTIFICATIONS_PUSH_PROVIDER", "firebase")
@@ -117,6 +132,37 @@ FIREBASE_SERVER_KEY = os.environ.get("FIREBASE_SERVER_KEY", "")
 
 # Debug-only OTP code logging. Keep false unless explicitly debugging locally.
 OTP_DEBUG_LOG_CODES = _env_bool("OTP_DEBUG_LOG_CODES", False)
+
+# Verification / KYC / KYB providers.
+# Phase 1 only reads configuration. Live provider calls are introduced in later phases.
+VERIFICATION_PROVIDER_PRIMARY = os.environ.get("VERIFICATION_PROVIDER_PRIMARY", "dojah").strip() or "dojah"
+VERIFICATION_PROVIDER_FALLBACK = os.environ.get("VERIFICATION_PROVIDER_FALLBACK", "sumsub").strip() or "sumsub"
+VERIFICATION_WEBHOOK_SECRET = os.environ.get("VERIFICATION_WEBHOOK_SECRET", "").strip()
+VERIFICATION_LIVE_PROVIDER_CALLS_ENABLED = _env_bool("VERIFICATION_LIVE_PROVIDER_CALLS_ENABLED", False)
+VERIFICATION_PROVIDER_SANDBOX_ENABLED = _env_bool("VERIFICATION_PROVIDER_SANDBOX_ENABLED", True)
+VERIFICATION_PROVIDER_SANDBOX_NETWORK_ENABLED = _env_bool("VERIFICATION_PROVIDER_SANDBOX_NETWORK_ENABLED", False)
+VERIFICATION_PROVIDER_TIMEOUT_SECONDS = int(os.environ.get("VERIFICATION_PROVIDER_TIMEOUT_SECONDS", "10"))
+VERIFICATION_WEBHOOK_BASE_URL = os.environ.get("VERIFICATION_WEBHOOK_BASE_URL", "").strip().rstrip("/")
+VERIFICATION_PROVIDER_LIVE_ALLOWED_ENVS = _env_csv("VERIFICATION_PROVIDER_LIVE_ALLOWED_ENVS", "staging")
+VERIFICATION_LIVE_PROVIDER_SUBJECTS = [
+    item.strip()
+    for item in os.environ.get("VERIFICATION_LIVE_PROVIDER_SUBJECTS", "").split(",")
+    if item.strip()
+]
+VERIFICATION_EXPIRY_REMINDER_DAYS = [
+    int(item.strip())
+    for item in os.environ.get("VERIFICATION_EXPIRY_REMINDER_DAYS", "30,14,7,1").split(",")
+    if item.strip().isdigit()
+]
+DOJAH_APP_ID = os.environ.get("DOJAH_APP_ID", "").strip()
+DOJAH_SECRET_KEY = os.environ.get("DOJAH_SECRET_KEY", "").strip()
+DOJAH_BASE_URL = os.environ.get("DOJAH_BASE_URL", "https://api.dojah.io").rstrip("/")
+SUMSUB_APP_TOKEN = os.environ.get("SUMSUB_APP_TOKEN", "").strip()
+SUMSUB_SECRET_KEY = os.environ.get("SUMSUB_SECRET_KEY", "").strip()
+SUMSUB_BASE_URL = os.environ.get("SUMSUB_BASE_URL", "https://api.sumsub.com").rstrip("/")
+SMILE_ID_PARTNER_ID = os.environ.get("SMILE_ID_PARTNER_ID", "").strip()
+SMILE_ID_API_KEY = os.environ.get("SMILE_ID_API_KEY", "").strip()
+SMILE_ID_BASE_URL = os.environ.get("SMILE_ID_BASE_URL", "").rstrip("/")
 
 # Application definition
 INSTALLED_APPS = [
@@ -155,6 +201,7 @@ INSTALLED_APPS = [
     "apps.background_removal.apps.BackgroundRemovalConfig",
     "apps.statuses.apps.StatusesConfig",
     "apps.billing.apps.BillingConfig",
+    "apps.verification.apps.VerificationConfig",
 
     # chats
     "apps.chat.apps.ChatConfig",

@@ -12,12 +12,15 @@ if os.environ.get("ALLOW_ALL_HOSTS", "False").lower() in ("1", "true", "yes", "o
     ALLOWED_HOSTS = ["*"]
 else:
     ALLOWED_HOSTS = [
-        host.strip()
+        os.path.expandvars(host.strip())
         for host in os.environ.get("ALLOWED_HOSTS", f"{LOCAL_DEV_HOST},10.0.2.2").split(",")
-        if host.strip()
+        if os.path.expandvars(host.strip())
     ]
+    if DEBUG and os.environ.get("KIS_STRICT_LOCAL_ALLOWED_HOSTS", "False").lower() not in ("1", "true", "yes", "on"):
+        ALLOWED_HOSTS.extend(["localhost", "127.0.0.1", "0.0.0.0", LOCAL_DEV_HOST])
 if LOCAL_DEV_HOST not in ALLOWED_HOSTS and ALLOWED_HOSTS != ["*"]:
     ALLOWED_HOSTS.append(LOCAL_DEV_HOST)
+ALLOWED_HOSTS = list(dict.fromkeys(ALLOWED_HOSTS))
 if "testserver" not in ALLOWED_HOSTS:
     ALLOWED_HOSTS.append("testserver")
 

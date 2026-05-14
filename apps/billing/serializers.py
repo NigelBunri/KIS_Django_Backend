@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 
-from decimal import Decimal, ROUND_HALF_UP
 from rest_framework import serializers
 
 from .documents import build_receipt_urls
@@ -10,6 +9,8 @@ from .models import (
     BillingReconciliation,
     CreditAccount,
     InsuranceClaim,
+    DirectPaymentAuditEvent,
+    DirectPaymentIntent,
     PaymentDispute,
     PromoCode,
     WalletAccount,
@@ -17,6 +18,11 @@ from .models import (
     WalletTransaction,
 )
 from .services import cents_to_usd, cents_to_usd_compact
+from .promotional_credits import (
+    PROMOTIONAL_CREDIT_POLICY,
+    promotional_credit_label_from_cents,
+    credit_delta_label,
+)
 from apps.core.models import HealthcareOrganization, PatientMasterRecord
 from apps.accounts.models import AccountTier, User
 
@@ -27,6 +33,11 @@ class WalletAccountSerializer(serializers.ModelSerializer):
     balance_micro = serializers.SerializerMethodField()
     balance_kisc_label = serializers.SerializerMethodField()
     balance_usd_label = serializers.SerializerMethodField()
+    promotional_credit_label = serializers.SerializerMethodField()
+    promotional_credit_policy = serializers.SerializerMethodField()
+    can_buy_promotional_credits = serializers.SerializerMethodField()
+    can_transfer_promotional_credits = serializers.SerializerMethodField()
+    can_convert_promotional_credits_to_cash = serializers.SerializerMethodField()
 
     class Meta:
         model = WalletAccount
@@ -38,6 +49,11 @@ class WalletAccountSerializer(serializers.ModelSerializer):
             "balance_usd_compact",
             "balance_kisc_label",
             "balance_usd_label",
+            "promotional_credit_label",
+            "promotional_credit_policy",
+            "can_buy_promotional_credits",
+            "can_transfer_promotional_credits",
+            "can_convert_promotional_credits_to_cash",
             "currency",
             "status",
             "metadata",
@@ -54,23 +70,97 @@ class WalletAccountSerializer(serializers.ModelSerializer):
         return int((obj.balance_cents or 0) * 10)
 
     def get_balance_kisc_label(self, obj):
-        cents = int(obj.balance_cents or 0)
-        kisc = Decimal(cents) / Decimal("10000")
-        quantized = kisc.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        text = format(quantized, "f")
-        return f"{text} KISC"
+        # Backward-compatible field name; value is intentionally reframed.
+        return promotional_credit_label_from_cents(int(obj.balance_cents or 0))
 
     def get_balance_usd_label(self, obj):
-        usd = cents_to_usd(int(obj.balance_cents or 0))
-        quantized = usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        text = format(quantized, "f")
-        return f"${text}"
+        # Backward-compatible field name retained without implying an exchange rate.
+        return None
+
+    def get_promotional_credit_label(self, obj):
+        return promotional_credit_label_from_cents(int(obj.balance_cents or 0))
+
+    def get_promotional_credit_policy(self, obj):
+        return PROMOTIONAL_CREDIT_POLICY
+
+    def get_can_buy_promotional_credits(self, obj):
+        return False
+
+    def get_can_transfer_promotional_credits(self, obj):
+        return False
+
+    def get_can_convert_promotional_credits_to_cash(self, obj):
+        return False
+
+
+class DirectPaymentIntentSerializer(serializers.ModelSerializer):
+    amount_usd_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DirectPaymentIntent
+        fields = [
+            "id",
+            "provider",
+            "target_type",
+            "target_id",
+            "amount_cents",
+            "amount_usd_label",
+            "currency",
+            "status",
+            "tx_ref",
+            "provider_ref",
+            "payment_url",
+            "metadata",
+            "processed_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_amount_usd_label(self, obj):
+        return f"${(int(obj.amount_cents or 0) / 100):,.2f}"
+
+
+class DirectPaymentAuditEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DirectPaymentAuditEvent
+        fields = [
+            "id",
+            "intent",
+            "event",
+            "provider",
+            "tx_ref",
+            "target_type",
+            "target_id",
+            "status",
+            "actor",
+            "metadata",
+            "created_at",
+        ]
+        read_only_fields = fields
 
 
 class CreditAccountSerializer(serializers.ModelSerializer):
+    promotional_credit_label = serializers.SerializerMethodField()
+    promotional_credit_policy = serializers.SerializerMethodField()
+
     class Meta:
         model = CreditAccount
-        fields = ["id", "credits", "locked_credits", "metadata", "created_at"]
+        fields = [
+            "id",
+            "credits",
+            "locked_credits",
+            "promotional_credit_label",
+            "promotional_credit_policy",
+            "metadata",
+            "created_at",
+        ]
+
+    def get_promotional_credit_label(self, obj):
+        return f"{int(obj.credits or 0)} promotional credits"
+
+    def get_promotional_credit_policy(self, obj):
+        return PROMOTIONAL_CREDIT_POLICY
 
 
 class WalletLedgerEntrySerializer(serializers.ModelSerializer):
@@ -83,6 +173,8 @@ class WalletLedgerEntrySerializer(serializers.ModelSerializer):
     counterparty_phone = serializers.SerializerMethodField()
     receipt_url = serializers.SerializerMethodField()
     receipt_pdf_url = serializers.SerializerMethodField()
+    amount_promotional_credit_label = serializers.SerializerMethodField()
+    credits_delta_label = serializers.SerializerMethodField()
 
     _REFERENCE_COUNTERPARTY_UUID_PATTERN = re.compile(
         r"^(?:transfer_to|transfer_from|credit_transfer_to|credit_transfer_from):"
@@ -97,7 +189,9 @@ class WalletLedgerEntrySerializer(serializers.ModelSerializer):
             "amount_cents",
             "amount_usd",
             "amount_usd_compact",
+            "amount_promotional_credit_label",
             "credits_delta",
+            "credits_delta_label",
             "balance_after_cents",
             "balance_after_usd",
             "balance_after_usd_compact",
@@ -212,6 +306,12 @@ class WalletLedgerEntrySerializer(serializers.ModelSerializer):
 
     def get_amount_usd_compact(self, obj):
         return cents_to_usd_compact(int(obj.amount_cents or 0))
+
+    def get_amount_promotional_credit_label(self, obj):
+        return promotional_credit_label_from_cents(int(obj.amount_cents or 0))
+
+    def get_credits_delta_label(self, obj):
+        return credit_delta_label(int(obj.credits_delta or 0))
 
     def get_balance_after_usd(self, obj):
         return str(cents_to_usd(int(obj.balance_after_cents or 0)))

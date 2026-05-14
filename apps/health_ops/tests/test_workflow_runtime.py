@@ -10,7 +10,8 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
-from apps.billing.models import WalletLedgerEntry
+from apps.billing.direct_payments import reconcile_direct_payment_callback
+from apps.billing.models import DirectPaymentIntent, WalletLedgerEntry
 from apps.billing.services import get_wallet_account
 from apps.health_ops.models import (
     EngineCompletionMode,
@@ -292,6 +293,7 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_410_GONE)
 
+    @override_settings(KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED=True)
     def test_authorize_payment_debits_kis_wallet_once(self):
         billing_engine = _seed_engine(
             "payment_billing",
@@ -377,3 +379,118 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
         self.assertEqual(authorize_again.status_code, status.HTTP_200_OK)
         wallet.refresh_from_db()
         self.assertEqual(wallet.balance_cents, 30000)
+
+    def test_health_billing_defaults_to_usd_provider_pending_without_wallet_debit(self):
+        billing_engine = _seed_engine(
+            "payment_billing",
+            "Payment USD",
+            ["review_charges", "select_payment_method", "authorize_payment"],
+        )
+        billing_map = ServiceEngineMap.objects.create(
+            service=self.service,
+            engine=billing_engine,
+            execution_order=1,
+            config={},
+            cost_micro=200000,
+            is_required=True,
+            access_window_days=2,
+            completion_mode=EngineCompletionMode.STEP_PROGRESS,
+        )
+        workflow = self._create_workflow([billing_map])
+        wallet = get_wallet_account(self.user)
+        wallet.balance_cents = 50000
+        wallet.save(update_fields=["balance_cents", "updated_at"])
+
+        start_response = self.client.post(
+            reverse("health-ops-billing-session-start"),
+            {
+                "workflow_session_id": str(workflow.id),
+                "total_amount_micro": 200000,
+                "payable_amount_micro": 200000,
+            },
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(start_response.status_code, status.HTTP_201_CREATED, start_response.data)
+        billing_session = start_response.data["billing_session"]
+        self.assertEqual(billing_session["payment_provider"], "flutterwave")
+        self.assertEqual(billing_session["currency_label"], "USD")
+        billing_session_id = str(billing_session["id"])
+        step_url = reverse("health-ops-billing-session-step", kwargs={"billing_session_id": billing_session_id})
+
+        review = self.client.patch(
+            step_url,
+            {"step_key": "review_charges", "is_completed": True},
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(review.status_code, status.HTTP_200_OK, review.data)
+
+        select = self.client.patch(
+            step_url,
+            {"step_key": "select_payment_method", "is_completed": True, "payload": {"payment_provider": "flutterwave"}},
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(select.status_code, status.HTTP_200_OK, select.data)
+
+        authorize = self.client.patch(
+            step_url,
+            {"step_key": "authorize_payment", "is_completed": True, "payload": {"payment_provider": "flutterwave"}},
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(authorize.status_code, status.HTTP_200_OK, authorize.data)
+        session = PaymentBillingSession.objects.get(id=billing_session_id)
+        self.assertEqual(session.status, "payment_pending")
+        self.assertIsNone(session.paid_at)
+        self.assertEqual(session.payment_provider, "flutterwave")
+        intent = DirectPaymentIntent.objects.get(id=session.metadata["direct_payment_intent_id"])
+        self.assertEqual(intent.target_type, DirectPaymentIntent.TARGET_HEALTH_BILLING_SESSION)
+        self.assertEqual(intent.amount_cents, 20000)
+        self.assertEqual(session.payment_reference, intent.tx_ref)
+
+        ok, result, _intent = reconcile_direct_payment_callback(
+            payload={"data": {"tx_ref": intent.tx_ref, "status": "successful", "id": "flw-health-001"}},
+            signature="",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(result, "paid")
+        session.refresh_from_db()
+        self.assertEqual(session.status, "paid")
+        self.assertIsNotNone(session.paid_at)
+        self.assertEqual(session.payload["payment_status"], "paid")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance_cents, 50000)
+
+    def test_health_wallet_checkout_is_disabled_by_default(self):
+        billing_engine = _seed_engine(
+            "payment_billing",
+            "Payment Wallet Block",
+            ["review_charges", "select_payment_method"],
+        )
+        billing_map = ServiceEngineMap.objects.create(
+            service=self.service,
+            engine=billing_engine,
+            execution_order=1,
+            config={},
+            cost_micro=200000,
+            is_required=True,
+            access_window_days=2,
+            completion_mode=EngineCompletionMode.STEP_PROGRESS,
+        )
+        workflow = self._create_workflow([billing_map])
+
+        start_response = self.client.post(
+            reverse("health-ops-billing-session-start"),
+            {
+                "workflow_session_id": str(workflow.id),
+                "payment_provider": "kis_wallet",
+                "payable_amount_micro": 200000,
+            },
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(start_response.status_code, status.HTTP_403_FORBIDDEN, start_response.data)
+        self.assertEqual(start_response.data["code"], "legacy_health_wallet_checkout_disabled")

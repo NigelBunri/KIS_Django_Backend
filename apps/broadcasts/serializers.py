@@ -1,4 +1,5 @@
 import os
+from decimal import Decimal
 
 from django.conf import settings
 from django.urls import reverse
@@ -10,8 +11,21 @@ from apps.core.money import parse_decimal_amount
 from common.media_urls import absolutize_backend_media
 
 from .models import (
+    BroadcastChannel,
+    BroadcastChannelRole,
+    BroadcastChannelSubscription,
     BroadcastFeature,
+    BroadcastItem,
+    BroadcastPlaylist,
+    BroadcastPlaylistItem,
+    BroadcastSourceType,
+    ChannelAnalyticsDailyRollup,
     BroadcastVideo,
+    ChannelLiveStream,
+    ChannelContent,
+    ChannelContentAsset,
+    ChannelContentComment,
+    ChannelModerationRecord,
     BroadcastLesson,
     LessonEnrollment,
     EducationInstitutionAssessment,
@@ -56,6 +70,403 @@ class LenientDecimalField(serializers.DecimalField):
         if parsed is None:
             self.fail("invalid")
         return super().to_internal_value(str(parsed))
+
+
+def _viewer_channel_role(channel: BroadcastChannel, user) -> str:
+    if not getattr(user, "is_authenticated", False):
+        return ""
+    if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
+        return "staff"
+    if getattr(channel, "owner_user_id", None) and str(channel.owner_user_id) == str(getattr(user, "id", "")):
+        return "owner"
+    role = (
+        BroadcastChannelRole.objects.filter(channel=channel, user=user)
+        .order_by("created_at")
+        .values_list("role", flat=True)
+        .first()
+    )
+    return str(role or "")
+
+
+class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
+    is_subscribed = serializers.SerializerMethodField()
+    viewer_role = serializers.SerializerMethodField()
+    is_broadcast = serializers.SerializerMethodField()
+    broadcast_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BroadcastChannel
+        fields = [
+            "id",
+            "handle",
+            "display_name",
+            "description",
+            "avatar_url",
+            "banner_url",
+            "country",
+            "language",
+            "category",
+            "verification_badges",
+            "is_public",
+            "is_verified",
+            "is_broadcast",
+            "broadcast_id",
+            "subscriber_count",
+            "content_count",
+            "is_subscribed",
+            "viewer_role",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_is_subscribed(self, obj: BroadcastChannel) -> bool:
+        user = self.context.get("user") or getattr(self.context.get("request"), "user", None)
+        if not getattr(user, "is_authenticated", False):
+            return False
+        return BroadcastChannelSubscription.objects.filter(channel=obj, user=user).exists()
+
+    def get_viewer_role(self, obj: BroadcastChannel) -> str:
+        user = self.context.get("user") or getattr(self.context.get("request"), "user", None)
+        return _viewer_channel_role(obj, user)
+
+    def _active_broadcast(self, obj: BroadcastChannel):
+        return BroadcastItem.objects.filter(
+            source_type=BroadcastSourceType.BROADCAST_CHANNEL,
+            source_id=str(obj.id),
+            is_deleted=False,
+        ).only("id").first()
+
+    def get_is_broadcast(self, obj: BroadcastChannel) -> bool:
+        return self._active_broadcast(obj) is not None
+
+    def get_broadcast_id(self, obj: BroadcastChannel) -> str:
+        item = self._active_broadcast(obj)
+        return str(item.id) if item else ""
+
+
+class BroadcastChannelDetailSerializer(BroadcastChannelSummarySerializer):
+    links = serializers.JSONField(read_only=True)
+    branding = serializers.JSONField(read_only=True)
+    settings = serializers.SerializerMethodField()
+
+    class Meta(BroadcastChannelSummarySerializer.Meta):
+        fields = BroadcastChannelSummarySerializer.Meta.fields + [
+            "links",
+            "branding",
+            "settings",
+        ]
+
+    def get_settings(self, obj: BroadcastChannel) -> dict:
+        user = self.context.get("user") or getattr(self.context.get("request"), "user", None)
+        role = _viewer_channel_role(obj, user)
+        if role in {"owner", "manager", "staff"}:
+            return obj.settings or {}
+        return {}
+
+
+class BroadcastChannelSubscriptionSerializer(serializers.ModelSerializer):
+    channel = BroadcastChannelSummarySerializer(read_only=True)
+    channel_id = serializers.UUIDField(write_only=True, required=False)
+
+    class Meta:
+        model = BroadcastChannelSubscription
+        fields = [
+            "id",
+            "channel",
+            "channel_id",
+            "notifications",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "channel", "created_at", "updated_at"]
+
+
+class BroadcastPlaylistSerializer(serializers.ModelSerializer):
+    channel = BroadcastChannelSummarySerializer(read_only=True)
+    channel_id = serializers.UUIDField(write_only=True, required=False)
+
+    class Meta:
+        model = BroadcastPlaylist
+        fields = [
+            "id",
+            "channel",
+            "channel_id",
+            "title",
+            "description",
+            "visibility",
+            "sort_order",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "channel", "created_at", "updated_at"]
+
+
+class ChannelContentAssetSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentAsset
+        fields = [
+            "id",
+            "asset_type",
+            "url",
+            "mime_type",
+            "size_bytes",
+            "width",
+            "height",
+            "duration_seconds",
+            "thumbnail_url",
+            "caption",
+            "sort_order",
+            "processing_status",
+            "metadata",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class ChannelContentListSerializer(serializers.ModelSerializer):
+    channel = BroadcastChannelSummarySerializer(read_only=True)
+    first_asset = serializers.SerializerMethodField()
+    description_preview = serializers.SerializerMethodField()
+    text_plain_preview = serializers.SerializerMethodField()
+    engagement_counts = serializers.SerializerMethodField()
+    is_broadcast = serializers.SerializerMethodField()
+    broadcast_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelContent
+        fields = [
+            "id",
+            "channel",
+            "content_type",
+            "title",
+            "description_preview",
+            "text_plain_preview",
+            "thumbnail_url",
+            "first_asset",
+            "visibility",
+            "status",
+            "is_broadcast",
+            "broadcast_id",
+            "published_at",
+            "duration_seconds",
+            "stats",
+            "engagement_counts",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_first_asset(self, obj: ChannelContent):
+        asset = obj.assets.order_by("sort_order", "created_at").first()
+        return ChannelContentAssetSerializer(asset).data if asset else None
+
+    def get_description_preview(self, obj: ChannelContent) -> str:
+        return str(obj.description or "")[:240]
+
+    def get_text_plain_preview(self, obj: ChannelContent) -> str:
+        return str(obj.text_plain or "")[:240]
+
+    def get_engagement_counts(self, obj: ChannelContent) -> dict:
+        stats = obj.stats if isinstance(obj.stats, dict) else {}
+        return {
+            "views": int(stats.get("views") or 0),
+            "shares": int(stats.get("shares") or 0),
+            "comments": int(stats.get("comments") or 0),
+            "reactions": int(stats.get("reactions") or 0),
+        }
+
+    def _active_broadcast(self, obj: ChannelContent):
+        if obj.legacy_broadcast_item_id:
+            return obj.legacy_broadcast_item if obj.legacy_broadcast_item and not obj.legacy_broadcast_item.is_deleted else None
+        return BroadcastItem.objects.filter(
+            source_type=BroadcastSourceType.CHANNEL_CONTENT,
+            source_id=str(obj.id),
+            is_deleted=False,
+        ).only("id").first()
+
+    def get_is_broadcast(self, obj: ChannelContent) -> bool:
+        return self._active_broadcast(obj) is not None
+
+    def get_broadcast_id(self, obj: ChannelContent) -> str:
+        item = self._active_broadcast(obj)
+        return str(item.id) if item else ""
+
+
+class ChannelContentDetailSerializer(ChannelContentListSerializer):
+    assets = ChannelContentAssetSerializer(many=True, read_only=True)
+
+    class Meta(ChannelContentListSerializer.Meta):
+        fields = ChannelContentListSerializer.Meta.fields + [
+            "description",
+            "text_plain",
+            "text_doc",
+            "assets",
+            "metadata",
+            "scheduled_at",
+        ]
+
+
+class ChannelContentCommentSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelContentComment
+        fields = [
+            "id",
+            "content",
+            "user",
+            "user_display",
+            "body",
+            "parent",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "content", "user", "user_display", "created_at", "updated_at"]
+
+    def get_user_display(self, obj: ChannelContentComment) -> str:
+        user = obj.user
+        return (
+            getattr(user, "full_name", "")
+            or getattr(user, "username", "")
+            or getattr(user, "phone", "")
+            or "KIS user"
+        )
+
+
+class BroadcastPlaylistItemSerializer(serializers.ModelSerializer):
+    content = ChannelContentListSerializer(read_only=True)
+
+    class Meta:
+        model = BroadcastPlaylistItem
+        fields = ["id", "playlist", "content", "sort_order", "added_at"]
+        read_only_fields = fields
+
+
+class ChannelModerationRecordSerializer(serializers.ModelSerializer):
+    reporter_display = serializers.SerializerMethodField()
+    actor_display = serializers.SerializerMethodField()
+    content_title = serializers.SerializerMethodField()
+    comment_body = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelModerationRecord
+        fields = [
+            "id",
+            "channel",
+            "content",
+            "comment",
+            "target_type",
+            "target_id",
+            "reporter",
+            "reporter_display",
+            "actor",
+            "actor_display",
+            "reason",
+            "status",
+            "action",
+            "notes",
+            "metadata",
+            "content_title",
+            "comment_body",
+            "resolved_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def _display(self, user) -> str:
+        if not user:
+            return ""
+        return (
+            getattr(user, "full_name", "")
+            or getattr(user, "username", "")
+            or getattr(user, "phone", "")
+            or str(getattr(user, "id", ""))
+        )
+
+    def get_reporter_display(self, obj: ChannelModerationRecord) -> str:
+        return self._display(obj.reporter)
+
+    def get_actor_display(self, obj: ChannelModerationRecord) -> str:
+        return self._display(obj.actor)
+
+    def get_content_title(self, obj: ChannelModerationRecord) -> str:
+        return str(getattr(obj.content, "title", "") or "")
+
+    def get_comment_body(self, obj: ChannelModerationRecord) -> str:
+        return str(getattr(obj.comment, "body", "") or "")[:240]
+
+
+class ChannelAnalyticsDailyRollupSerializer(serializers.ModelSerializer):
+    content_title = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelAnalyticsDailyRollup
+        fields = [
+            "id",
+            "channel",
+            "content",
+            "content_title",
+            "date",
+            "views",
+            "unique_viewers",
+            "impressions",
+            "watch_time_seconds",
+            "average_duration_seconds",
+            "subscribers_gained",
+            "subscribers_lost",
+            "shares",
+            "saves",
+            "comments",
+            "reactions",
+            "embed_impressions",
+            "live_peak_viewers",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_content_title(self, obj: ChannelAnalyticsDailyRollup) -> str:
+        return str(getattr(obj.content, "title", "") or "")
+
+
+class ChannelLiveStreamSerializer(serializers.ModelSerializer):
+    channel = BroadcastChannelSummarySerializer(read_only=True)
+    content_id = serializers.UUIDField(source="content.id", read_only=True)
+    stream_key_available = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelLiveStream
+        fields = [
+            "id",
+            "channel",
+            "content_id",
+            "title",
+            "description",
+            "status",
+            "scheduled_start_at",
+            "started_at",
+            "ended_at",
+            "provider",
+            "provider_stream_id",
+            "ingest_url",
+            "stream_key_available",
+            "playback_url",
+            "replay_url",
+            "thumbnail_url",
+            "viewer_count",
+            "peak_viewer_count",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_stream_key_available(self, obj: ChannelLiveStream) -> bool:
+        return bool(obj.stream_key_hash)
 
 
 def _education_humanize(value) -> str:
@@ -362,6 +773,7 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
     pending_application_count = serializers.SerializerMethodField()
     current_membership = serializers.SerializerMethodField()
     can_manage = serializers.SerializerMethodField()
+    verification_summary = serializers.SerializerMethodField()
     logo_url = serializers.SerializerMethodField()
     image_url = serializers.SerializerMethodField()
     banner_image_url = serializers.SerializerMethodField()
@@ -393,6 +805,7 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
             "pending_application_count",
             "current_membership",
             "can_manage",
+            "verification_summary",
             "memberships",
             "created_at",
             "updated_at",
@@ -434,6 +847,11 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
             "manager",
             "administrator",
         }
+
+    def get_verification_summary(self, obj: EducationInstitution) -> dict:
+        from apps.verification.services import current_education_institution_verification_status
+
+        return current_education_institution_verification_status(obj)
 
     def get_logo_url(self, obj: EducationInstitution) -> str:
         branding = obj.branding or {}
@@ -1372,6 +1790,13 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
     booked_item_ends_at = serializers.SerializerMethodField()
     broadcast_title = serializers.CharField(source="broadcast.title", read_only=True, allow_null=True)
     learner_display_name = serializers.SerializerMethodField()
+    amount_usd_label = serializers.SerializerMethodField()
+    currency_label = serializers.SerializerMethodField()
+    payment_provider = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    payment_required = serializers.SerializerMethodField()
+    payment_intent_id = serializers.SerializerMethodField()
+    payment_url = serializers.SerializerMethodField()
 
     class Meta:
         model = EducationInstitutionBooking
@@ -1386,8 +1811,15 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
             "status",
             "seat_count",
             "amount_cents",
+            "amount_usd_label",
             "currency",
+            "currency_label",
             "payment_method",
+            "payment_provider",
+            "payment_status",
+            "payment_required",
+            "payment_intent_id",
+            "payment_url",
             "wallet_transaction_id",
             "provider_credit_transaction_id",
             "booked_item_id",
@@ -1407,6 +1839,39 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_amount_usd_label(self, obj):
+        return f"${(Decimal(int(getattr(obj, 'amount_cents', 0) or 0)) / Decimal('100')).quantize(Decimal('0.01'))}"
+
+    def get_currency_label(self, obj):
+        code = str(getattr(obj, "currency", "") or "").strip().upper()
+        if code == "USD":
+            return "USD"
+        if code in {"KISC", "KIS"}:
+            return "Historical promotional-credit booking"
+        return code or "USD"
+
+    def get_payment_provider(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(metadata.get("payment_provider") or obj.payment_method or ("legacy_wallet" if obj.wallet_transaction_id else "flutterwave"))
+
+    def get_payment_status(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(metadata.get("payment_status") or ("paid" if obj.wallet_transaction_id else "pending"))
+
+    def get_payment_required(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        if "payment_required" in metadata:
+            return bool(metadata.get("payment_required"))
+        return bool(int(getattr(obj, "amount_cents", 0) or 0) > 0 and not obj.wallet_transaction_id)
+
+    def get_payment_intent_id(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(metadata.get("direct_payment_intent_id") or "") or None
+
+    def get_payment_url(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(metadata.get("payment_url") or "") or None
 
     def _target(self, obj: EducationInstitutionBooking):
         targets = (

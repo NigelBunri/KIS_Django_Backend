@@ -22,7 +22,10 @@ from apps.partners.models import (
     PartnerPost,
     PartnerRole,
 )
-from apps.partners.serializers import PartnerPostSerializer
+from apps.partners.serializers import PartnerDetailSerializer, PartnerOrganizationProfileSerializer, PartnerPostSerializer
+from apps.verification.constants import VerificationBadgeCode, VerificationSubjectType
+from apps.verification.models import VerificationBadge
+from apps.verification.services import current_partner_verification_status, start_partner_verification_case
 
 
 class PartnerApiTests(TestCase):
@@ -102,6 +105,98 @@ class PartnerApiTests(TestCase):
         self.assertTrue(PartnerJoinConfig.objects.filter(partner=partner).exists())
         self.assertTrue(PartnerOrganizationProfile.objects.filter(partner=partner).exists())
         self.assertTrue(PartnerRole.objects.filter(partner=partner, name="Owner").exists())
+
+    def test_partner_verification_start_creates_central_case_with_safe_metadata(self):
+        partner = self._create_partner()
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            self._detail_url(partner, "verification/start/"),
+            {
+                "provider": "sumsub",
+                "evidence_metadata": {
+                    "company_registration": [
+                        {
+                            "type": "certificate",
+                            "private_media_id": "private-company-doc",
+                            "url": "https://example.com/public-company-doc.pdf",
+                        }
+                    ],
+                    "representative_authorization": [{"type": "board_resolution", "private_media_id": "private-auth-doc"}],
+                    "beneficial_owners": [{"name": "Owner", "percentage": 100, "private_media_id": "private-ubo-doc"}],
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["case"]["provider"], "sumsub")
+        case_id = response.data["case"]["id"]
+        from apps.verification.models import VerificationCase
+
+        case = VerificationCase.objects.get(id=case_id)
+        self.assertEqual(case.subject.subject_type, VerificationSubjectType.PARTNER)
+        self.assertEqual(case.evidence_metadata["company_registration"][0]["private_media_id"], "private-company-doc")
+        self.assertNotIn("url", case.evidence_metadata["company_registration"][0])
+
+    def test_staff_can_approve_partner_case_and_issue_public_badges(self):
+        partner = self._create_partner()
+        case = start_partner_verification_case(
+            partner=partner,
+            actor=self.owner,
+            evidence_metadata={"company_registration": [{"private_media_id": "private-company-doc"}]},
+        )
+        self.staff = self._create_user("staff", "+237670000099")
+        self.staff.is_staff = True
+        self.staff.save(update_fields=["is_staff"])
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.post(
+            self._detail_url(partner, f"verification/cases/{case.id}/review/"),
+            {"action": "approve", "badge_codes": ["verified_partner", "verified_organization", "official_partner"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        badge_codes = set(
+            VerificationBadge.objects.filter(
+                subject__subject_type=VerificationSubjectType.PARTNER,
+                subject__subject_id=partner.id,
+            ).values_list("code", flat=True)
+        )
+        self.assertIn(VerificationBadgeCode.VERIFIED_PARTNER, badge_codes)
+        self.assertIn(VerificationBadgeCode.VERIFIED_ORGANIZATION, badge_codes)
+        self.assertIn(VerificationBadgeCode.OFFICIAL_PARTNER, badge_codes)
+        self.assertTrue(current_partner_verification_status(partner)["verified"])
+
+    def test_partner_serializers_expose_verification_summary(self):
+        partner = self._create_partner()
+        case = start_partner_verification_case(partner=partner, actor=self.owner, evidence_metadata={})
+        self.staff = self._create_user("staff_summary", "+237670000098")
+        self.staff.is_staff = True
+        self.staff.save(update_fields=["is_staff"])
+        from apps.verification.services import review_partner_case
+
+        review_partner_case(case=case, actor=self.staff, action="approve")
+        profile = PartnerOrganizationProfile.objects.get(partner=partner)
+
+        detail = PartnerDetailSerializer(partner).data
+        profile_data = PartnerOrganizationProfileSerializer(profile).data
+
+        self.assertTrue(detail["verification_summary"]["verified"])
+        self.assertTrue(profile_data["verification_summary"]["verified"])
+
+    def test_partner_verification_start_rejects_raw_document_payload(self):
+        partner = self._create_partner()
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            self._detail_url(partner, "verification/start/"),
+            {"evidence_metadata": {"company_registration": [{"document_base64": "data:image/png;base64,abc123"}]}},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_non_manager_member_cannot_update_partner_settings(self):
         partner = self._create_partner()

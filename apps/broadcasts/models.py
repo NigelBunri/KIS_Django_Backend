@@ -3,6 +3,7 @@ from datetime import timedelta
 
 from django.db import models
 from django.db.models import Q
+from django.db.models.functions import Lower
 from django.utils import timezone
 
 from apps.accounts.models import Profile, User
@@ -19,6 +20,8 @@ class BroadcastSourceType(models.TextChoices):
     COMMUNITY_POST = "community_post", "Community Post"
     PARTNER_POST = "partner_post", "Partner Post"
     CHANNEL_MESSAGE = "channel_message", "Channel Message"
+    BROADCAST_CHANNEL = "broadcast_channel", "Broadcast Channel"
+    CHANNEL_CONTENT = "channel_content", "Channel Content"
     BROADCAST_FEED_ENTRY = "broadcast_feed_entry", "Broadcast Feed Entry"
     MARKET_PRODUCT = "market_product", "Market Product"
     MARKET_SERVICE = "market_service", "Market Service"
@@ -79,6 +82,514 @@ class BroadcastFeedProfile(models.Model):
 
     class Meta:
         db_table = "broadcast_feed_profile"
+
+
+class BroadcastChannel(models.Model):
+    class OwnerType(models.TextChoices):
+        USER = "user", "User"
+        SHOP = "shop", "Shop"
+        HEALTH = "health", "Health institution"
+        EDUCATION = "education", "Education institution"
+        PARTNER = "partner", "Partner organization"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner_type = models.CharField(max_length=24, choices=OwnerType.choices, db_index=True)
+    owner_id = models.UUIDField(db_index=True)
+    owner_user = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="owned_broadcast_channels",
+    )
+    handle = models.SlugField(max_length=80, unique=True)
+    display_name = models.CharField(max_length=140)
+    description = models.TextField(blank=True, default="")
+    avatar_url = models.URLField(blank=True, default="")
+    banner_url = models.URLField(blank=True, default="")
+    country = models.CharField(max_length=8, blank=True, default="")
+    language = models.CharField(max_length=16, blank=True, default="")
+    category = models.CharField(max_length=64, blank=True, default="")
+    links = models.JSONField(default=list, blank=True)
+    branding = models.JSONField(default=dict, blank=True)
+    verification_badges = models.JSONField(default=list, blank=True)
+    settings = models.JSONField(default=dict, blank=True)
+    is_public = models.BooleanField(default=True, db_index=True)
+    is_verified = models.BooleanField(default=False, db_index=True)
+    is_deleted = models.BooleanField(default=False, db_index=True)
+    subscriber_count = models.PositiveIntegerField(default=0)
+    content_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "broadcast_channel"
+        indexes = [
+            models.Index(fields=["owner_type", "owner_id"]),
+            models.Index(fields=["handle"]),
+            models.Index(fields=["is_public", "is_deleted"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(Lower("handle"), name="broadcast_channel_handle_ci_unique"),
+        ]
+
+    def __str__(self):
+        return f"@{self.handle}"
+
+
+class BroadcastChannelRole(models.Model):
+    class Role(models.TextChoices):
+        OWNER = "owner", "Owner"
+        MANAGER = "manager", "Manager"
+        EDITOR = "editor", "Editor"
+        MODERATOR = "moderator", "Moderator"
+        ANALYST = "analyst", "Analyst"
+
+    channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="roles")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="broadcast_channel_roles")
+    role = models.CharField(max_length=24, choices=Role.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "broadcast_channel_role"
+        unique_together = [("channel", "user", "role")]
+        indexes = [
+            models.Index(fields=["channel", "role"]),
+            models.Index(fields=["user", "role"]),
+        ]
+
+    def __str__(self):
+        return f"{self.channel_id}:{self.user_id}:{self.role}"
+
+
+class BroadcastChannelSubscription(models.Model):
+    class NotificationLevel(models.TextChoices):
+        NONE = "none", "None"
+        PERSONALIZED = "personalized", "Personalized"
+        ALL = "all", "All"
+
+    channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="subscriptions")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="broadcast_channel_subscriptions")
+    notifications = models.CharField(
+        max_length=16,
+        choices=NotificationLevel.choices,
+        default=NotificationLevel.PERSONALIZED,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "broadcast_channel_subscription"
+        unique_together = [("channel", "user")]
+        indexes = [
+            models.Index(fields=["channel", "notifications"]),
+            models.Index(fields=["user", "notifications"]),
+        ]
+
+    def __str__(self):
+        return f"{self.channel_id}:{self.user_id}:{self.notifications}"
+
+
+class BroadcastPlaylist(models.Model):
+    class Visibility(models.TextChoices):
+        PUBLIC = "public", "Public"
+        UNLISTED = "unlisted", "Unlisted"
+        PRIVATE = "private", "Private"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="playlists")
+    title = models.CharField(max_length=160)
+    description = models.TextField(blank=True, default="")
+    visibility = models.CharField(max_length=16, choices=Visibility.choices, default=Visibility.PUBLIC)
+    sort_order = models.PositiveIntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "broadcast_playlist"
+        ordering = ["sort_order", "-created_at"]
+        indexes = [
+            models.Index(fields=["channel", "visibility"]),
+            models.Index(fields=["channel", "sort_order"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class ChannelContentType(models.TextChoices):
+    VIDEO = "video", "Video"
+    SHORT_VIDEO = "short_video", "Short video"
+    IMAGE = "image", "Image"
+    GALLERY = "gallery", "Gallery"
+    TEXT = "text", "Text"
+    RICH_TEXT = "rich_text", "Rich text"
+    AUDIO = "audio", "Audio"
+    DOCUMENT = "document", "Document"
+    LINK = "link", "Link"
+    POLL = "poll", "Poll"
+    EVENT = "event", "Event"
+    LIVE_STREAM = "live_stream", "Live stream"
+    REPLAY = "replay", "Replay"
+
+
+class ChannelContent(models.Model):
+    class Visibility(models.TextChoices):
+        PUBLIC = "public", "Public"
+        UNLISTED = "unlisted", "Unlisted"
+        PRIVATE = "private", "Private"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        SCHEDULED = "scheduled", "Scheduled"
+        PUBLISHED = "published", "Published"
+        PROCESSING = "processing", "Processing"
+        FAILED = "failed", "Failed"
+        ARCHIVED = "archived", "Archived"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="contents")
+    legacy_broadcast_item = models.OneToOneField(
+        BroadcastItem,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="channel_content",
+    )
+    legacy_feed_entry_id = models.UUIDField(null=True, blank=True, db_index=True)
+    content_type = models.CharField(max_length=32, choices=ChannelContentType.choices, db_index=True)
+    title = models.CharField(max_length=220, blank=True, default="")
+    description = models.TextField(blank=True, default="")
+    text_plain = models.TextField(blank=True, default="")
+    text_doc = models.JSONField(default=dict, blank=True)
+    thumbnail_url = models.URLField(blank=True, default="")
+    visibility = models.CharField(max_length=16, choices=Visibility.choices, default=Visibility.PUBLIC, db_index=True)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.DRAFT, db_index=True)
+    published_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    scheduled_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    duration_seconds = models.PositiveIntegerField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    stats = models.JSONField(default=dict, blank=True)
+    is_deleted = models.BooleanField(default=False, db_index=True)
+    created_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_channel_contents",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "channel_content"
+        indexes = [
+            models.Index(fields=["channel", "status", "published_at"]),
+            models.Index(fields=["content_type", "status"]),
+            models.Index(fields=["visibility", "is_deleted"]),
+        ]
+
+    def __str__(self):
+        return self.title or str(self.id)
+
+
+class ChannelContentAsset(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    content = models.ForeignKey(ChannelContent, on_delete=models.CASCADE, related_name="assets")
+    asset_type = models.CharField(max_length=32)
+    url = models.URLField(blank=True, default="")
+    storage_path = models.CharField(max_length=512, blank=True, default="")
+    mime_type = models.CharField(max_length=128, blank=True, default="")
+    size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    duration_seconds = models.PositiveIntegerField(null=True, blank=True)
+    thumbnail_url = models.URLField(blank=True, default="")
+    caption = models.TextField(blank=True, default="")
+    sort_order = models.PositiveIntegerField(default=0)
+    processing_status = models.CharField(max_length=24, default="ready")
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "channel_content_asset"
+        ordering = ["sort_order", "created_at"]
+        indexes = [
+            models.Index(fields=["content", "asset_type"]),
+            models.Index(fields=["processing_status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.content_id}:{self.asset_type}"
+
+
+class ChannelLiveStream(models.Model):
+    class Status(models.TextChoices):
+        SCHEDULED = "scheduled", "Scheduled"
+        LIVE = "live", "Live"
+        ENDED = "ended", "Ended"
+        CANCELLED = "cancelled", "Cancelled"
+        FAILED = "failed", "Failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="live_streams")
+    content = models.OneToOneField(
+        ChannelContent,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="live_stream",
+    )
+    title = models.CharField(max_length=220)
+    description = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.SCHEDULED, db_index=True)
+    scheduled_start_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    provider = models.CharField(max_length=32, blank=True, default="")
+    provider_stream_id = models.CharField(max_length=160, blank=True, default="")
+    ingest_url = models.CharField(max_length=512, blank=True, default="")
+    stream_key_hash = models.CharField(max_length=128, blank=True, default="")
+    playback_url = models.URLField(blank=True, default="")
+    replay_url = models.URLField(blank=True, default="")
+    thumbnail_url = models.URLField(blank=True, default="")
+    viewer_count = models.PositiveIntegerField(default=0)
+    peak_viewer_count = models.PositiveIntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_channel_live_streams",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "channel_live_stream"
+        indexes = [
+            models.Index(fields=["channel", "status", "scheduled_start_at"]),
+            models.Index(fields=["provider", "provider_stream_id"]),
+            models.Index(fields=["status", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.title or str(self.id)
+
+
+class ChannelEmbedPolicy(models.Model):
+    channel = models.OneToOneField(
+        BroadcastChannel,
+        on_delete=models.CASCADE,
+        related_name="embed_policy",
+    )
+    allow_embeds = models.BooleanField(default=True)
+    allowed_domains = models.JSONField(default=list, blank=True)
+    blocked_domains = models.JSONField(default=list, blank=True)
+    require_signed_token = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "channel_embed_policy"
+
+    def __str__(self):
+        return f"{self.channel_id}:embeds"
+
+
+class ChannelContentEmbed(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    content = models.ForeignKey(
+        ChannelContent,
+        on_delete=models.CASCADE,
+        related_name="embeds",
+    )
+    domain = models.CharField(max_length=255, blank=True, default="")
+    token_hash = models.CharField(max_length=128, blank=True, default="")
+    is_active = models.BooleanField(default=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_channel_content_embeds",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "channel_content_embed"
+        indexes = [
+            models.Index(fields=["content", "is_active"]),
+            models.Index(fields=["domain", "is_active"]),
+            models.Index(fields=["expires_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.content_id}:{self.domain or 'any'}"
+
+
+class ChannelContentReaction(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    content = models.ForeignKey(ChannelContent, on_delete=models.CASCADE, related_name="reactions")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="channel_content_reactions")
+    reaction = models.CharField(max_length=32, default="like")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "channel_content_reaction"
+        unique_together = [("content", "user")]
+        indexes = [
+            models.Index(fields=["content", "reaction"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+
+class ChannelContentSave(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    content = models.ForeignKey(ChannelContent, on_delete=models.CASCADE, related_name="saves")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="saved_channel_contents")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "channel_content_save"
+        unique_together = [("content", "user")]
+        indexes = [
+            models.Index(fields=["content", "created_at"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+
+class ChannelContentComment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    content = models.ForeignKey(ChannelContent, on_delete=models.CASCADE, related_name="comments")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="channel_content_comments")
+    body = models.TextField()
+    parent = models.ForeignKey("self", null=True, blank=True, on_delete=models.CASCADE, related_name="replies")
+    is_deleted = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "channel_content_comment"
+        indexes = [
+            models.Index(fields=["content", "created_at"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+
+class ChannelWatchHistory(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    content = models.ForeignKey(ChannelContent, on_delete=models.CASCADE, related_name="watch_history")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="channel_watch_history")
+    progress_seconds = models.PositiveIntegerField(default=0)
+    completed = models.BooleanField(default=False)
+    last_viewed_at = models.DateTimeField(default=timezone.now, db_index=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "channel_watch_history"
+        unique_together = [("content", "user")]
+        indexes = [
+            models.Index(fields=["content", "last_viewed_at"]),
+            models.Index(fields=["user", "last_viewed_at"]),
+        ]
+
+
+class BroadcastPlaylistItem(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    playlist = models.ForeignKey(BroadcastPlaylist, on_delete=models.CASCADE, related_name="items")
+    content = models.ForeignKey(ChannelContent, on_delete=models.CASCADE, related_name="playlist_items")
+    sort_order = models.PositiveIntegerField(default=0)
+    added_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "broadcast_playlist_item"
+        unique_together = [("playlist", "content")]
+        ordering = ["sort_order", "added_at"]
+        indexes = [
+            models.Index(fields=["playlist", "sort_order"]),
+            models.Index(fields=["content"]),
+        ]
+
+
+class ChannelModerationRecord(models.Model):
+    class TargetType(models.TextChoices):
+        CHANNEL = "channel", "Channel"
+        CONTENT = "content", "Content"
+        COMMENT = "comment", "Comment"
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        REVIEWING = "reviewing", "Reviewing"
+        ACTIONED = "actioned", "Actioned"
+        DISMISSED = "dismissed", "Dismissed"
+
+    class Action(models.TextChoices):
+        NONE = "none", "None"
+        KEEP = "keep", "Keep"
+        HIDE = "hide", "Hide"
+        REMOVE = "remove", "Remove"
+        RESTRICT_COMMENTS = "restrict_comments", "Restrict comments"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="moderation_records")
+    content = models.ForeignKey(ChannelContent, null=True, blank=True, on_delete=models.CASCADE, related_name="moderation_records")
+    comment = models.ForeignKey(ChannelContentComment, null=True, blank=True, on_delete=models.CASCADE, related_name="moderation_records")
+    target_type = models.CharField(max_length=16, choices=TargetType.choices, db_index=True)
+    target_id = models.UUIDField(db_index=True)
+    reporter = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="channel_moderation_reports")
+    actor = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="channel_moderation_actions")
+    reason = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True)
+    action = models.CharField(max_length=32, choices=Action.choices, default=Action.NONE)
+    notes = models.TextField(blank=True, default="")
+    metadata = models.JSONField(default=dict, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "channel_moderation_record"
+        indexes = [
+            models.Index(fields=["channel", "status", "created_at"]),
+            models.Index(fields=["target_type", "target_id"]),
+            models.Index(fields=["reporter", "created_at"]),
+        ]
+
+
+class ChannelAnalyticsDailyRollup(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="analytics_rollups")
+    content = models.ForeignKey(ChannelContent, null=True, blank=True, on_delete=models.CASCADE, related_name="analytics_rollups")
+    date = models.DateField(db_index=True)
+    views = models.PositiveIntegerField(default=0)
+    unique_viewers = models.PositiveIntegerField(default=0)
+    impressions = models.PositiveIntegerField(default=0)
+    watch_time_seconds = models.PositiveBigIntegerField(default=0)
+    average_duration_seconds = models.PositiveIntegerField(default=0)
+    subscribers_gained = models.PositiveIntegerField(default=0)
+    subscribers_lost = models.PositiveIntegerField(default=0)
+    shares = models.PositiveIntegerField(default=0)
+    saves = models.PositiveIntegerField(default=0)
+    comments = models.PositiveIntegerField(default=0)
+    reactions = models.PositiveIntegerField(default=0)
+    embed_impressions = models.PositiveIntegerField(default=0)
+    live_peak_viewers = models.PositiveIntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "channel_analytics_daily_rollup"
+        unique_together = [("channel", "content", "date")]
+        indexes = [
+            models.Index(fields=["channel", "date"]),
+            models.Index(fields=["content", "date"]),
+        ]
 
 
 class BroadcastHealthProfile(models.Model):

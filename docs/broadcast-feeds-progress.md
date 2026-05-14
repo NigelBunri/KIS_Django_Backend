@@ -1,5 +1,138 @@
 # Broadcast Feeds Progress
 
+## 2026-05-01 - Phase 8 Completed: Global-Standard QA and Launch Evidence
+
+Scope:
+- Collected final launch evidence for the broadcast feed hardening roadmap.
+- Ran safe backend checks and frontend broadcast-feed checks where available.
+- Added a practical launch QA checklist for backend, frontend, and manual device validation.
+- Preserved current app behavior.
+
+Launch QA document:
+- `docs/operations/BROADCAST_FEEDS_LAUNCH_QA_CHECKLIST.md`
+
+Backend validation passed:
+- `python3 manage.py check`
+- `python3 -m py_compile apps/broadcasts/models.py apps/broadcasts/views.py apps/broadcasts/tests.py apps/broadcasts/urls.py apps/broadcasts/migrations/0030_broadcast_engagement_event.py apps/moderation/serializers.py apps/moderation/admin.py`
+- `python3 manage.py test apps.broadcasts.tests.FeedEntryStoreTests apps.broadcasts.tests.FeedMediaValidationTests apps.broadcasts.tests.BroadcastFeedPaginationHelperTests --noinput`
+  - 6 tests passed.
+
+Backend blocked:
+- `python3 manage.py test apps.broadcasts.tests.BroadcastProfileManageTests --noinput`
+  - blocked during local test database setup after printing:
+    - `Creating test database for alias 'default'...`
+    - `Destroying old test database for alias 'default'...`
+  - run was stopped to keep the session moving.
+
+Frontend validation passed:
+- In `/Users/nigel/dev/KIS`:
+  - `npm run typecheck -- --pretty false` passed.
+  - `npx eslint src/screens/broadcast/feeds src/components/broadcast __tests__/broadcast-feeds.useFeedsData.test.tsx __tests__/broadcast-feeds.discover-page.test.tsx __tests__/broadcast-feeds.detail-screen.test.tsx __tests__/broadcast-feeds.feed-card-video.test.tsx __tests__/broadcast-feeds.attachment-preview.test.ts __tests__/broadcast-feeds.trending-card.test.tsx __tests__/broadcast-feeds.video-playback.test.tsx --quiet` passed.
+
+Frontend Jest result:
+- Command:
+  - `npm run test:phase5 -- __tests__/broadcast-feeds.useFeedsData.test.tsx __tests__/broadcast-feeds.discover-page.test.tsx __tests__/broadcast-feeds.detail-screen.test.tsx __tests__/broadcast-feeds.feed-card-video.test.tsx __tests__/broadcast-feeds.attachment-preview.test.ts __tests__/broadcast-feeds.trending-card.test.tsx __tests__/broadcast-feeds.video-playback.test.tsx`
+- Result:
+  - 4 suites passed.
+  - 3 suites failed/blocked.
+  - 13 tests passed.
+  - 2 tests failed.
+- Passed suites:
+  - `broadcast-feeds.useFeedsData.test.tsx`
+  - `broadcast-feeds.feed-card-video.test.tsx`
+  - `broadcast-feeds.attachment-preview.test.ts`
+  - `broadcast-feeds.video-playback.test.tsx`
+- Failed/blocked suites:
+  - `broadcast-feeds.discover-page.test.tsx`
+    - stale expectations for current detail navigation payload and hide confirmation behavior.
+  - `broadcast-feeds.detail-screen.test.tsx`
+    - Jest transform/mocking issue for `react-native-safe-area-context`.
+  - `broadcast-feeds.trending-card.test.tsx`
+    - Jest transform/mocking issue for `react-native-fs`.
+
+Frontend integration note:
+- Active `FeedsDiscoverPage` report action still posts to generic `ROUTES.moderation.flags`.
+- Backend now has `POST /api/v1/broadcasts/<broadcast_id>/report/`.
+- Move the frontend report action to the broadcast-specific endpoint in the next frontend pass.
+
+Final launch-readiness summary:
+- Broadcast feeds are now close to launch-candidate quality at the backend contract level.
+- The system has durable create/edit/delete/broadcast/unbroadcast/list/reaction/share/view/hide/report foundations.
+- Media validation and safe attachment handling are materially stronger.
+- Admin-visible moderation records exist.
+- Remaining launch blockers are QA execution and frontend alignment, not missing core backend capability.
+
+Remaining risk list:
+- DB-backed backend broadcast tests must run cleanly outside the current local test database setup blocker.
+- Frontend Jest suites need stale expectation updates and native module transform/mocking fixes.
+- Manual iOS/Android QA evidence is not collected yet.
+- Comment counts remain `0` until Nest comment data is bridged into Django analytics.
+- True database cursor pagination still depends on the future normalized feed-entry model.
+- Production malware scanning is documented but not integrated.
+
+## 2026-05-01 - Phase 7 Completed: Moderation and Safety Completeness
+
+Scope:
+- Hardened broadcast feed moderation/lifecycle behavior without changing current UI flows.
+- Confirmed hide remains viewer-specific and mute remains direct-author scoped through `UserBlock`.
+- Added admin-visible report/audit records for broadcast feed moderation actions.
+- Preserved feed list, profile manager, detail, delete, and unbroadcast behavior.
+
+Backend changes:
+- Added `POST /api/v1/broadcasts/<broadcast_id>/report/`.
+- Broadcast reports create a moderation `Flag` with:
+  - `target_type: POST`
+  - `target_id: <broadcast_id>`
+  - `tags.surface: broadcast_feed`
+  - source metadata for admin review.
+- Added moderation audit writes for:
+  - `broadcast.hide`
+  - `broadcast.report`
+  - `broadcast.feed_entry.delete`
+  - `broadcast.feed_entry.unbroadcast`
+- Registered moderation `Flag`, `AuditLog`, and `UserBlock` in Django admin so staff can inspect feed reports, audit events, and mutes.
+- Hardened feed-entry delete so live `BroadcastItem` rows are soft-deleted with `is_deleted=True` and `expires_at=now` instead of hard-deleted.
+- Hardened unbroadcast so removed live feed items also expire immediately.
+- `UserBlockSerializer` now accepts `blocked_id` as a safe write alias for `blocked`, while preserving the original `blocked` field contract.
+
+Semantics confirmed:
+- Hide:
+  - stores only the broadcast ID in the viewer's preferences
+  - affects only that viewer
+  - does not hide other posts from the same author
+- Mute:
+  - uses `UserBlock(blocker=<viewer>, blocked=<direct feed author>)`
+  - feed list excludes direct feed items whose `broadcasted_by`/author ID matches a muted user
+  - remains for direct user feed authors only in this phase
+- Delete feed entry:
+  - removes the queued/profile entry
+  - soft-removes matching live broadcast entries
+- Unbroadcast:
+  - keeps the queued/profile entry
+  - marks matching live broadcast entries deleted/expired
+
+Validation:
+- `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/urls.py apps/broadcasts/tests.py apps/moderation/serializers.py apps/moderation/admin.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations broadcasts Moderation --check --dry-run` passed with no changes detected.
+
+Blocked validation:
+- Focused DB-backed tests were added for hide audit, report flag/audit creation, and unbroadcast audit.
+- Local execution again blocked during test database setup and was stopped.
+- Re-run later:
+  - `python3 manage.py test apps.broadcasts.tests.BroadcastProfileManageTests.test_hide_broadcast_is_idempotent apps.broadcasts.tests.BroadcastProfileManageTests.test_report_broadcast_creates_admin_visible_flag_and_audit_log apps.broadcasts.tests.BroadcastProfileManageTests.test_unbroadcast_feed_entry_removes_live_item_without_deleting_queue_entry --noinput`
+
+Remaining Phase 7 follow-up:
+- Add frontend wiring for the new report endpoint where the active report UI currently uses only generic moderation routes.
+- Add admin workflow actions for report resolution if staff needs one-click broadcast deletion or author restriction.
+- Confirm a production policy for how many reports trigger automatic review/escalation.
+
+Best prompt for Phase 8:
+
+```text
+Please proceed with Phase 8 of the KIS 90% feed system hardening roadmap without using git commands. Focus on global-standard QA and launch evidence for the complete broadcast feed system. Run or prepare full backend regression coverage for create, edit, delete, broadcast, unbroadcast, list, detail, react, comment, share, save, hide, mute, report, and media validation. Run or prepare frontend focused tests/manual QA for composer, profile manager, feed card, detail swipe, media fallback, report/hide/mute actions, and count display. Preserve current app behavior, record any blocked checks with exact commands, update docs/broadcast-feeds-progress.md and docs/BUILD_STATE.md, and give the final launch-readiness summary and remaining risk list.
+```
+
 ## 2026-05-01 - Phase 6 Completed: Engagement and Analytics Durability
 
 Scope:

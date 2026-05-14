@@ -112,6 +112,100 @@ class WalletTransaction(BaseEntity):
         ]
 
 
+class DirectPaymentIntent(BaseEntity):
+    STATUS_PENDING = "pending"
+    STATUS_PAID = "paid"
+    STATUS_FAILED = "failed"
+    STATUS_CANCELLED = "cancelled"
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_PAID, "Paid"),
+        (STATUS_FAILED, "Failed"),
+        (STATUS_CANCELLED, "Cancelled"),
+    ]
+
+    TARGET_MARKETPLACE_ORDER = "marketplace_order"
+    TARGET_SERVICE_BOOKING_PAYMENT = "service_booking_payment"
+    TARGET_EDUCATION_BOOKING = "education_booking"
+    TARGET_HEALTH_BILLING_SESSION = "health_billing_session"
+
+    TARGET_CHOICES = [
+        (TARGET_MARKETPLACE_ORDER, "Marketplace order"),
+        (TARGET_SERVICE_BOOKING_PAYMENT, "Service booking payment"),
+        (TARGET_EDUCATION_BOOKING, "Education booking"),
+        (TARGET_HEALTH_BILLING_SESSION, "Health billing session"),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="direct_payment_intents",
+    )
+    provider = models.CharField(max_length=64, default="flutterwave")
+    target_type = models.CharField(max_length=64, choices=TARGET_CHOICES)
+    target_id = models.UUIDField(db_index=True)
+    amount_cents = models.BigIntegerField(default=0)
+    currency = models.CharField(max_length=8, default="USD")
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    tx_ref = models.CharField(max_length=255, unique=True)
+    provider_ref = models.CharField(max_length=255, blank=True)
+    payment_url = models.URLField(blank=True)
+    idempotency_key = models.CharField(max_length=255, blank=True, db_index=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    provider_payload = models.JSONField(default=dict, blank=True)
+    raw_callback = models.JSONField(default=dict, blank=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user", "status"]),
+            models.Index(fields=["target_type", "target_id"]),
+            models.Index(fields=["tx_ref"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["target_type", "target_id", "status"],
+                condition=models.Q(status="pending"),
+                name="uniq_pending_direct_payment_target",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.provider}:{self.tx_ref}:{self.status}"
+
+
+class DirectPaymentAuditEvent(BaseEntity):
+    intent = models.ForeignKey(
+        DirectPaymentIntent,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="audit_events",
+    )
+    event = models.CharField(max_length=80)
+    provider = models.CharField(max_length=64, default="flutterwave")
+    tx_ref = models.CharField(max_length=255, blank=True, db_index=True)
+    target_type = models.CharField(max_length=64, blank=True)
+    target_id = models.UUIDField(null=True, blank=True)
+    status = models.CharField(max_length=32, blank=True)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="direct_payment_audit_events",
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["event", "created_at"]),
+            models.Index(fields=["tx_ref"]),
+            models.Index(fields=["target_type", "target_id"]),
+        ]
+
+
 class PromoCode(BaseEntity):
     code = models.CharField(max_length=64, unique=True)
     description = models.TextField(blank=True)

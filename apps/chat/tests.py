@@ -73,7 +73,7 @@ class ConversationUnreadContractTests(APITestCase):
         with patch.dict(
             os.environ,
             {"DJANGO_INTERNAL_TOKEN": "test-internal-token", "INTERNAL_SIGNATURE_REQUIRED": "0"},
-        ):
+        ), patch("apps.chat.views.notify_main_tab_badges_updated") as notify:
             res = self.client.patch(
                 url,
                 {
@@ -88,6 +88,9 @@ class ConversationUnreadContractTests(APITestCase):
             self.conversation.refresh_from_db()
             member = ConversationMember.objects.get(conversation=self.conversation, user=self.user)
             self.assertEqual(member.last_read_seq, 8)
+            notify.assert_called_once()
+            self.assertEqual(notify.call_args.kwargs["source"], "messages")
+            self.assertEqual(notify.call_args.kwargs["reason"], "read_state_updated")
 
             res = self.client.patch(
                 url,
@@ -145,7 +148,7 @@ class ConversationUnreadContractTests(APITestCase):
 
         self.assertEqual(res.status_code, 403)
 
-    def test_pending_direct_recipient_cannot_send_via_ws_perms(self):
+    def test_pending_direct_recipient_can_reply_via_ws_perms(self):
         self.conversation.request_state = ConversationRequestState.PENDING
         self.conversation.request_initiator = self.user
         self.conversation.request_recipient = self.peer
@@ -166,7 +169,8 @@ class ConversationUnreadContractTests(APITestCase):
 
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["isMember"], True)
-        self.assertEqual(res.json()["canSend"], False)
+        self.assertEqual(res.json()["canSend"], True)
+        self.assertIn("chat:direct_pending_reply", res.json()["scopes"])
 
     def test_search_returns_matching_conversation(self):
         self.client.force_authenticate(self.user)

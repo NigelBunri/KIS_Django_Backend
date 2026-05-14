@@ -69,6 +69,8 @@ class ConversationMemberSerializer(serializers.ModelSerializer):
             "notification_level",
             "color",
             "is_muted",
+            "is_pinned",
+            "is_hidden",
             "is_blocked",
             "joined_at",
             "left_at",
@@ -105,6 +107,9 @@ class ConversationListSerializer(ConversationImageUrlSerializerMixin, serializer
     has_mention = serializers.SerializerMethodField()
     last_read_seq = serializers.SerializerMethodField()
     read_state_authoritative = serializers.SerializerMethodField()
+    is_muted = serializers.SerializerMethodField()
+    is_pinned = serializers.SerializerMethodField()
+    is_hidden = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
@@ -116,6 +121,9 @@ class ConversationListSerializer(ConversationImageUrlSerializerMixin, serializer
             "avatar_url",
             "is_archived",
             "is_locked",
+            "is_muted",
+            "is_pinned",
+            "is_hidden",
             "last_message_at",
             "last_message_preview",
             "created_at",
@@ -185,6 +193,18 @@ class ConversationListSerializer(ConversationImageUrlSerializerMixin, serializer
 
     def get_read_state_authoritative(self, obj):
         return True
+
+    def get_is_muted(self, obj):
+        member = self._current_member(obj)
+        return bool(getattr(member, "is_muted", False)) if member else False
+
+    def get_is_pinned(self, obj):
+        member = self._current_member(obj)
+        return bool(getattr(member, "is_pinned", False)) if member else False
+
+    def get_is_hidden(self, obj):
+        member = self._current_member(obj)
+        return bool(getattr(member, "is_hidden", False)) if member else False
 
 
 class ConversationDetailSerializer(ConversationImageUrlSerializerMixin, serializers.ModelSerializer):
@@ -560,6 +580,10 @@ class DirectConversationCreateSerializer(serializers.Serializer):
 class MessageThreadLinkSerializer(serializers.ModelSerializer):
     """Link between a parent message and a child conversation (sub-room)."""
 
+    child_conversation = ConversationListSerializer(read_only=True)
+    child_conversation_id = serializers.UUIDField(source="child_conversation.id", read_only=True)
+    child_title = serializers.CharField(source="child_conversation.title", read_only=True)
+
     class Meta:
         model = MessageThreadLink
         fields = [
@@ -567,9 +591,17 @@ class MessageThreadLinkSerializer(serializers.ModelSerializer):
             "parent_conversation",
             "parent_message_key",
             "child_conversation",
+            "child_conversation_id",
+            "child_title",
             "parent_thread",
             "depth",
             "created_by",
             "created_at",
         ]
-        read_only_fields = ["created_by", "created_at"]
+        read_only_fields = [
+            "child_conversation",
+            "child_conversation_id",
+            "child_title",
+            "created_by",
+            "created_at",
+        ]

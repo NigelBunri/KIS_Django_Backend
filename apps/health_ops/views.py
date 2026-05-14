@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 from uuid import UUID, uuid4
 
 from django.core.cache import cache
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.http import HttpResponse
@@ -17,13 +18,27 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.permissions import IsAdminUser
 
 from apps.broadcasts.models import BroadcastHealthProfile
+from apps.billing.direct_payments import create_direct_payment_intent
 from apps.billing.services import debit_wallet_balance, get_wallet_account
 from apps.core.money import (
     KISC_MICRO_PER_KISC,
     KISC_MICRO_PER_USD_CENT,
     frontend_kisc_major_to_micro,
+)
+from apps.verification.constants import VerificationSubjectType
+from apps.verification.models import VerificationCase
+from apps.verification.serializers import (
+    HealthInstitutionVerificationReviewSerializer,
+    HealthInstitutionVerificationStartSerializer,
+)
+from apps.verification.services import (
+    current_health_institution_verification_status,
+    review_health_institution_case,
+    serialize_case_status,
+    start_health_institution_verification_case,
 )
 
 from .models import (
@@ -260,6 +275,32 @@ USD_PER_KISC = Decimal("100")
 USD_CENTS_PER_USD = 100
 USD_CENTS_PER_KISC = int((USD_PER_KISC * Decimal(USD_CENTS_PER_USD)))
 KIS_WALLET_PROVIDER = "kis_wallet"
+
+
+def _health_wallet_checkout_enabled() -> bool:
+    return bool(getattr(settings, "KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED", False))
+
+
+def _health_default_payment_provider() -> str:
+    return str(getattr(settings, "KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER", "flutterwave") or "flutterwave").strip().lower()
+
+
+def _is_legacy_health_wallet_provider(value: object) -> bool:
+    return str(value or "").strip().lower() in {"kis_wallet", "wallet", "wallet_balance", "kisc", "kisc_wallet"}
+
+
+def _health_provider_payment_confirmed(billing_session: PaymentBillingSession) -> bool:
+    if billing_session.paid_at:
+        return True
+    payload = billing_session.payload if isinstance(billing_session.payload, dict) else {}
+    metadata = billing_session.metadata if isinstance(billing_session.metadata, dict) else {}
+    status_value = str(
+        payload.get("payment_status")
+        or payload.get("paymentStatus")
+        or metadata.get("payment_status")
+        or ""
+    ).strip().lower()
+    return status_value in {"paid", "success", "succeeded", "settled"}
 VIDEO_CONSULTATION_STEP_ORDER = (
     "confirm_identity",
     "test_mic_camera",
@@ -1382,6 +1423,84 @@ class HealthInstitutionDetailView(APIView):
         if error_response:
             return error_response
         return Response({"institution": HealthInstitutionSerializer(institution).data}, status=status.HTTP_200_OK)
+
+
+class HealthInstitutionVerificationStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, institution_id):
+        institution, error_response = _resolve_institution_for_request(
+            request.user,
+            institution_id,
+            allow_bootstrap=True,
+        )
+        if error_response:
+            return error_response
+        if not _is_institution_member(request.user, institution):
+            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        return Response(current_health_institution_verification_status(institution), status=status.HTTP_200_OK)
+
+
+class HealthInstitutionVerificationStartView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, institution_id):
+        institution, error_response = _resolve_institution_for_request(
+            request.user,
+            institution_id,
+            allow_bootstrap=True,
+        )
+        if error_response:
+            return error_response
+        if not _can_manage_institution(request.user, institution):
+            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = HealthInstitutionVerificationStartSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        case = start_health_institution_verification_case(
+            institution=institution,
+            actor=request.user,
+            provider=serializer.validated_data.get("provider") or "",
+            evidence_metadata=serializer.validated_data.get("evidence_metadata") or {},
+        )
+        return Response(
+            {
+                "case": serialize_case_status(case),
+                "status": current_health_institution_verification_status(institution),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class HealthInstitutionVerificationReviewView(APIView):
+    permission_classes = [IsAdminUser]
+
+    @transaction.atomic
+    def post(self, request, institution_id, case_id):
+        institution = get_object_or_404(HealthInstitution, id=institution_id)
+        case = VerificationCase.objects.select_related("subject").filter(
+            id=case_id,
+            subject__subject_type=VerificationSubjectType.HEALTH_INSTITUTION,
+            subject__subject_id=institution.id,
+        ).first()
+        if not case:
+            raise ValidationError({"case_id": "Invalid health institution verification case."})
+        serializer = HealthInstitutionVerificationReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        case, badges = review_health_institution_case(
+            case=case,
+            actor=request.user,
+            action=serializer.validated_data["action"],
+            notes=serializer.validated_data.get("notes", ""),
+            badge_codes=serializer.validated_data.get("badge_codes") or None,
+        )
+        return Response(
+            {
+                "case": serialize_case_status(case),
+                "badges": [{"code": badge.code, "label": badge.label, "level": badge.level} for badge in badges],
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class HealthServiceListCreateView(APIView):
@@ -4610,7 +4729,21 @@ class PaymentBillingSessionStartView(APIView):
             payable_amount_micro = max(0, total_amount_micro - insurance_coverage_micro)
         else:
             payable_amount_micro = max(0, int(payable_amount_micro))
-        payment_provider = KIS_WALLET_PROVIDER
+        requested_provider = str(serializer.validated_data.get("payment_provider") or _health_default_payment_provider()).strip().lower()
+        if _is_legacy_health_wallet_provider(requested_provider) and not _health_wallet_checkout_enabled():
+            return Response(
+                {
+                    "detail": "Health wallet/KIS Coin checkout is disabled. Use USD checkout with Flutterwave or another configured payment provider.",
+                    "code": "legacy_health_wallet_checkout_disabled",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        payment_provider = KIS_WALLET_PROVIDER if _is_legacy_health_wallet_provider(requested_provider) else (requested_provider or _health_default_payment_provider())
+        metadata["currency"] = "KISC" if payment_provider == KIS_WALLET_PROVIDER else "USD"
+        metadata["payment_status"] = "not_required" if payable_amount_micro <= 0 else "pending"
+        metadata["payment_required"] = bool(payable_amount_micro > 0)
+        if payment_provider != KIS_WALLET_PROVIDER:
+            metadata["payment_provider"] = payment_provider
 
         billing_session = (
             PaymentBillingSession.objects.select_for_update()
@@ -4662,6 +4795,29 @@ class PaymentBillingSessionStartView(APIView):
                 billing_session.started_at = now_value
             billing_session.save()
 
+        if payment_provider != KIS_WALLET_PROVIDER and int(billing_session.payable_amount_micro or 0) > 0:
+            intent = create_direct_payment_intent(
+                user=request.user,
+                target_type="health_billing_session",
+                target_id=billing_session.id,
+                provider=payment_provider,
+                metadata={
+                    "source": "health_billing_session",
+                    "workflow_session_id": str(workflow.id),
+                    "engine_session_id": str(engine_session.id),
+                    "institution_id": str(workflow.institution_id),
+                    "service_id": str(workflow.service_id),
+                },
+            )
+            billing_session.payment_reference = intent.tx_ref
+            billing_session.metadata = {
+                **(billing_session.metadata if isinstance(billing_session.metadata, dict) else {}),
+                "payment_reference": intent.tx_ref,
+                "direct_payment_intent_id": str(intent.id),
+                "payment_url": intent.payment_url,
+            }
+            billing_session.save(update_fields=["payment_reference", "metadata", "updated_at"])
+
         next_state = engine_session.state_blob if isinstance(engine_session.state_blob, dict) else {}
         next_state.update(
             {
@@ -4669,6 +4825,8 @@ class PaymentBillingSessionStartView(APIView):
                 "billing_status": billing_session.status,
                 "payable_amount_micro": int(billing_session.payable_amount_micro or 0),
                 "payable_amount_kisc": _micro_to_kisc_text(billing_session.payable_amount_micro or 0),
+                "payable_amount_usd_label": f"${(Decimal(_micro_to_cents(billing_session.payable_amount_micro or 0)) / Decimal('100')).quantize(Decimal('0.01'))}",
+                "payment_provider": billing_session.payment_provider or payment_provider,
             }
         )
         engine_session.state_blob = next_state
@@ -4766,22 +4924,32 @@ class PaymentBillingSessionStepUpdateView(APIView):
             billing_session.status = PaymentBillingStatus.QUOTE_READY
             billing_session.started_at = billing_session.started_at or now_value
         elif step_key == "select_payment_method" and is_completed:
-            provider = str(payload_data.get("payment_provider") or payload_data.get("paymentProvider") or "").strip().lower()
-            if provider and provider != KIS_WALLET_PROVIDER:
+            provider = str(payload_data.get("payment_provider") or payload_data.get("paymentProvider") or billing_session.payment_provider or _health_default_payment_provider()).strip().lower()
+            if _is_legacy_health_wallet_provider(provider) and not _health_wallet_checkout_enabled():
                 return Response(
                     {
-                        "detail": "Only KIS Coin wallet payments are supported.",
-                        "allowed_payment_provider": KIS_WALLET_PROVIDER,
+                        "detail": "Health wallet/KIS Coin checkout is disabled. Use USD checkout with Flutterwave or another configured payment provider.",
+                        "code": "legacy_health_wallet_checkout_disabled",
                     },
-                    status=status.HTTP_400_BAD_REQUEST,
+                    status=status.HTTP_403_FORBIDDEN,
                 )
-            payload_data["payment_provider"] = KIS_WALLET_PROVIDER
-            billing_session.payment_provider = KIS_WALLET_PROVIDER
+            billing_session.payment_provider = KIS_WALLET_PROVIDER if _is_legacy_health_wallet_provider(provider) else (provider or _health_default_payment_provider())
+            payload_data["payment_provider"] = billing_session.payment_provider
             billing_session.status = PaymentBillingStatus.PAYMENT_PENDING
         elif step_key == "authorize_payment" and is_completed:
             if request.user.id != workflow.user_id:
                 return Response(
-                    {"detail": "Only the workflow owner can authorize payment from their KIS Coin account."},
+                    {"detail": "Only the workflow owner can authorize payment."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            provider = str(payload_data.get("payment_provider") or payload_data.get("paymentProvider") or billing_session.payment_provider or _health_default_payment_provider()).strip().lower()
+            legacy_wallet_payment = _is_legacy_health_wallet_provider(provider)
+            if legacy_wallet_payment and not _health_wallet_checkout_enabled():
+                return Response(
+                    {
+                        "detail": "Health wallet/KIS Coin checkout is disabled. Use USD checkout with Flutterwave or another configured payment provider.",
+                        "code": "legacy_health_wallet_checkout_disabled",
+                    },
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
@@ -4812,8 +4980,8 @@ class PaymentBillingSessionStepUpdateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # Debit the user's KIS Coin wallet exactly once at payment authorization.
-            if not billing_session.paid_at and int(billing_session.amount_paid_micro or 0) > 0:
+            # Legacy wallet debit is retained only behind an explicit migration flag.
+            if legacy_wallet_payment and not billing_session.paid_at and int(billing_session.amount_paid_micro or 0) > 0:
                 charge_micro = int(billing_session.amount_paid_micro or 0)
                 charge_cents = _micro_to_cents(charge_micro)
                 wallet = get_wallet_account(workflow.user)
@@ -4850,10 +5018,16 @@ class PaymentBillingSessionStepUpdateView(APIView):
             payload_data["amount_paid_kisc"] = _micro_to_kisc_text(billing_session.amount_paid_micro or 0)
             billing_session.payment_reference = str(payload_data.get("payment_reference") or billing_session.payment_reference or "").strip()
             if not billing_session.payment_reference:
-                billing_session.payment_reference = f"kis-wallet-{str(billing_session.id).replace('-', '')[:12]}"
-            billing_session.payment_provider = KIS_WALLET_PROVIDER
-            billing_session.status = PaymentBillingStatus.PAID
-            billing_session.paid_at = billing_session.paid_at or now_value
+                prefix = "kis-wallet" if legacy_wallet_payment else str(provider or _health_default_payment_provider()).replace("_", "-")
+                billing_session.payment_reference = f"{prefix}-{str(billing_session.id).replace('-', '')[:12]}"
+            billing_session.payment_provider = KIS_WALLET_PROVIDER if legacy_wallet_payment else (provider or _health_default_payment_provider())
+            if legacy_wallet_payment or _health_provider_payment_confirmed(billing_session) or str(payload_data.get("payment_status") or payload_data.get("paymentStatus") or "").strip().lower() in {"paid", "success", "succeeded", "settled"}:
+                billing_session.status = PaymentBillingStatus.PAID
+                billing_session.paid_at = billing_session.paid_at or now_value
+                payload_data["payment_status"] = "paid"
+            else:
+                billing_session.status = PaymentBillingStatus.PAYMENT_PENDING
+                payload_data["payment_status"] = "pending"
         elif step_key == "issue_receipt" and is_completed:
             billing_session.invoice_number = str(payload_data.get("invoice_number") or billing_session.invoice_number or "").strip()
             billing_session.status = PaymentBillingStatus.COMPLETED
@@ -4880,6 +5054,7 @@ class PaymentBillingSessionStepUpdateView(APIView):
                 "last_billing_step": step_key,
                 "payable_amount_kisc": _micro_to_kisc_text(billing_session.payable_amount_micro or 0),
                 "amount_paid_kisc": _micro_to_kisc_text(billing_session.amount_paid_micro or 0),
+                "payment_provider": billing_session.payment_provider,
             }
         )
         engine_session.state_blob = next_state
@@ -4946,18 +5121,18 @@ class PaymentBillingSessionPayloadView(APIView):
             payload_data.get("payment_provider")
             or payload_data.get("paymentProvider")
             or billing_session.payment_provider
-            or ""
+            or _health_default_payment_provider()
         ).strip().lower()
-        if requested_provider and requested_provider != KIS_WALLET_PROVIDER:
+        if _is_legacy_health_wallet_provider(requested_provider) and not _health_wallet_checkout_enabled():
             return Response(
                 {
-                    "detail": "Only KIS Coin wallet payments are supported.",
-                    "allowed_payment_provider": KIS_WALLET_PROVIDER,
+                    "detail": "Health wallet/KIS Coin checkout is disabled. Use USD checkout with Flutterwave or another configured payment provider.",
+                    "code": "legacy_health_wallet_checkout_disabled",
                 },
-                status=status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_403_FORBIDDEN,
             )
-        payload_data["payment_provider"] = KIS_WALLET_PROVIDER
-        billing_session.payment_provider = KIS_WALLET_PROVIDER
+        billing_session.payment_provider = KIS_WALLET_PROVIDER if _is_legacy_health_wallet_provider(requested_provider) else (requested_provider or _health_default_payment_provider())
+        payload_data["payment_provider"] = billing_session.payment_provider
         if "payment_reference" in payload_data:
             billing_session.payment_reference = str(payload_data.get("payment_reference") or "").strip()
         if "invoice_number" in payload_data:
@@ -5033,9 +5208,10 @@ class PaymentBillingSessionEndView(APIView):
             if int(billing_session.payable_amount_micro or 0) > 0 and not billing_session.paid_at:
                 return Response(
                     {
-                        "detail": "Authorize payment from KIS Coin wallet before completing billing.",
+                        "detail": "Provider payment must be confirmed before completing billing.",
                         "required_micro": int(billing_session.payable_amount_micro or 0),
                         "required_kisc": _micro_to_kisc_text(billing_session.payable_amount_micro or 0),
+                        "payment_provider": billing_session.payment_provider or _health_default_payment_provider(),
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )

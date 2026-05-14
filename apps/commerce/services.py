@@ -3,6 +3,7 @@ import hashlib, uuid
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, Iterable, List
 from io import BytesIO
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
@@ -15,9 +16,9 @@ from apps.billing.services import (
     refund_locked_booking_funds,
 )
 from apps.billing.models import WalletTransaction
+from apps.billing.direct_payments import create_direct_payment_intent
 from apps.notifications.services import create_notification
-from apps.core.money import frontend_kisc_major_to_usd_cents, parse_decimal_amount
-from .constants import KIS_COIN_CODE
+from apps.core.money import parse_decimal_amount
 from .models import (
     ShopVerificationRequest,
     ProductAuthenticityCheck,
@@ -127,7 +128,12 @@ def build_recommendations(user_id) -> List[Dict[str, Any]]:
 
 
 def place_marketplace_order(*, buyer, shop_id, items, metadata=None):
-    """Create a marketplace order, lock the buyer funds, and persist the order/items."""
+    """Create a marketplace order.
+
+    New orders default to USD/provider-payment checkout. The old wallet escrow
+    path is retained only behind an explicit legacy flag for historical
+    migration or tightly controlled local tests.
+    """
     if not items:
         raise ValidationError('At least one order item is required.')
     shop = Shop.objects.filter(id=shop_id).first()
@@ -139,33 +145,59 @@ def place_marketplace_order(*, buyer, shop_id, items, metadata=None):
     if total_cents <= 0:
         raise ValidationError('Order total must be greater than zero.')
 
-    wallet = get_wallet_account(buyer)
-    if wallet.balance_cents < total_cents:
-        raise ValidationError('Insufficient wallet balance for this marketplace order.')
     metadata_payload = {**(metadata or {})}
+    requested_method = str(
+        metadata_payload.get('payment_method')
+        or metadata_payload.get('paymentMethod')
+        or settings.KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER
+    ).strip().lower()
+    legacy_wallet_requested = requested_method in {'wallet', 'kisc', 'kis_wallet', 'wallet_balance'}
+    legacy_wallet_enabled = bool(getattr(settings, 'KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED', False))
+    if legacy_wallet_requested and not legacy_wallet_enabled:
+        raise ValidationError(
+            'Commerce wallet/KIS Coin checkout is disabled. Use USD checkout with Flutterwave or another configured payment provider.'
+        )
+
     cart_id = metadata_payload.get('cart_id')
     metadata_payload.setdefault('items', len(normalized_items))
     metadata_payload.setdefault('total_amount_cents', total_cents)
+    metadata_payload.setdefault('currency', 'USD')
+    metadata_payload.setdefault('payment_method', requested_method if requested_method else settings.KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER)
     reference = f'marketplace-{buyer.id}-{uuid.uuid4().hex}'
 
     with transaction.atomic():
-        _, buyer_tx = lock_wallet_funds_for_booking(
-            user=buyer,
-            amount_cents=total_cents,
-            reference=reference,
-            meta={'source': 'marketplace_order', 'shop_id': str(shop_id), **metadata_payload},
-        )
+        buyer_tx = None
+        status = MarketplaceOrderStatus.TEMPORAL
+        if legacy_wallet_requested and legacy_wallet_enabled:
+            wallet = get_wallet_account(buyer)
+            if wallet.balance_cents < total_cents:
+                raise ValidationError('Insufficient wallet balance for this marketplace order.')
+            _, buyer_tx = lock_wallet_funds_for_booking(
+                user=buyer,
+                amount_cents=total_cents,
+                reference=reference,
+                meta={'source': 'marketplace_order', 'shop_id': str(shop_id), **metadata_payload},
+            )
+            metadata_payload['payment_status'] = 'paid'
+            metadata_payload['legacy_wallet_checkout'] = True
+        else:
+            metadata_payload['payment_status'] = 'pending'
+            metadata_payload['payment_provider'] = metadata_payload['payment_method']
+            metadata_payload['payment_required'] = True
+            metadata_payload['payment_reference'] = reference
+
         order = MarketplaceOrder.objects.create(
             buyer=buyer,
             shop=shop,
             total_amount=Decimal(total_cents) / Decimal('100'),
-            currency=KIS_COIN_CODE,
-            status=MarketplaceOrderStatus.TEMPORAL,
+            currency='USD',
+            status=status,
             metadata=metadata_payload,
             buyer_debit_transaction=buyer_tx,
         )
-        buyer_tx.meta = {**(buyer_tx.meta or {}), 'order_id': str(order.id)}
-        buyer_tx.save(update_fields=['meta'])
+        if buyer_tx:
+            buyer_tx.meta = {**(buyer_tx.meta or {}), 'order_id': str(order.id)}
+            buyer_tx.save(update_fields=['meta'])
         items_to_create = [
             MarketplaceOrderItem(
                 order=order,
@@ -179,8 +211,24 @@ def place_marketplace_order(*, buyer, shop_id, items, metadata=None):
             for item in normalized_items
         ]
         MarketplaceOrderItem.objects.bulk_create(items_to_create)
-        if cart_id:
+        if cart_id and (buyer_tx or not metadata_payload.get('payment_required')):
             Cart.objects.filter(id=cart_id, status='active').update(status='checked_out')
+        if not buyer_tx and metadata_payload.get('payment_required'):
+            intent = create_direct_payment_intent(
+                user=buyer,
+                target_type='marketplace_order',
+                target_id=order.id,
+                provider=metadata_payload.get('payment_provider') or metadata_payload.get('payment_method') or settings.KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER,
+                idempotency_key=str(metadata_payload.get('idempotency_key') or ''),
+                metadata={'source': 'marketplace_order', 'shop_id': str(shop.id)},
+            )
+            order.metadata = {
+                **(order.metadata or {}),
+                'payment_reference': intent.tx_ref,
+                'direct_payment_intent_id': str(intent.id),
+                'payment_url': intent.payment_url,
+            }
+            order.save(update_fields=['metadata'])
     return order
 
 
@@ -256,11 +304,17 @@ def _order_total_cents(order):
 
 
 def _decimal_price_to_cents(value):
-    """Convert frontend major-unit KISC values to USD cents, rounding half-up."""
+    """Convert frontend USD major-unit values to whole USD cents."""
     parsed = parse_decimal_amount(value)
     if parsed is None:
         return 0
-    return int(frontend_kisc_major_to_usd_cents(parsed) or 0)
+    return int((parsed * Decimal('100')).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+
+
+def _has_confirmed_provider_payment(order):
+    metadata = order.metadata if isinstance(order.metadata, dict) else {}
+    status = str(metadata.get('payment_status') or '').strip().lower()
+    return status in {'paid', 'success', 'succeeded', 'settled'}
 
 
 def cancel_marketplace_order(order):
@@ -269,12 +323,13 @@ def cancel_marketplace_order(order):
         raise ValidationError('Only temporal marketplace orders can be cancelled.')
     total_cents = _order_total_cents(order)
     reference = f'marketplace-refund-{order.id}'
-    refund_locked_booking_funds(
-        payer=order.buyer,
-        amount_cents=total_cents,
-        reference=reference,
-        meta={'order_id': str(order.id), 'source': 'marketplace_refund'},
-    )
+    if getattr(order, 'buyer_debit_transaction_id', None):
+        refund_locked_booking_funds(
+            payer=order.buyer,
+            amount_cents=total_cents,
+            reference=reference,
+            meta={'order_id': str(order.id), 'source': 'marketplace_refund'},
+        )
     order.status = MarketplaceOrderStatus.CANCELLED
     order.metadata = {**(order.metadata or {}), 'cancelled_at': timezone.now().isoformat()}
     order.save(update_fields=['status', 'metadata'])
@@ -292,23 +347,27 @@ def satisfy_marketplace_order(order):
         raise ValidationError('Only pending orders may be satisfied.')
     total_cents = _order_total_cents(order)
     reference = f'marketplace-payout-{order.id}'
-    release_locked_booking_funds(
-        payer=order.buyer,
-        provider=order.shop.owner,
-        amount_cents=total_cents,
-        reference=reference,
-        meta={'order_id': str(order.id), 'source': 'marketplace_payout'},
-    )
-    provider_tx = WalletTransaction.objects.create(
-        user=order.shop.owner,
-        provider='internal',
-        method='marketplace_payout',
-        amount_cents=total_cents,
-        currency=order.currency,
-        status='success',
-        tx_ref=reference,
-        meta={'order_id': str(order.id)},
-    )
+    provider_tx = None
+    if getattr(order, 'buyer_debit_transaction_id', None):
+        release_locked_booking_funds(
+            payer=order.buyer,
+            provider=order.shop.owner,
+            amount_cents=total_cents,
+            reference=reference,
+            meta={'order_id': str(order.id), 'source': 'marketplace_payout'},
+        )
+        provider_tx = WalletTransaction.objects.create(
+            user=order.shop.owner,
+            provider='internal',
+            method='marketplace_payout',
+            amount_cents=total_cents,
+            currency=order.currency,
+            status='success',
+            tx_ref=reference,
+            meta={'order_id': str(order.id)},
+        )
+    elif not _has_confirmed_provider_payment(order):
+        raise ValidationError('Provider payment must be confirmed before this marketplace order can be satisfied.')
     order.status = MarketplaceOrderStatus.SATISFIED
     order.provider_credit_transaction = provider_tx
     order.metadata = {
@@ -452,6 +511,8 @@ def _notify_buyer_provider_completed(order):
 def mark_provider_completed(order):
     if order.status != MarketplaceOrderStatus.TEMPORAL:
         raise ValidationError('Only temporal orders may be marked complete by the provider.')
+    if not getattr(order, 'buyer_debit_transaction_id', None) and not _has_confirmed_provider_payment(order):
+        raise ValidationError('Provider payment must be confirmed before this marketplace order can be marked complete.')
     now = timezone.now()
     deadline = now + timezone.timedelta(days=3)
     metadata = {

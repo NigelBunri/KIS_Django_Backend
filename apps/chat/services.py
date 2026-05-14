@@ -75,7 +75,7 @@ def get_or_create_direct_conversation(
             conversation = Conversation.objects.create(
                 type=ConversationType.DIRECT,
                 created_by=initiator,
-                is_locked=True,  # optional, but aligns with your “pending request” UX
+                is_locked=False,
                 request_state=ConversationRequestState.PENDING,
                 request_initiator=initiator,
                 request_recipient=recipient,

@@ -26,7 +26,12 @@ def auto_complete_education_booking(booking_id: str):
         return {"status": "waiting"}
 
     try:
-        if booking.amount_cents > 0 and not booking.provider_credit_transaction_id:
+        metadata = dict(booking.metadata) if isinstance(booking.metadata, dict) else {}
+        payment_status = str(metadata.get("payment_status") or "").strip().lower()
+        direct_provider_paid = payment_status in {"paid", "success", "succeeded", "settled"}
+        if booking.amount_cents > 0 and not booking.provider_credit_transaction_id and not booking.wallet_transaction_id and not direct_provider_paid:
+            return {"status": "failed", "error": "Provider payment must be confirmed before auto-completion."}
+        if booking.amount_cents > 0 and booking.wallet_transaction_id and not booking.provider_credit_transaction_id:
             reference = f"education-booking-payout-{booking.id}"
             release_locked_booking_funds(
                 payer=booking.user,
@@ -60,7 +65,6 @@ def auto_complete_education_booking(booking_id: str):
             )
             booking.provider_credit_transaction = provider_tx
 
-        metadata = dict(booking.metadata) if isinstance(booking.metadata, dict) else {}
         metadata["auto_released_at"] = timezone.now().isoformat()
         booking.status = EducationBookingStatus.COMPLETED
         booking.metadata = metadata

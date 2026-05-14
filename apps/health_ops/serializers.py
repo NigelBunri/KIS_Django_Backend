@@ -2,7 +2,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from rest_framework import serializers
-from apps.core.money import KISC_MICRO_PER_KISC, frontend_kisc_major_to_micro
+from apps.core.money import KISC_MICRO_PER_KISC, KISC_MICRO_PER_USD_CENT, frontend_kisc_major_to_micro
 
 from .models import (
     AdmissionBedSession,
@@ -62,6 +62,15 @@ def _micro_to_kisc_text(micro_value) -> str:
     return text or "0"
 
 
+def _micro_to_usd_label(micro_value) -> str:
+    try:
+        micro = int(micro_value or 0)
+    except (TypeError, ValueError):
+        micro = 0
+    cents = (Decimal(max(0, micro)) / Decimal(KISC_MICRO_PER_USD_CENT)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"${(cents / Decimal('100')).quantize(Decimal('0.01'))}"
+
+
 def _kisc_to_micro_or_none(value) -> int | None:
     if value in (None, ""):
         return None
@@ -91,6 +100,8 @@ class EngineRegistrySerializer(serializers.ModelSerializer):
 
 
 class HealthInstitutionSerializer(serializers.ModelSerializer):
+    verification_summary = serializers.SerializerMethodField()
+
     class Meta:
         model = HealthInstitution
         fields = [
@@ -102,10 +113,16 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
             "timezone",
             "settings",
             "is_active",
+            "verification_summary",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["owner", "slug", "created_at", "updated_at"]
+
+    def get_verification_summary(self, obj):
+        from apps.verification.services import current_health_institution_verification_status
+
+        return current_health_institution_verification_status(obj)
 
 
 class HealthServiceSerializer(serializers.ModelSerializer):
@@ -1069,6 +1086,14 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
     insurance_coverage_kisc = serializers.SerializerMethodField()
     payable_amount_kisc = serializers.SerializerMethodField()
     amount_paid_kisc = serializers.SerializerMethodField()
+    total_amount_usd_label = serializers.SerializerMethodField()
+    insurance_coverage_usd_label = serializers.SerializerMethodField()
+    payable_amount_usd_label = serializers.SerializerMethodField()
+    amount_paid_usd_label = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    currency_label = serializers.SerializerMethodField()
+    payment_intent_id = serializers.SerializerMethodField()
+    payment_url = serializers.SerializerMethodField()
 
     class Meta:
         model = PaymentBillingSession
@@ -1082,13 +1107,21 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
             "status",
             "total_amount_micro",
             "total_amount_kisc",
+            "total_amount_usd_label",
             "insurance_coverage_micro",
             "insurance_coverage_kisc",
+            "insurance_coverage_usd_label",
             "payable_amount_micro",
             "payable_amount_kisc",
+            "payable_amount_usd_label",
             "amount_paid_micro",
             "amount_paid_kisc",
+            "amount_paid_usd_label",
             "payment_provider",
+            "payment_status",
+            "currency_label",
+            "payment_intent_id",
+            "payment_url",
             "payment_reference",
             "invoice_number",
             "step_state",
@@ -1128,6 +1161,37 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
     def get_amount_paid_kisc(self, obj):
         return _micro_to_kisc_text(getattr(obj, "amount_paid_micro", 0))
 
+    def get_total_amount_usd_label(self, obj):
+        return _micro_to_usd_label(getattr(obj, "total_amount_micro", 0))
+
+    def get_insurance_coverage_usd_label(self, obj):
+        return _micro_to_usd_label(getattr(obj, "insurance_coverage_micro", 0))
+
+    def get_payable_amount_usd_label(self, obj):
+        return _micro_to_usd_label(getattr(obj, "payable_amount_micro", 0))
+
+    def get_amount_paid_usd_label(self, obj):
+        return _micro_to_usd_label(getattr(obj, "amount_paid_micro", 0))
+
+    def get_payment_status(self, obj):
+        payload = obj.payload if isinstance(obj.payload, dict) else {}
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(payload.get("payment_status") or metadata.get("payment_status") or getattr(obj, "status", "") or "waiting")
+
+    def get_payment_intent_id(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(metadata.get("direct_payment_intent_id") or "") or None
+
+    def get_payment_url(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(metadata.get("payment_url") or "") or None
+
+    def get_currency_label(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        if str(metadata.get("legacy_wallet_checkout") or "").lower() == "true" or str(obj.payment_provider or "").lower() == "kis_wallet":
+            return "Historical promotional-credit billing"
+        return "USD"
+
 
 class PaymentBillingStartSerializer(serializers.Serializer):
     workflow_session_id = serializers.UUIDField()
@@ -1149,10 +1213,8 @@ class PaymentBillingStartSerializer(serializers.Serializer):
             attrs["insurance_coverage_micro"] = _kisc_to_micro_or_none(attrs.get("insurance_coverage_kisc"))
         if "payable_amount_kisc" in attrs and "payable_amount_micro" not in attrs:
             attrs["payable_amount_micro"] = _kisc_to_micro_or_none(attrs.get("payable_amount_kisc"))
-        provider = str(attrs.get("payment_provider") or "").strip().lower()
-        if provider and provider != "kis_wallet":
-            raise serializers.ValidationError({"payment_provider": "Only kis_wallet is supported for health billing."})
-        attrs["payment_provider"] = "kis_wallet"
+        provider = str(attrs.get("payment_provider") or getattr(settings, "KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER", "flutterwave") or "flutterwave").strip().lower()
+        attrs["payment_provider"] = provider or "flutterwave"
         return attrs
 
 

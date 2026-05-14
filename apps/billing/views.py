@@ -4,6 +4,7 @@ import logging
 import uuid
 import os
 from datetime import timedelta
+from typing import Any
 import requests
 from django.conf import settings
 from django.utils import timezone
@@ -30,6 +31,8 @@ from apps.core.models import HealthcareOrganization, MedicalProfile
 from .models import (
     BillingReconciliation,
     CreditAccount,
+    DirectPaymentAuditEvent,
+    DirectPaymentIntent,
     InsuranceClaim,
     PaymentDispute,
     PromoCode,
@@ -41,6 +44,8 @@ from .models import (
 from .serializers import (
     BillingReconciliationSerializer,
     CreditAccountSerializer,
+    DirectPaymentAuditEventSerializer,
+    DirectPaymentIntentSerializer,
     InsuranceClaimSerializer,
     PaymentDisputeSerializer,
     WalletAccountSerializer,
@@ -49,6 +54,7 @@ from .serializers import (
     PromoCodeSerializer,
     PricingTierSerializer,
 )
+from .direct_payments import create_direct_payment_intent, reconcile_direct_payment_callback
 from apps.accounts.serializers import SubscriptionSerializer
 from .documents import build_invoice_urls, build_receipt_urls
 from .services import (
@@ -115,6 +121,16 @@ def _parse_int_field(value, field_name: str) -> int:
 
 
 _parse_frontend_money_to_cents = parse_frontend_money_to_cents
+
+
+def _legacy_financial_flow_disabled(message: str) -> Response:
+    return Response(
+        {
+            "detail": message,
+            "code": "legacy_financial_flow_disabled",
+        },
+        status=status.HTTP_403_FORBIDDEN,
+    )
 
 
 def _normalized_phone_variants(phone: str, country_hint: str | None = None) -> list[str]:
@@ -647,6 +663,10 @@ class WalletViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="deposit")
     def deposit(self, request):
+        if not getattr(settings, "KIS_LEGACY_WALLET_DEPOSIT_ENABLED", False):
+            return _legacy_financial_flow_disabled(
+                "Wallet top-ups are disabled. KIS promotional credits cannot be bought."
+            )
         try:
             amount = _parse_frontend_money_to_cents(request.data)
         except ValueError as exc:
@@ -770,6 +790,10 @@ class WalletViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="convert")
     def convert(self, request):
+        if not getattr(settings, "KIS_LEGACY_CASH_CREDIT_CONVERSION_ENABLED", False):
+            return _legacy_financial_flow_disabled(
+                "Cash/credit conversion is disabled. KIS promotional credits cannot be bought, sold, or converted to cash."
+            )
         direction = request.data.get("direction")
         try:
             if direction == "cash_to_credits":
@@ -804,6 +828,10 @@ class WalletViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="transfer")
     def transfer(self, request):
+        if not getattr(settings, "KIS_LEGACY_WALLET_TRANSFER_ENABLED", False):
+            return _legacy_financial_flow_disabled(
+                "Peer-to-peer wallet and promotional-credit transfers are disabled."
+            )
         recipient_id = request.data.get("recipient_id")
         recipient_phone = request.data.get("recipient_phone")
         country_hint = request.data.get("country") or getattr(request.user, "country", None)
@@ -883,7 +911,7 @@ class WalletViewSet(viewsets.ViewSet):
     def upgrade(self, request):
         tier_id = request.data.get("tier")
         tier = get_object_or_404(AccountTier, id=tier_id)
-        payment_method = request.data.get("payment_method", "credits")
+        payment_method = request.data.get("payment_method", "flutterwave")
         mock = bool(request.data.get("mock")) or getattr(settings, "PAYMENTS_MOCK", False)
         AuditLog.log(
             request.user,
@@ -916,6 +944,10 @@ class WalletViewSet(viewsets.ViewSet):
             return Response(result, status=status.HTTP_200_OK)
 
         if payment_method in ("kisc", "wallet", "wallet_balance"):
+            if not getattr(settings, "KIS_LEGACY_WALLET_UPGRADE_ENABLED", False):
+                return _legacy_financial_flow_disabled(
+                    "Wallet/KIS Coin upgrade payments are disabled. Use secure USD checkout; promotional credits may subsidize eligible upgrades."
+                )
             tx_ref = f"kis_upgrade_{uuid.uuid4().hex}"
             wallet_account = get_wallet_account(request.user)
             if wallet_account.balance_cents < tier.price_cents:
@@ -1026,13 +1058,28 @@ class WalletViewSet(viewsets.ViewSet):
         if PromoRedemption.objects.filter(user=request.user, promo=promo).exists():
             return Response({"detail": "Promo already redeemed"}, status=status.HTTP_400_BAD_REQUEST)
 
+        cash_bonus_cents = int(promo.cash_bonus_cents or 0)
+        credit_bonus = int(promo.credit_bonus or 0)
+        cash_bonus_blocked = False
+        if cash_bonus_cents and not getattr(settings, "KIS_LEGACY_PROMO_CASH_BONUS_ENABLED", False):
+            cash_bonus_blocked = True
+            cash_bonus_cents = 0
+            if credit_bonus <= 0:
+                return Response(
+                    {
+                        "detail": "This promo grants legacy wallet value and is disabled.",
+                        "code": "legacy_financial_flow_disabled",
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
         record_ledger(
             user=request.user,
             kind="promo",
-            amount_cents=promo.cash_bonus_cents,
-            credits_delta=promo.credit_bonus,
+            amount_cents=cash_bonus_cents,
+            credits_delta=credit_bonus,
             reference=f"promo:{promo.code}",
-            meta={"promo": promo.code},
+            meta={"promo": promo.code, "legacy_cash_bonus_blocked": cash_bonus_blocked},
         )
         promo.used_count += 1
         promo.save(update_fields=["used_count", "updated_at"])
@@ -1040,10 +1087,11 @@ class WalletViewSet(viewsets.ViewSet):
         return Response(
             {
                 "code": promo.code,
-                "cash_bonus_cents": promo.cash_bonus_cents,
-                "cash_bonus_usd": str(cents_to_usd(int(promo.cash_bonus_cents or 0))),
-                "cash_bonus_usd_compact": cents_to_usd_compact(int(promo.cash_bonus_cents or 0)),
-                "credit_bonus": promo.credit_bonus,
+                "cash_bonus_cents": cash_bonus_cents,
+                "cash_bonus_usd": str(cents_to_usd(cash_bonus_cents)),
+                "cash_bonus_usd_compact": cents_to_usd_compact(cash_bonus_cents),
+                "credit_bonus": credit_bonus,
+                "legacy_cash_bonus_blocked": cash_bonus_blocked,
             }
         )
 
@@ -1180,6 +1228,14 @@ class FlutterwaveWebhookView(APIView):
         if not tx_ref:
             return Response({"detail": "tx_ref missing"}, status=status.HTTP_400_BAD_REQUEST)
 
+        if DirectPaymentIntent.objects.filter(tx_ref=tx_ref).exists():
+            ok, result, _intent = reconcile_direct_payment_callback(payload=payload, signature=signature or "")
+            if not ok and result == "invalid_signature":
+                return Response({"detail": "invalid signature"}, status=status.HTTP_403_FORBIDDEN)
+            if not ok:
+                return Response({"detail": result}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"status": "ok", "result": result})
+
         transaction_obj = WalletTransaction.objects.filter(tx_ref=tx_ref).first()
         if not transaction_obj:
             return Response({"detail": "unknown transaction"}, status=status.HTTP_404_NOT_FOUND)
@@ -1222,6 +1278,65 @@ class FlutterwaveWebhookView(APIView):
             transaction_obj.meta = meta
             transaction_obj.save(update_fields=["status", "raw_payload", "meta", "updated_at"])
         return Response({"status": "ok"})
+
+
+class DirectPaymentIntentView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        target_type = str(request.data.get("target_type") or request.data.get("targetType") or "").strip()
+        target_id = request.data.get("target_id") or request.data.get("targetId")
+        provider = str(request.data.get("provider") or "flutterwave").strip().lower()
+        idempotency_key = str(
+            request.headers.get("Idempotency-Key")
+            or request.data.get("idempotency_key")
+            or request.data.get("idempotencyKey")
+            or ""
+        ).strip()
+        metadata = request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {}
+        if not target_type or not target_id:
+            return Response({"detail": "target_type and target_id are required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            intent = create_direct_payment_intent(
+                user=request.user,
+                target_type=target_type,
+                target_id=target_id,
+                provider=provider,
+                idempotency_key=idempotency_key,
+                metadata=metadata,
+            )
+        except PermissionError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"intent": DirectPaymentIntentSerializer(intent).data}, status=status.HTTP_201_CREATED)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class DirectPaymentFlutterwaveWebhookView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, *args, **kwargs):
+        signature = request.headers.get("verif-hash") or ""
+        payload = request.data if isinstance(request.data, dict) else {}
+        ok, result, intent = reconcile_direct_payment_callback(payload=payload, signature=signature)
+        if not ok and result == "invalid_signature":
+            return Response({"detail": "invalid signature"}, status=status.HTTP_403_FORBIDDEN)
+        if not ok and result == "missing_tx_ref":
+            return Response({"detail": "tx_ref missing"}, status=status.HTTP_400_BAD_REQUEST)
+        if not ok and result == "unmatched":
+            return Response({"detail": "unknown transaction"}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"status": "ok", "result": result, "intent_id": str(intent.id) if intent else None})
+
+
+class DirectPaymentAuditEventViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAdminUser]
+    serializer_class = DirectPaymentAuditEventSerializer
+    queryset = DirectPaymentAuditEvent.objects.select_related("intent", "actor").order_by("-created_at")
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["event", "provider", "target_type", "status"]
+    ordering_fields = ["created_at"]
 
 
 class WalletAdminViewSet(viewsets.ViewSet):

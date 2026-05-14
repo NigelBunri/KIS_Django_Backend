@@ -316,6 +316,10 @@ def _resolve_media_url(request, file_field, fallback_url):
 
 def _build_profile_payload(profile: Profile, viewer: Optional[User], request=None) -> dict:
     owner = profile.user
+    from apps.verification.constants import VerificationSubjectType
+    from apps.verification.services import verification_summary
+
+    owner_verification_summary = verification_summary(VerificationSubjectType.USER, owner.id)
     owner_id_str = str(owner.id)
     viewer_id = str(getattr(viewer, "id", "")) if viewer else ""
     rules = {
@@ -490,6 +494,7 @@ def _build_profile_payload(profile: Profile, viewer: Optional[User], request=Non
         "user": {
             "id": owner.id,
             "display_name": owner.display_name,
+            "verification_summary": owner_verification_summary,
             "avatar_url": maybe(
                 _resolve_media_url(request, profile.avatar_file, profile.avatar_url),
                 "avatar",
@@ -517,6 +522,7 @@ def _build_profile_payload(profile: Profile, viewer: Optional[User], request=Non
             "branding_prefs": profile.branding_prefs,
             "created_at": profile.created_at,
             "updated_at": profile.updated_at,
+            "verification_summary": owner_verification_summary,
         },
         "sections": {
             "experiences": experiences,
@@ -1281,11 +1287,16 @@ class UserViewSet(viewsets.ModelViewSet):
     def me(self, request):
         phone = (request.query_params.get("phone") or "").strip()
         if not request.user.is_authenticated and phone:
-            try:
-                normalized = to_e164(phone)
-            except Exception:
-                return Response({"detail": "Invalid phone format."}, status=status.HTTP_400_BAD_REQUEST)
-            candidate = User.objects.filter(phone=normalized).first()
+            country_hint = str(request.query_params.get("country") or "CM").strip().upper() or "CM"
+            candidates = _phone_variants(phone, country_hint)
+            digit_candidates = [_digits_only(value) for value in candidates]
+            digit_candidates = [value for value in digit_candidates if value]
+            candidate = (
+                User.objects.select_related("profile")
+                .filter(Q(phone__in=candidates) | Q(phone_number__in=digit_candidates))
+                .order_by("id")
+                .first()
+            )
             if not candidate:
                 return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
             serializer = self.get_serializer(candidate)

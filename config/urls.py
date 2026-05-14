@@ -72,6 +72,7 @@ urlpatterns = [
     path("api/v1/", include("apps.background_removal.urls")),
     path("api/v1/", include("apps.statuses.urls", namespace="statuses")),
     path("api/v1/", include("apps.billing.urls")),
+    path("api/v1/verification/", include("apps.verification.urls", namespace="verification")),
 
     # --- JWT auth endpoints (SimpleJWT) ---
     # Obtain access/refresh with username/password
@@ -90,7 +91,8 @@ urlpatterns = [
 
     #chat urls
 
-    path("api/v1/chat/", include("apps.chat.urls", namespace="chat")),
+    path("api/v1/chat/", include("apps.chat.urls", namespace="chat-singular")),
+    path("api/v1/chats/", include("apps.chat.urls", namespace="chat")),
 ]
 
 if settings.DEBUG:

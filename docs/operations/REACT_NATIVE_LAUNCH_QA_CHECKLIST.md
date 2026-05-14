@@ -206,6 +206,27 @@ Pass criteria:
 - Phone change clears local auth and forces sign-in again.
 - Cached profile refresh does not overwrite freshly saved state unexpectedly.
 
+## Verification Center And Badges
+
+Smoke path:
+
+- Open profile dashboard and tap the verification badge/status card.
+- Submit only private media reference metadata in a non-production environment.
+- Open market/shop management and verify shop verification action opens.
+- Open health institution management and verify health verification action opens.
+- Open education institution workspace overview and verify education verification action opens.
+- Open partner workspace and verify partner verification action opens.
+- Refresh after a staff-issued badge and confirm the public badge appears.
+- Refresh after badge revocation and confirm the public badge disappears.
+
+Pass criteria:
+
+- Verification sheet never asks for raw document contents or base64.
+- Provider handoff text stays placeholder-only unless explicitly enabled.
+- No provider secrets or bearer tokens appear in UI/logs.
+- Badge rows render consistently in light and dark themes.
+- Revoked/expired badges do not display publicly after refresh.
+
 ## Evidence To Save
 
 - Command outputs for required gates.
@@ -213,6 +234,7 @@ Pass criteria:
 - Device and OS versions.
 - Backend/API environment name.
 - Screenshots for successful health booking, service booking review, education detail, market cart, wallet verification, and video fallback.
+- Screenshots for verification badge display on profile, shop, partner, health institution, and education institution.
 - Notes for any blocked path, including missing test data or provider dependency.
 
 ## Phase 16 Current Evidence Status

@@ -53,6 +53,15 @@ def _build_media_url(request, relative_path: str) -> str:
     return request.build_absolute_uri(f"{media_url}{relative}")
 
 
+def _public_currency_label(value: object | None) -> str:
+    code = str(value or "").strip().upper()
+    if code == "USD":
+        return "USD"
+    if code in {"KISC", "KIS"}:
+        return "Historical promotional credits"
+    return code or "USD"
+
+
 # -----------------------------
 # Font setup (optional)
 # -----------------------------
@@ -478,8 +487,9 @@ def render_booking_receipt_pdf(booking: ServiceBooking, receipt: Optional[Servic
     )
     currency = (
         (receipt.currency if receipt and receipt.currency else None)
-        or (getattr(payment, "currency", "KISC") or "KISC")
-    ).upper()
+        or (getattr(payment, "currency", "USD") or "USD")
+    )
+    currency_label = _public_currency_label(currency)
     receipt_ref = getattr(receipt, "transaction_reference", "") if receipt else ""
     payment_ref = (
         (receipt_ref.strip() if receipt_ref and receipt_ref.strip() else None)
@@ -495,7 +505,7 @@ def render_booking_receipt_pdf(booking: ServiceBooking, receipt: Optional[Servic
         ("Provider", provider_name),
         ("Scheduled for", scheduled_str),
         ("Status", status_label),
-        ("Amount", f"{currency} {amount_cents / 100:.2f}"),
+        ("Amount", f"{currency_label} {amount_cents / 100:.2f}"),
         ("Payment reference", payment_ref),
         ("Customer", payer_name),
         ("Instructions", instructions),
@@ -916,8 +926,9 @@ def _render_booking_receipt_html(booking, receipt: Optional[ServiceBookingReceip
     )
     currency = (
         (receipt.currency if receipt and receipt.currency else None)
-        or (getattr(payment, "currency", "KISC") or "KISC")
-    ).upper()
+        or (getattr(payment, "currency", "USD") or "USD")
+    )
+    currency_label = _public_currency_label(currency)
     receipt_ref = str(getattr(receipt, "transaction_reference", "") or "").strip() if receipt else ""
     payment_ref = (
         receipt_ref
@@ -932,7 +943,7 @@ def _render_booking_receipt_html(booking, receipt: Optional[ServiceBookingReceip
         ("Provider", provider_name),
         ("Scheduled for", _safe(scheduled_str)),
         ("Status", _safe(str(booking.status or "pending").replace("_", " ").capitalize())),
-        ("Amount", f"{currency} {amount / 100:.2f}"),
+        ("Amount", f"{currency_label} {amount / 100:.2f}"),
         ("Payment reference", _safe(payment_ref)),
         ("Customer", payer_name),
         ("Instructions", instructions),

@@ -1,10 +1,11 @@
 # chat/views.py
+import logging
 import os
 import uuid
 from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-from django.db import DatabaseError
+from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Q
 
 from .internal_auth import require_internal_auth
@@ -22,6 +23,7 @@ from .models import (
     MessageThreadLink,
     ConversationType,
     BaseConversationRole,
+    ConversationNotificationLevel,
     ConversationSendPolicy,
     ConversationRequestState,
 )
@@ -34,7 +36,10 @@ from .serializers import (
     ConversationSettingsSerializer,
     MessageThreadLinkSerializer,
 )
+
+logger = logging.getLogger(__name__)
 from .services import allocate_conversation_seq, get_or_create_direct_conversation, user_is_active_member
+from apps.notifications.realtime import notify_main_tab_badges_updated
 
 from apps.accounts.models import User
 from apps.partners.models import Partner
@@ -172,7 +177,11 @@ class ConversationViewSet(viewsets.ModelViewSet):
         user = self.request.user
         qs = (
             Conversation.objects
-            .filter(memberships__user=user, memberships__left_at__isnull=True)
+            .filter(
+                memberships__user=user,
+                memberships__left_at__isnull=True,
+                memberships__is_hidden=False,
+            )
             .distinct()
             .select_related('created_by', 'request_initiator', 'request_recipient')
             .select_related('community_main', 'community_posts')
@@ -290,6 +299,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
     # ------------------------------------------------------------------
     @action(detail=False, methods=['post'], url_path='direct')
     def direct(self, request):
+        print("see request.data: ", request.data)
         """
         POST /api/v1/conversations/direct/
 
@@ -491,6 +501,80 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.save(update_fields=['is_archived', 'archived_by'])
         return Response(ConversationDetailSerializer(conversation).data, status=200)
 
+    def _current_member_for_action(self, request, conversation):
+        member = ConversationMember.objects.filter(
+            conversation=conversation,
+            user=request.user,
+            left_at__isnull=True,
+        ).first()
+        if not member:
+            raise PermissionDenied("You are not a member of this conversation.")
+        return member
+
+    @action(detail=True, methods=['post'], url_path='pin')
+    def pin(self, request, pk=None):
+        conversation = self.get_object()
+        member = self._current_member_for_action(request, conversation)
+        pinned = bool(request.data.get("pinned", True))
+        member.is_pinned = pinned
+        member.save(update_fields=["is_pinned"])
+        return Response({
+            "ok": True,
+            "conversation_id": str(conversation.id),
+            "is_pinned": member.is_pinned,
+        })
+
+    @action(detail=True, methods=['post'], url_path='mute')
+    def mute(self, request, pk=None):
+        conversation = self.get_object()
+        member = self._current_member_for_action(request, conversation)
+        muted = bool(request.data.get("muted", True))
+        member.is_muted = muted
+        member.notification_level = (
+            "none" if muted else ConversationNotificationLevel.ALL
+        )
+        member.save(update_fields=["is_muted", "notification_level"])
+        return Response({
+            "ok": True,
+            "conversation_id": str(conversation.id),
+            "is_muted": member.is_muted,
+            "notification_level": member.notification_level,
+        })
+
+    @action(detail=True, methods=['post'], url_path='delete-for-me')
+    def delete_for_me(self, request, pk=None):
+        conversation = self.get_object()
+        member = self._current_member_for_action(request, conversation)
+        member.is_hidden = True
+        member.is_pinned = False
+        member.save(update_fields=["is_hidden", "is_pinned"])
+        return Response({
+            "ok": True,
+            "conversation_id": str(conversation.id),
+            "is_hidden": member.is_hidden,
+        })
+
+    @action(detail=True, methods=['post'], url_path='mark-read')
+    def mark_read(self, request, pk=None):
+        conversation = self.get_object()
+        member = self._current_member_for_action(request, conversation)
+        member.last_read_seq = max(int(conversation.last_message_seq or 0), 0)
+        member.last_read_at = timezone.now()
+        member.save(update_fields=["last_read_seq", "last_read_at"])
+        notify_main_tab_badges_updated(
+            [str(request.user.id)],
+            source="messages",
+            reason="mark_read",
+            extra={"conversation_id": str(conversation.id)},
+        )
+        return Response({
+            "ok": True,
+            "conversation_id": str(conversation.id),
+            "last_read_seq": int(member.last_read_seq or 0),
+            "last_read_at": member.last_read_at.isoformat() if member.last_read_at else None,
+            "unread_count": 0,
+        })
+
     @action(detail=True, methods=['post'], url_path='lock')
     def lock(self, request, pk=None):
         conversation = self.get_object()
@@ -539,7 +623,12 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
         conversation.last_message_at = dt
         conversation.last_message_preview = preview
-        conversation.save(update_fields=['last_message_at', 'last_message_preview'])
+        update_fields = ['last_message_at', 'last_message_preview']
+        if conversation.type == ConversationType.DIRECT and conversation.is_locked:
+            conversation.is_locked = False
+            conversation.locked_by = None
+            update_fields.extend(['is_locked', 'locked_by'])
+        conversation.save(update_fields=update_fields)
 
         return Response({"ok": True})
 
@@ -600,6 +689,12 @@ class ConversationViewSet(viewsets.ModelViewSet):
         member.last_read_seq = next_seq
         member.last_read_at = parsed_at
         member.save(update_fields=["last_read_seq", "last_read_at"])
+        notify_main_tab_badges_updated(
+            [str(user_id)],
+            source="messages",
+            reason="read_state_updated",
+            extra={"conversation_id": str(conversation.id), "last_read_seq": int(member.last_read_seq or 0)},
+        )
 
         return Response({
             "ok": True,
@@ -707,12 +802,10 @@ class ConversationViewSet(viewsets.ModelViewSet):
         can_send = True
         settings = ConversationSettings.objects.filter(conversation=conversation).first()
         if (
-            conversation.type == ConversationType.DIRECT
-            and conversation.request_state == ConversationRequestState.PENDING
-            and conversation.request_recipient_id == member.user_id
+            conversation.type != ConversationType.DIRECT
+            and conversation.is_locked
+            and member.base_role not in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN)
         ):
-            can_send = False
-        if conversation.is_locked and member.base_role not in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
             can_send = False
         if member.base_role == BaseConversationRole.READONLY:
             can_send = False
@@ -723,6 +816,29 @@ class ConversationViewSet(viewsets.ModelViewSet):
         scopes = []
         if member.base_role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
             scopes.append("chat:admin")
+        if (
+            conversation.type == ConversationType.DIRECT
+            and conversation.request_state == ConversationRequestState.PENDING
+            and conversation.request_recipient_id == member.user_id
+        ):
+            scopes.append("chat:direct_pending_reply")
+
+        logger.info(
+            "chat.ws_perms decision conversation=%s user=%s type=%s request_state=%s "
+            "request_recipient=%s is_locked=%s member_role=%s member_blocked=%s "
+            "send_policy=%s can_send=%s scopes=%s",
+            conversation.id,
+            user_id,
+            conversation.type,
+            conversation.request_state,
+            conversation.request_recipient_id,
+            conversation.is_locked,
+            member.base_role,
+            member.is_blocked,
+            getattr(settings, "send_policy", None),
+            can_send,
+            scopes,
+        )
 
         return Response({
             "isMember": True,
@@ -837,6 +953,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
 # ----------------------------------------------------------------------
 class MessageThreadLinkViewSet(
     mixins.CreateModelMixin,
+    mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
     viewsets.GenericViewSet,
 ):
@@ -844,8 +961,106 @@ class MessageThreadLinkViewSet(
     serializer_class = MessageThreadLinkSerializer
     permission_classes = [IsAuthenticated]
 
-    def perform_create(self, serializer):
-        parent = serializer.validated_data['parent_conversation']
-        if not user_is_active_member(self.request.user, parent):
+    def get_queryset(self):
+        user = self.request.user
+        qs = (
+            MessageThreadLink.objects
+            .select_related("parent_conversation", "child_conversation", "created_by")
+            .filter(
+                Q(parent_conversation__memberships__user=user, parent_conversation__memberships__left_at__isnull=True)
+                | Q(child_conversation__memberships__user=user, child_conversation__memberships__left_at__isnull=True)
+            )
+            .distinct()
+            .order_by("-created_at")
+        )
+        parent_conversation = self.request.query_params.get("parent_conversation")
+        if parent_conversation:
+            qs = qs.filter(parent_conversation_id=parent_conversation)
+        return qs
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        parent_id = serializer.validated_data["parent_conversation"].id
+        parent = Conversation.objects.select_for_update(of=("self",)).get(id=parent_id)
+        if not user_is_active_member(request.user, parent):
             raise PermissionDenied("Not a member")
-        serializer.save(created_by=self.request.user)
+
+        settings_obj = getattr(parent, "settings", None)
+        member = ConversationMember.objects.filter(
+            conversation=parent,
+            user=request.user,
+            left_at__isnull=True,
+        ).first()
+        if (
+            settings_obj
+            and settings_obj.subroom_policy == "admins_only"
+            and (not member or member.base_role not in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN))
+        ):
+            raise PermissionDenied("Only admins can create sub-rooms in this conversation.")
+
+        parent_thread = serializer.validated_data.get("parent_thread")
+        depth = (parent_thread.depth + 1) if parent_thread else 1
+        max_depth = getattr(settings_obj, "max_subroom_depth", 8) if settings_obj else 8
+        if max_depth and depth > max_depth:
+            raise ValidationError({"parent_thread": "Maximum sub-room depth reached."})
+
+        parent_message_key = serializer.validated_data["parent_message_key"]
+        existing = MessageThreadLink.objects.filter(
+            parent_conversation=parent,
+            parent_message_key=parent_message_key,
+        ).select_related("child_conversation").first()
+        if existing:
+            return Response(self.get_serializer(existing).data, status=status.HTTP_200_OK)
+
+        raw_title = str(request.data.get("title") or "").strip()
+        title = raw_title[:255] or f"Sub-room for message {str(parent_message_key)[:8]}"
+
+        child = Conversation.objects.create(
+            type=ConversationType.THREAD,
+            title=title,
+            description=f"Sub-room from message {parent_message_key}",
+            created_by=request.user,
+        )
+        ConversationSettings.objects.create(conversation=child)
+        parent_members = ConversationMember.objects.filter(
+            conversation=parent,
+            left_at__isnull=True,
+        ).select_related("user")
+        ConversationMember.objects.bulk_create(
+            [
+                ConversationMember(
+                    conversation=child,
+                    user=row.user,
+                    base_role=row.base_role,
+                    display_name=row.display_name,
+                    notification_level=row.notification_level,
+                    color=row.color,
+                    is_muted=row.is_muted,
+                    is_blocked=row.is_blocked,
+                )
+                for row in parent_members
+            ],
+            ignore_conflicts=True,
+        )
+
+        try:
+            link = MessageThreadLink.objects.create(
+                parent_conversation=parent,
+                parent_message_key=parent_message_key,
+                child_conversation=child,
+                parent_thread=parent_thread,
+                depth=depth,
+                created_by=request.user,
+            )
+        except IntegrityError:
+            child.delete()
+            link = MessageThreadLink.objects.select_related("child_conversation").get(
+                parent_conversation=parent,
+                parent_message_key=parent_message_key,
+            )
+            return Response(self.get_serializer(link).data, status=status.HTTP_200_OK)
+
+        return Response(self.get_serializer(link).data, status=status.HTTP_201_CREATED)
