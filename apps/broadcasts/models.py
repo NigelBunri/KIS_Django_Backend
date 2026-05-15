@@ -2083,6 +2083,128 @@ class EducationInstitutionEnrollment(models.Model):
         ]
 
 
+class EducationCourseReviewStatus(models.TextChoices):
+    PENDING = "pending", "Pending review"
+    APPROVED = "approved", "Approved"
+    REJECTED = "rejected", "Rejected"
+    HIDDEN = "hidden", "Hidden"
+
+
+class EducationCourseQuestionStatus(models.TextChoices):
+    OPEN = "open", "Open"
+    ANSWERED = "answered", "Answered"
+    HIDDEN = "hidden", "Hidden"
+    CLOSED = "closed", "Closed"
+
+
+class EducationCourseReview(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="course_reviews",
+    )
+    broadcast = models.ForeignKey(
+        EducationInstitutionBroadcast,
+        on_delete=models.CASCADE,
+        related_name="course_reviews",
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.SET_NULL,
+        related_name="reviews",
+        null=True,
+        blank=True,
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="education_course_reviews",
+    )
+    rating = models.PositiveSmallIntegerField(default=5)
+    title = models.CharField(max_length=140, blank=True, default="")
+    comment = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=16,
+        choices=EducationCourseReviewStatus.choices,
+        default=EducationCourseReviewStatus.APPROVED,
+        db_index=True,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_course_review"
+        unique_together = [("broadcast", "user")]
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["broadcast", "status"]),
+            models.Index(fields=["course", "status"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        self.rating = min(5, max(1, int(self.rating or 1)))
+        super().save(*args, **kwargs)
+
+
+class EducationCourseQuestion(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="course_questions",
+    )
+    broadcast = models.ForeignKey(
+        EducationInstitutionBroadcast,
+        on_delete=models.CASCADE,
+        related_name="course_questions",
+    )
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.SET_NULL,
+        related_name="questions",
+        null=True,
+        blank=True,
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="education_course_questions",
+    )
+    question = models.TextField()
+    answer = models.TextField(blank=True, default="")
+    answered_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="answered_education_course_questions",
+        null=True,
+        blank=True,
+    )
+    answered_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=EducationCourseQuestionStatus.choices,
+        default=EducationCourseQuestionStatus.OPEN,
+        db_index=True,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_course_question"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["broadcast", "status"]),
+            models.Index(fields=["course", "status"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+
 class EducationInstitutionBooking(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     institution = models.ForeignKey(

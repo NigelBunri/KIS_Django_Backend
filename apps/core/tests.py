@@ -1,17 +1,351 @@
 from django.test import TestCase
 from django.test import override_settings
 from django.contrib.contenttypes.models import ContentType
-from rest_framework.test import APIClient
+from django.urls import reverse
+from django.utils import timezone
+import uuid
+from rest_framework import status
+from rest_framework.test import APIClient, APITestCase
 
-from apps.accounts.models import User
+from apps.accounts.models import User, UserContact
 from apps.core import models
-from apps.broadcasts.models import BroadcastHealthProfile, BroadcastHealthInstitution, BroadcastHealthInstitutionMember
+from apps.broadcasts.models import (
+    BroadcastChannel,
+    BroadcastHealthProfile,
+    BroadcastHealthInstitution,
+    BroadcastHealthInstitutionMember,
+    ChannelContent,
+)
+from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
+from apps.moderation.models import UserBlock
 from apps.core.money import (
     frontend_kisc_major_to_micro,
     frontend_kisc_major_to_usd_cents,
     parse_frontend_money_to_cents,
 )
 from common.media_urls import absolutize_backend_media, strip_backend_origin
+
+
+class SocialRecommendationFoundationTests(APITestCase):
+    def setUp(self):
+        self.viewer = User.objects.create_user(phone="+237670030001", password="TestPass123!", country="CM")
+        self.contact = User.objects.create_user(phone="+237670030002", password="TestPass123!", country="CM")
+        self.blocked = User.objects.create_user(phone="+237670030003", password="TestPass123!", country="CM")
+        UserContact.objects.create(
+            user=self.viewer,
+            contact_user=self.contact,
+            contact_phone=self.contact.phone,
+            contact_display_name="Trusted Contact",
+        )
+        UserBlock.objects.create(blocker=self.viewer, blocked=self.blocked, reason="recommendation_exclusion")
+        BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.contact.id,
+            owner_user=self.contact,
+            handle="trusted-channel",
+            display_name="Trusted Channel",
+            category="bible",
+            is_public=True,
+            is_verified=True,
+            subscriber_count=120,
+        )
+        BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.blocked.id,
+            owner_user=self.blocked,
+            handle="blocked-channel",
+            display_name="Blocked Channel",
+            category="market",
+            is_public=True,
+            subscriber_count=999,
+        )
+
+    def test_recommendation_foundation_excludes_blocked_users_and_private_signals(self):
+        self.client.force_authenticate(self.viewer)
+        response = self.client.get(reverse("core:social-recommendation-foundation"), {"limit": 6})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.data
+        serialized = str(payload)
+        channel_titles = [item["title"] for item in payload["sections"]["channels"]]
+        people_titles = [item["title"] for item in payload["sections"]["people"]]
+
+        self.assertIn("Trusted Channel", channel_titles)
+        self.assertNotIn("Blocked Channel", serialized)
+        self.assertTrue(payload["controls"]["blocked_users_excluded"])
+        self.assertTrue(payload["controls"]["christian_content_safe_ranking"])
+        self.assertFalse(payload["privacy"]["health_data_exposed"])
+        self.assertFalse(payload["privacy"]["payment_data_exposed"])
+        self.assertTrue(any("670030002" in title or title == "Trusted Contact" for title in people_titles))
+
+    def test_child_age_mode_applies_family_safe_recommendation_controls(self):
+        self.viewer.preferences = {"family_accessibility": {"age_mode": "child", "hide_sensitive_commerce": False}}
+        self.viewer.save(update_fields=["preferences"])
+        self.client.force_authenticate(self.viewer)
+
+        response = self.client.get(reverse("core:social-recommendation-foundation"), {"limit": 6})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["controls"]["age_mode"], "child")
+        self.assertTrue(response.data["controls"]["commerce_hidden_for_child_mode"])
+        self.assertEqual(response.data["sections"]["commerce"], [])
+
+
+class UnifiedPlatformDashboardSummaryTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(phone="+237670031001", password="TestPass123!", country="CM")
+        self.client.force_authenticate(self.user)
+        BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.user.id,
+            owner_user=self.user,
+            handle="phase20-creator",
+            display_name="Phase 20 Creator",
+            category="bible",
+            is_public=True,
+            is_verified=True,
+            subscriber_count=7,
+        )
+
+    def test_unified_dashboard_summary_is_safe_and_owner_scoped(self):
+        from apps.commerce.models import Shop
+
+        Shop.objects.create(
+            owner=self.user,
+            name="Phase 20 Shop",
+            slug="phase-20-shop",
+            description="USD-only readiness surface.",
+            is_verified=True,
+            followers_count=3,
+        )
+
+        response = self.client.get(reverse("core:core-unified-dashboard"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.data
+        serialized = str(payload).lower()
+
+        self.assertEqual(payload["version"], "phase_20_dashboard_foundation")
+        self.assertGreaterEqual(payload["counts"]["channels"], 1)
+        self.assertGreaterEqual(payload["counts"]["shops"], 1)
+        self.assertTrue(payload["privacy"]["no_secrets"])
+        self.assertTrue(payload["privacy"]["no_raw_documents"])
+        self.assertTrue(payload["privacy"]["no_payment_instrument_data"])
+        self.assertIn("family_accessibility", payload)
+        self.assertNotIn("card_number", serialized)
+
+
+class StaffSafetyCommandCenterTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            phone="+237670032001",
+            password="TestPass123!",
+            country="CM",
+            is_staff=True,
+        )
+        self.user = User.objects.create_user(phone="+237670032002", password="TestPass123!", country="CM")
+
+    def test_staff_command_center_returns_safe_operational_summary(self):
+        from apps.billing.models import DirectPaymentIntent
+        from apps.media.models import MediaSafetyScan
+        from apps.moderation.models import Flag
+        from apps.notifications.models import Notification, NotificationDelivery
+
+        target_id = uuid.uuid4()
+        MediaSafetyScan.objects.create(
+            owner=self.user,
+            upload_id="phase21-upload",
+            context="chat",
+            status="pending_review",
+            quarantine=True,
+            requires_review=True,
+        )
+        Flag.objects.create(
+            source="USER",
+            target_type="POST",
+            target_id=target_id,
+            reporter_id=self.user.id,
+            reason="Unsafe content report",
+            severity="HIGH",
+            status="PENDING",
+        )
+        intent = DirectPaymentIntent.objects.create(
+            user=self.user,
+            target_type=DirectPaymentIntent.TARGET_MARKETPLACE_ORDER,
+            target_id=target_id,
+            amount_cents=2500,
+            currency="USD",
+            status=DirectPaymentIntent.STATUS_PENDING,
+            tx_ref=f"phase21-{uuid.uuid4()}",
+        )
+        note = Notification.objects.create(
+            user_id=self.user.id,
+            type="PHASE21",
+            title="Phase 21",
+            body="Command center test",
+        )
+        NotificationDelivery.objects.create(notification=note, channel="PUSH", status="FAILED")
+
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(reverse("core:core-admin-safety-command-center"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.data
+        serialized = str(payload).lower()
+
+        self.assertEqual(payload["version"], "phase_21_safety_command_center")
+        self.assertTrue(payload["privacy"]["staff_only"])
+        self.assertTrue(payload["privacy"]["no_secrets"])
+        self.assertGreaterEqual(payload["counts"]["media_open_queue"], 1)
+        self.assertGreaterEqual(payload["counts"]["moderation_pending_flags"], 1)
+        self.assertGreaterEqual(payload["counts"]["payment_pending_intents"], 1)
+        self.assertGreaterEqual(payload["counts"]["notification_failed_deliveries"], 1)
+        self.assertNotIn("raw_callback", serialized)
+        self.assertNotIn("card_number", serialized)
+
+    def test_command_center_requires_staff(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get(reverse("core:core-admin-safety-command-center"))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class PerformanceOfflinePolicyTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(phone="+237670033001", password="TestPass123!", country="CM")
+        self.client.force_authenticate(self.user)
+
+    def test_policy_exposes_safe_performance_foundation(self):
+        response = self.client.get(reverse("core:core-performance-offline-policy"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.data
+        serialized = str(payload).lower()
+
+        self.assertEqual(payload["version"], "phase_22_performance_offline_foundation")
+        self.assertTrue(payload["mode"]["offline_first_enabled"])
+        self.assertTrue(payload["mode"]["stale_while_revalidate_enabled"])
+        self.assertTrue(payload["mode"]["request_deduplication_enabled"])
+        self.assertTrue(payload["media_policy"]["placeholder_on_missing_thumbnail"])
+        self.assertTrue(payload["pagination_policy"]["prefer_cursor"])
+        self.assertTrue(payload["telemetry_policy"]["redacted"])
+        self.assertTrue(payload["privacy"]["no_secrets"])
+        self.assertNotIn("card_number", serialized)
+
+    def test_child_mode_defaults_to_low_bandwidth(self):
+        self.user.preferences = {"family_accessibility": {"age_mode": "child"}}
+        self.user.save(update_fields=["preferences"])
+
+        response = self.client.get(reverse("core:core-performance-offline-policy"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["mode"]["low_bandwidth_default"])
+
+
+class SecurityPrivacyLaunchGateTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            phone="+237670034001",
+            password="TestPass123!",
+            country="CM",
+            is_staff=True,
+        )
+        self.user = User.objects.create_user(phone="+237670034002", password="TestPass123!", country="CM")
+
+    def test_security_launch_gate_is_staff_only_and_redacted(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(reverse("core:core-admin-security-launch-gate"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.data
+        serialized = str(payload).lower()
+
+        self.assertEqual(payload["version"], "phase_23_security_privacy_child_safety_launch_gate")
+        self.assertIn(payload["summary"]["go_live_status"], {"go", "conditional", "blocked"})
+        self.assertGreater(payload["summary"]["total_checks"], 10)
+        self.assertTrue(payload["privacy"]["staff_only"])
+        self.assertTrue(payload["privacy"]["no_secret_values"])
+        self.assertNotIn("password", serialized)
+        self.assertNotIn("card_number", serialized)
+
+    def test_security_launch_gate_rejects_non_staff(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get(reverse("core:core-admin-security-launch-gate"))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class MonetizationSafetySummaryTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(phone="+237670035001", password="TestPass123!", country="CM")
+        self.client.force_authenticate(self.user)
+
+    def test_monetization_summary_keeps_promotional_credits_non_cash(self):
+        response = self.client.get(reverse("core:core-monetization-safety-summary"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.data
+        serialized = str(payload).lower()
+
+        self.assertEqual(payload["version"], "phase_24_monetization_without_legal_risk")
+        self.assertEqual(payload["principles"]["platform_currency"], "USD")
+        self.assertTrue(payload["principles"]["promotional_credits_non_cash"])
+        self.assertTrue(payload["principles"]["promotional_credits_non_transferable"])
+        self.assertTrue(payload["principles"]["promotional_credits_non_withdrawable"])
+        self.assertTrue(payload["principles"]["promotional_credits_not_exchange_rated"])
+        self.assertFalse(payload["legacy_flags"]["wallet_deposit_enabled"])
+        self.assertFalse(payload["legacy_flags"]["wallet_transfer_enabled"])
+        self.assertFalse(payload["legacy_flags"]["commerce_wallet_checkout_enabled"])
+        self.assertTrue(payload["privacy"]["no_secret_values"])
+        self.assertTrue(payload["privacy"]["no_payment_instrument_data"])
+        self.assertNotIn("flw_secret", serialized)
+        self.assertNotIn("card_number", serialized)
+
+    @override_settings(KIS_LEGACY_WALLET_TRANSFER_ENABLED=True)
+    def test_legacy_transfer_flag_blocks_launch_status(self):
+        response = self.client.get(reverse("core:core-monetization-safety-summary"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["legacy_flags"]["wallet_transfer_enabled"], True)
+        self.assertEqual(response.data["summary"]["go_live_status"], "blocked")
+        self.assertGreaterEqual(response.data["summary"]["critical_failures"], 1)
+
+
+class AIAssistanceSafetyPolicyTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(phone="+237670036001", password="TestPass123!", country="CM")
+        self.client.force_authenticate(self.user)
+
+    def test_ai_safety_policy_is_redacted_and_guarded(self):
+        response = self.client.get(reverse("core:core-ai-safety-policy"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.data
+        serialized = str(payload).lower()
+
+        self.assertEqual(payload["version"], "phase_25_ai_assistance_christian_safety_boundaries")
+        self.assertFalse(payload["provider"]["live_calls_enabled"])
+        self.assertFalse(payload["provider"]["secret_values_exposed"])
+        self.assertTrue(payload["boundaries"]["christian_principles_required"])
+        self.assertTrue(payload["boundaries"]["pornographic_or_sexual_content_blocked"])
+        self.assertTrue(payload["boundaries"]["medical_diagnosis_blocked"])
+        self.assertTrue(payload["boundaries"]["financial_advice_blocked"])
+        self.assertTrue(payload["privacy_controls"]["input_redaction_required"])
+        self.assertTrue(payload["privacy_controls"]["output_moderation_required"])
+        self.assertFalse(payload["privacy_controls"]["store_raw_prompts"])
+        self.assertFalse(payload["privacy_controls"]["store_raw_responses"])
+        self.assertIn("bible_study_help", payload["assistant_surfaces"])
+        self.assertNotIn("api_key", serialized)
+        self.assertNotIn("card_number", serialized)
+
+    @override_settings(KIS_AI_LIVE_PROVIDER_CALLS_ENABLED=True, KIS_AI_PROVIDER="", KIS_AI_OUTPUT_MODERATION_REQUIRED=False)
+    def test_ai_live_calls_without_guardrails_block_launch_status(self):
+        response = self.client.get(reverse("core:core-ai-safety-policy"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["provider"]["live_calls_enabled"])
+        self.assertEqual(response.data["summary"]["go_live_status"], "blocked")
+        self.assertGreaterEqual(response.data["summary"]["critical_failures"], 1)
 
 
 class CommunityPermissionHelperTests(TestCase):
@@ -104,6 +438,82 @@ class BackendMediaUrlNormalizationTests(TestCase):
                 absolutize_backend_media("http://10.112.162.99:8000/media/institutions/logo.png", request=request),
                 "http://10.112.162.99:8000/media/institutions/logo.png",
             )
+
+
+class UnifiedSearchApiTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            phone="+237670009001",
+            password="StrongPass123",
+            country="CM",
+            display_name="Search Owner",
+            username="search_owner",
+        )
+        self.peer = User.objects.create_user(
+            phone="+237670009002",
+            password="StrongPass123",
+            country="CM",
+            display_name="Faithful Friend",
+            username="faithful_friend",
+        )
+        self.client.force_authenticate(self.user)
+        self.conversation = Conversation.objects.create(
+            type=ConversationType.DIRECT,
+            title="Faithful conversation",
+            created_by=self.user,
+            last_message_preview="Pray without ceasing",
+        )
+        ConversationMember.objects.create(
+            conversation=self.conversation,
+            user=self.user,
+            base_role=BaseConversationRole.OWNER,
+        )
+        ConversationMember.objects.create(
+            conversation=self.conversation,
+            user=self.peer,
+            base_role=BaseConversationRole.MEMBER,
+        )
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.user.id,
+            owner_user=self.user,
+            handle="faith-channel",
+            display_name="Faith Channel",
+            description="Public testimony channel",
+            is_public=True,
+        )
+        self.content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type="text",
+            title="Faith Teaching",
+            text_plain="A teaching about faith and wisdom.",
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.user,
+        )
+
+    def test_unified_search_returns_grouped_permission_safe_results(self):
+        response = self.client.get("/api/v1/core/search/unified/", {"q": "Faith", "groups": "contacts,conversations,channels,channel_content"})
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertGreaterEqual(response.data["count"], 4)
+        self.assertIn("contacts", response.data["groups"])
+        self.assertIn("conversations", response.data["groups"])
+        self.assertIn("channels", response.data["groups"])
+        self.assertIn("channel_content", response.data["groups"])
+        kinds = {row["kind"] for row in response.data["results"]}
+        self.assertIn("contact", kinds)
+        self.assertIn("conversation", kinds)
+        self.assertIn("channel", kinds)
+        self.assertIn("channel_content", kinds)
+
+    def test_unified_search_requires_authentication(self):
+        self.client.force_authenticate(None)
+
+        response = self.client.get("/api/v1/core/search/unified/", {"q": "Faith"})
+
+        self.assertEqual(response.status_code, 401)
 
 
 class PatientCanonicalHealthProfileTests(TestCase):

@@ -137,6 +137,7 @@ from apps.partners.services import (
     reactivate_partner_profile,
     get_partner_organization_apps_for_user,
     filter_partner_channels_for_user,
+    build_partner_discord_summary,
 )
 from apps.verification.constants import VerificationSubjectType
 from apps.verification.models import VerificationCase
@@ -2018,6 +2019,14 @@ class PartnerViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+    @action(detail=True, methods=["get"], url_path="discord-summary")
+    def discord_summary(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view partner workspace summary.")
+        payload = build_partner_discord_summary(partner, request.user)
+        return Response(payload, status=status.HTTP_200_OK)
 
     @action(
         detail=True,

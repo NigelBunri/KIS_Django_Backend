@@ -31,6 +31,8 @@ from .models import (
     LoyaltyPoint,
     ShopFollow,
     ProductShare,
+    ProductReview,
+    ProductQuestion,
     AIRecommendation,
     AuditLog,
     FraudSignal,
@@ -48,6 +50,7 @@ from .models import (
     CartItem,
     MarketplaceOrder,
     MarketplaceOrderItem,
+    MarketplaceOrderStatus,
     MarketplaceComplaint,
     CatalogCategory,
 )
@@ -69,6 +72,37 @@ def _commerce_currency_label(currency: object, metadata: dict | None = None) -> 
     if code in {'KISC', 'KIS'}:
         return 'Historical promotional-credit order'
     return code or 'USD'
+
+
+def _public_user_summary(user) -> dict | None:
+    if not user:
+        return None
+    display = (
+        getattr(user, 'display_name', '')
+        or getattr(user, 'username', '')
+        or getattr(user, 'phone', '')
+        or 'KIS member'
+    )
+    return {
+        'id': str(getattr(user, 'id', '')),
+        'display_name': display,
+    }
+
+
+def _commerce_trust_summary(shop: Shop | None) -> dict:
+    if not shop:
+        return {'verified': False, 'badges': [], 'label': 'Seller'}
+    badges = [str(item) for item in (getattr(shop, 'trust_badges', []) or []) if str(item).strip()]
+    verified = bool(getattr(shop, 'is_verified', False) or str(getattr(shop, 'verification_status', '')).upper() == 'VERIFIED')
+    if verified and not any(item in badges for item in ('verified-shop', 'trusted-merchant')):
+        badges.append('verified-shop')
+    return {
+        'verified': verified,
+        'badges': sorted(set(badges)),
+        'label': 'Verified seller' if verified else 'Seller',
+        'rating_avg': float(getattr(shop, 'rating_avg', 0) or 0),
+        'rating_count': int(getattr(shop, 'rating_count', 0) or 0),
+    }
 
 
 def normalize_availability_rules_value(value):
@@ -478,6 +512,78 @@ class ProductRatingSerializer(serializers.ModelSerializer):
         return value
 
 
+class ProductReviewSerializer(serializers.ModelSerializer):
+    user = serializers.SerializerMethodField()
+    product_name = serializers.CharField(source='product.name', read_only=True)
+
+    class Meta:
+        model = ProductReview
+        fields = (
+            'id',
+            'product',
+            'product_name',
+            'user',
+            'rating',
+            'title',
+            'body',
+            'status',
+            'helpful_count',
+            'created_at',
+            'updated_at',
+        )
+        read_only_fields = ('id', 'user', 'status', 'helpful_count', 'created_at', 'updated_at')
+
+    def get_user(self, obj):
+        return _public_user_summary(getattr(obj, 'user', None))
+
+    def validate_rating(self, value):
+        if value < 1 or value > 5:
+            raise serializers.ValidationError('Rating must be between 1 and 5.')
+        return value
+
+    def validate(self, attrs):
+        title = str(attrs.get('title') or '').strip()
+        body = str(attrs.get('body') or '').strip()
+        if not title and not body:
+            raise serializers.ValidationError({'body': 'Share a short review before submitting.'})
+        return attrs
+
+
+class ProductQuestionSerializer(serializers.ModelSerializer):
+    user = serializers.SerializerMethodField()
+    answered_by = serializers.SerializerMethodField()
+    product_name = serializers.CharField(source='product.name', read_only=True)
+
+    class Meta:
+        model = ProductQuestion
+        fields = (
+            'id',
+            'product',
+            'product_name',
+            'user',
+            'question',
+            'answer',
+            'answered_by',
+            'answered_at',
+            'status',
+            'created_at',
+            'updated_at',
+        )
+        read_only_fields = ('id', 'user', 'answer', 'answered_by', 'answered_at', 'status', 'created_at', 'updated_at')
+
+    def get_user(self, obj):
+        return _public_user_summary(getattr(obj, 'user', None))
+
+    def get_answered_by(self, obj):
+        return _public_user_summary(getattr(obj, 'answered_by', None))
+
+    def validate_question(self, value):
+        normalized = str(value or '').strip()
+        if len(normalized) < 4:
+            raise serializers.ValidationError('Ask a clear product question.')
+        return normalized
+
+
 class ShopLandingTestimonialSerializer(serializers.ModelSerializer):
     class Meta:
         model = ShopLandingTestimonial
@@ -782,6 +888,11 @@ class ProductSerializer(serializers.ModelSerializer):
     is_broadcasted = serializers.SerializerMethodField()
     broadcast_item_id = serializers.SerializerMethodField()
     currency_display = serializers.SerializerMethodField()
+    seller_trust = serializers.SerializerMethodField()
+    review_summary = serializers.SerializerMethodField()
+    question_summary = serializers.SerializerMethodField()
+    fulfillment_summary = serializers.SerializerMethodField()
+    recommendation_context = serializers.SerializerMethodField()
 
     brand = serializers.CharField(required=False, allow_blank=True)
     condition = serializers.CharField(required=False, allow_blank=True)
@@ -845,10 +956,79 @@ class ProductSerializer(serializers.ModelSerializer):
             'is_broadcasted',
             'broadcast_item_id',
             'currency_display',
+            'seller_trust',
+            'review_summary',
+            'question_summary',
+            'fulfillment_summary',
+            'recommendation_context',
         )
 
     def get_currency_display(self, obj):
         return 'USD'
+
+    def get_seller_trust(self, obj):
+        return _commerce_trust_summary(getattr(obj, 'shop', None))
+
+    def get_review_summary(self, obj):
+        reviews = getattr(obj, 'reviews', None)
+        ratings = getattr(obj, 'ratings', None)
+        published_reviews = reviews.filter(status=ProductReview.STATUS_PUBLISHED, is_deleted=False) if reviews is not None else []
+        try:
+            review_count = published_reviews.count()
+            avg_rating = sum(float(item.rating or 0) for item in published_reviews[:50]) / review_count if review_count else 0
+        except Exception:
+            review_count = 0
+            avg_rating = 0
+        if not review_count and ratings is not None:
+            try:
+                rating_values = list(ratings.values_list('score', flat=True)[:100])
+                review_count = len(rating_values)
+                avg_rating = sum(float(item or 0) for item in rating_values) / review_count if review_count else 0
+            except Exception:
+                review_count = 0
+                avg_rating = 0
+        return {
+            'count': review_count,
+            'average': round(avg_rating, 2) if avg_rating else 0,
+            'label': f"{round(avg_rating, 1)} stars" if avg_rating else 'No reviews yet',
+        }
+
+    def get_question_summary(self, obj):
+        questions = getattr(obj, 'questions', None)
+        if questions is None:
+            return {'count': 0, 'answered_count': 0}
+        qs = questions.filter(is_deleted=False).exclude(status=ProductQuestion.STATUS_HIDDEN)
+        return {
+            'count': qs.count(),
+            'answered_count': qs.filter(status=ProductQuestion.STATUS_ANSWERED).count(),
+        }
+
+    def get_fulfillment_summary(self, obj):
+        attrs = getattr(obj, 'attributes', {}) if isinstance(getattr(obj, 'attributes', None), dict) else {}
+        requires_shipping = bool(getattr(obj, 'requires_shipping', True))
+        pickup_available = bool(attrs.get('pickup_available') or attrs.get('pickupAvailable') or False)
+        delivery_estimate = str(attrs.get('delivery_estimate') or attrs.get('deliveryEstimate') or '').strip()
+        return {
+            'requires_shipping': requires_shipping,
+            'pickup_available': pickup_available,
+            'delivery_estimate': delivery_estimate or ('Provider delivery' if requires_shipping else 'Digital or service fulfillment'),
+            'stock_status': 'in_stock' if int(getattr(obj, 'stock_qty', 0) or 0) > 0 else 'out_of_stock',
+        }
+
+    def get_recommendation_context(self, obj):
+        category_names = []
+        try:
+            category_names = list(obj.catalog_categories.values_list('name', flat=True)[:5])
+        except Exception:
+            category_names = []
+        return {
+            'reason': 'Based on seller trust, product category, and availability.',
+            'signals': {
+                'featured': bool(getattr(obj, 'is_featured', False)),
+                'verified_seller': bool(getattr(getattr(obj, 'shop', None), 'is_verified', False)),
+                'categories': category_names,
+            },
+        }
 
     def get_image_url(self, obj):
         request = self.context.get('request')
@@ -1393,11 +1573,22 @@ class ShopServiceSerializer(serializers.ModelSerializer):
     coverage = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     remote_regions = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     remote_meeting_link = serializers.CharField(required=False, allow_blank=True)
+    seller_trust = serializers.SerializerMethodField()
+    service_quality_summary = serializers.SerializerMethodField()
+    fulfillment_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = ShopService
         fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at', 'is_broadcasted', 'broadcast_item_id')
+        read_only_fields = (
+            'created_at',
+            'updated_at',
+            'is_broadcasted',
+            'broadcast_item_id',
+            'seller_trust',
+            'service_quality_summary',
+            'fulfillment_summary',
+        )
         validators: list = []
 
     def to_internal_value(self, data):
@@ -1481,6 +1672,26 @@ class ShopServiceSerializer(serializers.ModelSerializer):
             return None
         serializer = CatalogCategorySerializer(first_category, context=self.context)
         return serializer.data
+
+    def get_seller_trust(self, obj):
+        return _commerce_trust_summary(getattr(obj, 'shop', None))
+
+    def get_service_quality_summary(self, obj):
+        return {
+            'rating_avg': float(getattr(obj, 'rating_avg', 0) or 0),
+            'rating_count': int(getattr(obj, 'rating_count', 0) or 0),
+            'label': f"{float(getattr(obj, 'rating_avg', 0) or 0):.1f} stars" if getattr(obj, 'rating_count', 0) else 'No ratings yet',
+        }
+
+    def get_fulfillment_summary(self, obj):
+        delivery_modes = [str(item) for item in (getattr(obj, 'delivery_modes', []) or []) if str(item).strip()]
+        return {
+            'delivery_modes': delivery_modes,
+            'duration_minutes': int(getattr(obj, 'duration_minutes', 0) or 0),
+            'remote_available': any(item.lower() == 'remote' for item in delivery_modes),
+            'coverage': getattr(obj, 'coverage', []) or [],
+            'turnaround_hours': int(getattr(obj, 'turnaround_hours', 0) or 0),
+        }
 
     def get_image_url(self, obj):
         image_file = getattr(obj, 'image_file', None)
@@ -2335,6 +2546,9 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
     payment_required = serializers.SerializerMethodField()
     payment_intent_id = serializers.SerializerMethodField()
     payment_url = serializers.SerializerMethodField()
+    fulfillment_summary = serializers.SerializerMethodField()
+    seller_trust = serializers.SerializerMethodField()
+    next_action = serializers.SerializerMethodField()
 
     class Meta:
         model = MarketplaceOrder
@@ -2355,6 +2569,9 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
             'payment_required',
             'payment_intent_id',
             'payment_url',
+            'fulfillment_summary',
+            'seller_trust',
+            'next_action',
             'metadata',
             'items',
             'created_at',
@@ -2414,6 +2631,44 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
     def get_payment_url(self, obj):
         meta = obj.metadata if isinstance(obj.metadata, dict) else {}
         return str(meta.get('payment_url') or '') or None
+
+    def get_fulfillment_summary(self, obj):
+        meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return {
+            'status': str(obj.status or ''),
+            'provider_completed_at': meta.get('provider_completed_at'),
+            'satisfaction_deadline': meta.get('awaiting_satisfaction_until') or meta.get('satisfaction_deadline'),
+            'delivery_status': meta.get('delivery_status') or meta.get('fulfillment_status') or ('awaiting_satisfaction' if obj.status == MarketplaceOrderStatus.AWAITING_SATISFACTION else 'pending'),
+            'tracking_reference': meta.get('tracking_reference') or meta.get('fulfillment_reference') or '',
+            'buyer_message': self._fulfillment_buyer_message(obj, meta),
+        }
+
+    def get_seller_trust(self, obj):
+        return _commerce_trust_summary(getattr(obj, 'shop', None))
+
+    def get_next_action(self, obj):
+        meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+        payment_status = str(meta.get('payment_status') or '').lower()
+        if payment_status in {'pending', 'failed', 'cancelled', 'canceled'}:
+            return {
+                'code': 'open_checkout',
+                'label': 'Complete secure USD payment',
+                'enabled': bool(meta.get('payment_url')),
+            }
+        if obj.status == MarketplaceOrderStatus.AWAITING_SATISFACTION:
+            return {'code': 'confirm_satisfaction', 'label': 'Confirm satisfaction or open a complaint', 'enabled': True}
+        if obj.status == MarketplaceOrderStatus.TEMPORAL:
+            return {'code': 'await_provider_completion', 'label': 'Waiting for seller fulfillment', 'enabled': False}
+        return {'code': 'none', 'label': 'No action needed', 'enabled': False}
+
+    def _fulfillment_buyer_message(self, obj, meta):
+        if obj.status == MarketplaceOrderStatus.AWAITING_SATISFACTION:
+            return 'Seller marked the order complete. Confirm satisfaction within 3 days or file a complaint.'
+        if obj.status == MarketplaceOrderStatus.COMPLAINT:
+            return 'A complaint is open for review.'
+        if str(meta.get('payment_status') or '').lower() in {'pending', 'failed'}:
+            return 'Complete secure Flutterwave checkout before fulfillment begins.'
+        return 'Seller fulfillment is being tracked on KIS.'
 
 
 class MarketplaceOrderItemCreateSerializer(serializers.Serializer):

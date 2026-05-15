@@ -17,67 +17,24 @@ from django.shortcuts import get_object_or_404
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from apps.accounts.jwt_auth import DeviceBoundJWTAuthentication
 
-from .models import MediaAsset, MediaVariant, ProcessingJob, MediaMetrics
+from .models import MediaAsset, MediaVariant, ProcessingJob, MediaMetrics, MediaSafetyScan
 from django.db import models
 from .serializers import (
-    MediaAssetSerializer, MediaVariantSerializer, ProcessingJobSerializer, MediaMetricsSerializer
+    MediaAssetSerializer, MediaVariantSerializer, ProcessingJobSerializer, MediaMetricsSerializer, MediaSafetyScanSerializer
 )
 from .permissions import IsOwnerOrReadOnly
+from .safety import (
+    explicit_scan_required,
+    hash_upload,
+    normalize_upload_context,
+    scan_upload_for_explicit_content,
+    user_safe_upload_response,
+    validate_upload_file_safety,
+)
 
-MAX_UPLOAD_BYTES = int(os.environ.get("UPLOAD_MAX_BYTES", str(50 * 1024 * 1024)))
 MEDIA_SIGNED_URL_TTL_SECONDS = int(os.environ.get("MEDIA_SIGNED_URL_TTL_SECONDS", "300"))
-UPLOAD_SCAN_REQUIRED = str(os.environ.get("UPLOAD_SCAN_REQUIRED", "0")).strip().lower() in {"1", "true", "yes"}
 PRIVATE_VISIBILITY_VALUES = {"private", "restricted", "owner", "authenticated", "tenant"}
 PUBLIC_VISIBILITY_VALUES = {"public", "published", "open"}
-BLOCKED_UPLOAD_EXTENSIONS = {
-    ".apk",
-    ".app",
-    ".bat",
-    ".bin",
-    ".cmd",
-    ".com",
-    ".dll",
-    ".dmg",
-    ".exe",
-    ".js",
-    ".mjs",
-    ".msi",
-    ".ps1",
-    ".scr",
-    ".sh",
-    ".vbs",
-}
-ALLOWED_UPLOAD_MIME_PREFIXES = ("image/", "video/", "audio/", "text/")
-ALLOWED_UPLOAD_MIME_TYPES = {
-    "application/json",
-    "application/octet-stream",
-    "application/pdf",
-    "application/msword",
-    "application/vnd.ms-excel",
-    "application/vnd.ms-powerpoint",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/zip",
-}
-
-
-def _is_allowed_upload_mime(mime_type: str | None) -> bool:
-    normalized = str(mime_type or "").strip().lower()
-    if not normalized:
-        return False
-    return normalized in ALLOWED_UPLOAD_MIME_TYPES or normalized.startswith(ALLOWED_UPLOAD_MIME_PREFIXES)
-
-
-def _validate_upload_file(upload):
-    filename = str(upload.name or "upload")
-    ext = os.path.splitext(filename)[1].lower()
-    if ext in BLOCKED_UPLOAD_EXTENSIONS:
-        raise ValidationError({"detail": "This file type is not allowed."})
-    if upload.size and upload.size > MAX_UPLOAD_BYTES:
-        raise ValidationError({"detail": "File too large."})
-    if not _is_allowed_upload_mime(upload.content_type):
-        raise ValidationError({"detail": "This MIME type is not allowed."})
 
 
 def _payload_visibility(payload) -> str:
@@ -351,6 +308,18 @@ class ProcessingJobViewSet(viewsets.ReadOnlyModelViewSet):
         return qs.filter(asset__owner=user)
 
 
+class MediaSafetyScanViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = MediaSafetyScanSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = MediaSafetyScan.objects.select_related("owner", "asset").filter(is_deleted=False).order_by("-created_at")
+        user = self.request.user
+        if user.is_staff:
+            return qs
+        return qs.filter(owner=user)
+
+
 def _guess_attachment_kind(mime_type: str | None) -> str:
     if not mime_type:
         return "other"
@@ -382,10 +351,16 @@ class UploadFileView(APIView):
         upload = request.FILES.get("file")
         if not upload:
             return Response({"detail": "A file is required."}, status=status.HTTP_400_BAD_REQUEST)
-        _validate_upload_file(upload)
+        context = normalize_upload_context(
+            request.data.get("context") or request.data.get("surface") or request.data.get("upload_context")
+        )
+        validate_upload_file_safety(upload, context=context)
 
         identifier = uuid.uuid4().hex
         filename = get_valid_filename(upload.name or "upload") or "upload"
+        checksum = hash_upload(upload)
+        mime_type = upload.content_type or ""
+        decision = scan_upload_for_explicit_content(filename=filename, mime_type=mime_type, context=context)
         relative_path = f"uploads/{identifier}/{filename}"
         saved_path = default_storage.save(relative_path, upload)
         sanitized_path = saved_path.replace("\\", "/")
@@ -393,20 +368,53 @@ class UploadFileView(APIView):
         public_url = request.build_absolute_uri(f"{media_root_url}/{sanitized_path.lstrip('/')}")
         visibility = str(request.data.get("visibility") or "private").strip().lower()
         is_public_upload = visibility in PUBLIC_VISIBILITY_VALUES
-        scan_status = "pending" if UPLOAD_SCAN_REQUIRED else "not_configured"
+        scan_status = decision.status
+
+        safety_scan = MediaSafetyScan.objects.create(
+            owner=request.user if request.user.is_authenticated else None,
+            upload_id=identifier,
+            context=context,
+            original_name=filename,
+            mime_type=mime_type,
+            bytes=upload.size or 0,
+            checksum=checksum,
+            provider=decision.provider,
+            status=decision.status,
+            quarantine=decision.quarantine,
+            requires_review=decision.requires_review,
+            policy_version=decision.policy_version,
+            reason=decision.reason,
+            result={
+                **decision.as_metadata(),
+                "surface": "upload_file",
+                "conversation_id": str(request.GET.get("conversationId") or ""),
+                "client_id": str(request.GET.get("clientId") or ""),
+                "device_id_present": bool(request.headers.get("X-Device-Id") or request.GET.get("device_id")),
+                "visibility": visibility,
+            },
+        )
+        try:
+            from apps.moderation.services import create_media_safety_alert_for_scan
+
+            create_media_safety_alert_for_scan(safety_scan, actor=request.user, request=request)
+        except Exception:
+            pass
 
         attachment = {
             "id": identifier,
-            "url": public_url if (settings.DEBUG or is_public_upload) else "",
+            "url": public_url if (settings.DEBUG and not decision.quarantine) or (is_public_upload and not decision.quarantine) else "",
             "localUrl": public_url if settings.DEBUG else "",
             "originalName": filename,
-            "mimeType": upload.content_type or "",
+            "mimeType": mime_type,
             "size": upload.size,
-            "kind": _guess_attachment_kind(upload.content_type),
+            "kind": _guess_attachment_kind(mime_type),
             "visibility": "public" if is_public_upload else "private",
             "private": not is_public_upload,
             "scanStatus": scan_status,
-            "quarantined": UPLOAD_SCAN_REQUIRED,
+            "quarantined": decision.quarantine,
+            "requiresReview": decision.requires_review,
+            "safetyScanId": str(safety_scan.id),
+            "safety": user_safe_upload_response(decision),
         }
 
         return Response({"attachment": attachment}, status=status.HTTP_201_CREATED)

@@ -17,6 +17,30 @@ from .models import (
 from .views import issue_tokens_for_user
 
 
+class FamilyAccessibilityPreferencesTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(phone="+237670040001", password="TestPass123!", country="CM")
+        self.client.force_authenticate(user=self.user)
+
+    def test_family_accessibility_preferences_default_and_child_mode_are_safe(self):
+        default_response = self.client.get(reverse("family-accessibility-preferences"))
+        self.assertEqual(default_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(default_response.data["preferences"]["age_mode"], "adult")
+        self.assertTrue(default_response.data["family_safety"]["pornography_blocked_everywhere"])
+
+        child_response = self.client.patch(
+            reverse("family-accessibility-preferences"),
+            {"preferences": {"age_mode": "child", "hide_sensitive_commerce": False, "navigation_mode": "standard"}},
+            format="json",
+        )
+        self.assertEqual(child_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(child_response.data["preferences"]["age_mode"], "child")
+        self.assertTrue(child_response.data["preferences"]["hide_sensitive_commerce"])
+        self.assertTrue(child_response.data["preferences"]["guardian_review_required"])
+        self.assertEqual(child_response.data["preferences"]["navigation_mode"], "guided")
+        self.assertGreaterEqual(child_response.data["accessibility"]["min_touch_target"], 52)
+
+
 class AccountsDeviceSessionTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(

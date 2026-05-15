@@ -630,6 +630,13 @@ class ConversationViewSet(viewsets.ModelViewSet):
             update_fields.extend(['is_locked', 'locked_by'])
         conversation.save(update_fields=update_fields)
 
+        if conversation.type == ConversationType.DIRECT:
+            ConversationMember.objects.filter(
+                conversation=conversation,
+                left_at__isnull=True,
+                is_hidden=True,
+            ).update(is_hidden=False)
+
         return Response({"ok": True})
 
     @action(

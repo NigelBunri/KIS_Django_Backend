@@ -23,9 +23,13 @@ from .services import mark_provider_completed, place_marketplace_order, satisfy_
 from .availability import DAY_KEYS, normalize_availability_payload
 from .models import (
     CatalogCategory,
+    Cart,
+    CartItem,
     MarketplaceOrderStatus,
     Product,
     ProductImage,
+    ProductQuestion,
+    ProductReview,
     ServiceBooking,
     ServiceBookingComplaint,
     ServiceBookingEscrow,
@@ -259,6 +263,112 @@ class MarketplaceUsdCheckoutTests(TestCase):
         data = MarketplaceOrderSerializer(order).data
 
         self.assertEqual(data['currency_label'], 'Historical promotional-credit order')
+
+    def test_marketplace_order_serializer_exposes_fulfillment_and_trust_guidance(self):
+        self.shop.is_verified = True
+        self.shop.trust_badges = ['trusted-merchant']
+        self.shop.save(update_fields=['is_verified', 'trust_badges'])
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+        )
+
+        data = MarketplaceOrderSerializer(order).data
+
+        self.assertEqual(data['seller_trust']['label'], 'Verified seller')
+        self.assertEqual(data['fulfillment_summary']['delivery_status'], 'pending')
+        self.assertEqual(data['next_action']['code'], 'open_checkout')
+        self.assertEqual(data['currency_label'], 'USD')
+
+
+class CommerceAmazonCoreApiTests(APITestCase):
+    def setUp(self):
+        disable_product_recommendation_signal(self)
+        User = get_user_model()
+        self.seller = User.objects.create_user(phone='5557771100', username='seller_120', password='secret', country='NG')
+        self.buyer = User.objects.create_user(phone='5557772200', username='buyer_120', password='secret', country='NG')
+        self.shop = Shop.objects.create(
+            owner=self.seller,
+            name='Trusted Royal Shop',
+            slug='trusted-royal-shop',
+            is_verified=True,
+            trust_badges=['verified-shop'],
+        )
+        self.product = Product.objects.create(
+            shop=self.shop,
+            sku='ROYAL-120-001',
+            name='Royal Lamp',
+            price=Decimal('25.00'),
+            sale_price=Decimal('20.00'),
+            stock_qty=3,
+            currency='USD',
+        )
+        self.client.force_authenticate(user=self.buyer)
+
+    def test_product_detail_exposes_trust_reviews_questions_and_fulfillment(self):
+        ProductReview.objects.create(product=self.product, user=self.buyer, rating=5, title='Excellent')
+        ProductQuestion.objects.create(
+            product=self.product,
+            user=self.buyer,
+            question='Does this ship this week?',
+            answer='Yes.',
+            answered_by=self.seller,
+            answered_at=timezone.now(),
+            status=ProductQuestion.STATUS_ANSWERED,
+        )
+
+        response = self.client.get(f'/api/v1/commerce/products/{self.product.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['currency'], 'USD')
+        self.assertTrue(response.data['seller_trust']['verified'])
+        self.assertEqual(response.data['review_summary']['count'], 1)
+        self.assertEqual(response.data['question_summary']['answered_count'], 1)
+        self.assertEqual(response.data['fulfillment_summary']['stock_status'], 'in_stock')
+
+    def test_cart_item_mutations_keep_cart_subtotal_in_sync(self):
+        cart = Cart.objects.create(user=self.buyer, shop=self.shop)
+        payload = {
+            'cart': str(cart.id),
+            'product': str(self.product.id),
+            'quantity': 2,
+            'price_snapshot': '20.00',
+            'stock_snapshot': 3,
+        }
+        create_response = self.client.post('/api/v1/commerce/cart-items/', payload, format='json')
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        cart.refresh_from_db()
+        self.assertEqual(cart.subtotal, Decimal('40.00'))
+
+        update_response = self.client.patch(
+            f"/api/v1/commerce/cart-items/{create_response.data['id']}/",
+            {'quantity': 1},
+            format='json',
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK, update_response.data)
+        cart.refresh_from_db()
+        self.assertEqual(cart.subtotal, Decimal('20.00'))
+
+    def test_reviews_questions_and_discovery_endpoints_are_available(self):
+        review_response = self.client.post(
+            '/api/v1/commerce/product-reviews/',
+            {'product': str(self.product.id), 'rating': 5, 'title': 'Loved it'},
+            format='json',
+        )
+        self.assertEqual(review_response.status_code, status.HTTP_201_CREATED, review_response.data)
+        question_response = self.client.post(
+            '/api/v1/commerce/product-questions/',
+            {'product': str(self.product.id), 'question': 'Can I pick this up?'},
+            format='json',
+        )
+        self.assertEqual(question_response.status_code, status.HTTP_201_CREATED, question_response.data)
+
+        discovery_response = self.client.get('/api/v1/commerce/discovery/?q=Royal')
+
+        self.assertEqual(discovery_response.status_code, status.HTTP_200_OK, discovery_response.data)
+        self.assertEqual(discovery_response.data['currency'], 'USD')
+        self.assertIn('featured_products', discovery_response.data['sections'])
 
 
 @override_settings(KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED=True)

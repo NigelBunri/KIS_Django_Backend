@@ -1,8 +1,11 @@
 import json
+from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from django.db import models
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -10,7 +13,16 @@ from apps.accounts.models import User
 from apps.bible.importers import scan_bible_translation_registry
 from apps.bible.models import (
     BibleBook,
+    BibleBookmark,
     BibleChapter,
+    BibleHighlight,
+    BibleNote,
+    BiblePreference,
+    BibleReadingPlanEvent,
+    BiblePublishStatus,
+    BibleDailyPassage,
+    BibleMeditationPost,
+    ReadingHistory,
     BibleTranslation,
     BibleTranslationCopyrightStatus,
     BibleTranslationMetadata,
@@ -36,11 +48,13 @@ class BibleTranslationRegistryTests(TestCase):
             user=self.admin_user,
             base_role=BaseConversationRole.OWNER,
         )
-        self.kcan = Partner.objects.create(
-            owner=self.admin_user,
-            name="KCAN, Kingdom Citizens & Ambassadors Network",
+        self.kcan, _ = Partner.objects.get_or_create(
             slug="kcan",
-            main_conversation=conversation,
+            defaults={
+                "owner": self.admin_user,
+                "name": "KCAN, Kingdom Citizens & Ambassadors Network",
+                "main_conversation": conversation,
+            },
         )
 
     def _create_user(self, username: str, phone: str) -> User:
@@ -136,26 +150,46 @@ class BibleTranslationRegistryTests(TestCase):
         self.client.force_authenticate(self.admin_user)
         response = self.client.get("/api/v1/bible/translation-registry/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data[0]["full_name"], "KING JAMES BIBLE")
+        registry_items = response.data.get("results", response.data) if isinstance(response.data, dict) else response.data
+        self.assertEqual(registry_items[0]["full_name"], "KING JAMES BIBLE")
 
     def _create_public_reader_fixture(self):
-        translation = BibleTranslation.objects.create(code="EN_KJV", name="King James Bible", language="en", is_active=True)
-        BibleTranslationMetadata.objects.create(
-            translation=translation,
+        BibleBook.objects.filter(models.Q(code="JOHN") | models.Q(name="John")).delete()
+        translation, _ = BibleTranslation.objects.update_or_create(
             code="EN_KJV",
-            language="en",
-            full_name="King James Bible",
-            source_path="en/KING JAMES BIBLE.json",
-            source_filename="KING JAMES BIBLE.json",
-            copyright_status=BibleTranslationCopyrightStatus.PUBLIC_DOMAIN,
-            is_licensed=True,
-            is_public=True,
-            validation_status=BibleTranslationValidationStatus.VALID,
+            defaults={"name": "King James Bible", "language": "en", "is_active": True},
         )
-        book = BibleBook.objects.create(code="JOHN", name="John", testament="NT", order=43)
-        chapter = BibleChapter.objects.create(book=book, number=3)
-        verse_16 = BibleVerse.objects.create(translation=translation, chapter=chapter, number=16, text="For God so loved the world.")
-        BibleVerse.objects.create(translation=translation, chapter=chapter, number=17, text="For God sent not his Son.")
+        BibleTranslationMetadata.objects.update_or_create(
+            code="EN_KJV",
+            defaults={
+                "translation": translation,
+                "language": "en",
+                "full_name": "King James Bible",
+                "source_path": "en/KING JAMES BIBLE.json",
+                "source_filename": "KING JAMES BIBLE.json",
+                "copyright_status": BibleTranslationCopyrightStatus.PUBLIC_DOMAIN,
+                "is_licensed": True,
+                "is_public": True,
+                "validation_status": BibleTranslationValidationStatus.VALID,
+            },
+        )
+        book, _ = BibleBook.objects.update_or_create(
+            code="JOHN",
+            defaults={"name": "John", "testament": "NT", "order": 43},
+        )
+        chapter, _ = BibleChapter.objects.get_or_create(book=book, number=3)
+        verse_16, _ = BibleVerse.objects.update_or_create(
+            translation=translation,
+            chapter=chapter,
+            number=16,
+            defaults={"text": "For God so loved the world."},
+        )
+        BibleVerse.objects.update_or_create(
+            translation=translation,
+            chapter=chapter,
+            number=17,
+            defaults={"text": "For God sent not his Son."},
+        )
         return translation, book, chapter, verse_16
 
     def test_reader_supports_passage_reference_ranges(self):
@@ -208,3 +242,48 @@ class BibleTranslationRegistryTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["passage_ref"], "John 3:16")
+
+    def test_spiritual_growth_summary_exposes_reader_journey_safety_and_publishing(self):
+        translation, _, chapter, verse = self._create_public_reader_fixture()
+        BiblePreference.objects.create(user=self.reader, default_translation=translation, enable_offline_cache=True)
+        ReadingHistory.objects.create(user=self.reader, translation=translation, chapter=chapter, last_verse=16)
+        BibleBookmark.objects.create(user=self.reader, verse=verse)
+        BibleHighlight.objects.create(user=self.reader, verse=verse, color="#D4AF37")
+        BibleNote.objects.create(user=self.reader, verse=verse, text="God loves the world.")
+        BibleReadingPlanEvent.objects.create(
+            user=self.reader,
+            translation=translation,
+            passage_ref="John 3",
+            start_at=timezone.now() - timedelta(hours=1),
+            status="scheduled",
+        )
+        BibleDailyPassage.objects.create(
+            partner=self.kcan,
+            date=timezone.now().date(),
+            language="en",
+            translation=translation,
+            title="Love of God",
+            passage_ref="John 3:16",
+            status=BiblePublishStatus.PUBLISHED,
+            published_at=timezone.now(),
+        )
+        BibleMeditationPost.objects.create(
+            partner=self.kcan,
+            title="Meditate on love",
+            body="God's love forms us.",
+            status=BiblePublishStatus.PUBLISHED,
+            published_at=timezone.now(),
+        )
+        self.client.force_authenticate(self.reader)
+
+        response = self.client.get("/api/v1/bible/spiritual-growth-summary/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["counts"]["bookmarks"], 1)
+        self.assertEqual(response.data["counts"]["highlights"], 1)
+        self.assertEqual(response.data["counts"]["notes"], 1)
+        self.assertGreaterEqual(response.data["counts"]["missed_reading_events"], 1)
+        self.assertTrue(response.data["readiness"]["offline_scripture_ready"])
+        self.assertTrue(response.data["readiness"]["family_safe_journey"])
+        self.assertEqual(response.data["safety"]["media_gate"], "enabled")
+        self.assertFalse(response.data["safety"]["explicit_content_provider_live_calls"])

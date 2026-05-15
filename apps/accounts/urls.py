@@ -16,6 +16,7 @@ from .views import (
     E2EERegisterKeysView,
     E2EEFetchBundleView,
     E2EEFetchDeviceBundlesView,
+    FamilyAccessibilityPreferencesView,
     DeviceSessionsView,
     DeviceSessionDetailView,
     DeviceBoundTokenRefreshView,
@@ -75,6 +76,7 @@ urlpatterns = [
     path("auth/e2ee/keys/<uuid:user_id>/devices/", E2EEFetchDeviceBundlesView.as_view(), name="auth-e2ee-keys-user-devices"),
     path("auth/devices/", DeviceSessionsView.as_view(), name="auth-devices"),
     path("auth/devices/<str:device_id>/", DeviceSessionDetailView.as_view(), name="auth-device-detail"),
+    path("profile-preferences/family-accessibility/", FamilyAccessibilityPreferencesView.as_view(), name="family-accessibility-preferences"),
 
     # Optional: direct SimpleJWT endpoints (tooling-friendly)
     path("auth/jwt/create/",  LoginView.as_view(), name="jwt-create"),

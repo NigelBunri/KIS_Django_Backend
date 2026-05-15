@@ -7,6 +7,8 @@ router.register(r'shops', views.ShopViewSet)
 router.register(r'shop-verifications', views.ShopVerificationRequestViewSet)
 router.register(r'products', views.ProductViewSet)
 router.register(r'product-ratings', views.ProductRatingViewSet)
+router.register(r'product-reviews', views.ProductReviewViewSet)
+router.register(r'product-questions', views.ProductQuestionViewSet)
 router.register(r'product-categories', views.ProductCategoryViewSet)
 router.register(r'product-auth-checks', views.ProductAuthenticityCheckViewSet)
 router.register(r'orders', views.OrderViewSet)
@@ -30,6 +32,11 @@ router.register(r'marketplace-complaints', views.MarketplaceComplaintViewSet)
 router.register(r'marketplace-provider-orders', views.MarketplaceProviderOrderViewSet, basename='marketplace-provider-orders')
 
 urlpatterns = [
+    path(
+        'discovery/',
+        views.CommerceDiscoveryView.as_view(),
+        name='commerce-discovery',
+    ),
     *router.urls,
     path(
         'payments/<uuid:payment_id>/satisfy/',

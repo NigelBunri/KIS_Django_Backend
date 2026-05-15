@@ -35,6 +35,7 @@ from .views import (
     BiblePreferenceViewSet,
     BibleCrossReferenceViewSet,
     BibleStatsView,
+    BibleSpiritualGrowthSummaryView,
     BibleCourseReactionView,
     BibleCourseCommentViewSet,
     BibleCourseShareView,
@@ -133,5 +134,6 @@ urlpatterns = [
     path("bible/lessons/<int:pk>/react/", BibleLessonReactionView.as_view(), name="bible-lesson-react"),
     path("bible/credentials/share/<str:token>/", BibleCourseCredentialShareView.as_view(), name="bible-credential-share"),
     path("bible/stats/", BibleStatsView.as_view(), name="bible-stats"),
+    path("bible/spiritual-growth-summary/", BibleSpiritualGrowthSummaryView.as_view(), name="bible-spiritual-growth-summary"),
     path("", include(router.urls)),
 ]

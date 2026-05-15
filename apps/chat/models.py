@@ -68,6 +68,15 @@ class Conversation(models.Model):
         db_index=True,
     )
 
+    direct_key = models.CharField(
+        max_length=160,
+        null=True,
+        blank=True,
+        unique=True,
+        db_index=True,
+        help_text="Canonical participant key for direct 1:1 conversations. Prevents duplicate direct rooms.",
+    )
+
     last_message_seq = models.BigIntegerField(
         default=0,
         help_text="Monotonic sequence counter for messages in this conversation.",
@@ -176,6 +185,7 @@ class Conversation(models.Model):
         db_table = 'chat_conversation'
         indexes = [
             models.Index(fields=['type', 'created_at']),
+            models.Index(fields=['type', 'direct_key']),
             models.Index(fields=['is_archived', 'last_message_at']),
             # Helpful for DM request inbox queries
             models.Index(fields=['request_recipient', 'request_state']),

@@ -1,7 +1,7 @@
 # chat/services.py
 from typing import Tuple, Optional
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F
 
 
@@ -23,10 +23,30 @@ def _normalize_pair(user_a: User, user_b: User) -> tuple[User, User]:
     return user_a, user_b
 
 
+def direct_conversation_key(user_a: User, user_b: User) -> str:
+    """
+    Stable identity for a direct room between exactly two users.
+    UUIDs are stringified and sorted so both caller directions resolve to
+    the same key.
+    """
+    a = str(user_a.id)
+    b = str(user_b.id)
+    first, second = sorted([a, b])
+    return f"direct:{first}:{second}"
+
+
 def _find_existing_direct(user_a: User, user_b: User) -> Optional[Conversation]:
     """
     Find existing DIRECT conversation where BOTH users are active members.
     """
+    key = direct_conversation_key(user_a, user_b)
+    keyed = Conversation.objects.filter(
+        type=ConversationType.DIRECT,
+        direct_key=key,
+    ).first()
+    if keyed:
+        return keyed
+
     qs = (
         Conversation.objects
         .filter(type=ConversationType.DIRECT)
@@ -34,7 +54,25 @@ def _find_existing_direct(user_a: User, user_b: User) -> Optional[Conversation]:
         .filter(memberships__user=user_b, memberships__left_at__isnull=True)
         .distinct()
     )
-    return qs.first() if qs.exists() else None
+    existing = qs.order_by("created_at").first()
+    if existing and not existing.direct_key:
+        try:
+            existing.direct_key = key
+            existing.save(update_fields=["direct_key"])
+        except IntegrityError:
+            return Conversation.objects.filter(
+                type=ConversationType.DIRECT,
+                direct_key=key,
+            ).first()
+    return existing
+
+
+def _restore_direct_membership_visibility(conversation: Conversation) -> None:
+    ConversationMember.objects.filter(
+        conversation=conversation,
+        left_at__isnull=True,
+        is_hidden=True,
+    ).update(is_hidden=False)
 
 
 def get_or_create_direct_conversation(
@@ -55,9 +93,11 @@ def get_or_create_direct_conversation(
            request_state=PENDING, initiator/recipient set, locked by default.
     """
     user_a, user_b = _normalize_pair(user_a, user_b)
+    direct_key = direct_conversation_key(user_a, user_b)
 
     existing = _find_existing_direct(user_a, user_b)
     if existing:
+        _restore_direct_membership_visibility(existing)
         return existing, False
 
     # If request flow is asked, initiator is required.
@@ -65,6 +105,16 @@ def get_or_create_direct_conversation(
         initiator = user_a  # safe fallback, but you should pass initiator explicitly
 
     with transaction.atomic():
+        existing = (
+            Conversation.objects
+            .select_for_update()
+            .filter(type=ConversationType.DIRECT, direct_key=direct_key)
+            .first()
+        )
+        if existing:
+            _restore_direct_membership_visibility(existing)
+            return existing, False
+
         if use_request_flow:
             if initiator.id not in (user_a.id, user_b.id):
                 # initiator must be one of the participants
@@ -72,14 +122,20 @@ def get_or_create_direct_conversation(
 
             recipient = user_b if initiator.id == user_a.id else user_a
 
-            conversation = Conversation.objects.create(
+            conversation, created = Conversation.objects.get_or_create(
                 type=ConversationType.DIRECT,
-                created_by=initiator,
-                is_locked=False,
-                request_state=ConversationRequestState.PENDING,
-                request_initiator=initiator,
-                request_recipient=recipient,
+                direct_key=direct_key,
+                defaults={
+                    "created_by": initiator,
+                    "is_locked": False,
+                    "request_state": ConversationRequestState.PENDING,
+                    "request_initiator": initiator,
+                    "request_recipient": recipient,
+                },
             )
+            if not created:
+                _restore_direct_membership_visibility(conversation)
+                return conversation, False
 
             # Roles: initiator is OWNER, recipient MEMBER (fast WhatsApp-like)
             ConversationMember.objects.bulk_create([
@@ -97,10 +153,17 @@ def get_or_create_direct_conversation(
 
         else:
             # classic direct conversation (no request workflow)
-            conversation = Conversation.objects.create(
+            conversation, created = Conversation.objects.get_or_create(
                 type=ConversationType.DIRECT,
-                created_by=user_a,
+                direct_key=direct_key,
+                defaults={
+                    "created_by": user_a,
+                },
             )
+            if not created:
+                _restore_direct_membership_visibility(conversation)
+                return conversation, False
+
             ConversationMember.objects.bulk_create([
                 ConversationMember(
                     conversation=conversation,

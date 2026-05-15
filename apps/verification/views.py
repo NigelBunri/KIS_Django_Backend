@@ -28,6 +28,7 @@ from .services import (
     expiring_verification_items,
     filter_staff_verification_cases,
     provider_callback_inspection,
+    public_trust_summary,
     record_audit_event,
     review_user_case,
     serialize_case_status,
@@ -37,6 +38,7 @@ from .services import (
     start_user_verification_case,
     submit_case_evidence,
     suspicious_verification_signals,
+    unified_identity_trust_overview,
 )
 
 
@@ -62,6 +64,24 @@ class UserVerificationStatusView(APIView):
 
     def get(self, request):
         return Response(current_user_verification_status(request.user), status=status.HTTP_200_OK)
+
+
+class UnifiedTrustOverviewView(APIView):
+    authentication_classes = (DeviceBoundJWTAuthentication,)
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request):
+        include_staff = bool(getattr(request.user, "is_staff", False))
+        return Response(unified_identity_trust_overview(request.user, include_staff=include_staff), status=status.HTTP_200_OK)
+
+
+class PublicTrustSummaryView(APIView):
+    authentication_classes = (DeviceBoundJWTAuthentication,)
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request, subject_type, subject_id):
+        include_staff = bool(getattr(request.user, "is_staff", False) and _request_bool(request.query_params.get("staff"), default=False))
+        return Response(public_trust_summary(subject_type, subject_id, include_staff=include_staff), status=status.HTTP_200_OK)
 
 
 class UserVerificationStartView(APIView):

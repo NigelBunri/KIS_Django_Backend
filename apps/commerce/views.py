@@ -24,6 +24,7 @@ from apps.billing.documents import build_booking_receipt_urls
 from apps.billing.direct_payments import create_direct_payment_intent
 from apps.billing.services import lock_wallet_funds_for_booking, release_locked_booking_funds, refund_locked_booking_funds
 from apps.core.money import parse_decimal_amount
+from apps.media.safety import validate_upload_file_safety
 
 from .availability import format_date_key, get_day_key, normalize_availability_payload
 from .category_catalog import ensure_catalog_categories
@@ -45,6 +46,8 @@ from .models import (
     AuditLog,
     FraudSignal,
     ProductRating,
+    ProductReview,
+    ProductQuestion,
     ShopService,
     ShopRole,
     ShopTeamMember,
@@ -86,6 +89,8 @@ from .serializers import (
     AuditLogSerializer,
     FraudSignalSerializer,
     ProductRatingSerializer,
+    ProductReviewSerializer,
+    ProductQuestionSerializer,
     CatalogCategorySerializer,
     ShopServiceSerializer,
     ShopTeamMemberSerializer,
@@ -129,6 +134,16 @@ def _commerce_default_payment_provider() -> str:
 
 def _is_legacy_wallet_method(value: object) -> bool:
     return str(value or "").strip().lower() in {"wallet", "kisc", "kis_wallet", "wallet_balance"}
+
+
+def _recalculate_cart_subtotal(cart: Cart | None) -> None:
+    if not cart:
+        return
+    subtotal = Decimal("0")
+    for item in cart.items.all():
+        subtotal += Decimal(item.price_snapshot or 0) * Decimal(item.quantity or 0)
+    cart.subtotal = subtotal.quantize(Decimal("0.01"))
+    cart.save(update_fields=["subtotal", "updated_at"])
 
 
 def _resolve_service_package_option(service, package_name):
@@ -719,6 +734,37 @@ class ShopViewSet(viewsets.ModelViewSet):
         return Response({'joined': True}, status=status.HTTP_200_OK)
 
 
+class CommerceDiscoveryView(APIView):
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def get(self, request):
+        query = str(request.query_params.get('q') or '').strip()
+        product_qs = Product.objects.select_related('shop').filter(is_active=True, is_deleted=False)
+        service_qs = ShopService.objects.select_related('shop').filter(is_active=True, is_deleted=False, status='published')
+        shop_qs = Shop.objects.filter(is_deleted=False)
+        if query:
+            product_qs = product_qs.filter(Q(name__icontains=query) | Q(description__icontains=query) | Q(shop__name__icontains=query))
+            service_qs = service_qs.filter(Q(name__icontains=query) | Q(description__icontains=query) | Q(shop__name__icontains=query))
+            shop_qs = shop_qs.filter(Q(name__icontains=query) | Q(description__icontains=query))
+        product_qs = product_qs.order_by('-is_featured', '-created_at')[:12]
+        service_qs = service_qs.order_by('-is_featured', '-created_at')[:8]
+        shop_qs = shop_qs.order_by('-is_verified', '-rating_avg', '-followers_count')[:8]
+        return Response({
+            'currency': 'USD',
+            'payment_provider': _commerce_default_payment_provider(),
+            'legacy_wallet_checkout_enabled': _commerce_wallet_checkout_enabled(),
+            'sections': {
+                'featured_products': ProductSerializer(product_qs, many=True, context={'request': request}).data,
+                'trusted_shops': ShopSerializer(shop_qs, many=True, context={'request': request}).data,
+                'service_spotlight': ShopServiceSerializer(service_qs, many=True, context={'request': request}).data,
+            },
+            'recommendation_context': {
+                'status': 'placeholder',
+                'reason': 'Personalized commerce recommendations will use verified seller, category, availability, and safe engagement signals.',
+            },
+        })
+
+
 @class_doc_decorator('Shop Verification Requests')
 class ShopVerificationRequestViewSet(viewsets.ModelViewSet):
     queryset = ShopVerificationRequest.objects.all().order_by('-created_at')
@@ -763,13 +809,37 @@ class ProductViewSet(viewsets.ModelViewSet):
     serializer_class = ProductSerializer
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = super().get_queryset().select_related("shop", "shop__owner").prefetch_related(
+            "catalog_categories",
+            "gallery_images",
+        )
         shop_id = self.request.query_params.get("shop")
         if shop_id:
             qs = qs.filter(shop_id=shop_id)
         owner_id = self.request.query_params.get("owner")
         if owner_id:
             qs = qs.filter(shop__owner_id=owner_id)
+        query = str(self.request.query_params.get("q") or self.request.query_params.get("search") or "").strip()
+        if query:
+            qs = qs.filter(
+                Q(name__icontains=query)
+                | Q(description__icontains=query)
+                | Q(sku__icontains=query)
+                | Q(shop__name__icontains=query)
+                | Q(catalog_categories__name__icontains=query)
+            ).distinct()
+        category = self.request.query_params.get("category")
+        if category:
+            qs = qs.filter(Q(catalog_categories__id=category) | Q(catalog_categories__slug=category)).distinct()
+        min_price = _decimal_from_value(self.request.query_params.get("min_price"))
+        max_price_raw = self.request.query_params.get("max_price")
+        if min_price > 0:
+            qs = qs.filter(Q(sale_price__gte=min_price) | Q(sale_price__isnull=True, price__gte=min_price))
+        if max_price_raw not in (None, ""):
+            max_price = _decimal_from_value(max_price_raw)
+            qs = qs.filter(Q(sale_price__lte=max_price) | Q(sale_price__isnull=True, price__lte=max_price))
+        if self.request.query_params.get("verified_seller") in {"1", "true", "yes"}:
+            qs = qs.filter(shop__is_verified=True)
         return qs
 
     def get_object(self):
@@ -793,9 +863,20 @@ class ProductViewSet(viewsets.ModelViewSet):
         if product_limit is not None and existing >= product_limit:
             raise ValidationError({"detail": f"Your tier allows up to {product_limit} products per shop."})
 
+        main_image = serializer.validated_data.get("main_image")
+        if main_image:
+            validate_upload_file_safety(main_image, context="commerce")
+        for upload in self.request.FILES.getlist("images"):
+            validate_upload_file_safety(upload, context="commerce")
+
         serializer.save()
 
     def perform_update(self, serializer):
+        main_image = serializer.validated_data.get("main_image")
+        if main_image:
+            validate_upload_file_safety(main_image, context="commerce")
+        for upload in self.request.FILES.getlist("images"):
+            validate_upload_file_safety(upload, context="commerce")
         super().perform_update(serializer)
 
     def update(self, request, *args, **kwargs):
@@ -1004,7 +1085,16 @@ class CartItemViewSet(viewsets.ModelViewSet):
     def _validate_product(self, cart: Cart, product: Product):
         if product.shop_id != cart.shop_id:
             raise ValidationError({'product': 'Product must belong to the same shop as the cart.'})
+        if not product.is_active or product.is_deleted:
+            raise ValidationError({'product': 'Product is unavailable.'})
         return product
+
+    def _validate_quantity(self, product: Product, quantity: int):
+        requested = max(1, int(quantity or 1))
+        attrs = product.attributes if isinstance(product.attributes, dict) else {}
+        if int(product.stock_qty or 0) < requested and not bool(attrs.get('allow_backorder')):
+            raise ValidationError({'quantity': 'Requested quantity is not available.'})
+        return requested
 
     def perform_create(self, serializer):
         cart = serializer.validated_data.get('cart')
@@ -1013,9 +1103,11 @@ class CartItemViewSet(viewsets.ModelViewSet):
             raise ValidationError({'detail': 'Cart and product are required.'})
         self._validate_cart(cart)
         self._validate_product(cart, product)
+        serializer.validated_data['quantity'] = self._validate_quantity(product, serializer.validated_data.get('quantity'))
         serializer.validated_data.setdefault('price_snapshot', product.sale_price or product.price)
         serializer.validated_data.setdefault('stock_snapshot', product.stock_qty or 0)
-        serializer.save()
+        item = serializer.save()
+        _recalculate_cart_subtotal(item.cart)
 
     def perform_update(self, serializer):
         cart = serializer.validated_data.get('cart') or serializer.instance.cart
@@ -1024,7 +1116,17 @@ class CartItemViewSet(viewsets.ModelViewSet):
         product = serializer.validated_data.get('product') or serializer.instance.product
         if cart and product:
             self._validate_product(cart, product)
-        serializer.save()
+            serializer.validated_data['quantity'] = self._validate_quantity(
+                product,
+                serializer.validated_data.get('quantity', serializer.instance.quantity),
+            )
+        item = serializer.save()
+        _recalculate_cart_subtotal(item.cart)
+
+    def perform_destroy(self, instance):
+        cart = instance.cart
+        super().perform_destroy(instance)
+        _recalculate_cart_subtotal(cart)
 
 
 @class_doc_decorator('Product Ratings')
@@ -1035,6 +1137,78 @@ class ProductRatingViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
+
+
+@class_doc_decorator('Product Reviews')
+class ProductReviewViewSet(viewsets.ModelViewSet):
+    queryset = ProductReview.objects.select_related('product', 'user').filter(is_deleted=False).order_by('-created_at')
+    serializer_class = ProductReviewSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        product_id = self.request.query_params.get('product')
+        if product_id:
+            qs = qs.filter(product_id=product_id)
+        user = self.request.user
+        if not getattr(user, 'is_staff', False):
+            qs = qs.filter(status=ProductReview.STATUS_PUBLISHED)
+        return qs
+
+    def perform_create(self, serializer):
+        product = serializer.validated_data.get('product')
+        if not product or not getattr(product, 'is_active', False):
+            raise ValidationError({'product': 'Product is unavailable.'})
+        serializer.save(
+            user=self.request.user,
+            status=ProductReview.STATUS_PUBLISHED,
+            metadata={'source': 'commerce_product_detail'},
+        )
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def helpful(self, request, pk=None):
+        review = self.get_object()
+        review.helpful_count = (review.helpful_count or 0) + 1
+        review.save(update_fields=['helpful_count', 'updated_at'])
+        return Response({'helpful_count': review.helpful_count})
+
+
+@class_doc_decorator('Product Questions')
+class ProductQuestionViewSet(viewsets.ModelViewSet):
+    queryset = ProductQuestion.objects.select_related('product', 'product__shop', 'user', 'answered_by').filter(is_deleted=False).order_by('-created_at')
+    serializer_class = ProductQuestionSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        product_id = self.request.query_params.get('product')
+        if product_id:
+            qs = qs.filter(product_id=product_id)
+        user = self.request.user
+        if not getattr(user, 'is_staff', False):
+            qs = qs.exclude(status=ProductQuestion.STATUS_HIDDEN)
+        return qs
+
+    def perform_create(self, serializer):
+        product = serializer.validated_data.get('product')
+        if not product or not getattr(product, 'is_active', False):
+            raise ValidationError({'product': 'Product is unavailable.'})
+        serializer.save(user=self.request.user, metadata={'source': 'commerce_product_detail'})
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def answer(self, request, pk=None):
+        question = self.get_object()
+        if not _provider_can_manage_shop(request.user, question.product.shop) and not request.user.is_staff:
+            raise PermissionDenied('Only the seller, managers, or staff can answer this question.')
+        answer = str(request.data.get('answer') or '').strip()
+        if len(answer) < 2:
+            raise ValidationError({'answer': 'Provide a clear answer.'})
+        question.answer = answer
+        question.answered_by = request.user
+        question.answered_at = timezone.now()
+        question.status = ProductQuestion.STATUS_ANSWERED
+        question.save(update_fields=['answer', 'answered_by', 'answered_at', 'status', 'updated_at'])
+        return Response(self.get_serializer(question).data)
 
 
 @class_doc_decorator('Product Categories')
@@ -1199,6 +1373,11 @@ class ShopServiceViewSet(viewsets.ModelViewSet):
         shop = serializer.validated_data.get("shop")
         if not shop or (shop.owner_id != self.request.user.id and not self.request.user.is_staff):
             raise PermissionDenied("Only shop owners or staff can create services.")
+        image_file = serializer.validated_data.get("image_file")
+        if image_file:
+            validate_upload_file_safety(image_file, context="commerce")
+        for upload in self.request.FILES.getlist("images"):
+            validate_upload_file_safety(upload, context="commerce")
         serializer.save()
 
     def get_object(self):
@@ -1207,6 +1386,14 @@ class ShopServiceViewSet(viewsets.ModelViewSet):
             if obj.shop.owner_id != self.request.user.id and not self.request.user.is_staff:
                 raise PermissionDenied("Only shop owners or staff can modify services.")
         return obj
+
+    def perform_update(self, serializer):
+        image_file = serializer.validated_data.get("image_file")
+        if image_file:
+            validate_upload_file_safety(image_file, context="commerce")
+        for upload in self.request.FILES.getlist("images"):
+            validate_upload_file_safety(upload, context="commerce")
+        super().perform_update(serializer)
 
     @action(detail=True, methods=['post', 'delete'], url_path='broadcast')
     def broadcast(self, request, pk=None):
@@ -2145,11 +2332,14 @@ class MarketplaceComplaintViewSet(viewsets.GenericViewSet, mixins.ListModelMixin
     def create(self, request, *args, **kwargs):
         serializer = MarketplaceComplaintCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        attachment = serializer.validated_data.get('attachment')
+        if attachment:
+            validate_upload_file_safety(attachment, context="commerce")
         complaint = create_marketplace_complaint_from_data(
             order_id=serializer.validated_data['order_id'],
             user=request.user,
             text=serializer.validated_data['text'],
-            attachment=serializer.validated_data.get('attachment'),
+            attachment=attachment,
         )
         output = MarketplaceComplaintSerializer(complaint, context=self.get_serializer_context())
         return Response(output.data, status=status.HTTP_201_CREATED)

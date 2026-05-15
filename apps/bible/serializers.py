@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from apps.media.safety import validate_attachment_metadata_for_safe_messaging
 
 from .models import (
     BibleTranslation,
@@ -599,6 +600,10 @@ class BibleLessonSerializer(serializers.ModelSerializer):
         progress = BibleLessonProgress.objects.filter(user=user, lesson=obj).first()
         return progress.last_position_ms if progress else 0
 
+    def validate(self, attrs):
+        validate_attachment_metadata_for_safe_messaging(attrs.get("attachments"))
+        return super().validate(attrs)
+
 
 class BibleQuizChoiceSerializer(serializers.ModelSerializer):
     class Meta:
@@ -678,6 +683,10 @@ class BibleAssignmentSubmissionSerializer(serializers.ModelSerializer):
             "graded_at",
         ]
         read_only_fields = ["user", "score", "feedback", "status", "plagiarism_score", "plagiarism_status", "created_at", "graded_at"]
+
+    def validate(self, attrs):
+        validate_attachment_metadata_for_safe_messaging(attrs.get("attachments"))
+        return super().validate(attrs)
 
 
 class BiblePeerReviewSerializer(serializers.ModelSerializer):

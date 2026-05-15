@@ -3,6 +3,7 @@ from urllib.parse import urlparse
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
+from apps.core.security_launch_gate import security_privacy_child_safety_launch_gate
 
 
 def _is_weak_secret(value):
@@ -150,6 +151,86 @@ class Command(BaseCommand):
             "Docs staff-only outside DEBUG",
             not settings.DEBUG,
             "config.urls selects staff-only OpenAPI views when DEBUG is false",
+        )
+        check(
+            "Media safety enabled",
+            bool(getattr(settings, "MEDIA_SAFETY_ENABLED", True)),
+            "MEDIA_SAFETY_ENABLED should remain true",
+        )
+        check(
+            "Explicit media scan required",
+            bool(getattr(settings, "MEDIA_EXPLICIT_SCAN_REQUIRED", False)) if production_mode else True,
+            "MEDIA_EXPLICIT_SCAN_REQUIRED should be true in production",
+        )
+        check(
+            "Raw telemetry disabled",
+            not _env_bool("KIS_RAW_TELEMETRY_ENABLED"),
+            "KIS_RAW_TELEMETRY_ENABLED must not be enabled",
+        )
+        check(
+            "Uploads not public by default",
+            not _env_bool("SERVE_UPLOADS_PUBLICLY"),
+            "SERVE_UPLOADS_PUBLICLY should remain false unless approved",
+        )
+
+        legacy_money_flags = {
+            "KIS_LEGACY_WALLET_DEPOSIT_ENABLED": _env_bool("KIS_LEGACY_WALLET_DEPOSIT_ENABLED"),
+            "KIS_LEGACY_WALLET_TRANSFER_ENABLED": _env_bool("KIS_LEGACY_WALLET_TRANSFER_ENABLED"),
+            "KIS_LEGACY_CASH_CREDIT_CONVERSION_ENABLED": _env_bool("KIS_LEGACY_CASH_CREDIT_CONVERSION_ENABLED"),
+            "KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED": _env_bool("KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED"),
+            "KIS_LEGACY_EDUCATION_WALLET_CHECKOUT_ENABLED": _env_bool("KIS_LEGACY_EDUCATION_WALLET_CHECKOUT_ENABLED"),
+            "KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED": _env_bool("KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED"),
+        }
+        enabled_legacy_money = sorted(name for name, enabled in legacy_money_flags.items() if enabled)
+        check(
+            "Legacy wallet-as-money flows disabled",
+            not enabled_legacy_money,
+            f"{len(enabled_legacy_money)} legacy money flag(s) enabled; keep credits non-cash/non-transferable/non-withdrawable",
+        )
+        direct_payment_provider_ok = all(
+            str(os.environ.get(name, "flutterwave") or "").strip().lower() == "flutterwave"
+            for name in (
+                "KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER",
+                "KIS_EDUCATION_DEFAULT_PAYMENT_PROVIDER",
+                "KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER",
+            )
+        )
+        check(
+            "USD direct-provider monetization",
+            direct_payment_provider_ok,
+            "commerce, education, and health defaults should remain Flutterwave/direct-provider first",
+        )
+        ai_live_enabled = _env_bool("KIS_AI_LIVE_PROVIDER_CALLS_ENABLED")
+        ai_output_moderation = _env_bool("KIS_AI_OUTPUT_MODERATION_REQUIRED") or os.environ.get("KIS_AI_OUTPUT_MODERATION_REQUIRED", "") == ""
+        ai_input_redaction = _env_bool("KIS_AI_INPUT_REDACTION_REQUIRED") or os.environ.get("KIS_AI_INPUT_REDACTION_REQUIRED", "") == ""
+        ai_child_safe = _env_bool("KIS_AI_CHILD_SAFE_MODE_REQUIRED") or os.environ.get("KIS_AI_CHILD_SAFE_MODE_REQUIRED", "") == ""
+        ai_provider = os.environ.get("KIS_AI_PROVIDER", "").strip()
+        ai_provider_key_present = bool(
+            os.environ.get("GEMINI_API_KEY", "").strip()
+            or os.environ.get("GROQ_API_KEY", "").strip()
+            or os.environ.get("OPENAI_API_KEY", "").strip()
+        )
+        check(
+            "AI provider calls gated",
+            (not ai_live_enabled) or (bool(ai_provider) and ai_provider_key_present and ai_output_moderation and ai_input_redaction and ai_child_safe),
+            "live AI calls must stay disabled unless provider, redaction, moderation, and child-safety controls are configured",
+        )
+        check(
+            "AI raw prompt storage disabled",
+            not _env_bool("KIS_AI_STORE_PROMPTS_ENABLED") and not _env_bool("KIS_AI_STORE_RESPONSES_ENABLED"),
+            "raw prompts/responses should not be stored before privacy and retention approval",
+        )
+        check(
+            "AI diagnosis/advice disabled",
+            not _env_bool("KIS_AI_MEDICAL_DIAGNOSIS_ENABLED") and not _env_bool("KIS_AI_FINANCIAL_ADVICE_ENABLED"),
+            "AI must not provide medical diagnosis or financial advice",
+        )
+
+        launch_gate = security_privacy_child_safety_launch_gate()
+        check(
+            "Phase 23 launch gate critical checks",
+            int(launch_gate["summary"]["critical_failures"]) == 0,
+            f"{launch_gate['summary']['critical_failures']} critical launch gate failure(s)",
         )
 
         failures = [row for row in rows if not row[1]]

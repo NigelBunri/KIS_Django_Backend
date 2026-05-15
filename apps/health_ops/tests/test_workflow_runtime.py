@@ -18,8 +18,12 @@ from apps.health_ops.models import (
     EngineRegistry,
     EngineSession,
     EngineStepDefinition,
+    HealthCarePlan,
     HealthInstitution,
+    HealthInstitutionMembership,
     HealthService,
+    HealthVitalReading,
+    MembershipRole,
     PaymentBillingSession,
     ServiceEngineMap,
     ServiceWorkflowSession,
@@ -122,6 +126,77 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
         self.assertTrue(serializer.is_valid(), serializer.errors)
         self.assertEqual(serializer.validated_data["total_amount_micro"], 123456)
         self.assertEqual(serializer.validated_data["payable_amount_micro"], 654321)
+
+    def test_care_summary_exposes_care_plan_vitals_and_workflow_counts(self):
+        workflow = ServiceWorkflowSession.objects.create(
+            institution=self.institution,
+            service=self.service,
+            user=self.user,
+            status=WorkflowStatus.IN_PROGRESS,
+            metadata={},
+        )
+        HealthCarePlan.objects.create(
+            institution=self.institution,
+            service=self.service,
+            workflow_session=workflow,
+            user=self.user,
+            title="Blood pressure follow-up",
+            goals=[{"label": "Track daily readings"}],
+        )
+        HealthVitalReading.objects.create(
+            institution=self.institution,
+            workflow_session=workflow,
+            user=self.user,
+            reading_type="heart_rate",
+            label="Resting heart rate",
+            value="72",
+            unit="bpm",
+        )
+
+        response = self.client.get("/api/v1/health-ops/care-summary/", secure=True)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["summary"]["openWorkflowCount"], 1)
+        self.assertEqual(response.data["summary"]["activeCarePlanCount"], 1)
+        self.assertEqual(response.data["summary"]["recentVitalCount"], 1)
+        self.assertTrue(response.data["summary"]["lowBandwidthReady"])
+
+    def test_member_can_create_care_plan_and_vital_reading(self):
+        HealthInstitutionMembership.objects.create(
+            institution=self.institution,
+            user=self.user,
+            role=MembershipRole.MEMBER,
+            is_active=True,
+        )
+
+        care_response = self.client.post(
+            "/api/v1/health-ops/care-plans/",
+            {
+                "institution": str(self.institution.id),
+                "service": str(self.service.id),
+                "title": "Family care plan",
+                "summary": "Follow-up plan",
+                "goals": [{"label": "Hydration"}],
+            },
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(care_response.status_code, status.HTTP_201_CREATED, care_response.data)
+
+        vital_response = self.client.post(
+            "/api/v1/health-ops/vitals/",
+            {
+                "institution": str(self.institution.id),
+                "reading_type": "blood_pressure",
+                "label": "Morning BP",
+                "systolic": 120,
+                "diastolic": 78,
+                "unit": "mmHg",
+            },
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(vital_response.status_code, status.HTTP_201_CREATED, vital_response.data)
 
     def _create_workflow(self, mappings: list[ServiceEngineMap]) -> ServiceWorkflowSession:
         workflow = ServiceWorkflowSession.objects.create(

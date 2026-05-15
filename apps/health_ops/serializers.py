@@ -11,6 +11,7 @@ from .models import (
     ClinicalEngineCode,
     ClinicalEngineSession,
     ClinicalEngineSessionStatus,
+    HealthCarePlan,
     EngineContentBlock,
     EmergencyDispatchSession,
     EmergencyDispatchStatus,
@@ -43,6 +44,7 @@ from .models import (
     VideoConsultationSession,
     WellnessProgramSession,
     WellnessProgramStatus,
+    HealthVitalReading,
 )
 from .services import (
     build_workflow_runtime_payload,
@@ -101,6 +103,9 @@ class EngineRegistrySerializer(serializers.ModelSerializer):
 
 class HealthInstitutionSerializer(serializers.ModelSerializer):
     verification_summary = serializers.SerializerMethodField()
+    trust_summary = serializers.SerializerMethodField()
+    care_summary = serializers.SerializerMethodField()
+    media_safety_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = HealthInstitution
@@ -114,6 +119,9 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
             "settings",
             "is_active",
             "verification_summary",
+            "trust_summary",
+            "care_summary",
+            "media_safety_summary",
             "created_at",
             "updated_at",
         ]
@@ -124,9 +132,44 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
 
         return current_health_institution_verification_status(obj)
 
+    def get_trust_summary(self, obj):
+        verification = self.get_verification_summary(obj) or {}
+        return {
+            "verified": bool(verification.get("is_verified") or verification.get("verified")),
+            "badges": verification.get("badges") or [],
+            "licensedProvider": any(
+                str((badge or {}).get("code") or badge).lower() in {"licensed_provider", "verified_health_institution"}
+                for badge in (verification.get("badges") or [])
+            ),
+            "memberCount": obj.memberships.filter(is_active=True).count(),
+            "serviceCount": obj.services.filter(is_active=True).count(),
+        }
+
+    def get_care_summary(self, obj):
+        active_statuses = ["active", "paused"]
+        return {
+            "activeCarePlanCount": obj.care_plans.filter(status__in=active_statuses).count(),
+            "openWorkflowCount": obj.workflow_sessions.exclude(status__in=["completed", "cancelled"]).count(),
+            "activeReminderCount": obj.notification_reminder_sessions.exclude(status__in=["completed", "disabled", "cancelled"]).count(),
+            "recentVitalCount": obj.vital_readings.count(),
+            "lowBandwidthReady": True,
+            "familySafeCare": True,
+        }
+
+    def get_media_safety_summary(self, obj):
+        return {
+            "quarantineEnabled": True,
+            "blockedIfUnsafe": True,
+            "providerLiveCallsEnabled": False,
+            "userSafeMessage": "Health media is checked before it can be used in care workflows.",
+        }
+
 
 class HealthServiceSerializer(serializers.ModelSerializer):
     base_cost_kisc = serializers.SerializerMethodField()
+    base_cost_usd_label = serializers.SerializerMethodField()
+    payment_summary = serializers.SerializerMethodField()
+    care_capabilities = serializers.SerializerMethodField()
 
     class Meta:
         model = HealthService
@@ -140,6 +183,9 @@ class HealthServiceSerializer(serializers.ModelSerializer):
             "assessment_schema",
             "base_cost_micro",
             "base_cost_kisc",
+            "base_cost_usd_label",
+            "payment_summary",
+            "care_capabilities",
             "created_at",
             "updated_at",
         ]
@@ -147,6 +193,92 @@ class HealthServiceSerializer(serializers.ModelSerializer):
 
     def get_base_cost_kisc(self, obj):
         return _micro_to_kisc_text(getattr(obj, "base_cost_micro", 0))
+
+    def get_base_cost_usd_label(self, obj):
+        return _micro_to_usd_label(getattr(obj, "base_cost_micro", 0))
+
+    def get_payment_summary(self, obj):
+        amount_micro = int(getattr(obj, "base_cost_micro", 0) or 0)
+        return {
+            "currency": "USD",
+            "amountUsdLabel": _micro_to_usd_label(amount_micro),
+            "isFree": amount_micro <= 0,
+            "provider": "flutterwave",
+            "legacyWalletDisabled": True,
+            "copy": "Free care flow" if amount_micro <= 0 else "Secure USD checkout",
+        }
+
+    def get_care_capabilities(self, obj):
+        engine_codes = [
+            str(mapping.engine.code)
+            for mapping in obj.engine_mappings.select_related("engine").all()
+            if getattr(mapping, "engine_id", None)
+        ]
+        return {
+            "appointmentReady": "appointment" in engine_codes,
+            "videoReady": "video_consultation" in engine_codes,
+            "secureMessagingReady": "secure_messaging" in engine_codes,
+            "clinicalRecordsReady": any(code in engine_codes for code in ["ehr_records", "lab_order", "imaging_order"]),
+            "billingReady": "payment_billing" in engine_codes,
+            "remindersReady": "notification_reminders" in engine_codes,
+            "wellnessReady": "wellness_program" in engine_codes,
+            "lowBandwidthReady": True,
+        }
+
+
+class HealthCarePlanSerializer(serializers.ModelSerializer):
+    institution_name = serializers.CharField(source="institution.name", read_only=True)
+    service_name = serializers.CharField(source="service.name", read_only=True, allow_null=True)
+
+    class Meta:
+        model = HealthCarePlan
+        fields = [
+            "id",
+            "institution",
+            "institution_name",
+            "service",
+            "service_name",
+            "workflow_session",
+            "user",
+            "title",
+            "summary",
+            "status",
+            "goals",
+            "tasks",
+            "medication_summary",
+            "reminder_summary",
+            "next_review_at",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
+
+
+class HealthVitalReadingSerializer(serializers.ModelSerializer):
+    institution_name = serializers.CharField(source="institution.name", read_only=True)
+
+    class Meta:
+        model = HealthVitalReading
+        fields = [
+            "id",
+            "institution",
+            "institution_name",
+            "workflow_session",
+            "user",
+            "reading_type",
+            "label",
+            "value",
+            "unit",
+            "systolic",
+            "diastolic",
+            "measured_at",
+            "source",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class ServiceEngineMapSerializer(serializers.ModelSerializer):
@@ -257,6 +389,8 @@ class EngineSessionSerializer(serializers.ModelSerializer):
 class ServiceWorkflowSessionSerializer(serializers.ModelSerializer):
     engine_sessions = EngineSessionSerializer(many=True, read_only=True)
     runtime = serializers.SerializerMethodField()
+    care_summary = serializers.SerializerMethodField()
+    payment_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceWorkflowSession
@@ -279,6 +413,8 @@ class ServiceWorkflowSessionSerializer(serializers.ModelSerializer):
             "metadata",
             "engine_sessions",
             "runtime",
+            "care_summary",
+            "payment_summary",
             "created_at",
             "updated_at",
         ]
@@ -296,6 +432,43 @@ class ServiceWorkflowSessionSerializer(serializers.ModelSerializer):
 
     def get_runtime(self, obj):
         return build_workflow_runtime_payload(obj)
+
+    def get_care_summary(self, obj):
+        try:
+            reminder = obj.notification_reminder
+        except NotificationReminderSession.DoesNotExist:
+            reminder = None
+        reminder_count = (
+            1
+            if reminder and reminder.status not in ["completed", "disabled", "cancelled"]
+            else 0
+        )
+        return {
+            "carePlanCount": obj.care_plans.exclude(status__in=["completed", "cancelled"]).count(),
+            "recentVitalCount": obj.vital_readings.count(),
+            "reminderCount": reminder_count,
+            "secureMessagingReady": hasattr(obj, "secure_messaging"),
+            "videoReady": hasattr(obj, "video_consultation"),
+            "lowBandwidthReady": True,
+        }
+
+    def get_payment_summary(self, obj):
+        billing = getattr(obj, "payment_billing", None)
+        if not billing:
+            return {
+                "currency": "USD",
+                "status": "not_required" if not obj.is_locked_by_payment else "waiting",
+                "copy": "No provider payment required yet.",
+            }
+        return {
+            "currency": "USD",
+            "status": str(getattr(billing, "status", "") or "waiting"),
+            "amountUsdLabel": _micro_to_usd_label(getattr(billing, "payable_amount_micro", 0)),
+            "provider": getattr(billing, "payment_provider", "") or "flutterwave",
+            "paymentIntentId": str((billing.metadata or {}).get("direct_payment_intent_id") or ""),
+            "paymentUrl": str((billing.metadata or {}).get("payment_url") or ""),
+            "copy": "Secure USD checkout" if getattr(billing, "payable_amount_micro", 0) else "No payment due",
+        }
 
 
 class WorkflowStartSerializer(serializers.Serializer):
@@ -1094,6 +1267,7 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
     currency_label = serializers.SerializerMethodField()
     payment_intent_id = serializers.SerializerMethodField()
     payment_url = serializers.SerializerMethodField()
+    next_action = serializers.SerializerMethodField()
 
     class Meta:
         model = PaymentBillingSession
@@ -1122,6 +1296,7 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
             "currency_label",
             "payment_intent_id",
             "payment_url",
+            "next_action",
             "payment_reference",
             "invoice_number",
             "step_state",
@@ -1191,6 +1366,22 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
         if str(metadata.get("legacy_wallet_checkout") or "").lower() == "true" or str(obj.payment_provider or "").lower() == "kis_wallet":
             return "Historical promotional-credit billing"
         return "USD"
+
+    def get_next_action(self, obj):
+        status_value = self.get_payment_status(obj)
+        payment_url = self.get_payment_url(obj)
+        payable_micro = int(getattr(obj, "payable_amount_micro", 0) or 0)
+        if str(status_value).lower() in {"paid", "completed"}:
+            return {"type": "none", "label": "Payment complete", "enabled": False}
+        if payable_micro <= 0:
+            return {"type": "none", "label": "No payment due", "enabled": False}
+        return {
+            "type": "open_provider_checkout" if payment_url else "wait_for_provider_link",
+            "label": "Open secure checkout" if payment_url else "Waiting for secure checkout link",
+            "enabled": bool(payment_url),
+            "provider": "flutterwave",
+            "currency": "USD",
+        }
 
 
 class PaymentBillingStartSerializer(serializers.Serializer):

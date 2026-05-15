@@ -5,6 +5,7 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
+from apps.channels.models import Channel
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
 from apps.partners.models import (
     Partner,
@@ -401,6 +402,47 @@ class PartnerApiTests(TestCase):
         self.assertEqual(response.data["partner_id"], str(partner.id))
         self.assertIn("public_metrics", response.data)
         self.assertIn("profile", response.data)
+
+    def test_partner_discord_summary_exposes_workspace_readiness_and_unread(self):
+        partner = self._create_partner()
+        PartnerMembership.objects.create(
+            partner=partner,
+            user=self.member,
+            status=PartnerMembershipStatus.MEMBER,
+            role="member",
+        )
+        channel_conversation = Conversation.objects.create(
+            type=ConversationType.CHANNEL,
+            title="Prayer room",
+            description="Partner channel",
+            created_by=self.owner,
+            last_message_seq=8,
+        )
+        Channel.objects.create(
+            partner=partner,
+            owner=self.owner,
+            conversation=channel_conversation,
+            name="Prayer room",
+            slug="prayer-room",
+            channel_type="text",
+        )
+        ConversationMember.objects.create(
+            conversation=channel_conversation,
+            user=self.member,
+            base_role=BaseConversationRole.MEMBER,
+            last_read_seq=5,
+        )
+
+        self.client.force_authenticate(self.member)
+        response = self.client.get(self._detail_url(partner, "discord-summary/"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["partner_id"], str(partner.id))
+        self.assertEqual(response.data["counts"]["visible_channels"], 1)
+        self.assertEqual(response.data["counts"]["unread_messages"], 3)
+        self.assertTrue(response.data["readiness"]["moderation_ready"])
+        self.assertTrue(response.data["readiness"]["family_safe_media"])
+        self.assertEqual(response.data["safety"]["media_gate"], "enabled")
 
     def test_manager_can_apply_automation_recipe(self):
         partner = self._create_partner()

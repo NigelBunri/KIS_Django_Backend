@@ -120,6 +120,34 @@ KIS_EDUCATION_DEFAULT_PAYMENT_PROVIDER = os.environ.get("KIS_EDUCATION_DEFAULT_P
 KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED = _env_bool("KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED", False)
 KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER = os.environ.get("KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER", "flutterwave").strip() or "flutterwave"
 
+# AI assistance safety. These defaults allow UI/policy placeholders but keep
+# networked provider calls disabled until an approved provider, moderation, and
+# privacy review are complete.
+KIS_AI_ASSISTANCE_ENABLED = _env_bool("KIS_AI_ASSISTANCE_ENABLED", True)
+KIS_AI_LIVE_PROVIDER_CALLS_ENABLED = _env_bool("KIS_AI_LIVE_PROVIDER_CALLS_ENABLED", False)
+KIS_AI_PROVIDER = os.environ.get("KIS_AI_PROVIDER", "").strip()
+KIS_AI_OUTPUT_MODERATION_REQUIRED = _env_bool("KIS_AI_OUTPUT_MODERATION_REQUIRED", True)
+KIS_AI_INPUT_REDACTION_REQUIRED = _env_bool("KIS_AI_INPUT_REDACTION_REQUIRED", True)
+KIS_AI_CHILD_SAFE_MODE_REQUIRED = _env_bool("KIS_AI_CHILD_SAFE_MODE_REQUIRED", True)
+KIS_AI_STORE_PROMPTS_ENABLED = _env_bool("KIS_AI_STORE_PROMPTS_ENABLED", False)
+KIS_AI_STORE_RESPONSES_ENABLED = _env_bool("KIS_AI_STORE_RESPONSES_ENABLED", False)
+KIS_AI_MEDICAL_DIAGNOSIS_ENABLED = _env_bool("KIS_AI_MEDICAL_DIAGNOSIS_ENABLED", False)
+KIS_AI_FINANCIAL_ADVICE_ENABLED = _env_bool("KIS_AI_FINANCIAL_ADVICE_ENABLED", False)
+
+# Public web / growth safety. Public pages expose only published public content
+# and redacted metadata; embeds still obey their stricter embed flags/policies.
+KIS_PUBLIC_WEB_ENABLED = _env_bool("KIS_PUBLIC_WEB_ENABLED", True)
+KIS_PUBLIC_WEB_BASE_URL = os.environ.get("KIS_PUBLIC_WEB_BASE_URL", "https://kis.app").strip().rstrip("/")
+KIS_PUBLIC_WEB_INDEXING_ENABLED = _env_bool("KIS_PUBLIC_WEB_INDEXING_ENABLED", False)
+KIS_PUBLIC_REFERRALS_ENABLED = _env_bool("KIS_PUBLIC_REFERRALS_ENABLED", False)
+
+# Launch-cut controls. The 80% launch cut keeps high-risk/optional systems
+# behind approval flags while preserving the roadmap toward 95% and 120%.
+KIS_LAUNCH_CUT_MODE = os.environ.get("KIS_LAUNCH_CUT_MODE", "80").strip() or "80"
+KIS_PARITY_95_FEATURES_ENABLED = _env_bool("KIS_PARITY_95_FEATURES_ENABLED", False)
+KIS_DIFFERENTIATION_120_FEATURES_ENABLED = _env_bool("KIS_DIFFERENTIATION_120_FEATURES_ENABLED", False)
+KIS_EXPERIMENTAL_120_FEATURES_ENABLED = _env_bool("KIS_EXPERIMENTAL_120_FEATURES_ENABLED", False)
+
 # Notifications / Firebase Cloud Messaging
 NOTIFICATIONS_PUSH_PROVIDER = os.environ.get("NOTIFICATIONS_PUSH_PROVIDER", "firebase")
 FIREBASE_APP_NAME = os.environ.get("FIREBASE_APP_NAME", "kis-backend")
@@ -435,6 +463,17 @@ MEDIA_SERVICE_URL = os.environ.get(
     "MEDIA_SERVICE_URL",
     _dev_host_url(port=DEV_BG_REMOVAL_PORT, path="/process/background-removal"),
 )
+
+# Central upload/media safety. Local development stays usable by default; production
+# should require explicit scan/review before user-uploaded media becomes public.
+MEDIA_SAFETY_ENABLED = _env_bool("MEDIA_SAFETY_ENABLED", True)
+MEDIA_EXPLICIT_SCAN_REQUIRED = _env_bool("MEDIA_EXPLICIT_SCAN_REQUIRED", not DEBUG)
+MEDIA_SAFETY_PROVIDER = os.environ.get("MEDIA_SAFETY_PROVIDER", "stub").strip() or "stub"
+MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED = _env_bool("MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED", False)
+MEDIA_SAFETY_MAX_UPLOAD_BYTES = int(os.environ.get("MEDIA_SAFETY_MAX_UPLOAD_BYTES", os.environ.get("UPLOAD_MAX_BYTES", 50 * 1024 * 1024)))
+MEDIA_SAFETY_ALLOWED_MIME_TYPES = os.environ.get("MEDIA_SAFETY_ALLOWED_MIME_TYPES", "")
+MEDIA_SAFETY_ALLOWED_MIME_PREFIXES = os.environ.get("MEDIA_SAFETY_ALLOWED_MIME_PREFIXES", "")
+MEDIA_SAFETY_BLOCKED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_BLOCKED_EXTENSIONS", "")
 
 # NestJS internal webhook base + token for realtime event fanout
 NEST_INTERNAL_URL = os.environ.get(

@@ -107,6 +107,59 @@ class NotificationAPITest(APITestCase):
         notify.assert_called_once()
         self.assertEqual(notify.call_args.kwargs["source"], "bible")
 
+    def test_attention_summary_and_filters_use_source_priority_and_urgency(self):
+        models.Notification.objects.create(
+            user_id=self.user.id,
+            type="BIBLE_DAILY_MEDITATION",
+            title="Morning prayer",
+            body="Read and pray",
+            priority="HIGH",
+            is_read=False,
+            context_data={"source": "bible", "badge_source": "bible", "urgency_label": "spiritual"},
+        )
+        models.Notification.objects.create(
+            user_id=self.user.id,
+            type="MARKET_PRODUCT_UPDATE",
+            title="Market update",
+            body="New product",
+            priority="LOW",
+            is_read=False,
+            context_data={"source": "broadcast", "badge_source": "broadcast", "urgency_label": "commerce"},
+        )
+
+        summary = self.client.get("/api/v1/notifications/attention-summary/")
+        filtered = self.client.get("/api/v1/notifications/", {"source": "bible", "urgency": "spiritual", "priority": "HIGH"})
+
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(summary.data["unread_count"], 2)
+        self.assertEqual(summary.data["urgent_now"], 1)
+        self.assertEqual(filtered.status_code, 200)
+        rows = filtered.data.get("results", filtered.data)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["title"], "Morning prayer")
+
+    def test_attention_preferences_store_quiet_hours_and_source_rule(self):
+        with patch("apps.notifications.views.notify_main_tab_badges_updated") as notify:
+            response = self.client.post(
+                "/api/v1/notifications/attention-preferences/",
+                {
+                    "quiet_hours": {"start": "21:00", "end": "06:00"},
+                    "digest": {"frequency": "daily", "time": "07:30"},
+                    "source": "broadcast",
+                    "source_enabled": False,
+                    "source_priority": "LOW",
+                    "source_channels": ["IN_APP"],
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["quiet_hours"]["start"], "21:00")
+        self.assertEqual(response.data["digest"]["frequency"], "daily")
+        self.assertEqual(response.data["source_rules"][0]["source"], "broadcast")
+        self.assertFalse(response.data["source_rules"][0]["enabled"])
+        notify.assert_called_once()
+
 class MainTabBadgeCountsAPITest(APITestCase):
     def setUp(self):
         User = get_user_model()

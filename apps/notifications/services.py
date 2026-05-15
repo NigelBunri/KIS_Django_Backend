@@ -18,6 +18,28 @@ BADGE_SOURCE_TOKENS: dict[str, tuple[str, ...]] = {
     "profile": ("profile", "account", "verification", "general"),
 }
 
+URGENCY_LABELS: dict[str, tuple[str, ...]] = {
+    "spiritual": ("bible", "prayer", "meditation", "devotional", "reading"),
+    "health": ("health", "medical", "appointment", "session", "emergency", "clinical"),
+    "learning": ("education", "course", "lesson", "class", "assessment", "learning"),
+    "commerce": ("market", "shop", "product", "service", "order", "payment"),
+    "social": ("message", "chat", "conversation", "partner", "community", "broadcast", "channel"),
+    "trust": ("profile", "account", "verification", "security", "badge"),
+}
+
+
+def infer_urgency_label(notification_type=None, target_type=None, context=None) -> str:
+    context = context or {}
+    explicit = str(context.get("urgency_label") or context.get("category") or "").strip().lower()
+    if explicit:
+        return explicit[:40]
+    haystack = f"{notification_type or ''} {target_type or ''} ".lower()
+    haystack += " ".join(str(value).lower() for value in context.values() if isinstance(value, (str, int, float)))
+    for label, tokens in URGENCY_LABELS.items():
+        if any(token in haystack for token in tokens):
+            return label
+    return "general"
+
 
 def should_suppress(user_id, notification_type, context=None):
     # Basic suppression logic: quiet hours, snoozes, and user rules.
@@ -40,6 +62,42 @@ def should_suppress(user_id, notification_type, context=None):
                 if start_t <= now_time <= end_t:
                     return True
     return False
+
+
+def user_notification_preferences(user_id) -> dict:
+    rules = models.NotificationRule.objects.filter(user_id=user_id, is_deleted=False)
+    global_rule = rules.filter(
+        type__isnull=True,
+        target_type__isnull=True,
+        target_id__isnull=True,
+        condition_json={},
+    ).order_by("-updated_at").first()
+    schedule = global_rule.schedule_json if global_rule and isinstance(global_rule.schedule_json, dict) else {}
+    quiet_hours = schedule.get("quiet_hours") if isinstance(schedule.get("quiet_hours"), dict) else {}
+    digest = schedule.get("digest") if isinstance(schedule.get("digest"), dict) else {}
+    source_rules = []
+    for rule in rules.exclude(condition_json={}).order_by("-updated_at")[:100]:
+        condition = rule.condition_json if isinstance(rule.condition_json, dict) else {}
+        source = condition.get("source") or condition.get("badge_source")
+        if not source:
+            continue
+        source_rules.append(
+            {
+                "id": str(rule.id),
+                "source": str(source),
+                "enabled": rule.enabled,
+                "priority": rule.priority or "",
+                "channels": rule.channels_json or [],
+                "schedule": rule.schedule_json or {},
+            }
+        )
+    return {
+        "quiet_hours": quiet_hours,
+        "digest": digest,
+        "source_rules": source_rules,
+        "child_youth_safe_defaults": True,
+    }
+
 
 
 def _normalize_channels(channel=None, preferred_channels=None) -> list[str]:
@@ -89,6 +147,10 @@ def normalize_notification_context(notification_type=None, target_type=None, con
     badge_source = infer_badge_source(notification_type=notification_type, target_type=target_type, context=context_data, explicit_source=source)
     context_data.setdefault("source", badge_source)
     context_data.setdefault("badge_source", badge_source)
+    context_data.setdefault(
+        "urgency_label",
+        infer_urgency_label(notification_type=notification_type, target_type=target_type, context=context_data),
+    )
     if target_type:
         context_data.setdefault("target_type", str(target_type))
     return context_data

@@ -10,6 +10,8 @@ from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError
 
+from apps.broadcasts.media_pipeline import prepare_channel_asset_payload
+
 
 @dataclass(frozen=True)
 class FeedEntryResolution:
@@ -158,7 +160,7 @@ def _asset_payload_from_attachment(attachment: dict[str, Any], index: int) -> di
     ).strip().lower()
     if asset_type == "file":
         asset_type = "document"
-    return {
+    payload = {
         "asset_type": asset_type[:32] or "document",
         "url": str(attachment.get("url") or attachment.get("uri") or "").strip(),
         "storage_path": str(attachment.get("path") or attachment.get("storage_path") or attachment.get("storagePath") or "").strip(),
@@ -173,6 +175,7 @@ def _asset_payload_from_attachment(attachment: dict[str, Any], index: int) -> di
         "processing_status": str(attachment.get("processing_status") or attachment.get("processingStatus") or "ready").strip()[:24] or "ready",
         "metadata": deepcopy(attachment),
     }
+    return prepare_channel_asset_payload(payload)
 
 
 def _entry_attachments(entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -252,6 +255,38 @@ def _get_or_create_personal_channel(user, profile: dict[str, Any] | None = None)
     return channel
 
 
+def _resolve_channel_for_feed_entry(user, profile: dict[str, Any] | None, entry: dict[str, Any]):
+    from apps.broadcasts.models import BroadcastChannel, BroadcastChannelRole
+
+    channel_uuid = _as_uuid(entry.get("channel_id") or entry.get("channelId"))
+    if channel_uuid:
+        channel = None
+        if getattr(user, "is_authenticated", False):
+            channel = BroadcastChannel.objects.filter(
+                id=channel_uuid,
+                is_deleted=False,
+                owner_user=user,
+            ).first()
+        if not channel and getattr(user, "is_authenticated", False):
+            channel = (
+                BroadcastChannel.objects.filter(
+                    id=channel_uuid,
+                    is_deleted=False,
+                    roles__user=user,
+                    roles__role__in=[
+                        BroadcastChannelRole.Role.OWNER,
+                        BroadcastChannelRole.Role.MANAGER,
+                        BroadcastChannelRole.Role.EDITOR,
+                    ],
+                )
+                .distinct()
+                .first()
+            )
+        if channel:
+            return channel
+    return _get_or_create_personal_channel(user, profile)
+
+
 def channel_content_payload_from_feed_entry(channel, entry: dict[str, Any], broadcast_item=None) -> dict[str, Any]:
     attachments = _entry_attachments(entry)
     first_attachment = attachments[0] if attachments else {}
@@ -277,6 +312,7 @@ def channel_content_payload_from_feed_entry(channel, entry: dict[str, Any], broa
         "thumbnail_url": str(
             entry.get("thumbnail_url")
             or entry.get("thumbnailUrl")
+            or entry.get("thumbnail")
             or first_attachment.get("thumbnail_url")
             or first_attachment.get("thumbUrl")
             or first_attachment.get("url")
@@ -290,6 +326,10 @@ def channel_content_payload_from_feed_entry(channel, entry: dict[str, Any], broa
         "metadata": {
             "legacy_feed_entry": deepcopy(entry),
             "legacy_profile_id": str((entry.get("profile_id") or "") or ""),
+            "playlist_ids": deepcopy(entry.get("playlist_ids") or entry.get("playlistIds") or []),
+            "captions": deepcopy(entry.get("captions") or None),
+            "embed_allowed": bool(entry.get("embed_allowed") or entry.get("embedAllowed")),
+            "composer_type": str(entry.get("composer_type") or entry.get("composerType") or "").strip(),
         },
         "stats": {
             "views": int(entry.get("views") or entry.get("view_count") or 0),
@@ -310,7 +350,7 @@ def sync_channel_content_from_feed_entry(user, profile: dict[str, Any] | None, e
 
     from apps.broadcasts.models import ChannelContent, ChannelContentAsset
 
-    channel = _get_or_create_personal_channel(user, profile)
+    channel = _resolve_channel_for_feed_entry(user, profile, entry)
     payload = channel_content_payload_from_feed_entry(channel, entry, broadcast_item=broadcast_item)
     created_by = user if getattr(user, "is_authenticated", False) else None
     content = ChannelContent.objects.filter(legacy_feed_entry_id=entry_uuid, channel=channel).first()

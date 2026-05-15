@@ -58,6 +58,15 @@ from apps.commerce.serializers import ProductSerializer, ServiceBookingSerialize
 from apps.moderation.models import AuditLog as ModerationAuditLog, Flag as ModerationFlag, UserBlock
 from apps.notifications.realtime import notify_main_tab_badges_updated
 from apps.partners.models import Partner, PartnerPost, PartnerMembership, PartnerMembershipStatus
+from apps.media.models import MediaSafetyScan
+from apps.media.safety import (
+    hash_upload,
+    normalize_upload_context,
+    scan_upload_for_explicit_content,
+    user_safe_upload_response,
+    validate_attachment_metadata_for_safe_messaging,
+    validate_upload_file_safety,
+)
 from apps.broadcasts.feed_entry_store import (
     append_feed_entry,
     archive_channel_content_for_feed_entry,
@@ -68,6 +77,11 @@ from apps.broadcasts.feed_entry_store import (
     replace_feed_entry,
     resolve_feed_entry,
     sync_channel_content_from_feed_entry,
+)
+from apps.broadcasts.media_pipeline import (
+    prepare_channel_asset_payload,
+    validate_channel_content_ready_for_publish,
+    validate_feed_entry_ready_for_broadcast,
 )
 from apps.broadcasts.models import (
     BroadcastChannel,
@@ -108,6 +122,10 @@ from apps.broadcasts.models import (
     EducationAssessmentType,
     EducationClassSessionMode,
     EducationClassSessionStatus,
+    EducationCourseQuestion,
+    EducationCourseQuestionStatus,
+    EducationCourseReview,
+    EducationCourseReviewStatus,
     EducationInstitution,
     EducationInstitutionAssessment,
     EducationInstitutionAssessmentOption,
@@ -186,6 +204,8 @@ from apps.broadcasts.serializers import (
     EducationInstitutionBookingSerializer,
     EducationInstitutionBroadcastSerializer,
     EducationInstitutionClassSessionSerializer,
+    EducationCourseQuestionSerializer,
+    EducationCourseReviewSerializer,
     EducationInstitutionCourseSerializer,
     EducationInstitutionCourseModuleSerializer,
     EducationInstitutionCourseModuleItemSerializer,
@@ -1963,6 +1983,12 @@ def _education_discovery_item_from_broadcast(
         "status": broadcast.status,
         "targetLabel": target_label,
         "viewerState": viewer_state,
+        "reviewSummary": _build_education_review_summary(broadcast),
+        "questionSummary": _build_education_question_summary(broadcast),
+        "paymentSummary": _build_education_payment_summary(broadcast),
+        "trustSummary": _build_public_institution_summary(broadcast.institution).get("trustSummary", {}),
+        "certificateSummary": _build_education_certificate_summary(broadcast),
+        "safetySummary": _build_education_safety_summary(broadcast),
     }
     if broadcast.class_session:
         item.update(
@@ -1991,6 +2017,11 @@ def _build_public_institution_summary(institution: EducationInstitution, request
     published = institution.education_broadcasts.filter(status=EducationBroadcastStatus.PUBLISHED)
     logo_url = branding.get("logo_url") or branding.get("image_url")
     image_url = branding.get("image_url") or branding.get("logo_url")
+    verification_summary = current_education_institution_verification_status(institution)
+    approved_review_stats = institution.course_reviews.filter(status=EducationCourseReviewStatus.APPROVED).aggregate(
+        rating=models.Avg("rating"),
+        count=models.Count("id"),
+    )
     return {
         "id": str(institution.id),
         "name": institution.name,
@@ -1999,11 +2030,97 @@ def _build_public_institution_summary(institution: EducationInstitution, request
         "membershipPolicy": institution.membership_policy,
         "logoUrl": build_absolute_url(request, logo_url) if logo_url else "",
         "imageUrl": build_absolute_url(request, image_url) if image_url else "",
+        "verificationSummary": verification_summary,
+        "trustSummary": {
+            "verified": bool(verification_summary.get("is_verified") or verification_summary.get("verified")),
+            "badges": verification_summary.get("badges") or [],
+            "rating": round(float(approved_review_stats.get("rating") or 0), 2),
+            "reviewCount": int(approved_review_stats.get("count") or 0),
+            "moderationSafe": True,
+        },
         "programCount": institution.programs.count(),
         "courseCount": institution.courses_v2.count(),
         "eventCount": institution.events.count(),
         "publishedBroadcastCount": published.count(),
         "memberCount": institution.memberships.filter(status=EducationInstitutionMembershipStatus.ACTIVE).count(),
+    }
+
+
+def _build_education_review_summary(broadcast: EducationInstitutionBroadcast) -> dict[str, Any]:
+    stats = broadcast.course_reviews.filter(status=EducationCourseReviewStatus.APPROVED).aggregate(
+        rating=models.Avg("rating"),
+        count=models.Count("id"),
+    )
+    count = int(stats.get("count") or 0)
+    return {
+        "rating": round(float(stats.get("rating") or 0), 2),
+        "reviewCount": count,
+        "label": f"{round(float(stats.get('rating') or 0), 1)} ({count})" if count else "New course",
+    }
+
+
+def _build_education_question_summary(broadcast: EducationInstitutionBroadcast) -> dict[str, Any]:
+    visible = broadcast.course_questions.exclude(status=EducationCourseQuestionStatus.HIDDEN)
+    total = visible.count()
+    answered = visible.filter(status=EducationCourseQuestionStatus.ANSWERED).count()
+    return {
+        "questionCount": total,
+        "answeredCount": answered,
+        "openCount": max(total - answered, 0),
+    }
+
+
+def _build_education_payment_summary(broadcast: EducationInstitutionBroadcast) -> dict[str, Any]:
+    amount_cents = int(round(float(broadcast.price_amount or 0) * 100))
+    return {
+        "currency": _normalize_education_currency(broadcast.price_currency),
+        "amountCents": amount_cents,
+        "isFree": amount_cents <= 0,
+        "provider": "flutterwave",
+        "providerRequired": amount_cents > 0,
+        "legacyWalletDisabled": True,
+        "copy": "Free enrollment" if amount_cents <= 0 else "Secure USD checkout",
+    }
+
+
+def _build_education_offline_summary(broadcast: EducationInstitutionBroadcast, course_outline: list[dict[str, Any]]) -> dict[str, Any]:
+    downloadable_count = 0
+    low_bandwidth_count = 0
+    for item in _flatten_learning_outline(course_outline):
+        content = item.get("content") if isinstance(item.get("content"), dict) else {}
+        if content.get("is_downloadable"):
+            downloadable_count += 1
+        mime = str(content.get("resource_mime_type") or "").lower()
+        if item.get("type") in {EducationCourseModuleItemType.MATERIAL, EducationCourseModuleItemType.LESSON} and (
+            "pdf" in mime or "audio" in mime or "text" in mime or not mime
+        ):
+            low_bandwidth_count += 1
+    return {
+        "downloadableItemCount": downloadable_count,
+        "lowBandwidthItemCount": low_bandwidth_count,
+        "offlineReady": downloadable_count > 0 or low_bandwidth_count > 0,
+        "placeholder": "Download pack support is prepared for low-bandwidth learners.",
+    }
+
+
+def _build_education_certificate_summary(broadcast: EducationInstitutionBroadcast) -> dict[str, Any]:
+    metadata = broadcast.course.metadata if broadcast.course_id and isinstance(broadcast.course.metadata, dict) else {}
+    return {
+        "available": bool(metadata.get("certificate_enabled", True)),
+        "issuer": broadcast.institution.name,
+        "type": str(metadata.get("certificate_type") or "KIS verified completion"),
+        "shareable": True,
+    }
+
+
+def _build_education_safety_summary(broadcast: EducationInstitutionBroadcast) -> dict[str, Any]:
+    metadata = broadcast.metadata if isinstance(broadcast.metadata, dict) else {}
+    safety = metadata.get("media_safety") if isinstance(metadata.get("media_safety"), dict) else {}
+    return {
+        "status": str(safety.get("status") or "allowed"),
+        "providerLiveCallsEnabled": False,
+        "quarantineEnabled": True,
+        "blockedIfUnsafe": True,
     }
 
 
@@ -2543,6 +2660,12 @@ def _build_public_education_content_detail(
     enrollment_metadata = enrollment.metadata or {} if enrollment else {}
     institution_summary = _build_public_institution_summary(institution, request)
     trust_signals = _build_public_content_trust_signals(broadcast, course_outline)
+    review_summary = _build_education_review_summary(broadcast)
+    question_summary = _build_education_question_summary(broadcast)
+    payment_summary = _build_education_payment_summary(broadcast)
+    offline_summary = _build_education_offline_summary(broadcast, course_outline)
+    certificate_summary = _build_education_certificate_summary(broadcast)
+    safety_summary = _build_education_safety_summary(broadcast)
     detail_item: dict[str, Any] = {
         "id": str(broadcast.id),
         "type": content_type,
@@ -2565,6 +2688,13 @@ def _build_public_education_content_detail(
         "courseOutline": course_outline,
         "institutionSummary": institution_summary,
         "trustSignals": trust_signals,
+        "trustSummary": institution_summary.get("trustSummary") or {},
+        "reviewSummary": review_summary,
+        "questionSummary": question_summary,
+        "paymentSummary": payment_summary,
+        "offlineSummary": offline_summary,
+        "certificateSummary": certificate_summary,
+        "safetySummary": safety_summary,
         "broadcastId": str(broadcast.id),
         "institutionId": str(institution.id),
         "broadcastKind": broadcast.broadcast_kind,
@@ -2664,7 +2794,15 @@ def _build_public_education_content_detail(
         "current_item": progress_payload.get("currentItem"),
         "current_module": progress_payload.get("currentModule"),
         "next_item": progress_payload.get("nextItem"),
-        "reviews": [],
+        "reviews": EducationCourseReviewSerializer(
+            broadcast.course_reviews.select_related("user").filter(status=EducationCourseReviewStatus.APPROVED)[:20],
+            many=True,
+        ).data,
+        "questions": EducationCourseQuestionSerializer(
+            broadcast.course_questions.select_related("user", "answered_by")
+            .exclude(status=EducationCourseQuestionStatus.HIDDEN)[:30],
+            many=True,
+        ).data,
         "faqs": [
             {
                 "question": "How do I access this content?",
@@ -2672,10 +2810,24 @@ def _build_public_education_content_detail(
             },
             {
                 "question": "How does payment work?",
-                "answer": "Paid education actions use KISC and follow the same held-funds settlement model as the market system.",
+                "answer": "Paid education actions use direct USD provider checkout. Promotional credits do not behave like cash and are not transferable.",
+            },
+            {
+                "question": "Can I learn with poor internet?",
+                "answer": offline_summary.get("placeholder") or "Low-bandwidth and offline learning support is prepared for eligible materials.",
             },
         ],
     }
+
+
+def _require_learning_access_for_content(user: User, broadcast: EducationInstitutionBroadcast) -> EducationInstitutionEnrollment:
+    enrollment = broadcast.enrollments.filter(
+        user=user,
+        status__in=[EducationEnrollmentStatus.ENROLLED, EducationEnrollmentStatus.COMPLETED],
+    ).first()
+    if not enrollment:
+        raise PermissionDenied("Enroll before posting course reviews or questions.")
+    return enrollment
 
 
 def _build_education_hub_payload(user: User, request) -> dict[str, Any]:
@@ -6522,6 +6674,7 @@ def _ensure_education_profile_structure(education: dict) -> dict:
 
 
 def _store_thumbnail_upload(file_obj) -> str:
+    validate_upload_file_safety(file_obj, context="broadcast")
     media_root = getattr(settings, "MEDIA_ROOT", "media")
     ext = os.path.splitext(file_obj.name or "")[1] or ".jpg"
     rel_name = f"{uuid.uuid4().hex}{ext}"
@@ -6532,6 +6685,34 @@ def _store_thumbnail_upload(file_obj) -> str:
         for chunk in file_obj.chunks():
             destination.write(chunk)
     return rel_path
+
+
+def _record_upload_safety(request, file_obj, *, context: str):
+    normalized_context = normalize_upload_context(context)
+    validate_upload_file_safety(file_obj, context=normalized_context)
+    checksum = hash_upload(file_obj)
+    decision = scan_upload_for_explicit_content(
+        filename=getattr(file_obj, "name", "") or "upload",
+        mime_type=getattr(file_obj, "content_type", "") or "",
+        context=normalized_context,
+    )
+    scan = MediaSafetyScan.objects.create(
+        owner=request.user if request and getattr(request.user, "is_authenticated", False) else None,
+        upload_id=uuid.uuid4().hex,
+        context=normalized_context,
+        original_name=getattr(file_obj, "name", "") or "",
+        mime_type=getattr(file_obj, "content_type", "") or "",
+        bytes=getattr(file_obj, "size", 0) or 0,
+        checksum=checksum,
+        provider=decision.provider,
+        status=decision.status,
+        quarantine=decision.quarantine,
+        requires_review=decision.requires_review,
+        policy_version=decision.policy_version,
+        reason=decision.reason,
+        result=decision.as_metadata(),
+    )
+    return decision, scan
 
 
 class BroadcastVideoUploadSerializer(serializers.Serializer):
@@ -8305,6 +8486,7 @@ class BroadcastVideoUploadView(APIView):
         serializer = BroadcastVideoUploadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         file_obj = serializer.validated_data["file"]
+        safety_decision, safety_scan = _record_upload_safety(request, file_obj, context="broadcast")
         title = serializer.validated_data.get("title") or os.path.splitext(file_obj.name or "")[0] or "Broadcast video"
         description = serializer.validated_data.get("description", "")
         thumbnail_url = serializer.validated_data.get("thumbnail_url", "")
@@ -8333,13 +8515,35 @@ class BroadcastVideoUploadView(APIView):
             duration_seconds=int(round(duration)),
             transcript_segments=transcript_segments,
         )
-        video.video_url = build_media_url(request, relative_path)
+        video.video_url = "" if safety_decision.quarantine else build_media_url(request, relative_path)
         ensure_local_thumbnail(video)
         video.save(update_fields=["video_url"])
-        return Response(
-            BroadcastVideoSerializer(video, context={"request": request}).data,
-            status=status.HTTP_201_CREATED,
-        )
+        payload = BroadcastVideoSerializer(video, context={"request": request}).data
+        payload["scan_status"] = safety_decision.status
+        payload["quarantined"] = safety_decision.quarantine
+        payload["requires_review"] = safety_decision.requires_review
+        payload["safety_scan_id"] = str(safety_scan.id)
+        payload["safety"] = user_safe_upload_response(safety_decision)
+        payload["processing_status"] = "pending_review" if safety_decision.requires_review or safety_decision.quarantine else "ready"
+        payload["pipeline"] = prepare_channel_asset_payload(
+            {
+                "asset_type": "short_video" if video.type == "short" else "video",
+                "url": payload.get("video_url") or "",
+                "storage_path": relative_path,
+                "mime_type": file_obj.content_type or "",
+                "size_bytes": getattr(file_obj, "size", 0) or 0,
+                "duration_seconds": video.duration_seconds,
+                "thumbnail_url": payload.get("thumbnail_url") or "",
+                "processing_status": payload["processing_status"],
+                "metadata": {
+                    "safety": payload["safety"],
+                    "safety_scan_id": str(safety_scan.id),
+                    "transcript_segments": transcript_segments,
+                },
+            },
+            content_type="short_video" if video.type == "short" else "video",
+        ).get("metadata", {}).get("pipeline", {})
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class BroadcastVideoStreamView(APIView):
@@ -10762,6 +10966,123 @@ class EducationContentDetailView(APIView):
         )
 
 
+class EducationContentReviewsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id: str):
+        broadcast = get_object_or_404(
+            EducationInstitutionBroadcast.objects.select_related("institution", "course"),
+            id=content_id,
+            status=EducationBroadcastStatus.PUBLISHED,
+        )
+        reviews = (
+            broadcast.course_reviews.select_related("user")
+            .filter(status=EducationCourseReviewStatus.APPROVED)
+            .order_by("-created_at")[:80]
+        )
+        return Response(
+            {
+                "summary": _build_education_review_summary(broadcast),
+                "reviews": EducationCourseReviewSerializer(reviews, many=True).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @transaction.atomic
+    def post(self, request, content_id: str):
+        broadcast = get_object_or_404(
+            EducationInstitutionBroadcast.objects.select_related("institution", "course"),
+            id=content_id,
+            status=EducationBroadcastStatus.PUBLISHED,
+        )
+        _require_learning_access_for_content(request.user, broadcast)
+        try:
+            rating = int(request.data.get("rating") or 0)
+        except (TypeError, ValueError):
+            rating = 0
+        if rating < 1 or rating > 5:
+            raise ValidationError({"rating": "Choose a rating from 1 to 5."})
+        comment = str(request.data.get("comment") or "").strip()
+        title = str(request.data.get("title") or "").strip()[:140]
+        review, created = EducationCourseReview.objects.update_or_create(
+            broadcast=broadcast,
+            user=request.user,
+            defaults={
+                "institution": broadcast.institution,
+                "course": broadcast.course,
+                "rating": rating,
+                "title": title,
+                "comment": comment,
+                "status": EducationCourseReviewStatus.APPROVED,
+                "metadata": {
+                    "source": "education_content_detail",
+                    "moderation_safe": True,
+                },
+            },
+        )
+        return Response(
+            {
+                "review": EducationCourseReviewSerializer(review).data,
+                "summary": _build_education_review_summary(broadcast),
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class EducationContentQuestionsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id: str):
+        broadcast = get_object_or_404(
+            EducationInstitutionBroadcast.objects.select_related("institution", "course"),
+            id=content_id,
+            status=EducationBroadcastStatus.PUBLISHED,
+        )
+        questions = (
+            broadcast.course_questions.select_related("user", "answered_by")
+            .exclude(status=EducationCourseQuestionStatus.HIDDEN)
+            .order_by("-created_at")[:80]
+        )
+        return Response(
+            {
+                "summary": _build_education_question_summary(broadcast),
+                "questions": EducationCourseQuestionSerializer(questions, many=True).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @transaction.atomic
+    def post(self, request, content_id: str):
+        broadcast = get_object_or_404(
+            EducationInstitutionBroadcast.objects.select_related("institution", "course"),
+            id=content_id,
+            status=EducationBroadcastStatus.PUBLISHED,
+        )
+        _require_learning_access_for_content(request.user, broadcast)
+        question_text = str(request.data.get("question") or "").strip()
+        if len(question_text) < 8:
+            raise ValidationError({"question": "Please add a clear course question."})
+        question = EducationCourseQuestion.objects.create(
+            institution=broadcast.institution,
+            broadcast=broadcast,
+            course=broadcast.course,
+            user=request.user,
+            question=question_text,
+            status=EducationCourseQuestionStatus.OPEN,
+            metadata={
+                "source": "education_content_detail",
+                "moderation_safe": True,
+            },
+        )
+        return Response(
+            {
+                "question": EducationCourseQuestionSerializer(question).data,
+                "summary": _build_education_question_summary(broadcast),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class EducationContentCertificateView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -12130,9 +12451,10 @@ def _build_feed_attachment(request, file_obj):
     if not file_obj:
         return None
     media_type = _validate_feed_media_file(file_obj)
+    safety_decision, safety_scan = _record_upload_safety(request, file_obj, context=request.data.get("context") or "broadcast")
     upload_user = request.user if request and getattr(request, "user", None) else None
     rel_path, bytes_written = _store_upload(file_obj, user=upload_user)
-    url = build_media_url(request, rel_path) if request else rel_path
+    url = "" if safety_decision.quarantine else (build_media_url(request, rel_path) if request else rel_path)
 
     attachment = {
         'url': url,
@@ -12142,10 +12464,14 @@ def _build_feed_attachment(request, file_obj):
         'size': bytes_written,
         'media_type': media_type,
         'validation_status': 'validated',
-        'scan_status': 'not_configured',
+        'scan_status': safety_decision.status,
+        'quarantined': safety_decision.quarantine,
+        'requires_review': safety_decision.requires_review,
+        'safety_scan_id': str(safety_scan.id),
+        'safety': user_safe_upload_response(safety_decision),
     }
 
-    if media_type == 'video' and request and getattr(request, 'user', None):
+    if media_type == 'video' and request and getattr(request, 'user', None) and not safety_decision.quarantine:
         video = BroadcastVideo.objects.create(
             title=file_obj.name or 'Broadcast video',
             description='',
@@ -12163,6 +12489,24 @@ def _build_feed_attachment(request, file_obj):
             reverse('broadcasts:video-stream', kwargs={'video_id': str(video.id)}),
         )
         attachment['video_id'] = str(video.id)
+        attachment['duration_seconds'] = video.duration_seconds
+        attachment['thumbnail_url'] = video.thumbnail_url or ''
+
+    attachment['processing_status'] = 'pending_review' if safety_decision.requires_review or safety_decision.quarantine else 'ready'
+    attachment['pipeline'] = prepare_channel_asset_payload(
+        {
+            'asset_type': media_type,
+            'url': attachment.get('url') or '',
+            'storage_path': rel_path,
+            'mime_type': file_obj.content_type or '',
+            'size_bytes': bytes_written,
+            'duration_seconds': attachment.get('duration_seconds'),
+            'thumbnail_url': attachment.get('thumbnail_url') or attachment.get('thumbUrl') or '',
+            'processing_status': attachment['processing_status'],
+            'metadata': attachment,
+        },
+        content_type=media_type,
+    ).get('metadata', {}).get('pipeline', {})
 
     return attachment
 
@@ -12240,6 +12584,7 @@ def _merge_client_attachments(
         for item in parsed
         if isinstance(item, dict)
     ]
+    validate_attachment_metadata_for_safe_messaging(normalized_client)
     return uploaded + normalized_client
 
 
@@ -12249,6 +12594,14 @@ def _build_composer_fields(data) -> dict[str, Any]:
     event = _parse_json_payload(data.get("event"), None)
     link = str(data.get("link") or "").strip()
     composer_type = str(data.get("composer_type") or data.get("composerType") or "").strip()
+    channel_id = str(data.get("channel_id") or data.get("channelId") or "").strip()
+    content_type = str(data.get("content_type") or data.get("contentType") or "").strip()
+    visibility = str(data.get("visibility") or "").strip().lower()
+    scheduled_at = str(data.get("scheduled_at") or data.get("scheduledAt") or "").strip()
+    thumbnail_url = str(data.get("thumbnail_url") or data.get("thumbnail") or data.get("thumbnailUrl") or "").strip()
+    playlist_ids = _parse_json_payload(data.get("playlist_ids") or data.get("playlistIds"), None)
+    captions = _parse_json_payload(data.get("captions"), None)
+    embed_allowed_raw = str(data.get("embed_allowed") or data.get("embedAllowed") or "").strip().lower()
     text_plain = str(data.get("text_plain") or data.get("textPlain") or "").strip()
     text_preview = str(data.get("text_preview") or data.get("textPreview") or "").strip()
     fields: dict[str, Any] = {}
@@ -12267,6 +12620,24 @@ def _build_composer_fields(data) -> dict[str, Any]:
         fields["link"] = link
     if composer_type:
         fields["composer_type"] = composer_type
+    if channel_id:
+        fields["channel_id"] = channel_id
+    if content_type:
+        fields["content_type"] = content_type
+    if visibility:
+        fields["visibility"] = visibility
+    if scheduled_at:
+        fields["scheduled_at"] = scheduled_at
+    if thumbnail_url:
+        fields["thumbnail_url"] = thumbnail_url
+    if isinstance(playlist_ids, list):
+        fields["playlist_ids"] = playlist_ids
+    if captions is not None:
+        fields["captions"] = captions
+    if embed_allowed_raw in {"1", "true", "yes", "on"}:
+        fields["embed_allowed"] = True
+    elif embed_allowed_raw in {"0", "false", "no", "off"}:
+        fields["embed_allowed"] = False
     return fields
 
 
@@ -12699,6 +13070,185 @@ def _embed_public_base_url(request=None) -> str:
     if request is not None:
         return request.build_absolute_uri("/").rstrip("/")
     return ""
+
+
+def _public_web_enabled() -> bool:
+    value = getattr(settings, "KIS_PUBLIC_WEB_ENABLED", os.getenv("KIS_PUBLIC_WEB_ENABLED", "True"))
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _public_web_base_url(request=None) -> str:
+    configured = str(getattr(settings, "KIS_PUBLIC_WEB_BASE_URL", os.getenv("KIS_PUBLIC_WEB_BASE_URL", "")) or "").strip().rstrip("/")
+    if configured:
+        return configured
+    if request is not None:
+        return request.build_absolute_uri("/").rstrip("/")
+    return "https://kis.app"
+
+
+def _public_indexing_enabled() -> bool:
+    value = getattr(settings, "KIS_PUBLIC_WEB_INDEXING_ENABLED", os.getenv("KIS_PUBLIC_WEB_INDEXING_ENABLED", "False"))
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_public_description(*values) -> str:
+    text = " ".join(str(value or "").strip() for value in values if str(value or "").strip())
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:260]
+
+
+def _content_is_public_web_safe(content: ChannelContent) -> bool:
+    metadata = content.metadata if isinstance(content.metadata, dict) else {}
+    if metadata.get("child_sensitive") or metadata.get("private_context") or metadata.get("contains_private_data"):
+        return False
+    return (
+        content.visibility == ChannelContent.Visibility.PUBLIC
+        and content.status == ChannelContent.Status.PUBLISHED
+        and not content.is_deleted
+        and content.channel.is_public
+        and not content.channel.is_deleted
+    )
+
+
+def _public_channel_url(request, channel: BroadcastChannel) -> str:
+    return f"{_public_web_base_url(request)}/channels/{channel.handle}"
+
+
+def _public_content_url(request, content: ChannelContent) -> str:
+    return f"{_public_web_base_url(request)}/channels/{content.channel.handle}/content/{content.id}"
+
+
+def _safe_public_content_asset(content: ChannelContent) -> dict:
+    asset = content.assets.order_by("sort_order", "created_at").first()
+    if not asset:
+        return {}
+    return {
+        "asset_type": asset.asset_type,
+        "url": asset.url,
+        "thumbnail_url": asset.thumbnail_url,
+        "mime_type": asset.mime_type,
+        "caption": asset.caption[:220],
+        "width": asset.width,
+        "height": asset.height,
+        "duration_seconds": asset.duration_seconds,
+    }
+
+
+def _public_content_card(request, content: ChannelContent) -> dict:
+    asset = _safe_public_content_asset(content)
+    thumbnail = content.thumbnail_url or asset.get("thumbnail_url") or asset.get("url") or ""
+    title = content.title or content.text_plain[:80] or "KIS content"
+    return {
+        "id": str(content.id),
+        "title": title[:220],
+        "description": _safe_public_description(content.description, content.text_plain),
+        "content_type": content.content_type,
+        "thumbnail_url": thumbnail,
+        "url": _public_content_url(request, content),
+        "published_at": content.published_at.isoformat() if content.published_at else None,
+        "stats": {
+            "views": int((content.stats or {}).get("views") or 0),
+            "shares": int((content.stats or {}).get("shares") or 0),
+            "comments": int((content.stats or {}).get("comments") or 0),
+        },
+    }
+
+
+def _public_channel_payload(request, channel: BroadcastChannel, *, include_contents: bool = True) -> dict:
+    public_url = _public_channel_url(request, channel)
+    description = _safe_public_description(channel.description)
+    latest = []
+    if include_contents:
+        latest = [
+            _public_content_card(request, item)
+            for item in ChannelContent.objects.filter(
+                channel=channel,
+                status=ChannelContent.Status.PUBLISHED,
+                visibility=ChannelContent.Visibility.PUBLIC,
+                is_deleted=False,
+            ).order_by("-published_at", "-created_at")[:12]
+            if _content_is_public_web_safe(item)
+        ]
+    return {
+        "type": "channel",
+        "id": str(channel.id),
+        "handle": channel.handle,
+        "display_name": channel.display_name,
+        "description": description,
+        "avatar_url": channel.avatar_url,
+        "banner_url": channel.banner_url,
+        "category": channel.category,
+        "language": channel.language,
+        "country": channel.country,
+        "subscriber_count": channel.subscriber_count,
+        "content_count": channel.content_count,
+        "trust_badges": channel.verification_badges if isinstance(channel.verification_badges, list) else [],
+        "url": public_url,
+        "seo": {
+            "title": f"{channel.display_name} (@{channel.handle}) on KIS",
+            "description": description or f"Watch and follow {channel.display_name} on KIS.",
+            "canonical_url": public_url,
+            "robots": "index,follow" if _public_indexing_enabled() else "noindex,nofollow",
+        },
+        "share_card": {
+            "title": channel.display_name,
+            "description": description,
+            "image": channel.banner_url or channel.avatar_url,
+            "url": public_url,
+        },
+        "growth": {
+            "referrals_enabled": bool(getattr(settings, "KIS_PUBLIC_REFERRALS_ENABLED", False)),
+            "invite_url": f"{public_url}?ref=share",
+        },
+        "report": {
+            "method": "POST",
+            "url": request.build_absolute_uri(reverse("broadcasts:broadcast-channel-report", args=[channel.id])),
+        },
+        "latest_contents": latest,
+    }
+
+
+def _public_content_payload(request, content: ChannelContent) -> dict:
+    if not _content_is_public_web_safe(content):
+        raise Http404
+    asset = _safe_public_content_asset(content)
+    thumbnail = content.thumbnail_url or asset.get("thumbnail_url") or asset.get("url") or ""
+    public_url = _public_content_url(request, content)
+    title = content.title or content.text_plain[:80] or "KIS content"
+    description = _safe_public_description(content.description, content.text_plain)
+    embed_url = request.build_absolute_uri(reverse("broadcasts:broadcast-channel-content-oembed", args=[content.id]))
+    return {
+        "type": "content",
+        "id": str(content.id),
+        "title": title[:220],
+        "description": description,
+        "content_type": content.content_type,
+        "thumbnail_url": thumbnail,
+        "asset": asset,
+        "channel": _public_channel_payload(request, content.channel, include_contents=False),
+        "url": public_url,
+        "seo": {
+            "title": f"{title[:160]} | KIS",
+            "description": description,
+            "canonical_url": public_url,
+            "robots": "index,follow" if _public_indexing_enabled() else "noindex,nofollow",
+        },
+        "share_card": {
+            "title": title[:220],
+            "description": description,
+            "image": thumbnail,
+            "url": public_url,
+        },
+        "embed": {
+            "oembed_url": embed_url,
+            "enabled": _embeds_enabled(),
+            "requires_policy_check": True,
+        },
+        "report": {
+            "method": "POST",
+            "url": request.build_absolute_uri(reverse("broadcasts:broadcast-channel-content-report", args=[content.id])),
+        },
+    }
 
 
 def _embed_signing_secret() -> str:
@@ -13190,6 +13740,9 @@ class BroadcastChannelContentListCreateView(APIView):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
         if not _user_can_edit_content(request.user, ChannelContent(channel=channel)):
             raise PermissionDenied("You cannot create content for this channel.")
+        raw_attachments = request.data.get("attachments")
+        if isinstance(raw_attachments, list):
+            validate_attachment_metadata_for_safe_messaging(raw_attachments)
         content = ChannelContent.objects.create(
             channel=channel,
             content_type=_content_type_from_request(request.data.get("content_type") or request.data.get("type")),
@@ -13222,13 +13775,15 @@ class BroadcastChannelContentListCreateView(APIView):
             },
             created_by=request.user,
         )
-        raw_attachments = request.data.get("attachments")
         if isinstance(raw_attachments, list):
             for index, attachment in enumerate(raw_attachments):
                 if isinstance(attachment, dict):
                     ChannelContentAsset.objects.create(
                         content=content,
-                        **_asset_payload_from_attachment(attachment, index),
+                        **prepare_channel_asset_payload(
+                            _asset_payload_from_attachment(attachment, index),
+                            content_type=content.content_type,
+                        ),
                     )
         BroadcastChannel.objects.filter(id=channel.id).update(content_count=models.F("content_count") + 1)
         return Response(ChannelContentDetailSerializer(content, context={"request": request}).data, status=status.HTTP_201_CREATED)
@@ -13285,6 +13840,7 @@ class ChannelContentPublishView(APIView):
         content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
         if not _user_can_edit_content(request.user, content):
             raise PermissionDenied("You cannot publish this content.")
+        validate_channel_content_ready_for_publish(content)
         content.status = ChannelContent.Status.PUBLISHED
         content.visibility = request.data.get("visibility") or content.visibility or ChannelContent.Visibility.PUBLIC
         content.published_at = timezone.now()
@@ -13322,6 +13878,7 @@ class ChannelContentBroadcastView(APIView):
         content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
         if not _user_can_edit_content(request.user, content):
             raise PermissionDenied("You cannot broadcast this content.")
+        validate_channel_content_ready_for_publish(content)
         if content.status != ChannelContent.Status.PUBLISHED:
             content.status = ChannelContent.Status.PUBLISHED
             content.visibility = ChannelContent.Visibility.PUBLIC
@@ -13394,7 +13951,11 @@ class ChannelContentAssetUploadView(APIView):
             "metadata": request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         }
         if "attachment" in request.data and isinstance(request.data.get("attachment"), dict):
+            validate_attachment_metadata_for_safe_messaging([request.data["attachment"]])
             payload.update(_asset_payload_from_attachment(request.data["attachment"], payload["sort_order"]))
+        else:
+            validate_attachment_metadata_for_safe_messaging([payload])
+            payload = prepare_channel_asset_payload(payload, content_type=content.content_type)
         asset = ChannelContentAsset.objects.create(content=content, **payload)
         return Response(ChannelContentAssetSerializer(asset).data, status=status.HTTP_201_CREATED)
 
@@ -13594,6 +14155,74 @@ class ChannelContentEmbedTokenView(APIView):
                 "embed_url": f"{base_url}/embed/content/{content.id}?token={token}",
             },
             status=status.HTTP_201_CREATED,
+        )
+
+
+class PublicChannelLandingView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, handle: str):
+        if not _public_web_enabled():
+            raise Http404
+        channel = get_object_or_404(
+            BroadcastChannel,
+            handle__iexact=str(handle or "").strip().lstrip("@"),
+            is_public=True,
+            is_deleted=False,
+        )
+        return Response(_public_channel_payload(request, channel))
+
+
+class PublicChannelContentLandingView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, content_id):
+        if not _public_web_enabled():
+            raise Http404
+        content = get_object_or_404(
+            ChannelContent.objects.select_related("channel").prefetch_related("assets"),
+            id=content_id,
+            is_deleted=False,
+        )
+        return Response(_public_content_payload(request, content))
+
+
+class PublicRobotsPolicyView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        allow_indexing = _public_web_enabled() and _public_indexing_enabled()
+        body = "User-agent: *\n"
+        body += "Allow: /\n" if allow_indexing else "Disallow: /\n"
+        body += f"Sitemap: {_public_web_base_url(request)}/sitemap.xml\n"
+        return HttpResponse(body, content_type="text/plain")
+
+
+class PublicSitemapPlanView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        if not _public_web_enabled():
+            raise Http404
+        channels = BroadcastChannel.objects.filter(is_public=True, is_deleted=False).order_by("-updated_at")[:200]
+        contents = (
+            ChannelContent.objects.filter(
+                channel__is_public=True,
+                channel__is_deleted=False,
+                status=ChannelContent.Status.PUBLISHED,
+                visibility=ChannelContent.Visibility.PUBLIC,
+                is_deleted=False,
+            )
+            .select_related("channel")
+            .order_by("-published_at", "-created_at")[:500]
+        )
+        return Response(
+            {
+                "indexing_enabled": _public_indexing_enabled(),
+                "robots": "index,follow" if _public_indexing_enabled() else "noindex,nofollow",
+                "channels": [_public_channel_url(request, channel) for channel in channels],
+                "contents": [_public_content_url(request, content) for content in contents if _content_is_public_web_safe(content)],
+            }
         )
 
 
@@ -14073,6 +14702,16 @@ class BroadcastFeedEntriesView(APIView):
             },
         }
         profile, feeds = append_feed_entry(profile, feed_entry)
+        channel_content = None
+        if feed_entry.get("channel_id"):
+            channel_content = sync_channel_content_from_feed_entry(request.user, profile, feed_entry)
+            if channel_content:
+                feed_entry = {**feed_entry, "channel_content_id": str(channel_content.id)}
+                profile, feeds, feed_entry = replace_feed_entry(
+                    profile,
+                    feed_entry["id"],
+                    lambda _entry: feed_entry,
+                )
         profile['updated_at'] = timezone.now().isoformat()
         profiles['broadcast_feed'] = profile
         _save_user_profiles(request.user, profiles)
@@ -14166,6 +14805,15 @@ class BroadcastFeedEntryDetailView(APIView):
             entry_id,
             lambda _entry: updated_entry,
         )
+        if updated_entry.get("channel_id"):
+            channel_content = sync_channel_content_from_feed_entry(request.user, profile, updated_entry)
+            if channel_content:
+                updated_entry = {**updated_entry, "channel_content_id": str(channel_content.id)}
+                profile, feeds, updated_entry = replace_feed_entry(
+                    profile,
+                    entry_id,
+                    lambda _entry: updated_entry,
+                )
         profile['updated_at'] = timezone.now().isoformat()
         resolved['profile'] = profile
         resolved['feeds'] = feeds
@@ -14277,12 +14925,17 @@ class BroadcastFeedEntryBroadcastView(APIView):
     def post(self, request, entry_id: str):
         resolved = _resolve_feed_entry(request.user, entry_id)
         entry = resolved['entry']
+        validate_feed_entry_ready_for_broadcast(entry)
         profile = resolved['profile']
         entry_updated = {
             **entry,
             'is_broadcast': True,
             'broadcasted_at': timezone.now().isoformat(),
         }
+        channel_content = sync_channel_content_from_feed_entry(request.user, profile, entry_updated)
+        if channel_content:
+            validate_channel_content_ready_for_publish(channel_content)
+            entry_updated = {**entry_updated, "channel_content_id": str(channel_content.id)}
         profile, feeds, entry_updated = replace_feed_entry(
             profile,
             entry_id,

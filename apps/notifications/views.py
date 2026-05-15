@@ -2,7 +2,7 @@
 import uuid
 
 from django.utils import timezone
-from django.db.models import Q
+from django.db.models import Count, Q
 from rest_framework import viewsets, status, serializers
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -77,6 +77,15 @@ class MarkSourceReadRequestSerializer(serializers.Serializer):
     types = serializers.ListField(child=serializers.CharField(), required=False)
 
 
+class NotificationPreferencesRequestSerializer(serializers.Serializer):
+    quiet_hours = serializers.DictField(required=False)
+    digest = serializers.DictField(required=False)
+    source = serializers.CharField(required=False, allow_blank=True)
+    source_enabled = serializers.BooleanField(required=False)
+    source_priority = serializers.CharField(required=False, allow_blank=True)
+    source_channels = serializers.ListField(child=serializers.CharField(), required=False)
+
+
 # -------------------------
 # Notification CRUD & Actions
 # -------------------------
@@ -100,7 +109,25 @@ class NotificationViewSet(viewsets.ModelViewSet):
         Limit notifications to the current user (exclude deleted).
         """
         user = self.request.user
-        return models.Notification.objects.filter(user_id=user.id, is_deleted=False)
+        qs = models.Notification.objects.filter(user_id=user.id, is_deleted=False)
+        q = str(self.request.query_params.get("q") or "").strip()
+        if q:
+            qs = qs.filter(Q(title__icontains=q) | Q(body__icontains=q) | Q(type__icontains=q) | Q(target_type__icontains=q))
+        priority = str(self.request.query_params.get("priority") or "").strip().upper()
+        if priority:
+            qs = qs.filter(priority=priority)
+        source = str(self.request.query_params.get("source") or "").strip().lower()
+        if source:
+            qs = qs.filter(Q(context_data__source__iexact=source) | Q(context_data__badge_source__iexact=source))
+        urgency = str(self.request.query_params.get("urgency") or "").strip().lower()
+        if urgency:
+            qs = qs.filter(context_data__urgency_label__iexact=urgency)
+        unread = str(self.request.query_params.get("unread") or "").strip().lower()
+        if unread in {"1", "true", "yes"}:
+            qs = qs.filter(is_read=False)
+        if unread in {"0", "false", "no"}:
+            qs = qs.filter(is_read=True)
+        return qs.order_by("-created_at")
 
     @swagger_auto_schema(
         operation_id="notifications_delete",
@@ -306,6 +333,73 @@ class NotificationViewSet(viewsets.ModelViewSet):
     def main_tab_badge_counts(self, request):
         payload = get_main_tab_badge_counts(request.user).as_dict()
         return Response(MainTabBadgeCountsResponseSerializer(payload).data)
+
+    @action(detail=False, methods=["get"], url_path="attention-summary")
+    def attention_summary(self, request):
+        qs = self.get_queryset()
+        unread = qs.filter(is_read=False)
+        by_priority = list(unread.values("priority").annotate(count=Count("id")).order_by("priority"))
+        by_source = list(unread.values("context_data__badge_source").annotate(count=Count("id")).order_by("context_data__badge_source"))
+        by_urgency = list(unread.values("context_data__urgency_label").annotate(count=Count("id")).order_by("context_data__urgency_label"))
+        urgent_now = unread.filter(priority__in=["URGENT", "HIGH"]).count()
+        return Response(
+            {
+                "unread_count": unread.count(),
+                "urgent_now": urgent_now,
+                "by_priority": by_priority,
+                "by_source": by_source,
+                "by_urgency": by_urgency,
+                "preferences": services.user_notification_preferences(request.user.id),
+            }
+        )
+
+    @action(detail=False, methods=["get", "post"], url_path="attention-preferences")
+    def attention_preferences(self, request):
+        if request.method == "GET":
+            return Response(services.user_notification_preferences(request.user.id))
+        serializer = NotificationPreferencesRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if "quiet_hours" in data or "digest" in data:
+            rule, _ = models.NotificationRule.objects.get_or_create(
+                user_id=request.user.id,
+                type=None,
+                target_type=None,
+                target_id=None,
+                defaults={"schedule_json": {}, "channels_json": ["IN_APP", "PUSH"]},
+            )
+            schedule = rule.schedule_json if isinstance(rule.schedule_json, dict) else {}
+            if "quiet_hours" in data:
+                schedule["quiet_hours"] = data.get("quiet_hours") or {}
+            if "digest" in data:
+                schedule["digest"] = data.get("digest") or {}
+            rule.schedule_json = schedule
+            rule.enabled = True
+            rule.save(update_fields=["schedule_json", "enabled", "updated_at"])
+        source = str(data.get("source") or "").strip().lower()
+        if source:
+            source_rule, _ = models.NotificationRule.objects.get_or_create(
+                user_id=request.user.id,
+                type=None,
+                target_type=None,
+                target_id=None,
+                condition_json={"source": source},
+                defaults={"schedule_json": {}, "channels_json": ["IN_APP", "PUSH"]},
+            )
+            if "source_enabled" in data:
+                source_rule.enabled = bool(data["source_enabled"])
+            if data.get("source_priority"):
+                source_rule.priority = str(data["source_priority"]).strip().upper()
+            if "source_channels" in data:
+                source_rule.channels_json = [str(value).strip().upper() for value in data["source_channels"] if str(value).strip()]
+            source_rule.save(update_fields=["enabled", "priority", "channels_json", "updated_at"])
+        notify_main_tab_badges_updated(
+            [str(request.user.id)],
+            source="notifications",
+            reason="attention_preferences_updated",
+            extra={},
+        )
+        return Response(services.user_notification_preferences(request.user.id))
 
     # ------------------------------------------
     # Create notification (internal service entrypoint)

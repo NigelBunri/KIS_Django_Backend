@@ -10,9 +10,11 @@ from .views import (
     StaffVerificationQueueView,
     StaffVerificationSuspiciousSignalsView,
     StaffUserVerificationReviewView,
+    PublicTrustSummaryView,
     UserVerificationEvidenceView,
     UserVerificationStartView,
     UserVerificationStatusView,
+    UnifiedTrustOverviewView,
     VerificationWebhookView,
 )
 
@@ -20,6 +22,8 @@ app_name = "verification"
 
 urlpatterns = [
     path("user/status/", UserVerificationStatusView.as_view(), name="user-status"),
+    path("trust/overview/", UnifiedTrustOverviewView.as_view(), name="trust-overview"),
+    path("trust/<str:subject_type>/<uuid:subject_id>/", PublicTrustSummaryView.as_view(), name="public-trust-summary"),
     path("user/start/", UserVerificationStartView.as_view(), name="user-start"),
     path("user/cases/<uuid:case_id>/evidence/", UserVerificationEvidenceView.as_view(), name="user-evidence"),
     path("staff/user/cases/<uuid:case_id>/review/", StaffUserVerificationReviewView.as_view(), name="staff-user-review"),

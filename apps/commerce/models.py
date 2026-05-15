@@ -908,6 +908,71 @@ class ProductRating(BaseEntity):
         unique_together = ('product', 'user')
 
 
+class ProductReview(BaseEntity):
+    STATUS_PENDING = 'pending_review'
+    STATUS_PUBLISHED = 'published'
+    STATUS_HIDDEN = 'hidden'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending review'),
+        (STATUS_PUBLISHED, 'Published'),
+        (STATUS_HIDDEN, 'Hidden'),
+    ]
+
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='reviews')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='commerce_product_reviews')
+    rating = models.PositiveSmallIntegerField(default=5)
+    title = models.CharField(max_length=160, blank=True, default='')
+    body = models.TextField(blank=True, default='')
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_PUBLISHED, db_index=True)
+    helpful_count = models.PositiveIntegerField(default=0)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        unique_together = ('product', 'user')
+        indexes = [
+            models.Index(fields=['product', 'status']),
+            models.Index(fields=['user', 'status']),
+        ]
+
+    def __str__(self):
+        return f"Review {self.rating} for {self.product_id} by {self.user_id}"
+
+
+class ProductQuestion(BaseEntity):
+    STATUS_OPEN = 'open'
+    STATUS_ANSWERED = 'answered'
+    STATUS_HIDDEN = 'hidden'
+    STATUS_CHOICES = [
+        (STATUS_OPEN, 'Open'),
+        (STATUS_ANSWERED, 'Answered'),
+        (STATUS_HIDDEN, 'Hidden'),
+    ]
+
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='questions')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='commerce_product_questions')
+    question = models.TextField()
+    answer = models.TextField(blank=True, default='')
+    answered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='commerce_product_answers',
+    )
+    answered_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_OPEN, db_index=True)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['product', 'status']),
+            models.Index(fields=['user', 'status']),
+        ]
+
+    def __str__(self):
+        return f"Question for {self.product_id} by {self.user_id}"
+
+
 class ProductAuthenticityCheck(BaseEntity):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='auth_checks')
     requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)

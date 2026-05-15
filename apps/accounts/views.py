@@ -95,6 +95,7 @@ from .serializers import (
     ApiTokenListSerializer,
 )
 from .feature_gate import require_feature
+from .family_accessibility import serialize_family_accessibility_preferences, update_family_accessibility_preferences
 from .tiers import ensure_default_account_tiers, get_user_tier_features, public_account_tiers_qs
 from apps.partners.models import Partner
 from apps.partners.serializers import PartnerListSerializer
@@ -1551,6 +1552,20 @@ class ProfilePreferencesViewSet(viewsets.ModelViewSet):
             pref = ProfilePreferences.objects.create(user=request.user)
         serializer = self.get_serializer(pref)
         return Response(serializer.data)
+
+
+class FamilyAccessibilityPreferencesView(APIView):
+    authentication_classes = JWT_AUTH
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        return Response(serialize_family_accessibility_preferences(request.user), status=status.HTTP_200_OK)
+
+    def patch(self, request):
+        if not isinstance(request.data, dict):
+            raise DRFValidationError({"detail": "Preference updates must be an object."})
+        payload = request.data.get("preferences") if isinstance(request.data.get("preferences"), dict) else request.data
+        return Response(update_family_accessibility_preferences(request.user, payload), status=status.HTTP_200_OK)
 
 
 @extend_schema_view(

@@ -29,6 +29,7 @@ from apps.broadcasts.models import (
     ChannelContentReaction,
     ChannelContentSave,
     ChannelModerationRecord,
+    ChannelContentType,
     BroadcastFeedProfile,
     BroadcastEngagementEvent,
     BroadcastItem,
@@ -38,7 +39,11 @@ from apps.broadcasts.models import (
     BroadcastVideo,
     EducationInstitution,
     EducationInstitutionBroadcast,
+    EducationInstitutionCourse,
+    EducationInstitutionEnrollment,
     EducationInstitutionEvent,
+    EducationCourseQuestion,
+    EducationCourseReview,
 )
 from apps.broadcasts.serializers import BroadcastChannelDetailSerializer, BroadcastChannelSummarySerializer
 from apps.verification.constants import VerificationBadgeCode, VerificationSubjectType
@@ -438,6 +443,78 @@ class BroadcastChannelApiTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    @override_settings(KIS_PUBLIC_WEB_ENABLED=True, KIS_PUBLIC_WEB_INDEXING_ENABLED=False, KIS_PUBLIC_WEB_BASE_URL="https://kis.example")
+    def test_public_channel_landing_returns_safe_seo_and_share_metadata(self):
+        ChannelContent.objects.create(
+            channel=self.channel,
+            content_type=ChannelContentType.VIDEO,
+            title="Public testimony",
+            description="Safe public testimony content.",
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.owner,
+        )
+
+        response = self.client.get("/api/v1/broadcasts/public/channels/api-channel/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        serialized = str(response.data).lower()
+        self.assertEqual(response.data["type"], "channel")
+        self.assertEqual(response.data["seo"]["robots"], "noindex,nofollow")
+        self.assertEqual(response.data["share_card"]["url"], "https://kis.example/channels/api-channel")
+        self.assertEqual(len(response.data["latest_contents"]), 1)
+        self.assertNotIn("storage_path", serialized)
+        self.assertNotIn("secret", serialized)
+
+    @override_settings(KIS_PUBLIC_WEB_ENABLED=True, KIS_PUBLIC_WEB_BASE_URL="https://kis.example")
+    def test_public_content_landing_hides_private_and_child_sensitive_content(self):
+        public_content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type=ChannelContentType.TEXT,
+            title="Public lesson",
+            text_plain="A public lesson.",
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.owner,
+        )
+        private_content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type=ChannelContentType.TEXT,
+            title="Private lesson",
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PRIVATE,
+            published_at=timezone.now(),
+            created_by=self.owner,
+        )
+        child_sensitive = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type=ChannelContentType.TEXT,
+            title="Child sensitive",
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            metadata={"child_sensitive": True},
+            created_by=self.owner,
+        )
+
+        public_response = self.client.get(f"/api/v1/broadcasts/public/contents/{public_content.id}/")
+        private_response = self.client.get(f"/api/v1/broadcasts/public/contents/{private_content.id}/")
+        child_response = self.client.get(f"/api/v1/broadcasts/public/contents/{child_sensitive.id}/")
+
+        self.assertEqual(public_response.status_code, status.HTTP_200_OK, public_response.data)
+        self.assertEqual(public_response.data["seo"]["canonical_url"], f"https://kis.example/channels/api-channel/content/{public_content.id}")
+        self.assertEqual(private_response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(child_response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @override_settings(KIS_PUBLIC_WEB_ENABLED=True, KIS_PUBLIC_WEB_INDEXING_ENABLED=False)
+    def test_public_robots_defaults_to_noindex_until_qa(self):
+        response = self.client.get("/api/v1/broadcasts/public/robots.txt")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("Disallow: /", response.content.decode("utf-8"))
+
     def test_user_can_create_own_channel_and_duplicate_handle_fails(self):
         self.client.force_authenticate(user=self.viewer)
         first = self.client.post(
@@ -572,6 +649,101 @@ class BroadcastChannelApiTests(APITestCase):
         )
         self.assertEqual(playlist.status_code, status.HTTP_201_CREATED, playlist.data)
         self.assertTrue(BroadcastPlaylist.objects.filter(channel=self.channel, title='Featured').exists())
+
+    def test_channel_content_rejects_review_held_attachments(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/contents/',
+            {
+                'content_type': 'image',
+                'title': 'Unsafe pending upload',
+                'attachments': [
+                    {
+                        'kind': 'image',
+                        'url': '',
+                        'scan_status': 'pending_review',
+                        'requiresReview': True,
+                    },
+                ],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(ChannelContent.objects.filter(title='Unsafe pending upload').exists())
+
+    def test_channel_content_publish_blocks_processing_asset(self):
+        content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type=ChannelContentType.VIDEO,
+            title='Processing video',
+            status=ChannelContent.Status.DRAFT,
+            visibility=ChannelContent.Visibility.PRIVATE,
+            created_by=self.owner,
+        )
+        ChannelContentAsset.objects.create(
+            content=content,
+            asset_type='video',
+            url='https://cdn.example.com/video.mp4',
+            mime_type='video/mp4',
+            processing_status='processing',
+            metadata={'pipeline': {'processing_status': 'processing'}},
+        )
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.post(f'/api/v1/broadcasts/channel-contents/{content.id}/publish/', {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        content.refresh_from_db()
+        self.assertEqual(content.status, ChannelContent.Status.DRAFT)
+
+    def test_legacy_feed_broadcast_blocks_review_held_attachment(self):
+        self.client.force_authenticate(user=self.owner)
+        create = self.client.post(
+            '/api/v1/broadcasts/profiles/feeds/',
+            {
+                'title': 'Review held legacy feed',
+                'summary': 'Must not broadcast yet.',
+                'media_type': 'image',
+                'attachment_payloads': json.dumps([
+                    {
+                        'kind': 'image',
+                        'url': 'https://cdn.example.com/image.jpg',
+                        'mime_type': 'image/jpeg',
+                        'scan_status': 'pending_review',
+                        'requiresReview': True,
+                    }
+                ]),
+            },
+            format='multipart',
+        )
+
+        self.assertEqual(create.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_legacy_feed_create_with_channel_id_creates_channel_scoped_content(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            '/api/v1/broadcasts/profiles/feeds/',
+            {
+                'title': 'Channel scoped legacy post',
+                'summary': 'This should live under the selected channel.',
+                'media_type': 'text',
+                'channel_id': str(self.channel.id),
+                'content_type': 'rich_text',
+                'visibility': 'private',
+                'text_plain': 'This should live under the selected channel.',
+            },
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        feed = response.data.get('feed') or {}
+        self.assertEqual(feed.get('channel_id'), str(self.channel.id))
+        self.assertTrue(feed.get('channel_content_id'))
+        content = ChannelContent.objects.get(id=feed.get('channel_content_id'))
+        self.assertEqual(content.channel_id, self.channel.id)
+        self.assertEqual(content.content_type, ChannelContentType.RICH_TEXT)
+        self.assertEqual(content.status, ChannelContent.Status.DRAFT)
 
     def test_owner_can_broadcast_and_unbroadcast_channel_idempotently(self):
         self.client.force_authenticate(user=self.owner)
@@ -2300,3 +2472,97 @@ class BroadcastVideoContractTests(APITestCase):
         self.assertEqual(get_response.status_code, status.HTTP_200_OK, get_response.data)
         normalized = (get_response.data.get('feed') or {}).get('attachment') or {}
         self.assertEqual(normalized.get('url'), 'http://10.14.20.99:8000/media/broadcast_videos/example.jpg')
+
+
+class EducationCourseraCoreTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5558800001',
+            username='education_owner',
+            password='secret',
+            country='NG',
+        )
+        self.learner = User.objects.create_user(
+            phone='5558800002',
+            username='education_learner',
+            password='secret',
+            country='NG',
+        )
+        self.institution = EducationInstitution.objects.create(
+            owner=self.owner,
+            name='Royal Academy',
+            description='Structured learning for families.',
+        )
+        self.course = EducationInstitutionCourse.objects.create(
+            institution=self.institution,
+            title='Foundations of Service',
+            summary='A practical course.',
+            status='published',
+            metadata={'certificate_enabled': True},
+        )
+        self.broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=self.institution,
+            created_by=self.owner,
+            broadcast_kind='course',
+            course=self.course,
+            title='Foundations of Service',
+            summary='Learn with excellence.',
+            description='A complete course detail.',
+            price_amount='15.00',
+            price_currency='USD',
+            status='published',
+        )
+
+    def test_discovery_exposes_coursera_style_trust_payment_and_safety_summaries(self):
+        self.client.force_authenticate(self.learner)
+        response = self.client.get('/api/v1/education/discovery/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        item = response.data['sections'][0]['items'][0]
+        self.assertEqual(item['paymentSummary']['currency'], 'USD')
+        self.assertTrue(item['paymentSummary']['providerRequired'])
+        self.assertTrue(item['paymentSummary']['legacyWalletDisabled'])
+        self.assertIn('reviewSummary', item)
+        self.assertIn('trustSummary', item)
+        self.assertEqual(item['safetySummary']['status'], 'allowed')
+
+    def test_enrolled_learner_can_create_review_and_question(self):
+        EducationInstitutionEnrollment.objects.create(
+            institution=self.institution,
+            broadcast=self.broadcast,
+            user=self.learner,
+            course=self.course,
+            status='enrolled',
+        )
+        self.client.force_authenticate(self.learner)
+
+        review_response = self.client.post(
+            f'/api/v1/education/contents/{self.broadcast.id}/reviews/',
+            {'rating': 5, 'comment': 'Excellent learning path.'},
+            format='json',
+        )
+        self.assertEqual(review_response.status_code, status.HTTP_201_CREATED, review_response.data)
+        self.assertEqual(review_response.data['summary']['reviewCount'], 1)
+        self.assertTrue(
+            EducationCourseReview.objects.filter(broadcast=self.broadcast, user=self.learner).exists()
+        )
+
+        question_response = self.client.post(
+            f'/api/v1/education/contents/{self.broadcast.id}/questions/',
+            {'question': 'How do I prepare for the final certificate?'},
+            format='json',
+        )
+        self.assertEqual(question_response.status_code, status.HTTP_201_CREATED, question_response.data)
+        self.assertEqual(question_response.data['summary']['questionCount'], 1)
+        self.assertTrue(
+            EducationCourseQuestion.objects.filter(broadcast=self.broadcast, user=self.learner).exists()
+        )
+
+    def test_non_enrolled_learner_cannot_post_review(self):
+        self.client.force_authenticate(self.learner)
+        response = self.client.post(
+            f'/api/v1/education/contents/{self.broadcast.id}/reviews/',
+            {'rating': 5},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

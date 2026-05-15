@@ -1,5 +1,1857 @@
 # BUILD_STATE (Django Backend)
 
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 30
+
+### Scope completed
+
+- Added the final 120 Percent Differentiation Layer foundation while preserving existing APIs/UI behavior.
+- Added `KIS_DIFFERENTIATION_120_FEATURES_ENABLED=False` as a disabled-by-default gate.
+- Added `docs/operations/KIS_120_PERCENT_DIFFERENTIATION_STRATEGY.md`.
+- Added `docs/operations/KIS_120_PERCENT_DIFFERENTIATION_RELEASE_SLICES.md`.
+- Added `scripts/security/kis_120_differentiation_readiness_check.py`.
+- Updated the 80% and 95% readiness checkers so 120% differentiation features remain disabled during the 80% launch cut.
+- Defined unique KIS differentiation pillars:
+  - Spiritual Growth OS;
+  - Kingdom Impact Dashboard;
+  - Creator Institution Ecosystem;
+  - Family-Safe Recommendations;
+  - Live Ministry Learning Commerce Health;
+  - Christian AI Companion;
+  - Global Low-Bandwidth Excellence;
+  - Royal UX Memory System.
+- Added pastoral, Christian principles, child/youth, media safety, privacy, security, rollback, and launch evidence gates.
+
+### Files changed
+
+- `config/settings/base.py`
+- `.env.example`
+- `docs/operations/KIS_120_PERCENT_DIFFERENTIATION_STRATEGY.md`
+- `docs/operations/KIS_120_PERCENT_DIFFERENTIATION_RELEASE_SLICES.md`
+- `scripts/security/kis_120_differentiation_readiness_check.py`
+- `scripts/security/kis_80_launch_cut_check.py`
+- `scripts/security/kis_95_parity_readiness_check.py`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile config/settings/base.py scripts/security/kis_80_launch_cut_check.py scripts/security/kis_95_parity_readiness_check.py scripts/security/kis_120_differentiation_readiness_check.py` passed.
+- `python3 scripts/security/kis_120_differentiation_readiness_check.py` passed.
+- `python3 scripts/security/kis_95_parity_readiness_check.py` passed.
+- `python3 scripts/security/kis_80_launch_cut_check.py` passed.
+- `python3 scripts/security/kis_120_launch_evidence_check.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Phase 30 is a final roadmap/gating phase, not a full implementation of every differentiated feature.
+- 80% launch is still controlled by external staging evidence.
+- 95% parity and 120% differentiation feature flags must remain disabled until the related release slice has owner approval, QA evidence, pastoral/child/media/security/privacy review, and rollback proof.
+
+### Recommended next execution prompt
+
+```text
+Please begin the next KIS release execution track without using git commands. Start with the 80% Launch Evidence Closure Track. Use docs/operations/KIS_80_PERCENT_LAUNCH_CUT.md, docs/operations/KIS_80_PERCENT_BLOCKER_REGISTER.md, docs/operations/KIS_120_STAGING_QA_RUNBOOK.md, docs/operations/KIS_120_STAGING_EVIDENCE_TEMPLATE.md, docs/operations/KIS_120_GO_NO_GO_SUMMARY.md, and docs/BUILD_STATE.md. Focus only on converting the remaining 80% launch blockers into concrete evidence: production environment values, provider callback proof, device-lab proof, media/child safety proof, backup/restore proof, rollback proof, and security launch-gate proof. Do not enable 95% or 120% feature flags. Preserve existing APIs/UI behavior, run safe validation, record blockers instead of stopping, update docs/BUILD_STATE.md and the relevant operations docs with evidence links/status, and give the best next prompt for closing the next highest-risk blocker.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 29
+
+### Scope completed
+
+- Added 95 Percent Category Parity Push foundation while preserving existing APIs/UI behavior.
+- Added `KIS_PARITY_95_FEATURES_ENABLED=False` parity gate in production-safe configuration.
+- Updated the 80% launch-cut checker so 95% parity features stay disabled during the 80% launch mode.
+- Added `docs/operations/KIS_95_PERCENT_PARITY_GAP_REGISTER.md`.
+- Updated `docs/operations/KIS_95_PERCENT_CATEGORY_PARITY_PUSH.md` with explicit risk controls.
+- Added `scripts/security/kis_95_parity_readiness_check.py`.
+- Defined post-80 release trains for:
+  - WhatsApp/Telegram messaging parity;
+  - YouTube channel parity;
+  - Coursera education parity;
+  - Amazon commerce parity;
+  - Apple Health-style health parity;
+  - Discord partner parity;
+  - Bible and spiritual growth parity;
+  - trust/safety and performance/offline readiness.
+
+### Files changed
+
+- `config/settings/base.py`
+- `.env.example`
+- `docs/operations/KIS_95_PERCENT_CATEGORY_PARITY_PUSH.md`
+- `docs/operations/KIS_95_PERCENT_PARITY_GAP_REGISTER.md`
+- `scripts/security/kis_95_parity_readiness_check.py`
+- `scripts/security/kis_80_launch_cut_check.py`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile config/settings/base.py scripts/security/kis_80_launch_cut_check.py scripts/security/kis_95_parity_readiness_check.py` passed.
+- `python3 scripts/security/kis_95_parity_readiness_check.py` passed.
+- `python3 scripts/security/kis_80_launch_cut_check.py` passed.
+- `python3 scripts/security/kis_120_launch_evidence_check.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Phase 29 is a planning and gating phase, not complete platform parity implementation.
+- 95% parity slices must remain disabled until owner approval, staging evidence, child/media/security/privacy review, and rollback proof exist.
+- 80% production launch still depends on external staging evidence from the Phase 27/28 launch gates.
+
+### Next prompt
+
+```text
+Please implement Phase 30 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on the 120 Percent Differentiation Layer. Build on the 80% launch cut, 95% parity plan, Christian principles, safety, trust, media, AI, public web, and evidence systems to define and safely prepare the unique KIS features that go beyond WhatsApp/Telegram, YouTube, Coursera, Amazon, Apple Health, Discord, and Bible apps. Add or update differentiation strategy docs, feature flags, staged implementation slices, UX principles, safety/child/pastoral review gates, and launch evidence criteria for advanced AI assistance, spiritual growth journeys, kingdom impact dashboards, creator/institution ecosystems, family-safe recommendations, live ministry/learning/commerce/health experiences, and global low-bandwidth excellence. Preserve existing APIs/UI behavior, run safe validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and provide final roadmap close-out and next execution prompt.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 28
+
+### Scope completed
+
+- Added 80 Percent Launch Cut foundation while preserving existing APIs/UI behavior.
+- Added `KIS_LAUNCH_CUT_MODE=80` and `KIS_EXPERIMENTAL_120_FEATURES_ENABLED=False` configuration defaults.
+- Added `.env.example` launch-cut flags.
+- Added `docs/operations/KIS_80_PERCENT_LAUNCH_CUT.md`.
+- Added `docs/operations/KIS_80_PERCENT_BLOCKER_REGISTER.md`.
+- Added `scripts/security/kis_80_launch_cut_check.py`.
+- Defined the minimum 80% launch scope across auth/profile, messaging, media safety, channels, Bible, commerce, education, health, partners, notifications, verification/trust, security, payments, backup, and rollback.
+- Defined systems that must remain deferred or feature-flagged for 80% launch:
+  - public indexing;
+  - referrals/growth loops;
+  - third-party embeds;
+  - live AI provider calls;
+  - verification live provider calls;
+  - creator payouts and advanced monetization;
+  - ads/sponsorship automation;
+  - live streaming provider calls;
+  - advanced recommendations;
+  - standalone public web renderer;
+  - full analytics drill-down.
+- Added P0/P1/P2/P3 launch-blocker triage and seeded current evidence blockers.
+
+### Files changed
+
+- `config/settings/base.py`
+- `.env.example`
+- `docs/operations/KIS_80_PERCENT_LAUNCH_CUT.md`
+- `docs/operations/KIS_80_PERCENT_BLOCKER_REGISTER.md`
+- `scripts/security/kis_80_launch_cut_check.py`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile config/settings/base.py scripts/security/kis_80_launch_cut_check.py` passed.
+- `python3 scripts/security/kis_80_launch_cut_check.py` passed.
+- `python3 scripts/security/kis_120_launch_evidence_check.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- The 80% launch cut is still NO-GO until staging evidence is attached.
+- Real provider evidence, device-lab evidence, backup/restore proof, rollback proof, child/media safety proof, and production environment evidence remain external staging tasks.
+- 95% and 120% feature areas must stay disabled or placeholder-only until later phases validate them.
+
+### Next prompt
+
+```text
+Please implement Phase 29 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on the 95 Percent Category Parity Push. Build on the 80 Percent Launch Cut and Phase 27 evidence system to plan and safely advance the features needed to reach strong parity with WhatsApp/Telegram messaging, YouTube channels, Coursera education, Amazon commerce, Apple Health-style health, Discord partners, and Bible/spiritual growth. Add or update parity gap documentation, prioritized post-80% implementation slices, feature flags, QA criteria, and risk controls for the next release train without destabilizing the 80% launch cut. Preserve existing APIs/UI behavior, run safe validation where possible, record blockers instead of stopping, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 30.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 27
+
+### Scope completed
+
+- Added Full QA, Device Lab, And Staging Evidence foundation without changing product APIs/UI.
+- Added `docs/operations/KIS_120_STAGING_QA_RUNBOOK.md`.
+- Added `docs/operations/KIS_120_DEVICE_LAB_CHECKLIST.md`.
+- Added `docs/operations/KIS_120_STAGING_EVIDENCE_TEMPLATE.md`.
+- Added `docs/operations/KIS_120_GO_NO_GO_SUMMARY.md`.
+- Added `scripts/security/kis_120_launch_evidence_check.py`.
+- Covered staging evidence collection for:
+  - Django backend;
+  - Nest backend;
+  - React Native iOS;
+  - React Native Android;
+  - public web/embeds;
+  - Flutterwave payments;
+  - Firebase notifications;
+  - media safety;
+  - child/youth safety;
+  - verification/trust;
+  - rollback/recovery.
+- Added device-lab coverage for messaging reliability, channels, Bible, commerce, education, health, partners, accessibility, family modes, offline, and low-bandwidth.
+- Added release evidence template and go/no-go sign-off summary.
+
+### Files changed
+
+- `docs/operations/KIS_120_STAGING_QA_RUNBOOK.md`
+- `docs/operations/KIS_120_DEVICE_LAB_CHECKLIST.md`
+- `docs/operations/KIS_120_STAGING_EVIDENCE_TEMPLATE.md`
+- `docs/operations/KIS_120_GO_NO_GO_SUMMARY.md`
+- `scripts/security/kis_120_launch_evidence_check.py`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile scripts/security/kis_120_launch_evidence_check.py` passed.
+- `python3 scripts/security/kis_120_launch_evidence_check.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Phase 27 creates the QA and evidence framework; it does not attach real staging evidence.
+- Final GO remains blocked until device-lab evidence, provider evidence, backup/restore evidence, rollback evidence, and child/media safety proof are captured.
+- Some broad checks such as full frontend eslint and full backend regression suites may still need longer CI execution outside this phase.
+
+### Next prompt
+
+```text
+Please implement Phase 28 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on the 80 Percent Launch Cut. Use the Phase 27 QA/evidence system to define and enforce the minimum launchable product scope across Django, Nest, React Native iOS/Android, payments, notifications, messaging, feed channels, Bible, commerce, education, health, partners, verification/trust, media safety, child safety, security, public web, and rollback. Add or update launch-cut documentation, blocker triage, feature flags for nonessential risky features, and production go/no-go criteria so the app can launch safely at 80% while preserving the path to 95% and 120%. Run safe validation where possible, record blockers instead of stopping, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 29.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 26
+
+### Scope completed
+
+- Added Public Web, Embeds, SEO, And Growth Loops foundation while preserving existing APIs/UI behavior.
+- Added public web/growth flags in `config/settings/base.py`.
+- Added `.env.example` placeholders for public web, indexing, referrals, and embeds.
+- Added safe public channel landing metadata endpoint:
+  - `/api/v1/broadcasts/public/channels/<handle>/`
+- Added safe public content landing metadata endpoint:
+  - `/api/v1/broadcasts/public/contents/<content_id>/`
+- Added public robots policy endpoint:
+  - `/api/v1/broadcasts/public/robots.txt`
+- Added sitemap-plan endpoint:
+  - `/api/v1/broadcasts/public/sitemap-plan/`
+- Added eligibility protections so public metadata only exposes public, published, non-deleted, non-child-sensitive content from public channels.
+- Added SEO-safe title, description, canonical URL, share-card metadata, public trust badges, growth/referral placeholders, embed pointers, and abuse-report URLs.
+- Ensured public payloads do not expose direct storage paths, secrets, private health/payment data, raw verification documents, or raw provider payloads.
+- Added React Native public growth routes, typed service, and Profile readiness card.
+- Added `docs/operations/PUBLIC_WEB_GROWTH_RUNBOOK.md`.
+
+### Files changed
+
+- `config/settings/base.py`
+- `.env.example`
+- `apps/broadcasts/views.py`
+- `apps/broadcasts/urls.py`
+- `apps/broadcasts/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/broadcastRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/publicGrowthService.ts`
+- `/Users/nigel/dev/KIS/src/components/dashboard/PublicGrowthReadinessCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/operations/PUBLIC_WEB_GROWTH_RUNBOOK.md`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile config/settings/base.py apps/broadcasts/views.py apps/broadcasts/urls.py apps/broadcasts/tests.py` passed.
+- `python3 manage.py test apps.broadcasts.tests.BroadcastChannelApiTests --noinput --keepdb` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/broadcastRoutes.ts src/services/publicGrowthService.ts src/components/dashboard/PublicGrowthReadinessCard.tsx src/screens/tabs/ProfileScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- This phase adds backend/public metadata and mobile readiness foundations; it does not create a full standalone public web renderer.
+- Public indexing remains disabled by default until QA evidence is approved.
+- Referral/growth loops remain disabled by default until anti-spam and privacy review are complete.
+- Embeds still obey the existing embed policy and remain disabled until `KIS_EMBEDS_ENABLED=True`.
+
+### Next prompt
+
+```text
+Please implement Phase 27 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Full QA, Device Lab, And Staging Evidence. Build on all completed 120 Percent phases: Christian principles, media safety, royal UX, navigation, messaging trust, safe messaging media, feed channels, media pipeline, moderation, unified search, notifications, commerce, education, health, partners, Bible, verification/trust, recommendations, accessibility/family modes, dashboards, safety command center, offline/performance, security launch gate, monetization safety, AI safety, and public web/growth. Add or update practical staging QA checklists, device-lab scripts, smoke-test runbooks, evidence capture templates, and launch go/no-go summaries for Django, Nest, React Native iOS/Android, public web/embeds, payments, notifications, media safety, child safety, verification, and rollback. Preserve existing APIs/UI behavior, run safe validation where possible, record blockers instead of stopping, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 28.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 25
+
+### Scope completed
+
+- Added AI Assistance With Christian And Safety Boundaries foundation while preserving existing APIs/UI behavior.
+- Added central AI safety flags in `config/settings/base.py`; live AI provider calls remain disabled by default.
+- Added `.env.example` placeholders for AI feature flags without adding secrets.
+- Added `apps/core/ai_assistance_safety.py`.
+- Added `/api/v1/core/ai/safety-policy/` for authenticated clients.
+- Added redacted AI safety policy payloads for:
+  - Christian principles;
+  - pornography/explicit content blocking;
+  - manipulation/predatory content blocking;
+  - child/youth safe mode;
+  - self-harm escalation;
+  - human review;
+  - medical diagnosis blocking;
+  - financial advice blocking;
+  - legal advice blocking;
+  - input redaction;
+  - output moderation;
+  - no raw prompt/response storage by default.
+- Added placeholder-ready assistant surfaces for Bible study, learning tutoring, health admin support, commerce/product help, moderation triage, creator/channel drafting, messaging suggestions, and admin insights.
+- Extended `verify_deployment_security` with AI provider-call gating, raw prompt/response storage, and diagnosis/advice checks.
+- Added React Native route/service support for AI safety policy.
+- Added `AIAssistanceSafetyCard` to Profile.
+- Added `docs/operations/AI_ASSISTANCE_SAFETY_RUNBOOK.md`.
+
+### Files changed
+
+- `config/settings/base.py`
+- `.env.example`
+- `apps/core/ai_assistance_safety.py`
+- `apps/core/views.py`
+- `apps/core/urls.py`
+- `apps/core/tests.py`
+- `apps/core/management/commands/verify_deployment_security.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/aiAssistanceSafetyService.ts`
+- `/Users/nigel/dev/KIS/src/components/dashboard/AIAssistanceSafetyCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/operations/AI_ASSISTANCE_SAFETY_RUNBOOK.md`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile config/settings/base.py apps/core/ai_assistance_safety.py apps/core/views.py apps/core/urls.py apps/core/tests.py apps/core/management/commands/verify_deployment_security.py` passed.
+- `python3 manage.py test apps.core.tests.AIAssistanceSafetyPolicyTests --noinput --keepdb` passed.
+- `python3 manage.py verify_deployment_security --target-production` ran safely without exposing secret values and reported expected local production-gate failures.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/miscRoutes.ts src/services/aiAssistanceSafetyService.ts src/components/dashboard/AIAssistanceSafetyCard.tsx src/screens/tabs/ProfileScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Local verifier blockers / expected failures
+
+- Local settings are not `config.settings.production`.
+- Local `DEBUG` is enabled.
+- Local `CSRF_TRUSTED_ORIGINS` is empty.
+- Local Redis/django-redis cache is not active.
+- Local internal signatures are not required.
+- Local HTTPS/HSTS flags are not production-active.
+- Local throttle rates include development-rate throttles.
+- Local explicit media scan is not production-required.
+- Firebase credential evidence, backup/restore evidence, rollback evidence, Flutterwave evidence, and production provider evidence are not configured locally.
+
+### Remaining risk
+
+- This phase creates the safety contract and placeholders only; it does not enable live AI provider calls.
+- Live AI needs staging evidence for input redaction, output moderation, refusal behavior, age-mode behavior, retrieval grounding, logging redaction, and human review.
+- Medical, legal, financial, child/youth, moderation, and pastoral boundaries need product/legal/pastoral approval before production AI enablement.
+
+### Next prompt
+
+```text
+Please implement Phase 26 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Public Web, Embeds, SEO, And Growth Loops. Build on feed channels, public embeds, channel/content safety, media pipeline, verification/trust badges, monetization-safe copy, AI safety boundaries, royal UX, and privacy/security launch gates. Add backend/frontend foundations for public channel/content landing pages, safe oEmbed/embed metadata, SEO-safe titles/descriptions, share cards, referral/invite growth loops, public trust badges, robots/sitemap planning, and abuse-safe public reporting while keeping private/unlisted/child-sensitive content protected. Preserve existing APIs/UI behavior, do not expose private data or raw storage paths, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 27.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 24
+
+### Scope completed
+
+- Added Monetization Without Legal Risk foundation while preserving existing APIs/UI behavior.
+- Added `apps/core/monetization_safety.py`.
+- Added `/api/v1/core/monetization/safety-summary/` for authenticated clients.
+- Added redacted backend policy summary proving:
+  - USD is the platform currency;
+  - Flutterwave/direct provider is the payment direction;
+  - KIS promotional credits are non-cash;
+  - credits are not transferable;
+  - credits are not withdrawable;
+  - credits are not exchange-rated;
+  - historical wallet/ledger/billing records remain read-only.
+- Added critical launch checks for legacy wallet-as-money flags:
+  - deposit/top-up;
+  - peer transfer;
+  - cash/credit conversion;
+  - commerce wallet checkout;
+  - education wallet checkout;
+  - health wallet checkout.
+- Added monetization surface summaries for subscriptions/upgrades, marketplace, education, health, partners, channels/creators, ads, and sponsorships.
+- Added copy guard forbidden/approved wording for public monetization language.
+- Extended `verify_deployment_security` with Phase 24 legacy wallet-as-money and USD/direct-provider checks.
+- Added React Native route/service support for monetization safety.
+- Added `MonetizationSafetyCard` to Profile.
+- Added `docs/operations/MONETIZATION_LEGAL_SAFETY_RUNBOOK.md`.
+
+### Files changed
+
+- `apps/core/monetization_safety.py`
+- `apps/core/views.py`
+- `apps/core/urls.py`
+- `apps/core/tests.py`
+- `apps/core/management/commands/verify_deployment_security.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/monetizationSafetyService.ts`
+- `/Users/nigel/dev/KIS/src/components/dashboard/MonetizationSafetyCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/operations/MONETIZATION_LEGAL_SAFETY_RUNBOOK.md`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/monetization_safety.py apps/core/views.py apps/core/urls.py apps/core/tests.py apps/core/management/commands/verify_deployment_security.py` passed.
+- `python3 manage.py test apps.core.tests.MonetizationSafetySummaryTests --noinput --keepdb` passed.
+- `python3 manage.py verify_deployment_security --target-production` ran safely without exposing secret values and reported expected local production-gate failures.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/miscRoutes.ts src/services/monetizationSafetyService.ts src/components/dashboard/MonetizationSafetyCard.tsx src/screens/tabs/ProfileScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Local verifier blockers / expected failures
+
+- Local settings are not `config.settings.production`.
+- Local `DEBUG` is enabled.
+- Local `CSRF_TRUSTED_ORIGINS` is empty.
+- Local Redis/django-redis cache is not active.
+- Local internal signatures are not required.
+- Local HTTPS/HSTS flags are not production-active.
+- Local throttle rates include development-rate throttles.
+- Local explicit media scan is not production-required.
+- Firebase credential evidence, backup/restore evidence, and rollback evidence env links are not configured locally.
+- Flutterwave secret/webhook evidence is not proven locally.
+
+### Remaining risk
+
+- This phase adds policy guardrails and launch visibility, not legal approval.
+- Creator payouts, ads, sponsorships, and institution monetization still need counsel/product approval and staging evidence before production enablement.
+- Public copy still needs final review across app store copy, marketing pages, emails, screenshots, and provider dashboard wording.
+
+### Next prompt
+
+```text
+Please implement Phase 25 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on AI Assistance With Christian And Safety Boundaries. Build on Christian principles, media safety, moderation operations, privacy-safe telemetry, child/youth protections, unified search, recommendations, messaging, feeds/channels, Bible, education, health, commerce, partners, and security launch gates. Add safe AI-assistant architecture placeholders and backend/frontend guardrails for Bible study help, learning tutoring, health admin support, commerce/product help, moderation triage, creator/channel drafting, messaging suggestions, and admin insights while preventing harmful, pornographic, manipulative, medical-diagnosis, financial-advice, or privacy-invasive outputs. Keep live AI provider calls disabled by default unless explicitly configured, do not expose secrets or private data, preserve existing APIs/UI behavior, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 26.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 23
+
+### Scope completed
+
+- Added Security, Privacy, Compliance, And Child Safety Launch Gate foundation while preserving existing APIs/UI behavior.
+- Added `apps/core/security_launch_gate.py`.
+- Added `/api/v1/core/admin/security-launch-gate/` guarded by staff/admin permission.
+- Added launch-gate checks for:
+  - DEBUG and production settings state;
+  - `ALLOWED_HOSTS`;
+  - CSRF trusted origins;
+  - Django CORS;
+  - secret strength shape without printing values;
+  - JWT secret shape;
+  - internal request signatures;
+  - Redis/shared cache;
+  - production throttle rates;
+  - private media public-serving flags;
+  - media safety gate;
+  - explicit-content scan/review requirement;
+  - explicit-content provider live-call state;
+  - verification provider live-call flags;
+  - Flutterwave direct-payment link flags;
+  - Firebase/admin credential evidence;
+  - raw telemetry disablement;
+  - child/youth safety defaults;
+  - staff-only admin command surfaces;
+  - backup/restore evidence;
+  - rollback drill evidence.
+- Added redacted launch-gate payloads with pass/fail/warning status only; no secret values, raw documents, private health data, payment instruments, or raw storage paths.
+- Extended `verify_deployment_security` with Phase 23 launch-gate checks.
+- Added React Native route/service support for the launch gate.
+- Added staff-only `SecurityLaunchGateCard` to Profile.
+- Added focused tests for staff access, non-staff denial, and redacted payload shape.
+
+### Files changed
+
+- `apps/core/security_launch_gate.py`
+- `apps/core/views.py`
+- `apps/core/urls.py`
+- `apps/core/tests.py`
+- `apps/core/management/commands/verify_deployment_security.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/securityLaunchGateService.ts`
+- `/Users/nigel/dev/KIS/src/components/dashboard/SecurityLaunchGateCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/security_launch_gate.py apps/core/views.py apps/core/urls.py apps/core/tests.py apps/core/management/commands/verify_deployment_security.py` passed.
+- `python3 manage.py test apps.core.tests.SecurityPrivacyLaunchGateTests --noinput --keepdb` passed.
+- `python3 manage.py verify_deployment_security --target-production` ran safely without exposing secret values and reported expected local production-gate failures.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/miscRoutes.ts src/services/securityLaunchGateService.ts src/components/dashboard/SecurityLaunchGateCard.tsx src/screens/tabs/ProfileScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Local verifier blockers / expected failures
+
+- Local settings are not `config.settings.production`.
+- Local `DEBUG` is enabled.
+- Local `CSRF_TRUSTED_ORIGINS` is empty.
+- Local Redis/django-redis cache is not active.
+- Local internal signatures are not required.
+- Local HTTPS/HSTS flags are not production-active.
+- Local throttle rates include development-rate throttles.
+- Local explicit media scan is not production-required.
+- Firebase credential evidence, backup/restore evidence, and rollback evidence env links are not configured locally.
+
+### Remaining risk
+
+- The launch gate is a safe readiness mechanism; final GO still depends on real staging/production evidence.
+- Socket.IO/Nest production-origin proof must be attached from deployed Nest environment checks.
+- Backup/restore, rollback, private-media tabletop, child/youth QA, Flutterwave callbacks, Firebase credential mounts, and verification provider proof remain provider-side evidence tasks.
+
+### Next prompt
+
+```text
+Please implement Phase 24 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Monetization Without Legal Risk. Build on the USD-only financial redesign, Flutterwave direct-payment readiness, promotional-credit safety model, verification/trust badges, commerce/education/health/partner/channel dashboards, security launch gate, privacy-safe telemetry, and child/youth protections. Add or improve safe monetization summaries, public copy guards, backend checks, React Native placeholders, and launch documentation so KIS promotional credits remain non-cash, non-transferable, non-withdrawable, and not exchange-rated, while subscriptions, upgrades, marketplace, education, health, partner, channel, ads/sponsorships, and creator monetization are USD/direct-provider-first. Preserve existing APIs/UI behavior, do not re-enable legacy wallet-as-money flows, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 25.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 22
+
+### Scope completed
+
+- Added Performance, Offline, And Low-Bandwidth Excellence foundation while preserving existing messaging, feed channels, Bible, commerce, education, health, partners, notification, dashboard, safety, media, family/accessibility, and royal UX behavior.
+- Added `apps/core/performance_offline.py` as a safe backend policy source.
+- Added `/api/v1/core/performance/offline-policy/` for authenticated clients.
+- Added server policy metadata for:
+  - offline-first caches;
+  - stale-while-revalidate;
+  - request deduplication;
+  - retry/backoff;
+  - low-bandwidth media preferences;
+  - thumbnail fallbacks;
+  - lazy media loading;
+  - cursor/pagination discipline;
+  - redacted telemetry placeholders.
+- Child and older-adult family/accessibility modes now default to low-bandwidth behavior in policy.
+- Added domain readiness flags for messaging, channels, Bible, commerce, education, health, partners, and notifications.
+- Added React Native route support for the performance/offline policy endpoint.
+- Added `performanceOfflineService` for:
+  - fetching/syncing policy;
+  - persisting low-bandwidth/offline settings;
+  - choosing low-bandwidth media URLs;
+  - computing retry delay;
+  - local redacted performance event storage.
+- Extended shared React Native cache helpers with:
+  - offline cache envelopes;
+  - cached timestamps;
+  - TTL expiry;
+  - stale reads for stale-while-revalidate;
+  - unchanged `getCache` compatibility for existing callers.
+- Extended `getRequest` with optional `offlineTtlSeconds` and `staleWhileRevalidate` fallback behavior while preserving current default behavior.
+- Added reusable `PerformanceOfflineCard` to Profile showing network state, low-data mode, cache readiness, policy refresh, and privacy-safe telemetry copy.
+
+### Files changed
+
+- `apps/core/performance_offline.py`
+- `apps/core/views.py`
+- `apps/core/urls.py`
+- `apps/core/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/network/get/index.tsx`
+- `/Users/nigel/dev/KIS/src/network/cache.tsx`
+- `/Users/nigel/dev/KIS/src/services/performanceOfflineService.ts`
+- `/Users/nigel/dev/KIS/src/components/dashboard/PerformanceOfflineCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/performance_offline.py apps/core/views.py apps/core/urls.py apps/core/tests.py` passed.
+- `python3 manage.py test apps.core.tests.PerformanceOfflinePolicyTests --noinput --keepdb` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/miscRoutes.ts src/services/performanceOfflineService.ts src/components/dashboard/PerformanceOfflineCard.tsx src/network/get/index.tsx src/network/cache.tsx src/screens/tabs/ProfileScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Screens still need targeted adoption of `offlineTtlSeconds`, `staleWhileRevalidate`, and `selectBestMediaUrl` for full app-wide offline behavior.
+- Production telemetry remains disabled/local; remote telemetry needs privacy review, sampling, redaction, and retention rules.
+- Server policy reports cache backend readiness but does not configure Redis or infrastructure.
+- Startup performance and media performance still need real-device profiling and QA evidence.
+
+### Next prompt
+
+```text
+Please implement Phase 23 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Security, Privacy, Compliance, And Child Safety Launch Gate. Build on previous security hardening, media safety, Christian moderation, verification/trust, payments, messaging reliability, notification badges, performance/offline policy, family/accessibility preferences, and safety command center. Add or improve launch-gate checklists/endpoints/scripts for production secrets, DEBUG/ALLOWED_HOSTS/CORS/CSRF/Socket.IO origins, Redis/cache, private media, child/youth safety controls, explicit-content provider state, verification/payment provider flags, backup/rollback evidence, audit logging, privacy-safe telemetry, and admin/staff-only surfaces. Preserve existing APIs/UI behavior, do not expose secrets or private data, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 24.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 21
+
+### Scope completed
+
+- Added Observability, Admin Intelligence, And Safety Command Center foundation while preserving existing security audit, verification, media safety, moderation, notification, payment, messaging, channel, commerce, education, health, partner, Bible/KCAN, family/accessibility, and dashboard behavior.
+- Added `apps/core/safety_command_center.py` as a staff-only safe aggregation layer.
+- Added `/api/v1/core/admin/safety-command-center/` with staff/admin permission.
+- Added safe command-center sections for:
+  - system health;
+  - abuse signals;
+  - media quarantine;
+  - verification queues;
+  - payment incidents;
+  - messaging delivery readiness;
+  - notification health;
+  - provider launch readiness.
+- Aggregated safe counts from:
+  - media safety scans;
+  - moderation flags, actions, alerts, and audit logs;
+  - verification cases and expiring badges;
+  - direct USD payment intents and payment audit events;
+  - in-app notifications, delivery rows, and active device tokens;
+  - chat conversations, members, and subrooms.
+- Added launch evidence placeholders for:
+  - Firebase/admin credential handling;
+  - Flutterwave callback proof;
+  - verification provider sandbox proof;
+  - explicit-content provider status;
+  - backup/restore proof;
+  - rollback proof.
+- Added privacy guarantees confirming no secrets, raw provider payloads, raw documents, raw storage paths, private health records, or payment instruments are exposed.
+- Added focused backend tests for staff access and non-staff denial.
+- Added React Native route/service support for the safety command center endpoint.
+- Added reusable `SafetyCommandCenterCard` with operational status, critical/warning/evidence counts, section cards, loading/retry behavior, and privacy-safe wording.
+- Added the staff-only command center card to the Profile overview beside the existing verification staff console flow.
+
+### Files changed
+
+- `apps/core/safety_command_center.py`
+- `apps/core/views.py`
+- `apps/core/urls.py`
+- `apps/core/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/safetyCommandCenterService.ts`
+- `/Users/nigel/dev/KIS/src/components/dashboard/SafetyCommandCenterCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/safety_command_center.py apps/core/views.py apps/core/urls.py apps/core/tests.py` passed.
+- `python3 manage.py test apps.core.tests.StaffSafetyCommandCenterTests --noinput --keepdb` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/miscRoutes.ts src/services/safetyCommandCenterService.ts src/components/dashboard/SafetyCommandCenterCard.tsx src/screens/tabs/ProfileScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- This is a summary foundation, not a full operational intelligence console.
+- Real provider evidence is still required for Firebase/admin, Flutterwave callbacks, verification sandbox, explicit-content provider, backup/restore, and rollback before production sign-off.
+- Messaging visibility is currently Django-side readiness; Nest websocket delivery latency/error telemetry should be added in a later phase.
+- Future drill-down admin views must preserve strict role checks and avoid private health/payment/evidence data leakage.
+
+### Next prompt
+
+```text
+Please implement Phase 22 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Performance, Offline, And Low-Bandwidth Excellence. Build on messaging reliability, feed channels, Bible, commerce, education, health, partners, notifications, unified dashboards, safety command center, media pipeline, family/accessibility preferences, and royal UX to improve app speed and resilience. Add safe backend and React Native foundations for offline-first caches, low-bandwidth modes, image/video thumbnail fallbacks, request deduplication, pagination/cursor discipline, stale-while-revalidate patterns, retry/backoff visibility, startup performance cleanup, and lightweight telemetry placeholders. Preserve existing APIs/UI behavior, do not expose secrets or private data in telemetry, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 23.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 20
+
+### Scope completed
+
+- Added Creator, Institution, And Business Dashboards foundation while preserving existing channel/studio, profile, partner, commerce, education, health, verification, payment, and notification behavior.
+- Added `apps/core/platform_dashboards.py` as a migration-free unified dashboard summary service.
+- Added `/api/v1/core/dashboards/unified/` for authenticated dashboard readiness.
+- Added owner-scoped summary sections for:
+  - creator channels;
+  - commerce shops;
+  - education institutions;
+  - health institutions;
+  - partner workspaces.
+- Added safe readiness placeholders for:
+  - analytics;
+  - content;
+  - moderation;
+  - verification/trust;
+  - USD payments;
+  - members;
+  - accessibility/family safety;
+  - launch readiness.
+- Added response-level privacy guarantees confirming no secrets, raw evidence documents, raw storage paths, private health records, or payment instruments are returned.
+- Connected family/accessibility preferences into the dashboard summary.
+- Added a React Native unified dashboard route and typed service helper.
+- Added reusable `UnifiedDashboardSummaryCard` component with metrics, readiness chips, surface cards, loading, retry, empty state, and privacy-safe copy.
+- Added the dashboard card to the Profile overview without replacing current wallet, quick actions, feed, education, health, partner, or verification workflows.
+- Added focused backend regression coverage for owner-scoped dashboard summaries and safe payload shape.
+
+### Files changed
+
+- `apps/core/platform_dashboards.py`
+- `apps/core/views.py`
+- `apps/core/urls.py`
+- `apps/core/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/unifiedDashboardService.ts`
+- `/Users/nigel/dev/KIS/src/components/dashboard/UnifiedDashboardSummaryCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/platform_dashboards.py apps/core/views.py apps/core/urls.py apps/core/tests.py` passed.
+- `python3 manage.py test apps.core.tests.UnifiedPlatformDashboardSummaryTests --noinput --keepdb` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/miscRoutes.ts src/services/unifiedDashboardService.ts src/components/dashboard/UnifiedDashboardSummaryCard.tsx src/screens/tabs/ProfileScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- The unified dashboard is a summary/readiness layer; detailed analytics, moderation queues, payment drilldowns, and launch checklists still remain in later phases.
+- Verification readiness for some institution types remains conservative until those domain dashboards fully consume centralized trust summaries.
+- Health summaries intentionally avoid patient records and expose only institution/service-level metadata.
+- Partner dashboard permissions should be deepened later for exact role-specific drill-down access.
+
+### Next prompt
+
+```text
+Please implement Phase 21 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Observability, Admin Intelligence, And Safety Command Center. Build on security audit logs, verification audits, media safety scans, moderation operations, notification badge lifecycle, payments, messaging reliability, channels, commerce, education, health, partners, Bible/KCAN, family/accessibility preferences, and unified dashboard summaries to create admin-visible operational intelligence. Add safe backend summary endpoints and React Native/admin placeholders for system health, abuse signals, media quarantine, verification queues, payment incidents, messaging delivery, notification health, content moderation, provider readiness, and launch blockers. Do not expose secrets, raw documents, private health/payment data, or raw storage paths. Preserve existing APIs/UI behavior, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 22.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 19
+
+### Scope completed
+
+- Added Accessibility, Age Modes, And Family Experience foundation while preserving existing profile, recommendation, Bible, education, health, commerce, messaging, and partner behavior.
+- Added migration-free family/accessibility settings stored under `User.preferences["family_accessibility"]`.
+- Added `/api/v1/profile-preferences/family-accessibility/` with `GET` and `PATCH`.
+- Added normalized age modes:
+  - child;
+  - youth;
+  - adult;
+  - older adult.
+- Added preference controls for:
+  - navigation mode;
+  - font scale;
+  - reduced motion;
+  - high contrast;
+  - family-safe content;
+  - safe recommendations;
+  - sensitive commerce hiding;
+  - public comment hiding for child mode;
+  - guardian review;
+  - Bible family journeys;
+  - learning family mode;
+  - large tap targets;
+  - simplified labels.
+- Child mode now forces guided/family-safe defaults, safe recommendations, sensitive commerce hiding, guardian review, large tap targets, and simplified labels.
+- Older-adult mode now forces larger tap targets and larger readable font scaling defaults.
+- Added serialized accessibility metadata for tap target size, font scale multiplier, reduced motion, high contrast, and simplified navigation.
+- Added family-safety metadata confirming Christian principles visibility, pornography blocked everywhere, media safety gate required, safe recommendations, child/youth defaults, and guardian review.
+- Connected the recommendation foundation to age-mode preferences so child mode hides commerce recommendations and surfaces age/simplified navigation controls.
+- Added React Native route/service support for family accessibility preferences.
+- Added app-wide royal UX age-mode token defaults in React Native theme constants.
+- Added a Profile card for switching Child, Youth, Adult, and Older adult modes.
+- Added focused backend tests for preference normalization and child-mode recommendation filtering.
+
+### Files changed
+
+- `apps/accounts/family_accessibility.py`
+- `apps/accounts/views.py`
+- `apps/accounts/urls.py`
+- `apps/accounts/tests.py`
+- `apps/core/social_recommendations.py`
+- `apps/core/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/authRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/familyAccessibilityService.ts`
+- `/Users/nigel/dev/KIS/src/theme/constants.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/accounts/family_accessibility.py apps/accounts/views.py apps/accounts/urls.py apps/accounts/tests.py apps/core/social_recommendations.py apps/core/tests.py` passed.
+- `python3 manage.py test apps.accounts.tests.FamilyAccessibilityPreferencesTests apps.core.tests.SocialRecommendationFoundationTests --noinput --keepdb` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/authRoutes.ts src/services/familyAccessibilityService.ts src/theme/constants.ts src/screens/tabs/ProfileScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Screen-wide adoption of age-mode preferences still needs later work for font scale, high contrast, reduced motion, simplified labels, and tap target enforcement.
+- Child/youth safety requires further guardian account linking, parental approval flows, age assurance, device QA, and legal review before production.
+- Commerce recommendations are hidden in child mode, but broader commerce navigation should consume the same preferences later.
+- Bible and learning family journeys are represented as settings/readiness flags; guided family journey UI remains future work.
+
+### Next prompt
+
+```text
+Please implement Phase 20 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Creator, Institution, And Business Dashboards. Build on channels/studio, partners, commerce shops, education institutions, health institutions, Bible/KCAN publishing, verification/trust badges, notification badges, media safety, family/accessibility preferences, and USD-only payment readiness to create unified dashboard foundations for creators, institutions, shops, partners, health providers, education providers, and ministry publishers. Add backend dashboard summary endpoints where missing, shared React Native dashboard components/placeholders for analytics, content, moderation, verification, payments, members, accessibility/family safety, and launch readiness, while preserving existing APIs/UI behavior. Run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 21.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 18
+
+### Scope completed
+
+- Added Social Graph And Recommendation Engine Foundation while preserving existing contacts, messaging, feeds/channels, commerce, education, Bible, notification, trust, and moderation behavior.
+- Added `apps/core/social_recommendations.py` as a conservative privacy-safe recommendation assembler.
+- Added `/api/v1/core/recommendations/foundation/` for authenticated recommendation sections.
+- Added recommendation sections for:
+  - people from existing contacts;
+  - public channels not already subscribed to;
+  - marketplace shops/products with USD-safe metadata;
+  - education institution courses not already enrolled in;
+  - Bible courses and published meditations.
+- Added placeholders for health and partner recommendations because those need explicit consent/public-only policies before deeper personalization.
+- Added blocked-user exclusion rules for people, channels, shops, and products where owner data is available.
+- Added payload-level privacy guarantees confirming no private relationship graph, health data, verification documents, payment data, or raw storage paths are exposed.
+- Added Christian/family-safe ranking controls and explicit media-gate safety metadata to the recommendation response.
+- Connected React Native routes and a typed recommendation service helper.
+- Added a “For your kingdom journey” rail to Channels discovery using the new foundation endpoint.
+- Added focused regression coverage proving blocked users are excluded and sensitive private domains remain hidden.
+
+### Files changed
+
+- `apps/core/social_recommendations.py`
+- `apps/core/views.py`
+- `apps/core/urls.py`
+- `apps/core/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/socialRecommendationService.ts`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/channels/ChannelsDiscoverPage.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/social_recommendations.py apps/core/views.py apps/core/urls.py apps/core/tests.py` passed.
+- `python3 manage.py test apps.core.tests.SocialRecommendationFoundationTests --noinput --keepdb` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/miscRoutes.ts src/services/socialRecommendationService.ts src/screens/broadcast/channels/ChannelsDiscoverPage.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed after rerunning with permission for the Nest backend to write `dist/tsconfig.tsbuildinfo`.
+
+### Remaining risk
+
+- Ranking is deterministic and conservative; a production recommendation engine still needs durable event aggregation, consent rules, model evaluation, and abuse monitoring.
+- Health and partner recommendations remain placeholders until explicit consent and public-only policy rules are added.
+- Saved/viewed/watch-history signals can be expanded later for channels, feeds, education, Bible, and commerce.
+- The frontend recommendation rail is currently shown in Channels discovery; other tabs can adopt the same endpoint in later phases.
+
+### Next prompt
+
+```text
+Please implement Phase 19 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Accessibility, Age Modes, And Family Experience. Build on the royal UX system, Christian principles, media safety gate, notification attention health, messaging family controls, Bible/spiritual growth, channels, commerce, education, health, partners, and the new privacy-safe recommendation foundation. Add app-wide accessibility defaults, larger tap targets, readable contrast rules, child/youth/adult/older-user mode foundations, family-safe content controls, simplified navigation options, safe recommendation filters by age mode, Bible and learning journeys for families, and frontend/backend preferences needed to persist these settings. Preserve existing APIs/UI behavior, avoid broad redesign, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 20.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 17
+
+### Scope completed
+
+- Added Unified Identity, Verification, Trust, And Badges foundation while preserving existing verification APIs, user/profile behavior, institution verification, partner verification, shop verification, staff console, and badge issue/revoke flows.
+- Added public-safe trust summary service for centralized verification subjects.
+- Added `/api/v1/verification/trust/overview/` for authenticated unified trust visibility across owned verification subjects, broadcast channels, and KCAN publisher readiness.
+- Added `/api/v1/verification/trust/<subject_type>/<subject_id>/` for subject-level public trust summaries.
+- Exposed safe trust metadata:
+  - verified state;
+  - trust tier;
+  - trust label;
+  - public badges;
+  - badge count;
+  - latest safe case metadata;
+  - last verified date;
+  - next review date;
+  - expiry warning.
+- Added privacy flags confirming no raw documents, provider payloads, storage paths, or revoke reasons are exposed.
+- Added staff-only aggregate evidence for staff viewers:
+  - open case count;
+  - expiring case/badge counts;
+  - recent audit count;
+  - suspicious verification signals;
+  - per-subject case/badge/audit counts.
+- Added channel trust summaries using existing BroadcastChannel `is_verified` and `verification_badges` fields.
+- Added KCAN/Bible publisher trust readiness through the existing partner verification subject when available.
+- Connected React Native verification routes and service helpers to the new trust overview and public trust endpoints.
+- Added a Verification Staff Console trust command card with verified count, open cases, expiry count, and privacy-safe evidence copy.
+- Added focused regression tests proving public trust summaries do not leak private media ids/provider secrets and that staff evidence remains staff-only.
+
+### Files changed
+
+- `apps/verification/services.py`
+- `apps/verification/views.py`
+- `apps/verification/urls.py`
+- `apps/verification/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/authRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/verificationService.ts`
+- `/Users/nigel/dev/KIS/src/components/verification/VerificationStaffConsole.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/verification/services.py apps/verification/views.py apps/verification/urls.py apps/verification/tests.py` passed.
+- `python3 manage.py test apps.verification.tests.UserVerificationFlowTests.test_public_trust_summary_excludes_private_verification_payloads apps.verification.tests.UserVerificationFlowTests.test_trust_overview_endpoint_unifies_owned_subjects_and_staff_evidence --noinput --keepdb` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`; local PostgreSQL migration-history check emitted a connection warning because PostgreSQL was not accepting connections on `127.0.0.1:5432`.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/authRoutes.ts src/services/verificationService.ts src/components/verification/VerificationStaffConsole.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Unified trust APIs are ready, but every product surface still needs gradual adoption so profiles, channels, shops, partners, health, education, KCAN/Bible publishers, commerce sellers, and broadcast cards use the same badge language.
+- Channel trust currently uses existing `is_verified` and JSON `verification_badges`; first-class channel verification can be added later if needed.
+- Staff evidence is aggregate and privacy-safe, but staging QA is still needed for expiry reminders, badge revocation visibility, and staff audit inspection on real devices.
+- Suspicious signals are verification-specific; deeper cross-app trust/risk scoring should be handled in later safety/intelligence phases.
+
+### Next prompt
+
+```text
+Please implement Phase 18 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Social Graph And Recommendation Engine Foundation. Build on the existing contacts, messaging, channels, feeds, education, health, commerce, partners, Bible, notification badges, trust badges, Christian safety rules, and media safety gate to create a privacy-safe social graph and recommendation foundation. Add backend services and serializers for follow/contact/channel/institution interest signals, viewed/saved/subscribed/enrolled/purchased-safe aggregates, blocked/muted/hidden exclusion rules, child/youth-safe defaults, Christian-content-safe ranking controls, and frontend placeholders for recommended channels, courses, products, partners, Bible journeys, and people. Do not expose private relationships or sensitive health/verification/payment data. Preserve existing APIs/UI behavior, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 19.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 16
+
+### Scope completed
+
+- Added Bible And Spiritual Growth Core foundation while preserving existing Bible reader, prayer, meditation, course, KCAN publishing, and React Native behavior.
+- Added `/api/v1/bible/spiritual-growth-summary/` for authenticated personal spiritual growth summaries.
+- Added reader journey counts for:
+  - reading sessions;
+  - bookmarks;
+  - highlights;
+  - notes;
+  - memory verses;
+  - active reading plans;
+  - scheduled and missed reading events;
+  - active/completed Bible courses;
+  - upcoming live sessions;
+  - public licensed translations.
+- Added journey payloads for streak, today's KCAN passage, latest meditation, prayer focus, and next reading event.
+- Added readiness metadata for licensed translations, offline scripture, audio sync, reading plans, highlights/notes, prayer calendar, study courses, live devotionals, family-safe journey, and low-bandwidth access.
+- Added KCAN publishing/admin evidence counts for daily passages, meditation posts, prayer months, and Bible content audit events.
+- Added Christian safety metadata showing media gate enabled, explicit-provider live calls disabled, quarantine support, child/youth-safe defaults, moderation-safe spiritual content, and no raw storage path exposure.
+- Added centralized media safety validation to Bible lesson attachments and assignment submission attachments.
+- Connected React Native Bible data loading to the new spiritual growth summary endpoint.
+- Added a Bible Spiritual Journey card showing streak, notes, highlights, plans, missed readings, family-safe status, low-bandwidth readiness, licensed text readiness, and study readiness.
+- Hardened existing Bible tests for preserved test database runs by making KCAN and reader fixtures idempotent.
+
+### Files changed
+
+- `apps/bible/views.py`
+- `apps/bible/urls.py`
+- `apps/bible/serializers.py`
+- `apps/bible/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/broadcastRoutes.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/bible/useBibleData.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/BibleScreen.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/bible/views.py apps/bible/urls.py apps/bible/serializers.py apps/bible/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`; local PostgreSQL migration-history check emitted a connection warning because PostgreSQL was not accepting connections on `127.0.0.1:5432`.
+- `python3 manage.py test apps.bible.tests.BibleTranslationRegistryTests.test_spiritual_growth_summary_exposes_reader_journey_safety_and_publishing --noinput --keepdb` passed.
+- `python3 manage.py test apps.bible.tests.BibleTranslationRegistryTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/broadcastRoutes.ts src/screens/tabs/bible/useBibleData.ts src/screens/tabs/BibleScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- The spiritual-growth summary is ready, but deeper Bible reader polish, plan completion flows, prayer group screens, and family/child spiritual journey modes still need frontend expansion.
+- Offline scripture readiness is surfaced, but full production offline pack management and sync conflict handling remain future work.
+- Bible learning media attachments now use the centralized media safety gate, but scan-provider evidence and quarantine moderation operations still need staging QA.
+- KCAN publishing/admin evidence is summarized, but richer ministry publishing dashboards and moderation queues remain later work.
+
+### Next prompt
+
+```text
+Please implement Phase 17 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Unified Identity, Verification, Trust, And Badges. Build on the existing user/shop/partner/health/education verification system, badge display, security audit logs, notification lifecycle, royal UX, media safety, and Christian trust principles to unify public trust summaries across profiles, channels, partners, institutions, shops, health providers, education providers, Bible/KCAN publishers, and commerce sellers. Improve badge consistency, revocation/expiry visibility, trust-risk signals, report/safety history summaries for staff, frontend badge rendering, and launch QA evidence without exposing private documents or secrets. Preserve existing APIs/UI behavior, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 18.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 15
+
+### Scope completed
+
+- Added Partners 120% Discord Plus foundation while preserving existing partner workspace APIs and React Native behavior.
+- Added a compatibility-safe Partner Discord-style workspace summary builder using existing:
+  - Partner records;
+  - partner memberships;
+  - partner roles and role assignments;
+  - partner channels and categories;
+  - conversation unread sequence state;
+  - partner policy;
+  - moderation actions;
+  - onboarding/join config;
+  - organization apps.
+- Added `/api/v1/partners/<partner_id>/discord-summary/` with existing partner access checks.
+- Exposed fast workspace counts for active members, pending members, categories, visible channels, total channels, roles, apps, open applications, open moderation actions, and unread messages.
+- Exposed membership roles, effective permissions, channel previews, per-channel unread counts, audit/moderation readiness, low-bandwidth readiness, family-safe media readiness, and legacy-wallet-disabled payment safety.
+- Connected React Native partner data loading to the new summary endpoint.
+- Added a Partner workspace command card showing members, channels, unread messages, moderation, family-safe media, low-bandwidth readiness, moderation state, and USD-safe workspace state.
+- Added a focused backend regression test for workspace readiness and unread count behavior.
+
+### Files changed
+
+- `apps/partners/services.py`
+- `apps/partners/views.py`
+- `apps/partners/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/broadcastRoutes.ts`
+- `/Users/nigel/dev/KIS/src/components/partners/partnersTypes.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnersData.ts`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnersCenterPane.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/partnersStyles.ts`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/partners/services.py apps/partners/views.py apps/partners/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`; local PostgreSQL migration-history check emitted a connection warning because PostgreSQL was not accepting connections on `127.0.0.1:5432`.
+- `python3 manage.py test apps.partners.tests.PartnerApiTests.test_partner_discord_summary_exposes_workspace_readiness_and_unread --noinput --keepdb` passed.
+- `python3 manage.py test apps.partners.tests.PartnerApiTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/broadcastRoutes.ts src/components/partners/partnersTypes.ts src/screens/tabs/partners/usePartnersData.ts src/components/partners/PartnersCenterPane.tsx src/components/partners/partnersStyles.ts --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- The Discord-style summary is API-ready, but deeper role editor, channel creation wizard, member onboarding wizard, and moderation queue UI still need fuller frontend panels.
+- Unread totals depend on existing `ConversationMember.last_read_seq`; realtime refresh/decrement should continue through the notification badge system and needs device QA.
+- Partner post attachments already use the centralized media safety gate, but provider scan evidence and quarantine moderation operations still need staging QA.
+- Low-bandwidth readiness is surfaced, but true offline partner workspace cache/sync remains later work.
+
+### Next prompt
+
+```text
+Please implement Phase 16 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Bible And Spiritual Growth Core. Build on the existing Bible reader, prayer, meditation, course, notification badge, partner/KCAN content management, royal UX, media safety, and Christian principles foundation to improve Bible reading UX, plans, streaks, reminders, highlights, notes, comments, audio/video devotionals, prayer groups, family/child-safe spiritual journeys, offline/low-bandwidth scripture access, study courses, partner ministry publishing, moderation-safe spiritual content, and admin evidence. Preserve existing Bible APIs and UI behavior, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 17.
+```
+
+## 2026-05-15 - KIS 120 Percent Platform Roadmap Phase 14
+
+### Scope completed
+
+- Added Health And Care 120% Apple Health Plus foundation while preserving existing health institution, appointment, workflow, and session APIs.
+- Added durable `HealthCarePlan` and `HealthVitalReading` models with a backward-compatible migration.
+- Added authenticated health operations endpoints for:
+  - `/api/v1/health-ops/care-summary/`;
+  - `/api/v1/health-ops/care-plans/`;
+  - `/api/v1/health-ops/vitals/`.
+- Extended health institution serializers with trust, verification, care, low-bandwidth, family-safe, and media-safety summaries.
+- Extended health service and workflow session serializers with care capabilities and USD/provider payment summaries.
+- Added membership-scoped creation for care plans and vital readings.
+- Added centralized media safety metadata validation for secure health messaging attachments.
+- Connected React Native health routes/services to care summary, care plan, and vital reading APIs.
+- Added health dashboard care overview cards for workflows, care plans, reminders, vitals, provider messaging, video care, low-bandwidth readiness, and family-safe care.
+- Updated visible React Native health session payment copy from KISC-style wording to USD/provider payment wording while preserving backend compatibility aliases.
+
+### Files changed
+
+- `apps/health_ops/models.py`
+- `apps/health_ops/serializers.py`
+- `apps/health_ops/views.py`
+- `apps/health_ops/urls.py`
+- `apps/health_ops/tests/test_workflow_runtime.py`
+- `apps/health_ops/migrations/0014_healthvitalreading_healthcareplan.py`
+- `/Users/nigel/dev/KIS/src/network/routes/healthRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/healthOpsWorkflowService.ts`
+- `/Users/nigel/dev/KIS/src/screens/health/HealthInstitutionDetailScreen.tsx`
+- `/Users/nigel/dev/KIS/src/screens/health/HealthServiceSessionScreen.tsx`
+- `/Users/nigel/dev/KIS/src/features/health-dashboard/ui/InstitutionDashboardShell.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/health_ops/models.py apps/health_ops/serializers.py apps/health_ops/views.py apps/health_ops/urls.py apps/health_ops/tests/test_workflow_runtime.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`; local PostgreSQL migration-history check emitted a connection warning because PostgreSQL was not accepting connections on `127.0.0.1:5432`.
+- `python3 manage.py test apps.health_ops.tests.test_workflow_runtime.HealthOpsWorkflowRuntimeTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/healthRoutes.ts src/services/healthOpsWorkflowService.ts src/screens/health/HealthInstitutionDetailScreen.tsx src/features/health-dashboard/ui/InstitutionDashboardShell.tsx src/screens/health/HealthServiceSessionScreen.tsx --quiet` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Care plans and vitals are now durable and API-ready, but medication scheduling, wearable imports, clinical record imports, and provider review workflows remain future work.
+- Health media safety validates metadata attachments, but full scan-provider evidence and quarantine staff operations still need staging QA.
+- Patient/provider messaging readiness is surfaced, but retention, emergency-care disclaimers, and clinical messaging policies still need provider/legal review.
+- Health billing copy is USD/provider-oriented, but live Flutterwave staging evidence remains part of the financial launch gate.
+
+### Next prompt
+
+```text
+Please implement Phase 15 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Partners 120% Discord Plus. Build on the existing partner workspaces, messaging/subroom reliability, verification badges, notification badge lifecycle, royal UX, media safety gate, and monetization-safe payment model to improve partner servers/workspaces, roles/permissions, channels/subrooms, group messaging, announcements, events, member onboarding, moderation/audit tools, unread counts, partner dashboards, low-bandwidth access, and family-safe partner media. Preserve existing partner APIs and UI behavior, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 16.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 13
+
+### Scope completed
+
+- Added Education 120% Coursera Core foundation while preserving existing education APIs and React Native behavior.
+- Added durable `EducationCourseReview` and `EducationCourseQuestion` models with a backward-compatible migration.
+- Added authenticated content review and Q&A endpoints for published education content.
+- Enforced enrollment before learners can post course reviews or questions.
+- Extended education discovery/detail payloads with:
+  - institution trust and verification summaries;
+  - review and Q&A summaries;
+  - direct USD provider payment summaries;
+  - offline/low-bandwidth readiness metadata;
+  - certificate readiness metadata;
+  - moderation-safe media safety metadata.
+- Updated public education FAQs away from KISC wording to direct USD provider checkout and promotional-credit-safe language.
+- Updated React Native education types and course/detail components to show verified institution, review, Q&A, low-bandwidth, USD checkout, certificate, and media-safety signals.
+- Preserved existing discovery, detail, progress, certificate, enrollment, booking, and institution management behavior.
+
+### Files changed
+
+- `apps/broadcasts/models.py`
+- `apps/broadcasts/serializers.py`
+- `apps/broadcasts/views.py`
+- `apps/broadcasts/urls.py`
+- `apps/broadcasts/tests.py`
+- `apps/broadcasts/migrations/0039_educationcoursereview_educationcoursequestion.py`
+- `/Users/nigel/dev/KIS/src/network/routes/broadcastRoutes.ts`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/education/api/education.models.ts`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/education/components/EducationContentCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/education/components/EducationDetailSheet.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/broadcasts/models.py apps/broadcasts/serializers.py apps/broadcasts/views.py apps/broadcasts/urls.py apps/broadcasts/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`; local PostgreSQL migration-history check emitted a connection warning because PostgreSQL was not accepting connections on `127.0.0.1:5432`.
+- `python3 manage.py test apps.broadcasts.tests.EducationCourseraCoreTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/screens/broadcast/education/EducationV2DiscoverPage.tsx src/screens/broadcast/education/components/EducationContentCard.tsx src/screens/broadcast/education/components/EducationDetailSheet.tsx src/screens/broadcast/education/api/education.models.ts src/network/routes/broadcastRoutes.ts --quiet` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Review and Q&A submission endpoints are ready, but complete learner submit/edit/report panels and instructor answer workflows are still future work.
+- Offline/low-bandwidth support is exposed as readiness metadata/placeholders; real download packs, sync state, and storage limits still need implementation.
+- Instructor dashboard support is still mostly through existing institution management APIs; deeper cohort analytics, assignment workflows, and grading views remain future work.
+- Education media safety is surfaced and compatible with the centralized gate, but full education-specific upload scan evidence and moderation queues still need staging QA.
+
+### Next prompt
+
+```text
+Please implement Phase 14 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Health And Care 120% Apple Health Plus. Build on the existing health institution/session/appointment system, USD-only payment redesign, verification badges, media safety gate, notification badge lifecycle, and family-safe UX foundation to improve health dashboard quality, appointment/session reliability, provider trust badges, care plans, health records summaries, reminders, medication/vitals placeholders, patient/provider messaging hooks, payment state UX, provider dashboards, low-bandwidth access, and moderation-safe health media. Preserve existing health APIs and UI behavior, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 15.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 12
+
+### Scope completed
+
+- Added Commerce 120% Amazon Core foundation while preserving existing commerce APIs and USD-first payment behavior.
+- Added durable `ProductReview` and `ProductQuestion` models with a backward-compatible migration.
+- Added product review and product Q&A serializers, ViewSets, routes, admin visibility, and focused regression tests.
+- Added `/api/v1/commerce/discovery/` for marketplace discovery sections:
+  - featured products;
+  - trusted shops;
+  - service spotlight;
+  - recommendation placeholder context.
+- Extended product detail serializers with seller trust, review summary, Q&A summary, fulfillment summary, and recommendation context.
+- Extended service serializers with seller trust, service quality, and fulfillment summaries.
+- Extended marketplace order serializers with seller trust, fulfillment summary, payment next-action guidance, and buyer-safe fulfillment messages.
+- Hardened cart item create/update/delete to recalculate cart subtotal and enforce stock availability.
+- Added centralized media safety validation for product images, service images, service galleries, and marketplace complaint attachments.
+- Updated React Native market discovery to use `/api/v1/commerce/discovery/`.
+- Updated React Native market home normalization for the new discovery sections shape.
+- Updated React Native product detail with seller trust, reviews, questions, and fulfillment signal tiles.
+- Removed visible KISC wording from cart list/detail totals and changed service booking deposit copy to Flutterwave.
+
+### Files changed
+
+- `apps/commerce/models.py`
+- `apps/commerce/serializers.py`
+- `apps/commerce/views.py`
+- `apps/commerce/urls.py`
+- `apps/commerce/admin.py`
+- `apps/commerce/tests.py`
+- `apps/commerce/migrations/0061_product_review_question.py`
+- `/Users/nigel/dev/KIS/src/network/routes/broadcastRoutes.ts`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/market/api/market.endpoints.ts`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/market/api/market.types.ts`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/market/ProductDetailsPage.tsx`
+- `/Users/nigel/dev/KIS/src/screens/market/cart/CartDetailPage.tsx`
+- `/Users/nigel/dev/KIS/src/screens/market/cart/CartsListPage.tsx`
+- `/Users/nigel/dev/KIS/src/screens/market/ServiceBookingScreen.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/commerce/models.py apps/commerce/serializers.py apps/commerce/views.py apps/commerce/urls.py apps/commerce/admin.py apps/commerce/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`; local PostgreSQL migration-history check emitted a connection warning because PostgreSQL was not accepting connections.
+- `python3 manage.py test apps.commerce.tests.MarketplaceUsdCheckoutTests apps.commerce.tests.CommerceAmazonCoreApiTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/screens/broadcast/market/ProductDetailsPage.tsx src/screens/broadcast/market/api/market.types.ts src/screens/broadcast/market/api/market.endpoints.ts src/screens/market/cart/CartDetailPage.tsx src/screens/market/cart/CartsListPage.tsx src/screens/market/ServiceBookingScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Product reviews/Q&A have backend durability and admin visibility, but a complete customer-facing review/Q&A submission UI is still later work.
+- Recommendations are placeholder/contextual; production personalization needs ranking, privacy, and abuse controls.
+- Fulfillment tracking is serializer/API-ready but still needs real provider updates, delivery integrations, and staging Flutterwave evidence.
+- Focused backend tests logged Redis/Celery connection warnings from existing notification hooks because Redis was not accepting connections locally; tests still passed.
+
+### Next prompt
+
+```text
+Please implement Phase 13 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Education 120% Coursera Core. Build on the existing education institution/course system, USD-only payment redesign, verification badges, media safety gate, and notification badge lifecycle to improve course discovery, institution trust badges, course detail quality, learning paths, progress tracking, certificates, reviews/Q&A, enrollment/payment state UX, instructor dashboards, offline/low-bandwidth learning placeholders, and moderation-safe education media. Preserve existing education APIs and UI behavior, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 14.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 11
+
+### Scope completed
+
+- Added notification intelligence and attention health foundation without database schema changes.
+- Added urgency labels for spiritual, health, learning, commerce, social, trust, and general notifications.
+- Added `/api/v1/notifications/attention-summary/` for unread totals, urgent count, priority/source/urgency grouping, and preferences snapshot.
+- Added `/api/v1/notifications/attention-preferences/` for quiet hours, digest preferences, source-level mute/snooze-like enablement, priority, and channel preferences.
+- Added notification list filtering by query, source, urgency, priority, and unread/read state.
+- Reused existing `NotificationRule` JSON fields for preferences to preserve current APIs and avoid risky migrations.
+- Preserved main-tab badge counts and realtime badge refresh behavior.
+- Added React Native routes and typed notification attention service bridge.
+
+### Files changed
+
+- `apps/notifications/services.py`
+- `apps/notifications/views.py`
+- `apps/notifications/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/adminRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/notificationAttentionService.ts`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/notifications/services.py apps/notifications/views.py apps/notifications/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` returned `No changes detected`; local PostgreSQL migration-history check emitted a connection warning because PostgreSQL was not accepting connections.
+- `python3 manage.py test apps.notifications.tests.NotificationAPITest --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/adminRoutes.ts src/services/notificationAttentionService.ts --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- Visible notification center UX is service-ready but not redesigned in this phase.
+- Quiet-hours and digest preferences are stored and exposed, but delivery workers still need deeper producer/scheduler QA before production.
+- Source-level mute/snooze needs source-by-source QA for Bible, broadcast, health, education, market, partners, messaging, and profile/account events.
+
+### Next prompt
+
+```text
+Please implement Phase 12 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Commerce 120% Amazon Core. Build on the USD-only financial redesign and media safety foundation to improve marketplace discovery, product/service detail quality, cart/order reliability, seller trust badges, safe reviews/questions, delivery/fulfillment visibility, direct Flutterwave payment state UX, recommendation placeholders, and moderation-safe product media. Preserve existing commerce APIs and USD payment behavior, keep KIS promotional credits non-cash and non-transferable, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 13.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 10
+
+### Scope completed
+
+- Added a unified, permission-aware super-app search foundation.
+- Added authenticated endpoint `/api/v1/core/search/unified/`.
+- Added grouped search result providers for:
+  - contacts;
+  - conversations;
+  - broadcast channels;
+  - normalized channel content;
+  - Bible verses;
+  - health institutions;
+  - notifications;
+  - verification subjects.
+- Added navigation-ready result metadata so frontend screens can open the exact section/result.
+- Preserved object-level access boundaries for conversations, channel/private content, notifications, and verification subjects.
+- Avoided exposing private media/storage paths in search results.
+- Added a React Native route and typed `unifiedSearchService` bridge.
+- Added focused backend regression tests for grouped results and authentication enforcement.
+
+### Files changed
+
+- `apps/core/views.py`
+- `apps/core/urls.py`
+- `apps/core/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/unifiedSearchService.ts`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/views.py apps/core/urls.py apps/core/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.core.tests.UnifiedSearchApiTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/miscRoutes.ts src/services/unifiedSearchService.ts --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- This phase is an aggregator foundation, not a full indexed search service.
+- Message body search still relies on existing chat/Nest message search; the unified endpoint currently covers conversation metadata and participants.
+- Market, education, partner, and health deep object search adapters should be expanded source by source.
+- Frontend result overlays and exact navigation/highlight handling are service-ready but not fully wired into every page.
+
+### Next prompt
+
+```text
+Please implement Phase 11 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Notification Intelligence And Attention Health. Build on the main-tab badge system and notification backend to add priority-aware notification grouping, quiet-hours controls, digest preferences, source-level mute/snooze, spiritual/health/learning/commerce urgency labels, child/youth-safe notification defaults, notification center search/filtering, and safe realtime refresh without notification spam. Preserve existing notification APIs and badges, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 12.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 09
+
+### Scope completed
+
+- Added a Christian content moderation and safety operations foundation on top of the existing media safety gate and channel moderation records.
+- Added staff-only moderation operations queue endpoint at `/api/v1/moderation/staff/operations-queue/`.
+- Added staff-only moderation action endpoint at `/api/v1/moderation/staff/operation-action/`.
+- Combined global moderation flags, quarantined/pending media safety scans, and channel moderation records into a single operations queue shape.
+- Added staff actions for approve, block, dismiss, escalate, review, and note.
+- Added media-safety scan action handling that updates scan status, quarantine, review state, linked media asset readiness/block state, and moderator history.
+- Added automatic moderation alert/audit creation when uploads are quarantined or require KIS family-safety review.
+- Preserved existing user-facing upload, reporting, channel, and moderation flows.
+- Added a React Native route/service bridge for staff moderation operations without exposing secrets or changing public UI behavior.
+- Kept live explicit-content/provider calls disabled by default.
+
+### Files changed
+
+- `apps/moderation/services.py`
+- `apps/moderation/views.py`
+- `apps/moderation/serializers.py`
+- `apps/moderation/urls.py`
+- `apps/moderation/tests.py`
+- `apps/media/views.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/moderationOperationsService.ts`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/moderation/views.py apps/moderation/services.py apps/moderation/serializers.py apps/moderation/urls.py apps/moderation/tests.py apps/media/views.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.moderation.tests apps.media.tests.MediaSafetyUploadTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/routes/miscRoutes.ts src/services/moderationOperationsService.ts --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Remaining risk
+
+- A polished visible staff safety command center is still needed; this phase created the backend operations layer and React Native service bridge.
+- Producer-specific escalation coverage still needs deeper follow-up for commerce, education, health, verification, partner spaces, messaging media, and comments beyond existing flags/reports/uploads.
+- User-facing appeal screens are not built yet. Staff appeal/review notes are preserved in scan moderation history and audit logs.
+- Live moderation/provider decisions remain disabled until explicit staging/provider approval.
+
+### Next prompt
+
+```text
+Please implement Phase 10 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Unified Search Across The Super-App. Build fast, safe, permission-aware search across Messaging, Broadcast/Channels, Bible, Profile, Partners, Health, Education, Market, Notifications, and verification/trust surfaces. Add backend search endpoints or aggregators where needed, support exact navigation to results, highlight matched messages/content briefly, preserve privacy/object-level access checks, avoid leaking private media or hidden content, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 11.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 08
+
+### Scope completed
+
+- Added a provider-ready production media pipeline foundation for feed/channel uploads.
+- Added normalized pipeline metadata for channel videos, shorts, images, audio, documents, thumbnails, captions/transcripts, and live/replay-style assets.
+- Kept live media/transcode/provider calls disabled by default through explicit feature flags.
+- Preserved legacy broadcast feed compatibility while enriching legacy attachments and normalized `ChannelContentAsset` payloads with safe pipeline metadata.
+- Enforced the media safety gate before channel content publish, normalized channel content broadcast, and legacy feed broadcast.
+- Blocked review-held, quarantined, blocked, failed, or still-processing media from being published or broadcast.
+- Added caption and transcript metadata normalization without storing raw provider secrets or raw storage paths.
+- Updated React Native upload mapping so composer payloads keep safety, scan, processing, caption, transcript, and pipeline metadata from the backend.
+- Added focused tests for processing-asset publish blocking and review-held legacy broadcast behavior.
+
+### Files changed
+
+- `apps/broadcasts/media_pipeline.py`
+- `apps/broadcasts/views.py`
+- `apps/broadcasts/feed_entry_store.py`
+- `apps/broadcasts/tests.py`
+- `/Users/nigel/dev/KIS/src/network/uploadBroadcastVideo.ts`
+- `docs/kis-120-roadmap/status.md`
+- `docs/feed-channels-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/feed_entry_store.py apps/broadcasts/media_pipeline.py apps/broadcasts/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.broadcasts.tests.ChannelContentCompatibilityTests --noinput --keepdb` passed.
+- `python3 manage.py test apps.broadcasts.tests.BroadcastChannelApiTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/uploadBroadcastVideo.ts src/components/feeds/videoAttachmentHelpers.ts src/components/feeds/composer/FeedComposerSheet.tsx src/screens/tabs/profile/useProfileController.ts --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+
+### Notes
+
+- The first parallel Django test attempt hit a temporary SQLite database lock. The same focused API suite passed when rerun alone.
+- No migrations were required for this phase.
+- No git commands were used.
+
+### Remaining risk
+
+- Real provider execution for transcoding, thumbnail extraction, caption/transcript generation, malware scanning, and live/replay processing is still disabled and not staged.
+- Production launch still needs provider choice, staging credentials, callback/webhook QA, monitoring, and rollback proof.
+- Chunked/resumable uploads and worker-backed media job queues remain later pipeline work.
+- Real-device QA is still needed for large videos, shorts, captions/transcripts, document uploads, blocked media, and review-held upload states.
+
+### Next prompt
+
+```text
+Please implement Phase 09 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Christian Content Moderation and Safety Operations. Build on the media safety gate and production media pipeline to add staff moderation queues, escalation workflows, audit views, automatic quarantine/review states, user reporting improvements, child/youth safety defaults, moderator action history, appeal/review notes, and producer coverage across feeds/channels, messaging media, partner spaces, profile media, comments, commerce, education, health, and verification. Keep live provider calls disabled unless explicitly configured, preserve existing user flows, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 10.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 07
+
+### Scope completed
+
+- Consolidated Feed Channels 120% YouTube Core behavior across the legacy profile feed bridge and normalized channel content system.
+- Preserved channel composer fields from React Native into the legacy profile feed form payload.
+- Added backend composer bridge support for `channel_id`, `content_type`, `visibility`, `scheduled_at`, `thumbnail_url`, `playlist_ids`, `captions`, and `embed_allowed`.
+- Made legacy profile feed creation with a selected channel immediately create normalized `ChannelContent` under that selected channel.
+- Made legacy profile feed edits resync selected channel content when a channel id is present.
+- Added channel upload metadata safety gates so review-held, quarantined, blocked, or failed attachments cannot be added as channel content/assets.
+- Added focused backend regression tests for selected-channel creation and unsafe channel attachment rejection.
+- Preserved legacy broadcast feed JSON behavior and existing public feed response shapes.
+
+### Files changed
+
+- `apps/broadcasts/views.py`
+- `apps/broadcasts/feed_entry_store.py`
+- `apps/broadcasts/tests.py`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile/useProfileController.ts`
+- `docs/feed-channels-roadmap/status.md`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/feed_entry_store.py apps/broadcasts/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.broadcasts.tests.BroadcastChannelApiTests --noinput --keepdb` passed.
+- `python3 manage.py test apps.broadcasts.tests.ChannelContentCompatibilityTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/screens/tabs/profile/useProfileController.ts src/screens/broadcast/channels/studio/ChannelStudioScreen.tsx src/screens/broadcast/channels/studio/ChannelContentManager.tsx src/screens/broadcast/channels/ChannelHomePage.tsx src/screens/broadcast/channels/ChannelContentDetailPage.tsx src/screens/broadcast/channels/hooks/useChannelsData.ts src/components/feeds/composer/FeedComposerSheet.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risk
+
+- Organization channel creation for shops, health, education, and partners remains a later ownership-wiring phase.
+- Production media processing, thumbnails, captions/transcripts, and real video/live provider flow remain Phase 08 work.
+- Real-device QA is still needed for channel Studio creation, channel-scoped publishing, subscription/bell behavior, comments, saves, playlists, and broadcast/unbroadcast UI states.
+
+### Next prompt
+
+```text
+Please implement Phase 08 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on the Production Media Pipeline for feeds/channels. Build provider-ready upload processing for channel videos, shorts, images, audio, documents, thumbnails, captions/transcripts, and live/replay assets; enforce the media safety gate before publish/broadcast; keep live provider calls disabled by default; preserve legacy broadcast feed compatibility; run safe Django/Nest/React Native validation; update docs/kis-120-roadmap/status.md, docs/feed-channels-roadmap/status.md, and docs/BUILD_STATE.md; and give the best prompt for Phase 09.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 06
+
+### Scope completed
+
+- Added a safe messaging-media enforcement layer on top of the centralized media safety gate.
+- Added reusable backend helpers to reject chat/status/partner attachments that are blocked, quarantined, failed, pending review, or missing safe media URLs.
+- Hardened Django `/uploads/file` chat/media uploads so family-safety scans record safe audit context without raw file paths or secrets.
+- Hardened status media creation so unsafe or review-held media is stopped before publication with a user-safe message.
+- Hardened partner post attachment serializers so review-held or blocked messaging-style attachments cannot be posted.
+- Hardened Nest realtime `chat.send` so unsafe attachment metadata is rejected before message persistence or fan-out.
+- Updated React Native chat uploads so DMs, groups, partner messages, statuses, voice clips, stickers, and attachments do not silently fall back to unsafe local device URIs when a safety upload is held or blocked.
+- Added user-safe media safety alerts in chat upload failure paths while preserving the existing chat UI.
+- Added focused tests for quarantined chat uploads and held status media.
+
+### Files changed
+
+- `apps/media/safety.py`
+- `apps/media/views.py`
+- `apps/media/tests.py`
+- `apps/statuses/serializers.py`
+- `apps/statuses/tests.py`
+- `apps/partners/serializers.py`
+- `/Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend/src/realtime/handlers/messages.ts`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/uploadFileToBackend.ts`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/ChatRoomHandlers.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/messaging-platform-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.media.tests.MediaSafetyUploadTests apps.statuses.tests.StatusPrivacyContractTests.test_media_status_is_held_for_family_safety_review --noinput --keepdb` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/services/mediaSafety.ts src/Module/ChatRoom/uploadFileToBackend.ts src/Module/ChatRoom/ChatRoomHandlers.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risk
+
+- Live explicit-content provider calls remain disabled by default. Production launch still needs provider selection, staging credentials, webhook QA, and threshold tuning.
+- Nest cannot inspect encrypted message bodies; enforcement is intentionally applied at upload and attachment metadata boundaries.
+- Direct model/file upload paths outside `/uploads/file`, statuses, partner post attachments, and broadcast/channel helpers still need ongoing audit in later phases.
+- Real-device QA is still needed for camera, gallery, voice, sticker, status, and partner-message review-held upload states.
+
+### Next prompt
+
+```text
+Please implement Phase 07 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Feed Channels 120% YouTube Core. Build on the existing Feed Channels roadmap and current Broadcast/Channels implementation to close the next highest-impact gaps: channel creation visibility, channel-scoped content creation, channel home/detail consistency, subscribe/bell behavior, playlists, comments, saves, history, broadcast/unbroadcast state, and safe media gating for channel uploads. Preserve legacy broadcast feed behavior, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md, docs/feed-channels-roadmap/status.md, and docs/BUILD_STATE.md, and give the best prompt for Phase 08.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 05
+
+### Scope completed
+
+- Strengthened messaging trust and reliability across Django, Nest, and React Native.
+- Added `Conversation.direct_key`, a canonical identity key for direct 1:1 conversations.
+- Updated Django direct chat creation so user A to user B and user B to user A resolve to the same direct conversation.
+- Restored hidden direct memberships when an existing direct chat is reopened.
+- Updated internal last-message sync to unhide direct chat memberships when a new message arrives, preventing the recipient's chat list from staying empty after prior delete-for-me/hidden states.
+- Added focused backend tests for:
+  - canonical direct conversation reuse;
+  - hidden direct chat restoration after last-message update.
+- Added Nest `conversation.updated` fan-out after successful `chat.send` so connected devices refresh conversation lists immediately.
+- Updated the React Native Messages screen to listen for `conversation.created` and `conversation.updated` and force-refresh the conversation list.
+- Hardened React Native cache identity so conversation rows dedupe by `id`, `conversationId`, or `conversation_id`.
+- Changed conversation-list cache refresh to clear the old list before writing the fresh backend list so stale hidden/deleted conversations do not return from cache.
+
+### Files changed
+
+- `apps/chat/models.py`
+- `apps/chat/services.py`
+- `apps/chat/views.py`
+- `apps/chat/tests.py`
+- `apps/chat/migrations/0009_conversation_direct_key.py`
+- `/Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend/src/chat/chat.types.ts`
+- `/Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend/src/realtime/handlers/messages.ts`
+- `/Users/nigel/dev/KIS/src/network/cache.tsx`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/normalizeConversation.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/MessagesScreen.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/messaging-platform-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.chat.tests.ConversationUnreadContractTests.test_direct_conversation_creation_is_canonical_and_restores_visibility apps.chat.tests.ConversationUnreadContractTests.test_internal_last_message_update_restores_hidden_direct_chat --noinput --keepdb` passed.
+- `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/network/cache.tsx src/Module/ChatRoom/normalizeConversation.ts src/screens/tabs/MessagesScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Blocked / existing issue
+
+- `python3 manage.py test apps.chat.tests.ConversationUnreadContractTests --noinput --keepdb` is still blocked by pre-existing URL reverse-name failures for `conversation-list`, `conversation-search`, and `conversation-participant-search`.
+
+### Remaining risk
+
+- Existing duplicate direct conversations are not merged automatically. A later cleanup/backfill phase should review production data and safely reconcile duplicates.
+- E2EE fallback behavior and multi-device delivery QA remain later messaging trust work.
+- Real-device staging QA is still needed for bidirectional delivery timing and conversation-list refresh under poor network conditions.
+
+### Required local step
+
+- Run `python3 manage.py migrate` before testing this phase against the Django backend.
+
+### Next prompt
+
+```text
+Please implement Phase 06 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Safe Messaging Media and Family Controls. Build on the Phase 02 media safety gate and Phase 05 messaging trust layer to enforce safe media uploads in DMs, group chats, partner messages, updates/status, and calls attachments. Add user-safe blocked/review states, child/youth-safe defaults, report/block controls for unsafe message media, and audit hooks without breaking existing chat UI. Keep live explicit-content provider calls disabled by default, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md, docs/messaging-platform-roadmap/status.md, and docs/BUILD_STATE.md, and give the best prompt for Phase 07.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 04
+
+### Scope completed
+
+- Added a shared global navigation/information-architecture scaffold for main-tab screens.
+- Added `MainTabPageHeader` for consistent screen titles, subtitles, primary actions, and secondary actions.
+- Added `MainTabStateBlock` for consistent empty, loading, error, and retry states.
+- Updated the Bible main tab to use the shared header while preserving the existing read/filter/tab behavior.
+- Updated the Profile missing-profile retry state to use the shared state block while preserving profile load behavior.
+- Added a navigation and information architecture guide covering:
+  - the main KIS tab mental model;
+  - consistent screen requirements;
+  - header rules;
+  - empty/loading/error rules;
+  - age-aware UX rules for children, youth, adults, and older users;
+  - next migration targets.
+- Preserved existing app routes and avoided broad navigation rewrites.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/components/common/MainTabScaffold.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/BibleScreen.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/operations/KIS_NAVIGATION_AND_IA_GUIDE.md`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && npx eslint src/components/common/MainTabScaffold.tsx src/screens/tabs/BibleScreen.tsx src/screens/tabs/ProfileScreen.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risk
+
+- Phase 04 establishes the shared pattern and migrates two representative surfaces. Messaging, Broadcast/Channels, Partners, Health, Education, Market, and Notifications still need incremental screen-level adoption.
+- Visual screenshot QA was not run in this phase.
+- Search, empty-state, and permission-state polish should continue in later feature-focused phases.
+
+### Next prompt
+
+```text
+Please implement Phase 05 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on the Messaging Trust Layer. Continue from docs/messaging-platform-roadmap/status.md and complete the next highest-risk messaging reliability slice: conversation identity, duplicate direct/subroom prevention, cache durability, sender alignment after restart, fast bidirectional delivery, invisible retry, and exact conversation list updates. Preserve existing chat UI, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md, docs/messaging-platform-roadmap/status.md, and docs/BUILD_STATE.md, and give the best prompt for Phase 06.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 03
+
+### Scope completed
+
+- Strengthened the shared Royal UX Design System foundation without redesigning individual screens.
+- Added centralized royal gradient tokens for metallic gold, purple, and cream surfaces.
+- Added semantic royal palette fields for royal panels, readable gold, gold borders, selected states, badges, and focus rings.
+- Added global component tokens for:
+  - buttons;
+  - cards;
+  - inputs;
+  - badges;
+  - tabs.
+- Added accessibility tokens for:
+  - minimum touch target;
+  - comfortable touch target;
+  - child-friendly touch target;
+  - elder-friendly touch target;
+  - minimum readable body/label sizes;
+  - line-height ratio.
+- Added shared style recipes for cards, selected controls, badges, and improved inputs.
+- Updated shared button styles and `KISButton` to use centralized royal gold gradients and safer contrast.
+- Updated icon color rules for readable primary/secondary icon colors in both themes.
+- Updated React Navigation theme to align with the white/cream light foundation and royal gold accents.
+- Updated bottom-tab selected gradient and badge styling to use centralized tokens.
+- Updated health theme colors to match the royal system while keeping health screens readable.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/theme/constants.ts`
+- `/Users/nigel/dev/KIS/src/theme/foundations/buttons.ts`
+- `/Users/nigel/dev/KIS/src/theme/foundations/icons.ts`
+- `/Users/nigel/dev/KIS/src/theme/navTheme.ts`
+- `/Users/nigel/dev/KIS/src/theme/health/colors.ts`
+- `/Users/nigel/dev/KIS/src/constants/KISButton.tsx`
+- `/Users/nigel/dev/KIS/src/navigation/AppNavigator.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && npx eslint src/theme src/constants/KISButton.tsx src/navigation/AppNavigator.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risk
+
+- This phase centralizes the foundation; it does not remove all screen-level hardcoded colors yet.
+- Many individual screens still need migration to shared card/input/badge/selected-control recipes.
+- Visual screenshot QA was not run in this phase. Phase 04 should include main-tab visual checks if a dev server/device target is available.
+
+### Next prompt
+
+```text
+Please implement Phase 04 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on global navigation and information architecture. Audit and improve the main tab and nested navigation experience so Messaging, Broadcast/Channels, Bible, Profile, Partners, Health, Education, Market, and Notifications feel coherent and easy for children, youth, adults, and older users. Add consistent headers, primary actions, empty/loading/error states, and clear entry points without breaking existing routes. Run safe frontend validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 05.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 02
+
+### Scope completed
+
+- Added a centralized media safety gate foundation for Christian/family-safe uploads.
+- Added `apps/media/safety.py` with:
+  - upload context normalization;
+  - MIME/extension/size validation;
+  - SHA-256 checksum capture;
+  - provider-neutral explicit-content scan decision shape;
+  - live provider calls disabled by default;
+  - user-safe blocked/review messages.
+- Added durable `MediaSafetyScan` model and migration.
+- Added admin visibility and owner/staff-scoped API visibility for media safety scan records.
+- Updated `/uploads/file` to create a safety scan row and return:
+  - `scanStatus`;
+  - `quarantined`;
+  - `requiresReview`;
+  - `safetyScanId`;
+  - `safety` user-safe metadata.
+- Hooked broadcast feed/profile/video upload paths into the same safety validation/scan record logic.
+- Added environment controls in settings and `.env.example`:
+  - `MEDIA_SAFETY_ENABLED`
+  - `MEDIA_EXPLICIT_SCAN_REQUIRED`
+  - `MEDIA_SAFETY_PROVIDER`
+  - `MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED`
+  - `MEDIA_SAFETY_MAX_UPLOAD_BYTES`
+  - `MEDIA_SAFETY_ALLOWED_MIME_TYPES`
+  - `MEDIA_SAFETY_ALLOWED_MIME_PREFIXES`
+  - `MEDIA_SAFETY_BLOCKED_EXTENSIONS`
+- Added React Native media-safety helper copy and wired upload context/safety metadata into chat uploads and verification evidence uploads.
+- Added operations runbook for media safety and Christian content policy.
+
+### Files changed
+
+- `apps/media/safety.py`
+- `apps/media/models.py`
+- `apps/media/admin.py`
+- `apps/media/serializers.py`
+- `apps/media/views.py`
+- `apps/media/urls.py`
+- `apps/media/tests.py`
+- `apps/media/migrations/0002_mediasafetyscan.py`
+- `apps/broadcasts/views.py`
+- `config/settings/base.py`
+- `.env.example`
+- `/Users/nigel/dev/KIS/src/services/mediaSafety.ts`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/uploadFileToBackend.ts`
+- `/Users/nigel/dev/KIS/src/services/verificationService.ts`
+- `/Users/nigel/dev/KIS/src/network/routes/adminRoutes.ts`
+- `docs/operations/MEDIA_SAFETY_AND_CHRISTIAN_CONTENT_POLICY.md`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.media.tests.MediaSafetyUploadTests --noinput --keepdb` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/services/mediaSafety.ts src/Module/ChatRoom/uploadFileToBackend.ts src/services/verificationService.ts src/network/routes/adminRoutes.ts --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risk
+
+- Phase 02 adds the architecture and provider-neutral stubs only. It does not call a live explicit-content scanning provider yet.
+- Production should require scan/review with `MEDIA_EXPLICIT_SCAN_REQUIRED=True`, but live provider calls should stay disabled until staging credentials and redacted callback handling are proven.
+- Staff pass/block review actions are not implemented yet.
+- Text safety scanning for sexually explicit text, grooming, and predatory behavior remains future work.
+- Upload paths outside the touched `/uploads/file` and broadcast helpers still need ongoing audit as each product surface is hardened.
+
+### Next prompt
+
+```text
+Please implement Phase 03 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Royal UX Design System 2.0. Centralize app-wide royal gold/deep purple/cream/white/dark theme tokens, button styles, selected states, tab badge styles, card/input rules, contrast-safe text/icon colors, age-friendly spacing and tap targets, and accessibility defaults. Preserve existing screens but make the shared foundation ready for global polish. Run focused frontend validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 04.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 01
+
+### Scope completed
+
+- Added a dedicated React Native `KISPrinciplesScreen`.
+- Added root navigation typing and route registration for `KISPrinciples`.
+- Added a visible `KIS Principles` action in the Profile overview action row.
+- The new page presents:
+  - KIS as a Christian platform;
+  - the Community Covenant;
+  - clear anti-pornography rules;
+  - rules for DMs, feeds, channels, comments, groups, profiles, shops, education, health, partners, live streams, files, links, and embeds;
+  - sensitive content guidance for medical, counselling, and educational contexts;
+  - reporting guidance;
+  - child, youth, adult, and older-user safety framing.
+- Styled the page with the current royal gold/deep purple/cream theme language while keeping text high contrast and readable.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/screens/profile/KISPrinciplesScreen.tsx`
+- `/Users/nigel/dev/KIS/src/navigation/types.ts`
+- `/Users/nigel/dev/KIS/App.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 manage.py check` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/screens/profile/KISPrinciplesScreen.tsx src/screens/tabs/ProfileScreen.tsx App.tsx src/navigation/types.ts --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risk
+
+- This phase adds the covenant and user-visible principles, but it does not yet technically block unsafe uploads.
+- The anti-pornography rule must be enforced in Phase 02 through centralized upload/media safety checks across backend and frontend surfaces.
+- The principles content is static in the app for now; policy version acceptance/admin-managed policy content can be added later.
+
+### Next prompt
+
+```text
+Please implement Phase 02 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on platform-wide anti-pornography and media safety architecture. Add or design a centralized media safety gate for uploads across DMs, feeds/channels, comments, profile media, partner spaces, commerce, education, health, and verification. Include MIME/size validation, quarantine states, explicit-content provider adapter stubs with live calls disabled by default, audit logs, user-safe blocked/review messages, and no raw secret/path logging. Preserve existing uploads where possible, run safe validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 03.
+```
+
+## 2026-05-14 - KIS 120 Percent Platform Roadmap Phase 00
+
+### Scope completed
+
+- Added a durable phase-by-phase roadmap for taking KIS from the current competitive analysis baseline toward an 80% launch-ready, 95% category-parity, and 120% differentiated platform target.
+- Defined KIS as a Christian verified social operating system combining messaging, channels, commerce, education, health, partners, Bible, verification, safety, and payments.
+- Added non-negotiable platform principles:
+  - KIS is a Christian app.
+  - Pornographic, sexually explicit, exploitative, abusive, predatory, or degrading content must not be uploadable anywhere.
+  - Christian principles must be visible from the Profile section.
+  - UX must be suitable for children, youth, adults, and older people.
+  - Existing foundations must be preserved while being lifted to global quality.
+- Created a 31-phase execution path from Phase 00 through Phase 30, including Christian safety, anti-pornography media safety, royal UX, messaging reliability, Feed Channels, commerce, education, health, partners, Bible, verification, recommendations, accessibility, observability, security, monetization, AI boundaries, public web, QA, launch cut, category parity, and final 120% differentiation.
+
+### Files changed
+
+- `docs/kis-120-roadmap/README.md`
+- `docs/kis-120-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- Documentation-only phase. No runtime validation required.
+
+### Remaining risk
+
+- No app behavior changed in Phase 00.
+- The Christian principles page and profile entry point are not implemented yet.
+- Platform-wide anti-pornography upload enforcement is not implemented yet; it must be technical and centralized, not only text policy.
+- UX improvements still need implementation through the royal design system and screen-level polish phases.
+
+### Next prompt
+
+```text
+Please implement Phase 01 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Christian principles and the Profile entry point. Add a beautiful, readable KIS Principles / Community Covenant page from the Profile section, with clear Christian content standards, anti-pornography rules, child/youth/adult/elder-safe wording, reporting guidance, and royal gold/deep purple styling. Preserve existing profile behavior, run safe validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 02.
+```
+
 ## 2026-05-14 - Notification Badge System Phase 6
 
 ### Scope completed

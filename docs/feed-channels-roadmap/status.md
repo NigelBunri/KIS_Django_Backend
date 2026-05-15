@@ -1,6 +1,6 @@
 # Feed Channels Roadmap Status
 
-Current status: Phase 14 completed. Channel/content broadcast promotion semantics are implemented; Phase 15 is next.
+Current status: KIS 120 Percent Phase 08 production media pipeline completed. Phase 09 safety operations is next.
 
 ## Completed
 
@@ -23,10 +23,13 @@ Current status: Phase 14 completed. Channel/content broadcast promotion semantic
 - 2026-05-13 KIS Feed Channels 200% YouTube roadmap created with Phase 13-24 plan.
 - 2026-05-13 Phase 13 completed: Channel Studio now exposes Create Channel UI, refreshes/selects the created channel, and opens the composer with selected `channel_id` context.
 - 2026-05-13 Phase 14 completed: channels and normalized channel content can be broadcast/unbroadcast idempotently with Studio controls and public feed bridge support.
+- 2026-05-14 KIS 120 Percent Phase 07 completed: channel-scoped legacy feed creation now persists normalized channel content under the selected channel, channel upload metadata is safety-gated, and frontend form submission preserves channel composer fields.
+- 2026-05-14 KIS 120 Percent Phase 08 completed: provider-ready channel media pipeline metadata, captions/transcripts, processing state, and publish/broadcast safety gates are implemented while preserving legacy feed compatibility.
 
 ## Global Blockers To Track
 
 - Production media/live provider choice is not selected.
+- Provider-backed transcoding, thumbnails, captions, malware scanning, and live/replay processing remain disabled by default until staging QA.
 - Existing profile feed entries are still JSON-backed through `BroadcastFeedProfile.profile_data["feeds"]` compatibility.
 - Embed security policy and allowed domains need product/legal approval.
 - Channel comments are now Django-backed for normalized channel content, while legacy broadcast comment behavior remains separate.
@@ -34,6 +37,8 @@ Current status: Phase 14 completed. Channel/content broadcast promotion semantic
 - Public production launch is NO-GO until real staging evidence, backfill apply approval, iOS/Android manual QA, and embed/live flag evidence are attached.
 - Immediate UX blocker: users need a visible Create Channel button and channel-scoped feed creation in the profile/feed workspace.
   - Resolved in Phase 13 for personal creator channels.
+- Consolidated in KIS 120 Percent Phase 07 by preserving `channel_id` through the legacy profile feed form and normalized channel bridge.
+- Production media pipeline readiness is now metadata-backed in KIS 120 Percent Phase 08, but real provider execution still needs staging evidence.
 
 ## Validation Log
 
@@ -49,6 +54,33 @@ YYYY-MM-DD - Phase X
 - Remaining risk:
 - Best next prompt:
 ```
+
+2026-05-14 - KIS 120 Percent Phase 08
+- Files changed:
+  - `apps/broadcasts/media_pipeline.py`
+  - `apps/broadcasts/views.py`
+  - `apps/broadcasts/feed_entry_store.py`
+  - `apps/broadcasts/tests.py`
+  - `/Users/nigel/dev/KIS/src/network/uploadBroadcastVideo.ts`
+  - `docs/kis-120-roadmap/status.md`
+  - `docs/feed-channels-roadmap/status.md`
+  - `docs/BUILD_STATE.md`
+- Commands passed:
+  - `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/feed_entry_store.py apps/broadcasts/media_pipeline.py apps/broadcasts/tests.py`
+  - `python3 manage.py check`
+  - `python3 manage.py makemigrations --check --dry-run`
+  - `python3 manage.py test apps.broadcasts.tests.ChannelContentCompatibilityTests --noinput --keepdb`
+  - `python3 manage.py test apps.broadcasts.tests.BroadcastChannelApiTests --noinput --keepdb`
+  - `cd /Users/nigel/dev/KIS && npx eslint src/network/uploadBroadcastVideo.ts src/components/feeds/videoAttachmentHelpers.ts src/components/feeds/composer/FeedComposerSheet.tsx src/screens/tabs/profile/useProfileController.ts --quiet`
+  - `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false`
+  - `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit`
+- Commands blocked:
+  - None. A first parallel backend test attempt hit a temporary SQLite database lock, then passed when rerun alone.
+- Remaining risk:
+  - Real media processing providers remain disabled by default and need staging credentials, webhook/callback QA, and real-device upload validation.
+  - This phase prepares pipeline metadata and safety gates; it does not yet implement chunked/resumable upload workers or production transcode jobs.
+- Best next prompt:
+  - Please implement Phase 09 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on Christian Content Moderation and Safety Operations. Build on the media safety gate and production media pipeline to add staff moderation queues, escalation workflows, audit views, automatic quarantine/review states, user reporting improvements, child/youth safety defaults, moderator action history, appeal/review notes, and producer coverage across feeds/channels, messaging media, partner spaces, profile media, comments, commerce, education, health, and verification. Keep live provider calls disabled unless explicitly configured, preserve existing user flows, run safe Django/Nest/React Native validation, update docs/kis-120-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 10.
 
 2026-05-07 - Phase 00
 - Files changed:
@@ -479,3 +511,29 @@ YYYY-MM-DD - Phase X
   - Real device visual QA was not run in this session.
 - Best next prompt:
   - Please implement Phase 15 of the KIS Feed Channels 200% YouTube roadmap without using git commands. Focus on a YouTube Studio-style content manager. Replace the simple placeholder list with a real operational Channel Studio content table/list: filters for Draft, Scheduled, Published, Archived, Live, Shorts, Posts, Documents; search by title/text; status chips, thumbnail, visibility, date, views, comments, broadcast state, and per-item actions for edit, publish/unpublish, broadcast/unbroadcast, archive, and add to playlist where safe. Preserve legacy feed compatibility and existing APIs, add focused backend/frontend validation, and update `docs/feed-channels-roadmap/youtube-200-roadmap.md`, `docs/feed-channels-roadmap/status.md`, and `docs/BUILD_STATE.md`.
+
+2026-05-14 - KIS 120 Percent Phase 07 Consolidation
+- Files changed:
+  - `apps/broadcasts/views.py`
+  - `apps/broadcasts/feed_entry_store.py`
+  - `apps/broadcasts/tests.py`
+  - `/Users/nigel/dev/KIS/src/screens/tabs/profile/useProfileController.ts`
+  - `docs/feed-channels-roadmap/status.md`
+  - `docs/kis-120-roadmap/status.md`
+  - `docs/BUILD_STATE.md`
+- Commands passed:
+  - `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/feed_entry_store.py apps/broadcasts/tests.py`
+  - `python3 manage.py check`
+  - `python3 manage.py makemigrations --check --dry-run`
+  - `python3 manage.py test apps.broadcasts.tests.BroadcastChannelApiTests --noinput --keepdb`
+  - `python3 manage.py test apps.broadcasts.tests.ChannelContentCompatibilityTests --noinput --keepdb`
+  - `npx eslint src/screens/tabs/profile/useProfileController.ts src/screens/broadcast/channels/studio/ChannelStudioScreen.tsx src/screens/broadcast/channels/studio/ChannelContentManager.tsx src/screens/broadcast/channels/ChannelHomePage.tsx src/screens/broadcast/channels/ChannelContentDetailPage.tsx src/screens/broadcast/channels/hooks/useChannelsData.ts src/components/feeds/composer/FeedComposerSheet.tsx --quiet`
+  - `npm run typecheck -- --pretty false`
+- Commands blocked:
+  - None.
+- Remaining risk:
+  - Organization channel creation for shops, health, education, and partners remains a later ownership-wiring phase.
+  - Live media provider and production-grade media processing remain Phase 08 work.
+  - Real-device QA is still needed for channel Studio composer flow, subscription/bell behavior, playlists, comments, saves, and broadcast/unbroadcast visual states.
+- Best next prompt:
+  - Please implement Phase 08 of the KIS 120 Percent Platform Roadmap without using git commands. Focus on the Production Media Pipeline for feeds/channels. Build provider-ready upload processing for channel videos, shorts, images, audio, documents, thumbnails, captions/transcripts, and live/replay assets; enforce the media safety gate before publish/broadcast; keep live provider calls disabled by default; preserve legacy broadcast feed compatibility; run safe Django/Nest/React Native validation; update docs/kis-120-roadmap/status.md, docs/feed-channels-roadmap/status.md, and docs/BUILD_STATE.md; and give the best prompt for Phase 09.

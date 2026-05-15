@@ -1,8 +1,11 @@
 from django.urls import reverse
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.accounts.models import User, UserContact
+from apps.media.models import MediaSafetyScan
 from apps.moderation.models import AuditLog, Flag, UserBlock
 from apps.statuses.models import (
     StatusAudienceTarget,
@@ -203,3 +206,21 @@ class StatusPrivacyContractTests(APITestCase):
         self.client.force_authenticate(self.viewer)
         viewer_res = self.client.get(reverse("status-viewers", kwargs={"pk": status_item.id}))
         self.assertEqual(viewer_res.status_code, status.HTTP_404_NOT_FOUND)
+
+    @override_settings(MEDIA_EXPLICIT_SCAN_REQUIRED=True, MEDIA_SAFETY_ENABLED=True)
+    def test_media_status_is_held_for_family_safety_review(self):
+        self.client.force_authenticate(self.author)
+        upload = SimpleUploadedFile("family.jpg", b"safe image bytes", content_type="image/jpeg")
+
+        res = self.client.post(
+            "/api/v1/statuses/",
+            {"type": StatusType.IMAGE, "file": upload, "visibility": StatusVisibility.CONTACTS},
+            format="multipart",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("file", res.json())
+        scan = MediaSafetyScan.objects.get(context="status")
+        self.assertEqual(scan.owner, self.author)
+        self.assertEqual(scan.status, "pending_review")
+        self.assertTrue(scan.quarantine)

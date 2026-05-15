@@ -14,6 +14,7 @@ from .models import (
     ConversationRequestState,
     ConversationType,
 )
+from .services import get_or_create_direct_conversation
 
 
 def _signed_internal_headers(method: str, path: str, body=None, secret: str = "test-internal-token"):
@@ -192,3 +193,66 @@ class ConversationUnreadContractTests(APITestCase):
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["results"][0]["conversation_id"], str(self.conversation.id))
         self.assertEqual(payload["results"][0]["user"]["id"], str(self.peer.id))
+
+    def test_direct_conversation_creation_is_canonical_and_restores_visibility(self):
+        user_a = User.objects.create_user(
+            phone="+2348000000003",
+            password="password123",
+            country="NG",
+            display_name="Direct A",
+        )
+        user_b = User.objects.create_user(
+            phone="+2348000000004",
+            password="password123",
+            country="NG",
+            display_name="Direct B",
+        )
+        first, created_first = get_or_create_direct_conversation(
+            user_a,
+            user_b,
+            initiator=user_a,
+            use_request_flow=True,
+        )
+        ConversationMember.objects.filter(conversation=first, user=user_b).update(is_hidden=True)
+
+        second, created_second = get_or_create_direct_conversation(
+            user_b,
+            user_a,
+            initiator=user_b,
+            use_request_flow=True,
+        )
+
+        self.assertIs(created_first, True)
+        self.assertIs(created_second, False)
+        self.assertEqual(first.id, second.id)
+        self.assertTrue(first.direct_key)
+        self.assertEqual(
+            Conversation.objects.filter(type=ConversationType.DIRECT, direct_key=first.direct_key).count(),
+            1,
+        )
+        self.assertFalse(
+            ConversationMember.objects.get(conversation=first, user=user_b).is_hidden
+        )
+
+    def test_internal_last_message_update_restores_hidden_direct_chat(self):
+        ConversationMember.objects.filter(conversation=self.conversation, user=self.peer).update(is_hidden=True)
+        url = f"/api/v1/conversations/{self.conversation.id}/update-last-message/"
+
+        with patch.dict(
+            os.environ,
+            {"DJANGO_INTERNAL_TOKEN": "test-internal-token", "INTERNAL_SIGNATURE_REQUIRED": "0"},
+        ):
+            res = self.client.patch(
+                url,
+                {
+                    "last_message_at": "2026-05-14T10:00:00Z",
+                    "last_message_preview": "New message",
+                },
+                format="json",
+                HTTP_X_INTERNAL_AUTH="test-internal-token",
+            )
+
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(
+            ConversationMember.objects.get(conversation=self.conversation, user=self.peer).is_hidden
+        )

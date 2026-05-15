@@ -3,6 +3,13 @@ import json
 from rest_framework import serializers
 
 from apps.accounts.models import UserContact
+from apps.media.models import MediaSafetyScan
+from apps.media.safety import (
+    USER_SAFE_REVIEW_MESSAGE,
+    hash_upload,
+    scan_upload_for_explicit_content,
+    validate_upload_file_safety,
+)
 from apps.statuses.models import (
     StatusAudienceTarget,
     StatusItem,
@@ -147,6 +154,36 @@ class StatusCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"text": "Text status requires text."})
         if status_type != StatusType.TEXT and not file:
             raise serializers.ValidationError({"file": "Media status requires a file."})
+        if file:
+            request = self.context.get("request")
+            user = getattr(request, "user", None)
+            validate_upload_file_safety(file, context="status")
+            checksum = hash_upload(file)
+            decision = scan_upload_for_explicit_content(
+                filename=getattr(file, "name", "status-upload"),
+                mime_type=getattr(file, "content_type", "") or "",
+                context="status",
+            )
+            MediaSafetyScan.objects.create(
+                owner=user if user and user.is_authenticated else None,
+                context="status",
+                original_name=getattr(file, "name", "") or "",
+                mime_type=getattr(file, "content_type", "") or "",
+                bytes=getattr(file, "size", 0) or 0,
+                checksum=checksum,
+                provider=decision.provider,
+                status=decision.status,
+                quarantine=decision.quarantine,
+                requires_review=decision.requires_review,
+                policy_version=decision.policy_version,
+                reason=decision.reason,
+                result={
+                    **decision.as_metadata(),
+                    "surface": "messaging_status",
+                },
+            )
+            if decision.quarantine or decision.requires_review or decision.status in {"blocked", "failed", "pending_review"}:
+                raise serializers.ValidationError({"file": decision.user_message or USER_SAFE_REVIEW_MESSAGE})
         if visibility in (StatusVisibility.CONTACTS_EXCEPT, StatusVisibility.ONLY_SHARE_WITH) and not target_user_ids:
             raise serializers.ValidationError(
                 {"target_user_ids": "Choose at least one contact for this audience setting."}

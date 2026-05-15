@@ -148,3 +148,51 @@ class MediaMetrics(BaseEntity):
         self.save(update_fields=["carbon_grams", "updated_at"])
         self.refresh_from_db()
         return self.carbon_grams
+
+
+class MediaSafetyScan(BaseEntity):
+    STATUS_CHOICES = [
+        ("pending_review", "Pending Review"),
+        ("passed", "Passed"),
+        ("blocked", "Blocked"),
+        ("failed", "Failed"),
+        ("not_configured", "Not Configured"),
+    ]
+
+    asset = models.ForeignKey(
+        MediaAsset,
+        related_name="safety_scans",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    owner = models.ForeignKey(
+        USER,
+        related_name="media_safety_scans",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    upload_id = models.CharField(max_length=128, blank=True, db_index=True)
+    context = models.CharField(max_length=64, default="general", db_index=True)
+    original_name = models.CharField(max_length=512, blank=True)
+    mime_type = models.CharField(max_length=256, blank=True)
+    bytes = models.BigIntegerField(default=0)
+    checksum = models.CharField(max_length=128, blank=True)
+    provider = models.CharField(max_length=64, default="stub", db_index=True)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default="pending_review", db_index=True)
+    quarantine = models.BooleanField(default=True, db_index=True)
+    requires_review = models.BooleanField(default=True, db_index=True)
+    policy_version = models.CharField(max_length=64, default="kis-christian-safety-v1")
+    reason = models.CharField(max_length=256, blank=True)
+    result = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["context", "status"]),
+            models.Index(fields=["owner", "status"]),
+            models.Index(fields=["upload_id", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.context} {self.status} {self.upload_id or self.id}"

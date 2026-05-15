@@ -1,6 +1,7 @@
 # apps/partners/serializers.py
 from django.db import models
 from rest_framework import serializers
+from apps.media.safety import validate_attachment_metadata_for_safe_messaging
 
 from apps.partners.models import (
     Partner,
@@ -458,6 +459,7 @@ class PartnerPostSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         if "text" in attrs or "styled_text" in attrs:
             attrs = prepare_partner_rich_text_attrs(attrs)
+        validate_attachment_metadata_for_safe_messaging(attrs.get("attachments"))
         return super().validate(attrs)
 
 
@@ -478,6 +480,7 @@ class PartnerPostCreateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         attrs = prepare_partner_rich_text_attrs(attrs)
+        validate_attachment_metadata_for_safe_messaging(attrs.get("attachments"))
         return super().validate(attrs)
 
     def create(self, validated_data):

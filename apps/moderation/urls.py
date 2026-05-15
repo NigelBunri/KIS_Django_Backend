@@ -7,8 +7,11 @@ from .views import (
     UserReputationViewSet,
     ModerationRuleViewSet,
     SafetyAlertViewSet,
-    UserBlockViewSet
+    UserBlockViewSet,
+    StaffModerationOperationActionView,
+    StaffModerationOperationsQueueView,
 )
+from django.urls import path
 
 router = DefaultRouter()
 router.register(r"flags", FlagViewSet, basename="flags")
@@ -19,4 +22,9 @@ router.register(r"moderation-rules", ModerationRuleViewSet, basename="moderation
 router.register(r"safety-alerts", SafetyAlertViewSet, basename="safety-alerts")
 router.register(r"user-blocks", UserBlockViewSet, basename="user-blocks")
 
-urlpatterns = router.urls
+urlpatterns = [
+    path("moderation/staff/operations-queue/", StaffModerationOperationsQueueView.as_view(), name="moderation-staff-operations-queue"),
+    path("moderation/staff/operation-action/", StaffModerationOperationActionView.as_view(), name="moderation-staff-operation-action"),
+]
+
+urlpatterns += router.urls

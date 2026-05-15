@@ -74,3 +74,16 @@ class UserBlockSerializer(serializers.ModelSerializer):
         if request and getattr(request, "user", None) and blocked == request.user:
             raise serializers.ValidationError({"blocked": "You cannot mute yourself."})
         return attrs
+
+
+class StaffModerationActionSerializer(serializers.Serializer):
+    target_type = serializers.ChoiceField(
+        choices=(
+            ("flag", "Flag"),
+            ("media_safety_scan", "Media safety scan"),
+            ("channel_moderation_record", "Channel moderation record"),
+        )
+    )
+    target_id = serializers.UUIDField()
+    action = serializers.ChoiceField(choices=("approve", "block", "dismiss", "escalate", "review", "note"))
+    notes = serializers.CharField(required=False, allow_blank=True, max_length=2000)

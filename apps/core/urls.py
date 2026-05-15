@@ -56,8 +56,16 @@ from .views import (
     ComplianceDocumentViewSet,
     DataAccessConsentViewSet,
     HealthDataAccessGrantViewSet,
+    AIAssistanceSafetyPolicyView,
     CommandCenterOverview,
     MedicalContextView,
+    MonetizationSafetySummaryView,
+    PerformanceOfflinePolicyView,
+    SecurityPrivacyLaunchGateView,
+    StaffSafetyCommandCenterView,
+    SocialRecommendationFoundationView,
+    UnifiedPlatformDashboardSummaryView,
+    UnifiedSearchView,
 )
 
 app_name = "core"
@@ -123,6 +131,14 @@ urlpatterns = [
     path("", include((router.urls, app_name), namespace=app_name)),
     path("core/medical/context/", MedicalContextView.as_view(), name="medical-context"),
     path("core/clinical/command-center/", CommandCenterOverview.as_view(), name="clinical-command-center"),
+    path("core/search/unified/", UnifiedSearchView.as_view(), name="core-unified-search"),
+    path("core/recommendations/foundation/", SocialRecommendationFoundationView.as_view(), name="social-recommendation-foundation"),
+    path("core/dashboards/unified/", UnifiedPlatformDashboardSummaryView.as_view(), name="core-unified-dashboard"),
+    path("core/admin/safety-command-center/", StaffSafetyCommandCenterView.as_view(), name="core-admin-safety-command-center"),
+    path("core/performance/offline-policy/", PerformanceOfflinePolicyView.as_view(), name="core-performance-offline-policy"),
+    path("core/admin/security-launch-gate/", SecurityPrivacyLaunchGateView.as_view(), name="core-admin-security-launch-gate"),
+    path("core/monetization/safety-summary/", MonetizationSafetySummaryView.as_view(), name="core-monetization-safety-summary"),
+    path("core/ai/safety-policy/", AIAssistanceSafetyPolicyView.as_view(), name="core-ai-safety-policy"),
 ]
 
 # Optional: add schema / docs routes (uncomment if you use drf-yasg or drf-spectacular)

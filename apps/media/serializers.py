@@ -1,7 +1,7 @@
 # media/serializers.py
 from rest_framework import serializers
 from .models import (
-    MediaAsset, MediaVariant, ProcessingJob, Provenance, Watermark, AccessPolicy, MediaMetrics
+    MediaAsset, MediaVariant, ProcessingJob, Provenance, Watermark, AccessPolicy, MediaMetrics, MediaSafetyScan
 )
 
 class MediaVariantSerializer(serializers.ModelSerializer):
@@ -38,3 +38,26 @@ class AccessPolicySerializer(serializers.ModelSerializer):
     class Meta:
         model = AccessPolicy
         fields = "__all__"
+
+
+class MediaSafetyScanSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MediaSafetyScan
+        fields = (
+            "id",
+            "asset",
+            "upload_id",
+            "context",
+            "original_name",
+            "mime_type",
+            "bytes",
+            "provider",
+            "status",
+            "quarantine",
+            "requires_review",
+            "policy_version",
+            "reason",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields

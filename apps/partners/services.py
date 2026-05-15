@@ -35,6 +35,7 @@ from apps.partners.models import (
     PartnerOrganizationAppType,
     PartnerOrganizationAppAccessLog,
     PartnerChannelPermissionOverwrite,
+    PartnerModerationAction,
 )
 import json
 import hmac
@@ -495,6 +496,163 @@ def filter_partner_channels_for_user(channels, user: Optional[User]) -> list:
         if not getattr(channel, "partner_id", None) or partner_user_can_view_channel(channel, user):
             visible_channels.append(channel)
     return visible_channels
+
+
+def build_partner_discord_summary(partner: Partner, user: Optional[User]) -> dict:
+    """
+    Fast, compatibility-safe partner workspace summary for Discord-style clients.
+
+    This intentionally reads existing Partner/Channel/Conversation state instead
+    of introducing a parallel server model.
+    """
+    from apps.channels.models import Channel
+
+    roles = sorted(get_partner_user_roles(partner, user))
+    can_manage = partner_user_can_manage(partner, user)
+    membership = _get_active_partner_membership(partner, user)
+    policy = ensure_partner_policy(partner)
+    settings = policy.settings or {}
+    visible_apps = get_partner_organization_apps_for_user(partner, user)
+
+    all_channels = list(
+        Channel.objects.filter(partner=partner, is_archived=False)
+        .select_related("conversation", "category", "owner")
+        .prefetch_related("permission_overwrites__role", "permission_overwrites__user")
+        .order_by("category__order", "category__name", "order", "name")
+    )
+    visible_channels = filter_partner_channels_for_user(all_channels, user)
+    channel_ids = [channel.id for channel in visible_channels]
+    conversation_ids = [channel.conversation_id for channel in visible_channels if channel.conversation_id]
+    if partner.main_conversation_id:
+        conversation_ids.append(partner.main_conversation_id)
+
+    unread_total = 0
+    unread_by_conversation: dict[str, int] = {}
+    if user and getattr(user, "is_authenticated", False) and conversation_ids:
+        members = (
+            ConversationMember.objects.filter(
+                user=user,
+                conversation_id__in=conversation_ids,
+                left_at__isnull=True,
+                is_hidden=False,
+            )
+            .select_related("conversation")
+        )
+        for member in members:
+            last_seq = int(getattr(member.conversation, "last_message_seq", 0) or 0)
+            read_seq = int(getattr(member, "last_read_seq", 0) or 0)
+            unread = max(last_seq - read_seq, 0)
+            unread_total += unread
+            unread_by_conversation[str(member.conversation_id)] = unread
+
+    active_members = PartnerMembership.objects.filter(
+        partner=partner,
+        status__in=(PartnerMembershipStatus.MEMBER, PartnerMembershipStatus.SUBSCRIBER),
+        is_banned=False,
+    ).count()
+    pending_members = PartnerMembership.objects.filter(
+        partner=partner,
+        status__in=(PartnerMembershipStatus.PENDING, PartnerMembershipStatus.APPLICANT),
+        is_banned=False,
+    ).count()
+    open_applications = PartnerApplication.objects.filter(
+        partner=partner,
+        status="pending",
+    ).count()
+    open_moderation = PartnerModerationAction.objects.filter(
+        partner=partner,
+        revoked_at__isnull=True,
+    ).count()
+
+    permission_codes: set[str] = set()
+    for assignment in PartnerRoleAssignment.objects.filter(partner=partner, user=user).select_related("role"):
+        permission_codes.update(_role_permission_set(assignment.role))
+    if can_manage:
+        permission_codes.update(
+            {
+                "partner.roles.manage",
+                "partner.audit.view",
+                "partner.settings.manage",
+                "partner.access.manage",
+            }
+        )
+
+    channel_previews = []
+    for channel in visible_channels[:20]:
+        permissions = resolve_partner_channel_permissions(channel, user)
+        channel_previews.append(
+            {
+                "id": str(channel.id),
+                "name": channel.name,
+                "type": channel.channel_type,
+                "category_id": str(channel.category_id) if channel.category_id else None,
+                "conversation_id": str(channel.conversation_id),
+                "can_send": PARTNER_CHANNEL_PERMISSION_SEND in permissions,
+                "can_manage": PARTNER_CHANNEL_PERMISSION_MANAGE in permissions,
+                "unread_count": unread_by_conversation.get(str(channel.conversation_id), 0),
+            }
+        )
+
+    return {
+        "partner_id": str(partner.id),
+        "workspace": {
+            "name": partner.name,
+            "slug": partner.slug,
+            "is_active": partner.is_active,
+            "main_conversation_id": str(partner.main_conversation_id) if partner.main_conversation_id else None,
+        },
+        "membership": {
+            "status": getattr(membership, "status", None),
+            "role": getattr(membership, "role", None),
+            "roles": roles,
+            "can_manage": can_manage,
+            "permissions": sorted(permission_codes),
+            "is_muted": bool(getattr(membership, "is_muted", False)),
+            "is_banned": bool(getattr(membership, "is_banned", False)),
+            "timed_out_until": membership.timed_out_until.isoformat() if membership and membership.timed_out_until else None,
+        },
+        "counts": {
+            "active_members": active_members,
+            "pending_members": pending_members,
+            "categories": partner.server_categories.count(),
+            "visible_channels": len(visible_channels),
+            "total_channels": len(all_channels),
+            "roles": partner.roles.count(),
+            "apps": len(visible_apps),
+            "open_applications": open_applications,
+            "open_moderation_actions": open_moderation,
+            "unread_messages": unread_total,
+        },
+        "channels": channel_previews,
+        "readiness": {
+            "roles_ready": partner.roles.exists(),
+            "channels_ready": bool(channel_ids),
+            "onboarding_ready": hasattr(partner, "join_config"),
+            "audit_ready": True,
+            "moderation_ready": True,
+            "apps_ready": bool(visible_apps),
+            "low_bandwidth_ready": True,
+            "family_safe_media": True,
+            "legacy_wallet_disabled": True,
+        },
+        "safety": {
+            "media_gate": "enabled",
+            "explicit_content_provider_live_calls": False,
+            "quarantine_supported": True,
+            "policy": {
+                "audit_enabled": bool((settings.get("compliance") or {}).get("audit_enabled", True)),
+                "dlp_enabled": bool((settings.get("dlp") or {}).get("enabled", False)),
+                "message_retention_days": (settings.get("retention") or {}).get("message_retention_days"),
+                "uploads_per_hour": (settings.get("rate_limits") or {}).get("uploads_per_hour"),
+            },
+        },
+        "next_actions": [
+            {"key": "create_channel", "label": "Create a channel", "enabled": can_manage},
+            {"key": "invite_members", "label": "Invite members", "enabled": can_manage},
+            {"key": "review_applications", "label": "Review applications", "enabled": can_manage and open_applications > 0},
+            {"key": "open_moderation", "label": "Review moderation queue", "enabled": can_manage and open_moderation > 0},
+        ],
+    }
 
 
 def user_can_manage_organization_apps(partner: Partner, user: Optional[User]) -> bool:

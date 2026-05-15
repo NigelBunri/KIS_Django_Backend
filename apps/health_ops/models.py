@@ -146,6 +146,24 @@ class PaymentBillingStatus(models.TextChoices):
     CANCELLED = "cancelled", "Cancelled"
 
 
+class CarePlanStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    ACTIVE = "active", "Active"
+    PAUSED = "paused", "Paused"
+    COMPLETED = "completed", "Completed"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class VitalReadingType(models.TextChoices):
+    BLOOD_PRESSURE = "blood_pressure", "Blood Pressure"
+    HEART_RATE = "heart_rate", "Heart Rate"
+    TEMPERATURE = "temperature", "Temperature"
+    OXYGEN_SATURATION = "oxygen_saturation", "Oxygen Saturation"
+    BLOOD_GLUCOSE = "blood_glucose", "Blood Glucose"
+    WEIGHT = "weight", "Weight"
+    CUSTOM = "custom", "Custom"
+
+
 class EngineCompletionMode(models.TextChoices):
     STEP_PROGRESS = "step_progress", "Step Progress"
     VIDEO_ITEMS = "video_items", "Video Items"
@@ -308,6 +326,74 @@ class ServiceWorkflowSession(TimeStampedUUIDModel):
             models.Index(fields=["user", "status"]),
             models.Index(fields=["service", "created_at"]),
         ]
+
+
+class HealthCarePlan(TimeStampedUUIDModel):
+    institution = models.ForeignKey(HealthInstitution, on_delete=models.CASCADE, related_name="care_plans")
+    service = models.ForeignKey(HealthService, on_delete=models.SET_NULL, related_name="care_plans", null=True, blank=True)
+    workflow_session = models.ForeignKey(
+        ServiceWorkflowSession,
+        on_delete=models.SET_NULL,
+        related_name="care_plans",
+        null=True,
+        blank=True,
+    )
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="health_ops_care_plans")
+    title = models.CharField(max_length=180)
+    summary = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=24, choices=CarePlanStatus.choices, default=CarePlanStatus.ACTIVE, db_index=True)
+    goals = models.JSONField(default=list, blank=True)
+    tasks = models.JSONField(default=list, blank=True)
+    medication_summary = models.JSONField(default=dict, blank=True)
+    reminder_summary = models.JSONField(default=dict, blank=True)
+    next_review_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "health_ops_care_plan"
+        ordering = ["-updated_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["user", "status"]),
+            models.Index(fields=["workflow_session", "status"]),
+            models.Index(fields=["next_review_at"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class HealthVitalReading(TimeStampedUUIDModel):
+    institution = models.ForeignKey(HealthInstitution, on_delete=models.CASCADE, related_name="vital_readings")
+    workflow_session = models.ForeignKey(
+        ServiceWorkflowSession,
+        on_delete=models.SET_NULL,
+        related_name="vital_readings",
+        null=True,
+        blank=True,
+    )
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="health_ops_vital_readings")
+    reading_type = models.CharField(max_length=40, choices=VitalReadingType.choices, default=VitalReadingType.CUSTOM, db_index=True)
+    label = models.CharField(max_length=120, blank=True, default="")
+    value = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    unit = models.CharField(max_length=32, blank=True, default="")
+    systolic = models.PositiveIntegerField(null=True, blank=True)
+    diastolic = models.PositiveIntegerField(null=True, blank=True)
+    measured_at = models.DateTimeField(default=timezone.now, db_index=True)
+    source = models.CharField(max_length=64, blank=True, default="manual")
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "health_ops_vital_reading"
+        ordering = ["-measured_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "reading_type"]),
+            models.Index(fields=["user", "reading_type", "measured_at"]),
+            models.Index(fields=["workflow_session", "reading_type"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id}:{self.reading_type}:{self.measured_at}"
 
 
 class EngineSession(TimeStampedUUIDModel):

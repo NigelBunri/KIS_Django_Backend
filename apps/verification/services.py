@@ -115,6 +115,170 @@ def serialize_public_badge(badge: VerificationBadge) -> dict:
     }
 
 
+def _safe_iso(value):
+    return value.isoformat() if value else None
+
+
+def _days_until(value):
+    if not value:
+        return None
+    delta = value - timezone.now()
+    if delta.total_seconds() < 0:
+        return 0
+    return max(0, delta.days + (1 if delta.seconds or delta.microseconds else 0))
+
+
+def _trust_tier_for(subject: VerificationSubject | None, badges: list[dict]) -> str:
+    if not subject:
+        return "unverified"
+    status_value = str(subject.current_status or "").lower()
+    badge_codes = {str(item.get("code") or "") for item in badges}
+    if VerificationBadgeCode.OFFICIAL_PARTNER in badge_codes:
+        return "official"
+    if any(code in badge_codes for code in {
+        VerificationBadgeCode.ID_VERIFIED,
+        VerificationBadgeCode.LICENSED_PROVIDER,
+        VerificationBadgeCode.ACCREDITED_EDUCATION,
+        VerificationBadgeCode.TRUSTED_MERCHANT,
+    }):
+        return "verified_high"
+    if badges:
+        return "verified"
+    if status_value in {VerificationCaseStatus.SUBMITTED, VerificationCaseStatus.IN_REVIEW, VerificationCaseStatus.PROVIDER_PENDING}:
+        return "in_review"
+    if status_value == VerificationCaseStatus.NEEDS_MORE_INFO:
+        return "needs_info"
+    if status_value == VerificationCaseStatus.REJECTED:
+        return "not_approved"
+    return "unverified"
+
+
+def public_trust_summary(subject_type: str, subject_id, *, include_staff: bool = False) -> dict:
+    """Return a public-safe trust surface for any centralized verification subject.
+
+    This intentionally excludes evidence metadata, raw provider payloads, reviewer
+    notes, revoke reasons, document names, storage paths, IP addresses, and user
+    agent strings. Staff-only aggregate counts are safe for dashboards.
+    """
+    normalized_id = normalize_subject_id(subject_id)
+    if not normalized_id:
+        return {
+            "subject_type": subject_type,
+            "subject_id": str(subject_id or ""),
+            "display_name": "",
+            "verified": False,
+            "status": "",
+            "trust_tier": "unverified",
+            "trust_label": "Unverified",
+            "badges": [],
+            "badge_count": 0,
+            "last_verified_at": None,
+            "next_review_at": None,
+            "expiry": {"expires_soon": False, "days_until": None},
+            "privacy": {
+                "public_safe": True,
+                "raw_documents_exposed": False,
+                "provider_payload_exposed": False,
+                "storage_paths_exposed": False,
+            },
+        }
+    subject = VerificationSubject.objects.filter(subject_type=subject_type, subject_id=normalized_id).first()
+    if not subject:
+        return {
+            "subject_type": subject_type,
+            "subject_id": str(normalized_id),
+            "display_name": "",
+            "verified": False,
+            "status": "",
+            "trust_tier": "unverified",
+            "trust_label": "Unverified",
+            "badges": [],
+            "badge_count": 0,
+            "last_verified_at": None,
+            "next_review_at": None,
+            "expiry": {"expires_soon": False, "days_until": None},
+            "privacy": {
+                "public_safe": True,
+                "raw_documents_exposed": False,
+                "provider_payload_exposed": False,
+                "storage_paths_exposed": False,
+            },
+        }
+
+    now = timezone.now()
+    active_badge_qs = (
+        subject.badges.filter(status=VerificationBadgeStatus.ACTIVE, public=True)
+        .filter(models_q_not_expired(now))
+        .order_by("code")
+    )
+    badges = [serialize_public_badge(badge) for badge in active_badge_qs]
+    next_expiry = (
+        subject.badges.filter(status=VerificationBadgeStatus.ACTIVE, public=True, expires_at__isnull=False)
+        .filter(expires_at__gt=now)
+        .order_by("expires_at")
+        .values_list("expires_at", flat=True)
+        .first()
+    )
+    latest_case = subject.cases.order_by("-created_at").only("id", "status", "level", "provider", "submitted_at", "reviewed_at", "expires_at").first()
+    next_review_at = next_expiry or getattr(latest_case, "expires_at", None)
+    days_until = _days_until(next_review_at)
+    tier = _trust_tier_for(subject, badges)
+    trust_labels = {
+        "official": "Official verified",
+        "verified_high": "Strongly verified",
+        "verified": "Verified",
+        "in_review": "Verification in review",
+        "needs_info": "Needs more information",
+        "not_approved": "Not approved",
+        "unverified": "Unverified",
+    }
+    payload = {
+        "subject_type": subject.subject_type,
+        "subject_id": str(subject.subject_id),
+        "display_name": subject.display_name,
+        "verified": bool(badges),
+        "status": subject.current_status,
+        "level": subject.current_level,
+        "trust_tier": tier,
+        "trust_label": trust_labels.get(tier, "Unverified"),
+        "badges": badges,
+        "badge_count": len(badges),
+        "last_verified_at": _safe_iso(subject.last_verified_at),
+        "next_review_at": _safe_iso(next_review_at),
+        "latest_case": {
+            "id": str(latest_case.id),
+            "status": latest_case.status,
+            "level": latest_case.level,
+            "provider": latest_case.provider,
+            "submitted_at": _safe_iso(latest_case.submitted_at),
+            "reviewed_at": _safe_iso(latest_case.reviewed_at),
+        }
+        if latest_case
+        else None,
+        "expiry": {
+            "expires_soon": days_until is not None and days_until <= 30,
+            "days_until": days_until,
+        },
+        "privacy": {
+            "public_safe": True,
+            "raw_documents_exposed": False,
+            "provider_payload_exposed": False,
+            "storage_paths_exposed": False,
+            "revoke_reasons_exposed": False,
+        },
+    }
+    if include_staff:
+        payload["staff_evidence"] = {
+            "case_count": subject.cases.count(),
+            "active_badge_count": len(badges),
+            "revoked_badge_count": subject.badges.filter(status=VerificationBadgeStatus.REVOKED).count(),
+            "expired_badge_count": subject.badges.filter(status=VerificationBadgeStatus.EXPIRED).count(),
+            "audit_event_count": subject.audit_events.count(),
+            "open_case_count": subject.cases.filter(status__in=STAFF_QUEUE_STATUSES).count(),
+        }
+    return payload
+
+
 def verification_summary(subject_type: str, subject_id) -> dict:
     normalized_id = normalize_subject_id(subject_id)
     if not normalized_id:
@@ -154,6 +318,117 @@ def current_user_verification_status(user) -> dict:
         latest_case = subject.cases.order_by("-created_at").first()
     summary["case"] = serialize_case_status(latest_case) if latest_case else None
     return summary
+
+
+def _public_channel_trust(channel) -> dict:
+    badges = []
+    for item in getattr(channel, "verification_badges", []) or []:
+        code = str(item.get("code") if isinstance(item, dict) else item).strip()
+        if not code:
+            continue
+        badges.append({"code": code, "label": PUBLIC_BADGE_LABELS.get(code, code.replace("_", " ").title()), "level": "", "issued_at": None, "expires_at": None})
+    verified = bool(getattr(channel, "is_verified", False) or badges)
+    return {
+        "surface": "channel",
+        "subject_type": "broadcast_channel",
+        "subject_id": str(getattr(channel, "id", "")),
+        "display_name": getattr(channel, "display_name", "") or getattr(channel, "handle", ""),
+        "handle": getattr(channel, "handle", ""),
+        "verified": verified,
+        "status": "approved" if verified else "unverified",
+        "trust_tier": "verified" if verified else "unverified",
+        "trust_label": "Verified channel" if verified else "Channel",
+        "badges": badges,
+        "badge_count": len(badges),
+        "privacy": {
+            "public_safe": True,
+            "raw_documents_exposed": False,
+            "provider_payload_exposed": False,
+            "storage_paths_exposed": False,
+        },
+    }
+
+
+def unified_identity_trust_overview(user, *, include_staff: bool = False) -> dict:
+    subjects = VerificationSubject.objects.filter(owner=user).order_by("subject_type", "display_name", "created_at")
+    summaries = [public_trust_summary(subject.subject_type, subject.subject_id, include_staff=include_staff) for subject in subjects]
+    by_type = {}
+    for item in summaries:
+        key = item["subject_type"]
+        row = by_type.setdefault(key, {"total": 0, "verified": 0, "open": 0, "expiring": 0})
+        row["total"] += 1
+        row["verified"] += 1 if item.get("verified") else 0
+        row["open"] += 1 if item.get("trust_tier") in {"in_review", "needs_info"} else 0
+        row["expiring"] += 1 if item.get("expiry", {}).get("expires_soon") else 0
+
+    channels = []
+    try:
+        from apps.broadcasts.models import BroadcastChannel
+
+        channels = [_public_channel_trust(channel) for channel in BroadcastChannel.objects.filter(owner_user=user, is_deleted=False).order_by("display_name")[:25]]
+    except Exception:
+        channels = []
+
+    kcan_summary = None
+    try:
+        from apps.partners.models import Partner
+
+        partner = Partner.objects.filter(slug="kcan").first()
+        if partner:
+            kcan_summary = public_trust_summary(VerificationSubjectType.PARTNER, partner.id, include_staff=include_staff)
+            kcan_summary["surface"] = "bible_kcan_publisher"
+    except Exception:
+        kcan_summary = None
+
+    active_badges = VerificationBadge.objects.filter(subject__owner=user, status=VerificationBadgeStatus.ACTIVE, public=True).filter(models_q_not_expired(timezone.now())).count()
+    expiring_cases, expiring_badges = expiring_verification_items(days=30)
+    user_expiring_badges = [badge for badge in expiring_badges[:200] if badge.subject.owner_id == getattr(user, "id", None)]
+    payload = {
+        "generated_at": timezone.now().isoformat(),
+        "viewer": {"is_staff": bool(getattr(user, "is_staff", False))},
+        "counts": {
+            "subjects": len(summaries),
+            "verified_subjects": sum(1 for item in summaries if item.get("verified")),
+            "active_public_badges": active_badges,
+            "expiring_badges_30d": len(user_expiring_badges),
+            "channels": len(channels),
+            "verified_channels": sum(1 for item in channels if item.get("verified")),
+        },
+        "by_type": by_type,
+        "subjects": summaries,
+        "channels": channels,
+        "bible_kcan_publisher": kcan_summary,
+        "privacy": {
+            "public_safe": True,
+            "raw_documents_exposed": False,
+            "provider_payload_exposed": False,
+            "storage_paths_exposed": False,
+            "staff_only_evidence_visible": bool(include_staff),
+        },
+        "surfaces_ready": {
+            "profiles": True,
+            "channels": True,
+            "partners": True,
+            "shops": True,
+            "health": True,
+            "education": True,
+            "bible_kcan": bool(kcan_summary),
+            "commerce_sellers": True,
+            "broadcasts": True,
+        },
+    }
+    if include_staff:
+        open_cases = filter_staff_verification_cases({}).count()
+        pending_expiry_cases = expiring_cases.count()
+        pending_expiry_badges = expiring_badges.count()
+        payload["staff_evidence"] = {
+            "open_case_count": open_cases,
+            "expiring_case_count_30d": pending_expiry_cases,
+            "expiring_badge_count_30d": pending_expiry_badges,
+            "recent_audit_count": VerificationAuditEvent.objects.filter(created_at__gte=timezone.now() - timezone.timedelta(days=7)).count(),
+            "suspicious_signals": suspicious_verification_signals(),
+        }
+    return payload
 
 
 def _provider_case_lookup_id(value: str | None) -> str:

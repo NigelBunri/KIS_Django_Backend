@@ -1,10 +1,12 @@
 # Messaging Platform Roadmap Status
 
-Current status: Phase 00 completed. Implementation has not started from this roadmap.
+Current status: Phase 06 safe messaging media slice completed from the KIS 120 Percent roadmap. Phase 07 is next.
 
 ## Completed
 
 - Phase 00 planning document created.
+- Phase 05 KIS 120 Percent messaging trust layer reliability slice implemented.
+- Phase 06 KIS 120 Percent safe messaging media and family controls slice implemented.
 - Product spec created in `docs/messaging-platform-roadmap/product-spec.md`.
 - Phase 01-16 handoff documents created.
 
@@ -65,3 +67,63 @@ YYYY-MM-DD - Phase X
 - Best next prompt:
   - Use `docs/messaging-platform-roadmap/phase-01-message-reliability-and-cache.md`.
 
+2026-05-14 - Phase 05 / Messaging Trust Layer Reliability Slice
+- Files changed:
+  - `apps/chat/models.py`
+  - `apps/chat/services.py`
+  - `apps/chat/views.py`
+  - `apps/chat/tests.py`
+  - `apps/chat/migrations/0009_conversation_direct_key.py`
+  - `/Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend/src/chat/chat.types.ts`
+  - `/Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend/src/realtime/handlers/messages.ts`
+  - `/Users/nigel/dev/KIS/src/network/cache.tsx`
+  - `/Users/nigel/dev/KIS/src/Module/ChatRoom/normalizeConversation.ts`
+  - `/Users/nigel/dev/KIS/src/screens/tabs/MessagesScreen.tsx`
+  - `docs/kis-120-roadmap/status.md`
+  - `docs/messaging-platform-roadmap/status.md`
+  - `docs/BUILD_STATE.md`
+- Commands passed:
+  - `python3 manage.py check`
+  - `python3 manage.py makemigrations --check --dry-run`
+  - `python3 manage.py test apps.chat.tests.ConversationUnreadContractTests.test_direct_conversation_creation_is_canonical_and_restores_visibility apps.chat.tests.ConversationUnreadContractTests.test_internal_last_message_update_restores_hidden_direct_chat --noinput --keepdb`
+  - `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit`
+  - `cd /Users/nigel/dev/KIS && npx eslint src/network/cache.tsx src/Module/ChatRoom/normalizeConversation.ts src/screens/tabs/MessagesScreen.tsx --quiet`
+  - `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false`
+- Commands blocked:
+  - `python3 manage.py test apps.chat.tests.ConversationUnreadContractTests --noinput --keepdb` is still blocked by existing URL reverse-name failures for `conversation-list`, `conversation-search`, and `conversation-participant-search`.
+- Remaining risk:
+  - Existing duplicate direct conversations are not merged automatically.
+  - E2EE production policy and multi-device delivery QA remain later messaging work.
+  - Run `python3 manage.py migrate` before testing locally.
+- Best next prompt:
+  - Use the Phase 06 KIS 120 prompt in `docs/kis-120-roadmap/status.md`.
+
+2026-05-14 - Phase 06 / Safe Messaging Media And Family Controls
+- Files changed:
+  - `apps/media/safety.py`
+  - `apps/media/views.py`
+  - `apps/media/tests.py`
+  - `apps/statuses/serializers.py`
+  - `apps/statuses/tests.py`
+  - `apps/partners/serializers.py`
+  - `/Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend/src/realtime/handlers/messages.ts`
+  - `/Users/nigel/dev/KIS/src/Module/ChatRoom/uploadFileToBackend.ts`
+  - `/Users/nigel/dev/KIS/src/Module/ChatRoom/ChatRoomHandlers.tsx`
+  - `docs/kis-120-roadmap/status.md`
+  - `docs/messaging-platform-roadmap/status.md`
+  - `docs/BUILD_STATE.md`
+- Commands passed:
+  - `python3 manage.py check`
+  - `python3 manage.py makemigrations --check --dry-run`
+  - `python3 manage.py test apps.media.tests.MediaSafetyUploadTests apps.statuses.tests.StatusPrivacyContractTests.test_media_status_is_held_for_family_safety_review --noinput --keepdb`
+  - `cd /Users/nigel/All other files/CC/KIS/main_kis_bakend/backend/Nestjs/CC_Node_Backend && pnpm tsc --noEmit`
+  - `cd /Users/nigel/dev/KIS && npx eslint src/services/mediaSafety.ts src/Module/ChatRoom/uploadFileToBackend.ts src/Module/ChatRoom/ChatRoomHandlers.tsx --quiet`
+  - `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false`
+- Commands blocked:
+  - None in this phase.
+- Remaining risk:
+  - Live explicit-content provider calls remain disabled by default.
+  - Encrypted message content itself is not inspected by Nest; attachment safety is enforced at upload and send metadata boundaries.
+  - Real-device QA is still needed for voice/sticker/camera review-held upload feedback.
+- Best next prompt:
+  - Use the Phase 07 KIS 120 prompt in `docs/kis-120-roadmap/status.md`.

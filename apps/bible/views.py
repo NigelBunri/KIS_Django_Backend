@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 import secrets
 
@@ -26,6 +26,7 @@ from .models import (
     BibleAudio,
     BibleTranslationMetadata,
     BibleTranslationLicenseReviewStatus,
+    BiblePublishStatus,
     DailyDevotional,
     BibleDailyPassage,
     BibleMeditationPost,
@@ -938,6 +939,134 @@ class BibleStatsView(APIView):
                 "streak": max(history_count, 1),
             }
         )
+
+
+class BibleSpiritualGrowthSummaryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        now = timezone.now()
+        today = now.date()
+        history = ReadingHistory.objects.filter(user=user)
+        unique_days = {
+            value.date() if hasattr(value, "date") else value
+            for value in history.values_list("updated_at", flat=True)
+            if value
+        }
+        streak = 0
+        cursor = today
+        while cursor in unique_days:
+            streak += 1
+            cursor -= timedelta(days=1)
+        if not streak and unique_days:
+            streak = 1
+
+        active_events = BibleReadingPlanEvent.objects.filter(user=user, status="scheduled")
+        missed_events = BibleReadingPlanEvent.objects.filter(user=user, status="missed").count()
+        overdue_events = active_events.filter(start_at__lt=now).count()
+        next_event = active_events.order_by("start_at").first()
+        today_passage = (
+            BibleDailyPassage.objects.filter(
+                partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS,
+                status=BiblePublishStatus.PUBLISHED,
+                date=today,
+            )
+            .select_related("translation", "partner")
+            .first()
+        )
+        latest_meditation = (
+            BibleMeditationPost.objects.filter(
+                partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS,
+                status=BiblePublishStatus.PUBLISHED,
+            )
+            .order_by("-published_at", "-created_at")
+            .first()
+        )
+        current_prayer_month = (
+            BiblePrayerMonth.objects.filter(
+                partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS,
+                status=BiblePublishStatus.PUBLISHED,
+                year=today.year,
+                month=today.month,
+            )
+            .first()
+        )
+        prayer_day = None
+        if current_prayer_month:
+            prayer_day = BiblePrayerDay.objects.filter(prayer_month=current_prayer_month, day=today.day).first()
+
+        enrolled_courses = BibleCourseEnrollment.objects.filter(user=user)
+        active_courses = enrolled_courses.filter(status="active").count()
+        completed_courses = enrolled_courses.filter(status="completed").count()
+        upcoming_live_sessions = BibleLiveSession.objects.filter(
+            course__enrollments__user=user,
+            start_at__gte=now,
+        ).distinct().count()
+
+        public_translations = public_translation_queryset()
+        preference, _ = BiblePreference.objects.get_or_create(user=user)
+        kcan_partner = get_kcan_partner()
+        audit_count = (
+            BibleContentAuditLog.objects.filter(partner=kcan_partner).count()
+            if kcan_partner
+            else 0
+        )
+
+        payload = {
+            "counts": {
+                "reading_sessions": history.count(),
+                "bookmarks": BibleBookmark.objects.filter(user=user).count(),
+                "highlights": BibleHighlight.objects.filter(user=user).count(),
+                "notes": BibleNote.objects.filter(user=user).count(),
+                "memory_verses": MemoryVerse.objects.filter(user=user).count(),
+                "active_reading_plans": ReadingPlanEnrollment.objects.filter(user=user, status="active").count(),
+                "scheduled_reading_events": active_events.count(),
+                "missed_reading_events": missed_events + overdue_events,
+                "active_courses": active_courses,
+                "completed_courses": completed_courses,
+                "upcoming_live_sessions": upcoming_live_sessions,
+                "public_translations": public_translations.count(),
+            },
+            "journey": {
+                "streak": streak,
+                "today": today.isoformat(),
+                "today_passage": BibleDailyPassageSerializer(today_passage).data if today_passage else None,
+                "latest_meditation": BibleMeditationPostSerializer(latest_meditation).data if latest_meditation else None,
+                "prayer_focus": BiblePrayerDaySerializer(prayer_day).data if prayer_day else None,
+                "next_reading_event": BibleReadingPlanEventSerializer(next_event).data if next_event else None,
+            },
+            "readiness": {
+                "licensed_translations_ready": public_translations.exists(),
+                "offline_scripture_ready": bool(preference.enable_offline_cache),
+                "audio_sync_ready": bool(preference.enable_audio_sync),
+                "reading_plans_ready": ReadingPlan.objects.exists(),
+                "highlights_notes_ready": True,
+                "prayer_calendar_ready": bool(current_prayer_month),
+                "study_courses_ready": BibleCourse.objects.filter(is_bible_course=True, published=True).exists(),
+                "live_devotionals_ready": BibleLiveSession.objects.exists(),
+                "family_safe_journey": True,
+                "low_bandwidth_ready": True,
+            },
+            "publishing": {
+                "partner": kcan_partner.name if kcan_partner else KCAN_PARTNER_NAME,
+                "daily_passages": BibleDailyPassage.objects.filter(partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).count(),
+                "meditation_posts": BibleMeditationPost.objects.filter(partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).count(),
+                "prayer_months": BiblePrayerMonth.objects.filter(partner__slug__in=LEGACY_DEFAULT_PARTNER_SLUGS).count(),
+                "content_audit_events": audit_count,
+                "admin_evidence_ready": audit_count > 0,
+            },
+            "safety": {
+                "christian_principles": "enabled",
+                "media_gate": "enabled",
+                "explicit_content_provider_live_calls": False,
+                "quarantine_supported": True,
+                "child_youth_defaults": "family_safe",
+                "moderation_safe_spiritual_content": True,
+                "raw_storage_paths_exposed": False,
+            },
+        }
+        return Response(payload, status=status.HTTP_200_OK)
 
 
 def can_manage_partner_courses(user, partner: Partner) -> bool:

@@ -25,11 +25,45 @@ from . import models, serializers
 from .interoperability import export_patient_fhir_bundle, import_patient_fhir_bundle
 
 from apps.notifications import services as notification_services
+from .ai_assistance_safety import ai_assistance_safety_policy
+from .monetization_safety import monetization_without_legal_risk_summary
+from .performance_offline import performance_offline_policy
+from .platform_dashboards import unified_platform_dashboard_summary
+from .safety_command_center import staff_safety_command_center_summary
+from .security_launch_gate import security_privacy_child_safety_launch_gate
+from .social_recommendations import privacy_safe_social_recommendation_foundation
 
 # Convenience user model
 from django.apps import apps
 from django.conf import settings
 UserModel = apps.get_model(settings.AUTH_USER_MODEL)
+
+
+def _search_text(value) -> str:
+    return str(value or "").strip()
+
+
+def _display_user(user) -> str:
+    return (
+        _search_text(getattr(user, "display_name", ""))
+        or _search_text(getattr(user, "full_name", ""))
+        or _search_text(getattr(user, "username", ""))
+        or _search_text(getattr(user, "phone", ""))
+        or "KIS user"
+    )
+
+
+def _unified_result(*, kind: str, title: str, subtitle: str = "", target_type: str, target_id, route: str, score: int = 1, metadata=None):
+    return {
+        "kind": kind,
+        "title": title,
+        "subtitle": subtitle,
+        "target_type": target_type,
+        "target_id": str(target_id),
+        "route": route,
+        "score": score,
+        "metadata": metadata or {},
+    }
 
 
 def _resolve_patient_for_user(user):
@@ -215,6 +249,286 @@ class CanManageRolesPermission(IsAuthenticated):
 class CanAccessComplianceData(BasePermission):
     def has_permission(self, request, view):
         return bool(request.user and request.user.is_authenticated)
+
+
+class UnifiedSearchView(APIView):
+    permission_classes = [IsAuthenticated]
+    throttle_scope = "search"
+
+    def _limit(self, request):
+        try:
+            return min(max(int(request.query_params.get("limit") or 8), 1), 25)
+        except (TypeError, ValueError):
+            return 8
+
+    def _groups(self, request):
+        raw = _search_text(request.query_params.get("groups") or request.query_params.get("group") or "all").lower()
+        if not raw or raw == "all":
+            return {"contacts", "conversations", "channels", "channel_content", "bible", "health", "notifications", "verification"}
+        return {item.strip() for item in raw.split(",") if item.strip()}
+
+    def _search_contacts(self, request, query: str, limit: int):
+        qs = UserModel.objects.filter(is_active=True).filter(
+            Q(display_name__icontains=query)
+            | Q(username__icontains=query)
+            | Q(phone__icontains=query)
+            | Q(email__icontains=query)
+        ).exclude(id=request.user.id).order_by("display_name", "username", "phone")[:limit]
+        return [
+            _unified_result(
+                kind="contact",
+                title=_display_user(user),
+                subtitle=_search_text(getattr(user, "phone", "")),
+                target_type="user",
+                target_id=user.id,
+                route="Messages/AddContactOrDirectChat",
+                score=100,
+                metadata={"username": _search_text(getattr(user, "username", ""))},
+            )
+            for user in qs
+        ]
+
+    def _search_conversations(self, request, query: str, limit: int):
+        try:
+            from apps.chat.models import Conversation
+        except Exception:
+            return []
+        qs = (
+            Conversation.objects.filter(
+                memberships__user=request.user,
+                memberships__left_at__isnull=True,
+                memberships__is_hidden=False,
+            )
+            .filter(
+                Q(title__icontains=query)
+                | Q(description__icontains=query)
+                | Q(last_message_preview__icontains=query)
+                | Q(memberships__user__display_name__icontains=query)
+                | Q(memberships__user__phone__icontains=query)
+                | Q(memberships__user__username__icontains=query)
+            )
+            .distinct()
+            .order_by("-last_message_at", "-updated_at")[:limit]
+        )
+        rows = []
+        for conv in qs:
+            rows.append(
+                _unified_result(
+                    kind="conversation",
+                    title=_search_text(conv.title) or "Conversation",
+                    subtitle=_search_text(conv.last_message_preview),
+                    target_type="conversation",
+                    target_id=conv.id,
+                    route="Messages/ChatRoom",
+                    score=95,
+                    metadata={"conversation_type": conv.type},
+                )
+            )
+        return rows
+
+    def _search_channels(self, request, query: str, limit: int):
+        try:
+            from apps.broadcasts.models import BroadcastChannel
+        except Exception:
+            return []
+        qs = (
+            BroadcastChannel.objects.filter(is_deleted=False)
+            .filter(Q(is_public=True) | Q(owner_user=request.user) | Q(roles__user=request.user))
+            .filter(Q(handle__icontains=query) | Q(display_name__icontains=query) | Q(description__icontains=query))
+            .distinct()
+            .order_by("-subscriber_count", "-updated_at")[:limit]
+        )
+        return [
+            _unified_result(
+                kind="channel",
+                title=channel.display_name,
+                subtitle=f"@{channel.handle}",
+                target_type="broadcast_channel",
+                target_id=channel.id,
+                route="Broadcast/ChannelHome",
+                score=90,
+                metadata={"handle": channel.handle, "avatar_url": channel.avatar_url},
+            )
+            for channel in qs
+        ]
+
+    def _search_channel_content(self, request, query: str, limit: int):
+        try:
+            from apps.broadcasts.models import ChannelContent
+        except Exception:
+            return []
+        qs = (
+            ChannelContent.objects.select_related("channel")
+            .filter(is_deleted=False)
+            .filter(
+                Q(status="published", visibility__in=["public", "unlisted"])
+                | Q(channel__owner_user=request.user)
+                | Q(channel__roles__user=request.user)
+            )
+            .filter(Q(title__icontains=query) | Q(description__icontains=query) | Q(text_plain__icontains=query))
+            .distinct()
+            .order_by("-published_at", "-updated_at")[:limit]
+        )
+        return [
+            _unified_result(
+                kind="channel_content",
+                title=_search_text(content.title) or _search_text(content.text_plain)[:80] or "Channel content",
+                subtitle=content.channel.display_name,
+                target_type="channel_content",
+                target_id=content.id,
+                route="Broadcast/ChannelContentDetail",
+                score=85,
+                metadata={
+                    "channel_id": str(content.channel_id),
+                    "content_type": content.content_type,
+                    "thumbnail_url": content.thumbnail_url,
+                },
+            )
+            for content in qs
+        ]
+
+    def _search_bible(self, request, query: str, limit: int):
+        try:
+            from apps.bible.models import BibleVerse
+            from apps.bible.views import public_translation_queryset
+        except Exception:
+            return []
+        translation_ids = public_translation_queryset().values_list("id", flat=True)
+        qs = (
+            BibleVerse.objects.select_related("chapter", "chapter__book", "translation")
+            .filter(translation_id__in=translation_ids, text__icontains=query)
+            .order_by("chapter__book__order", "chapter__number", "number")[:limit]
+        )
+        rows = []
+        for verse in qs:
+            chapter = verse.chapter
+            book = chapter.book
+            reference = f"{book.name} {chapter.number}:{verse.number}"
+            rows.append(
+                _unified_result(
+                    kind="bible_verse",
+                    title=reference,
+                    subtitle=verse.text[:180],
+                    target_type="bible_verse",
+                    target_id=verse.id,
+                    route="Bible/Reader",
+                    score=80,
+                    metadata={
+                        "translation": str(verse.translation_id),
+                        "book": getattr(book, "code", "") or book.name,
+                        "chapter": chapter.number,
+                        "verse": verse.number,
+                    },
+                )
+            )
+        return rows
+
+    def _search_health(self, request, query: str, limit: int):
+        try:
+            from apps.broadcasts.models import BroadcastHealthInstitution
+        except Exception:
+            return []
+        qs = BroadcastHealthInstitution.objects.filter(
+            Q(name__icontains=query)
+            | Q(owner_name__icontains=query)
+            | Q(owner_phone__icontains=query)
+            | Q(owner_email__icontains=query)
+            | Q(institution_type__icontains=query)
+        ).order_by("-updated_at", "-created_at")[:limit]
+        return [
+            _unified_result(
+                kind="health_institution",
+                title=row.name,
+                subtitle=_search_text(getattr(row, "institution_type", "")),
+                target_type="health_institution",
+                target_id=row.id,
+                route="Health/Institution",
+                score=70,
+                metadata={},
+            )
+            for row in qs
+        ]
+
+    def _search_notifications(self, request, query: str, limit: int):
+        try:
+            from apps.notifications.models import Notification
+        except Exception:
+            return []
+        qs = (
+            Notification.objects.filter(user_id=request.user.id)
+            .filter(Q(title__icontains=query) | Q(body__icontains=query))
+            .order_by("-created_at")[:limit]
+        )
+        return [
+            _unified_result(
+                kind="notification",
+                title=row.title,
+                subtitle=row.body[:180],
+                target_type=row.target_type or "notification",
+                target_id=row.target_id or row.id,
+                route="Notifications/Detail",
+                score=60,
+                metadata={"notification_id": str(row.id), "read": bool(getattr(row, "is_read", False))},
+            )
+            for row in qs
+        ]
+
+    def _search_verification(self, request, query: str, limit: int):
+        try:
+            from apps.verification.models import VerificationSubject
+        except Exception:
+            return []
+        qs = VerificationSubject.objects.filter(owner=request.user).filter(
+            Q(display_name__icontains=query) | Q(subject_type__icontains=query) | Q(current_status__icontains=query)
+        ).order_by("-updated_at")[:limit]
+        return [
+            _unified_result(
+                kind="verification",
+                title=row.display_name,
+                subtitle=f"{row.subject_type} · {row.current_status}",
+                target_type="verification_subject",
+                target_id=row.id,
+                route="Profile/VerificationCenter",
+                score=50,
+                metadata={"subject_type": row.subject_type, "status": row.current_status},
+            )
+            for row in qs
+        ]
+
+    def get(self, request):
+        query = _search_text(request.query_params.get("q") or request.query_params.get("query"))
+        if len(query) < 2:
+            return Response({"query": query, "results": [], "groups": {}, "count": 0})
+        limit = self._limit(request)
+        groups = self._groups(request)
+        providers = {
+            "contacts": self._search_contacts,
+            "conversations": self._search_conversations,
+            "channels": self._search_channels,
+            "channel_content": self._search_channel_content,
+            "bible": self._search_bible,
+            "health": self._search_health,
+            "notifications": self._search_notifications,
+            "verification": self._search_verification,
+        }
+        grouped = {}
+        results = []
+        for key, provider in providers.items():
+            if key not in groups:
+                continue
+            rows = provider(request, query, limit)
+            grouped[key] = rows
+            results.extend(rows)
+        results.sort(key=lambda row: (int(row.get("score") or 0), row.get("title") or ""), reverse=True)
+        return Response(
+            {
+                "query": query,
+                "results": results[: limit * max(len(grouped), 1)],
+                "groups": grouped,
+                "count": len(results),
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 # ---------------------------
@@ -1841,3 +2155,77 @@ class ChannelSettingsViewSet(viewsets.GenericViewSet, mixins.RetrieveModelMixin,
     queryset = models.ChannelSettings.objects.select_related("channel").all()
     serializer_class = serializers.ChannelSettingsUpdateSerializer
     permission_classes = [IsAuthenticated]
+
+
+class SocialRecommendationFoundationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            limit = int(request.query_params.get("limit", 8))
+        except (TypeError, ValueError):
+            limit = 8
+        return Response(
+            privacy_safe_social_recommendation_foundation(request.user, limit=limit),
+            status=status.HTTP_200_OK,
+        )
+
+
+class UnifiedPlatformDashboardSummaryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(
+            unified_platform_dashboard_summary(request.user),
+            status=status.HTTP_200_OK,
+        )
+
+
+class StaffSafetyCommandCenterView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(
+            staff_safety_command_center_summary(),
+            status=status.HTTP_200_OK,
+        )
+
+
+class PerformanceOfflinePolicyView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(
+            performance_offline_policy(request.user),
+            status=status.HTTP_200_OK,
+        )
+
+
+class SecurityPrivacyLaunchGateView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(
+            security_privacy_child_safety_launch_gate(),
+            status=status.HTTP_200_OK,
+        )
+
+
+class MonetizationSafetySummaryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(
+            monetization_without_legal_risk_summary(),
+            status=status.HTTP_200_OK,
+        )
+
+
+class AIAssistanceSafetyPolicyView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(
+            ai_assistance_safety_policy(request.user),
+            status=status.HTTP_200_OK,
+        )

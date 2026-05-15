@@ -23,6 +23,7 @@ from rest_framework.permissions import IsAdminUser
 from apps.broadcasts.models import BroadcastHealthProfile
 from apps.billing.direct_payments import create_direct_payment_intent
 from apps.billing.services import debit_wallet_balance, get_wallet_account
+from apps.media.safety import validate_attachment_metadata_for_safe_messaging
 from apps.core.money import (
     KISC_MICRO_PER_KISC,
     KISC_MICRO_PER_USD_CENT,
@@ -54,6 +55,7 @@ from .models import (
     EngineSession,
     EngineStepDefinition,
     EngineStepProgress,
+    HealthCarePlan,
     HealthInstitution,
     HealthInstitutionMembership,
     HomeLogisticsSession,
@@ -72,6 +74,7 @@ from .models import (
     SecureMessagingStatus,
     ServiceEngineMap,
     ServiceWorkflowSession,
+    HealthVitalReading,
     VideoEngineItem,
     VideoEngineItemComment,
     VideoEngineItemLike,
@@ -103,6 +106,7 @@ from .serializers import (
     EmergencyDispatchStepUpdateSerializer,
     EmergencyDispatchTrackingSerializer,
     HealthInstitutionSerializer,
+    HealthCarePlanSerializer,
     HomeLogisticsEndSerializer,
     HomeLogisticsPayloadSerializer,
     HomeLogisticsSessionSerializer,
@@ -110,6 +114,7 @@ from .serializers import (
     HomeLogisticsStepUpdateSerializer,
     HomeLogisticsTrackingSerializer,
     HealthServiceSerializer,
+    HealthVitalReadingSerializer,
     InstitutionEngineManagedItemSerializer,
     PharmacyFulfillmentEndSerializer,
     PharmacyFulfillmentPayloadSerializer,
@@ -1425,6 +1430,38 @@ class HealthInstitutionDetailView(APIView):
         return Response({"institution": HealthInstitutionSerializer(institution).data}, status=status.HTTP_200_OK)
 
 
+class HealthCareSummaryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        workflows = ServiceWorkflowSession.objects.filter(user=request.user).select_related("institution", "service")
+        open_workflows = workflows.exclude(status__in=[WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED])
+        care_plans = HealthCarePlan.objects.filter(user=request.user).select_related("institution", "service")
+        active_care_plans = care_plans.exclude(status__in=["completed", "cancelled"])
+        latest_vitals = HealthVitalReading.objects.filter(user=request.user).select_related("institution")[:10]
+        reminders = NotificationReminderSession.objects.filter(user=request.user).exclude(
+            status__in=[NotificationReminderStatus.COMPLETED, NotificationReminderStatus.DISABLED, NotificationReminderStatus.CANCELLED]
+        )
+        return Response(
+            {
+                "summary": {
+                    "openWorkflowCount": open_workflows.count(),
+                    "activeCarePlanCount": active_care_plans.count(),
+                    "activeReminderCount": reminders.count(),
+                    "recentVitalCount": HealthVitalReading.objects.filter(user=request.user).count(),
+                    "providerMessagingReady": SecureMessagingSession.objects.filter(user=request.user).exists(),
+                    "videoCareReady": VideoConsultationSession.objects.filter(user=request.user).exists(),
+                    "lowBandwidthReady": True,
+                    "familySafeCare": True,
+                },
+                "care_plans": HealthCarePlanSerializer(active_care_plans[:20], many=True).data,
+                "latest_vitals": HealthVitalReadingSerializer(latest_vitals, many=True).data,
+                "workflows": ServiceWorkflowSessionSerializer(open_workflows[:20], many=True).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class HealthInstitutionVerificationStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -1549,6 +1586,54 @@ class HealthServiceListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         service = serializer.save()
         return Response({"service": HealthServiceSerializer(service).data}, status=status.HTTP_201_CREATED)
+
+
+class HealthCarePlanListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = HealthCarePlan.objects.filter(user=request.user).select_related("institution", "service", "workflow_session")
+        institution_id = request.query_params.get("institution")
+        workflow_id = request.query_params.get("workflow_session")
+        if institution_id:
+            qs = qs.filter(institution_id=institution_id)
+        if workflow_id:
+            qs = qs.filter(workflow_session_id=workflow_id)
+        return Response({"results": HealthCarePlanSerializer(qs[:80], many=True).data}, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def post(self, request):
+        institution = get_object_or_404(HealthInstitution, id=request.data.get("institution"))
+        if not _is_institution_member(request.user, institution):
+            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = HealthCarePlanSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        care_plan = serializer.save(user=request.user)
+        return Response({"care_plan": HealthCarePlanSerializer(care_plan).data}, status=status.HTTP_201_CREATED)
+
+
+class HealthVitalReadingListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = HealthVitalReading.objects.filter(user=request.user).select_related("institution", "workflow_session")
+        institution_id = request.query_params.get("institution")
+        reading_type = request.query_params.get("reading_type")
+        if institution_id:
+            qs = qs.filter(institution_id=institution_id)
+        if reading_type:
+            qs = qs.filter(reading_type=reading_type)
+        return Response({"results": HealthVitalReadingSerializer(qs[:120], many=True).data}, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def post(self, request):
+        institution = get_object_or_404(HealthInstitution, id=request.data.get("institution"))
+        if not _is_institution_member(request.user, institution):
+            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = HealthVitalReadingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        vital = serializer.save(user=request.user)
+        return Response({"vital": HealthVitalReadingSerializer(vital).data}, status=status.HTTP_201_CREATED)
 
 
 class ServiceEngineMappingView(APIView):
@@ -2641,6 +2726,10 @@ class SecureMessagingMessageCreateView(APIView):
 
         serializer = SecureMessageCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        metadata = serializer.validated_data.get("metadata", {})
+        if isinstance(metadata, dict):
+            validate_attachment_metadata_for_safe_messaging(metadata.get("attachments") or [])
+            validate_attachment_metadata_for_safe_messaging([metadata.get("attachment")] if metadata.get("attachment") else [])
 
         message = SecureMessage.objects.create(
             session=messaging_session,
@@ -2648,7 +2737,14 @@ class SecureMessagingMessageCreateView(APIView):
             message_type=serializer.validated_data["message_type"],
             body=serializer.validated_data.get("body", ""),
             attachment_url=serializer.validated_data.get("attachment_url"),
-            metadata=serializer.validated_data.get("metadata", {}),
+            metadata={
+                **(metadata if isinstance(metadata, dict) else {}),
+                "media_safety": {
+                    "status": "allowed",
+                    "quarantine_enabled": True,
+                    "provider_live_calls_enabled": False,
+                },
+            },
         )
 
         now_value = timezone.now()

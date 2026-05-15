@@ -37,6 +37,8 @@ from .models import (
     EducationInstitutionBroadcast,
     EducationInstitutionBooking,
     EducationInstitutionEnrollment,
+    EducationCourseQuestion,
+    EducationCourseReview,
     EducationInstitutionEvent,
     EducationInstitutionStaffAssignment,
     EducationInstitutionProgram,
@@ -1767,6 +1769,67 @@ class EducationInstitutionEnrollmentSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+
+class EducationCourseReviewSerializer(serializers.ModelSerializer):
+    user_id = serializers.UUIDField(source="user.id", read_only=True)
+    author_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EducationCourseReview
+        fields = [
+            "id",
+            "broadcast_id",
+            "course_id",
+            "user_id",
+            "author_name",
+            "rating",
+            "title",
+            "comment",
+            "status",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_author_name(self, obj: EducationCourseReview) -> str:
+        user = getattr(obj, "user", None)
+        return getattr(user, "display_name", "") or getattr(user, "username", "") or "Learner"
+
+
+class EducationCourseQuestionSerializer(serializers.ModelSerializer):
+    user_id = serializers.UUIDField(source="user.id", read_only=True)
+    author_name = serializers.SerializerMethodField()
+    answered_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EducationCourseQuestion
+        fields = [
+            "id",
+            "broadcast_id",
+            "course_id",
+            "user_id",
+            "author_name",
+            "question",
+            "answer",
+            "answered_by",
+            "answered_by_name",
+            "answered_at",
+            "status",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_author_name(self, obj: EducationCourseQuestion) -> str:
+        user = getattr(obj, "user", None)
+        return getattr(user, "display_name", "") or getattr(user, "username", "") or "Learner"
+
+    def get_answered_by_name(self, obj: EducationCourseQuestion) -> str:
+        user = getattr(obj, "answered_by", None)
+        return getattr(user, "display_name", "") or getattr(user, "username", "") or ""
 
 
 class EducationInstitutionBookingSerializer(serializers.ModelSerializer):

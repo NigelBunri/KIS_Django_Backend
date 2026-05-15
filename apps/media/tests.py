@@ -1,10 +1,12 @@
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
+from django.test import override_settings
 from rest_framework.test import APITestCase
 from urllib.parse import urlparse
 
-from .models import MediaAsset, ProcessingJob
+from .models import MediaAsset, MediaSafetyScan, ProcessingJob
 
 
 class MediaJobOwnershipTests(APITestCase):
@@ -105,3 +107,94 @@ class PrivateMediaAccessTests(APITestCase):
         asset_ids = {str(row["id"]) for row in rows}
         self.assertNotIn(str(self.private_asset.id), asset_ids)
         self.assertIn(str(self.public_asset.id), asset_ids)
+
+
+class MediaSafetyUploadTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(phone="+237670003201", password="TestPass123!", country="CM")
+        self.client.force_authenticate(self.user)
+
+    @override_settings(MEDIA_EXPLICIT_SCAN_REQUIRED=True, MEDIA_SAFETY_ENABLED=True)
+    def test_upload_creates_quarantined_safety_scan_when_scan_required(self):
+        upload = SimpleUploadedFile("family-photo.jpg", b"safe image bytes", content_type="image/jpeg")
+
+        response = self.client.post(
+            "/uploads/file",
+            {"file": upload, "context": "chat", "visibility": "private"},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        attachment = response.data["attachment"]
+        self.assertEqual(attachment["scanStatus"], "pending_review")
+        self.assertTrue(attachment["quarantined"])
+        self.assertTrue(attachment["requiresReview"])
+        self.assertEqual(attachment["url"], "")
+        self.assertEqual(attachment["safety"]["policyVersion"], "kis-christian-safety-v1")
+        scan = MediaSafetyScan.objects.get(upload_id=attachment["id"])
+        self.assertEqual(scan.context, "chat")
+        self.assertEqual(scan.status, "pending_review")
+        self.assertTrue(scan.quarantine)
+        self.assertEqual(scan.owner, self.user)
+
+    @override_settings(MEDIA_EXPLICIT_SCAN_REQUIRED=True, MEDIA_SAFETY_ENABLED=True)
+    def test_chat_upload_records_safe_audit_context_without_paths_or_secrets(self):
+        upload = SimpleUploadedFile("family-photo.jpg", b"safe image bytes", content_type="image/jpeg")
+
+        response = self.client.post(
+            "/uploads/file?conversationId=conv-1&clientId=client-1&device_id=device-1",
+            {"file": upload, "context": "dm", "visibility": "private"},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        scan = MediaSafetyScan.objects.get(upload_id=response.data["attachment"]["id"])
+        self.assertEqual(scan.context, "dm")
+        self.assertEqual(scan.result["conversation_id"], "conv-1")
+        self.assertEqual(scan.result["client_id"], "client-1")
+        self.assertIs(scan.result["device_id_present"], True)
+        self.assertNotIn("bucket_key", scan.result)
+        self.assertNotIn("path", scan.result)
+
+    @override_settings(MEDIA_EXPLICIT_SCAN_REQUIRED=False, MEDIA_SAFETY_ENABLED=True)
+    def test_upload_remains_usable_in_local_style_configuration(self):
+        upload = SimpleUploadedFile("family-photo.jpg", b"safe image bytes", content_type="image/jpeg")
+
+        response = self.client.post(
+            "/uploads/file",
+            {"file": upload, "context": "profile", "visibility": "private"},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        attachment = response.data["attachment"]
+        self.assertEqual(attachment["scanStatus"], "not_configured")
+        self.assertFalse(attachment["quarantined"])
+        scan = MediaSafetyScan.objects.get(upload_id=attachment["id"])
+        self.assertEqual(scan.context, "profile")
+        self.assertEqual(scan.status, "not_configured")
+
+    def test_upload_blocks_dangerous_extension_before_storage(self):
+        upload = SimpleUploadedFile("payload.sh", b"echo unsafe", content_type="text/plain")
+
+        response = self.client.post(
+            "/uploads/file",
+            {"file": upload, "context": "chat", "visibility": "private"},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(MediaSafetyScan.objects.count(), 0)
+
+    def test_safety_scan_list_is_limited_to_owner(self):
+        other = get_user_model().objects.create_user(phone="+237670003202", password="TestPass123!", country="CM")
+        own_scan = MediaSafetyScan.objects.create(owner=self.user, upload_id="own", context="chat", status="pending_review")
+        MediaSafetyScan.objects.create(owner=other, upload_id="other", context="chat", status="pending_review")
+
+        response = self.client.get("/api/v1/media-safety-scans/")
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.data.get("results", response.data)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(str(rows[0]["id"]), str(own_scan.id))

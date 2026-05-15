@@ -17,11 +17,13 @@ from .models import VerificationAuditEvent, VerificationBadge, VerificationCase
 from .providers import get_provider_adapter, provider_public_status
 from .services import (
     get_or_create_subject,
+    public_trust_summary,
     schedule_verification_expiry_notifications,
     start_education_institution_verification_case,
     start_health_institution_verification_case,
     start_partner_verification_case,
     start_user_verification_case,
+    unified_identity_trust_overview,
     user_subject_for,
     verification_summary,
 )
@@ -103,6 +105,73 @@ class UserVerificationFlowTests(APITestCase):
             ).exists()
         )
         self.assertTrue(verification_summary(VerificationSubjectType.USER, self.user.id)["verified"])
+
+    def test_public_trust_summary_excludes_private_verification_payloads(self):
+        subject = user_subject_for(self.user)
+        case = VerificationCase.objects.create(
+            subject=subject,
+            requested_by=self.user,
+            level="identity_verified",
+            status=VerificationCaseStatus.APPROVED,
+            provider="manual",
+            evidence_metadata={"documents": [{"private_media_id": "private-secret-doc"}]},
+            provider_payload={"secret": "provider-secret"},
+            submitted_at=timezone.now(),
+            reviewed_at=timezone.now(),
+        )
+        VerificationBadge.objects.create(
+            subject=subject,
+            case=case,
+            code=VerificationBadgeCode.VERIFIED_USER,
+            status=VerificationBadgeStatus.ACTIVE,
+            public=True,
+            expires_at=timezone.now() + timezone.timedelta(days=20),
+        )
+
+        summary = public_trust_summary(VerificationSubjectType.USER, self.user.id)
+        payload = json.dumps(summary)
+
+        self.assertTrue(summary["verified"])
+        self.assertEqual(summary["trust_tier"], "verified")
+        self.assertTrue(summary["expiry"]["expires_soon"])
+        self.assertNotIn("private-secret-doc", payload)
+        self.assertNotIn("provider-secret", payload)
+        self.assertFalse(summary["privacy"]["raw_documents_exposed"])
+
+    def test_trust_overview_endpoint_unifies_owned_subjects_and_staff_evidence(self):
+        subject = user_subject_for(self.user)
+        VerificationBadge.objects.create(
+            subject=subject,
+            code=VerificationBadgeCode.ID_VERIFIED,
+            status=VerificationBadgeStatus.ACTIVE,
+            public=True,
+        )
+
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get(reverse("verification:trust-overview"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["counts"]["subjects"], 1)
+        self.assertEqual(response.data["counts"]["verified_subjects"], 1)
+        self.assertFalse(response.data["privacy"]["raw_documents_exposed"])
+        self.assertNotIn("staff_evidence", response.data)
+
+        self.staff.is_staff = True
+        self.staff.save(update_fields=["is_staff"])
+        staff_subject = user_subject_for(self.staff)
+        VerificationCase.objects.create(
+            subject=staff_subject,
+            requested_by=self.staff,
+            level="identity_verified",
+            status=VerificationCaseStatus.SUBMITTED,
+            submitted_at=timezone.now(),
+        )
+        self.client.force_authenticate(user=self.staff)
+        staff_response = self.client.get(reverse("verification:trust-overview"))
+
+        self.assertEqual(staff_response.status_code, status.HTTP_200_OK)
+        self.assertIn("staff_evidence", staff_response.data)
+        self.assertIn("open_case_count", staff_response.data["staff_evidence"])
 
     def test_webhook_without_signature_is_rejected(self):
         response = self.client.post(reverse("verification:webhook", kwargs={"provider": "dojah"}), {"event": "test"}, format="json")

@@ -16,7 +16,9 @@ from .models import (
     Product,
     ProductAuthenticityCheck,
     ProductImage,
+    ProductQuestion,
     ProductRating,
+    ProductReview,
     ProductShare,
     ProductSubscription,
     ProductVariant,
@@ -182,6 +184,20 @@ class ProductImageAdmin(admin.ModelAdmin):
 @admin.register(ProductRating)
 class ProductRatingAdmin(admin.ModelAdmin):
     list_display = ('id', 'product', 'user', 'score')
+
+
+@admin.register(ProductReview)
+class ProductReviewAdmin(admin.ModelAdmin):
+    list_display = ('id', 'product', 'user', 'rating', 'status', 'helpful_count', 'created_at')
+    list_filter = ('status', 'rating')
+    search_fields = ('product__name', 'user__username', 'title', 'body')
+
+
+@admin.register(ProductQuestion)
+class ProductQuestionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'product', 'user', 'status', 'answered_by', 'created_at')
+    list_filter = ('status',)
+    search_fields = ('product__name', 'question', 'answer')
 
 
 @admin.register(ProductAuthenticityCheck)
