@@ -4119,8 +4119,26 @@ def _sync_health_profile_tables_from_payload(health_profile: BroadcastHealthProf
             if not owner_contact and isinstance(institution.get("ownerContact"), dict):
                 owner_contact = institution.get("ownerContact")
 
+            profile_owner_user = getattr(getattr(health_profile, "profile", None), "user", None)
             owner_user_id = str(owner_contact.get("userId") or owner_contact.get("user_id") or "").strip()
             owner_user = User.objects.filter(id=owner_user_id).first() if owner_user_id else None
+            if owner_user is None:
+                owner_user = profile_owner_user
+                if owner_user:
+                    owner_user_id = str(owner_user.id)
+                    owner_contact = {
+                        **owner_contact,
+                        "userId": owner_user_id,
+                        "user_id": owner_user_id,
+                        "name": str(
+                            owner_contact.get("name")
+                            or getattr(owner_user, "display_name", "")
+                            or getattr(owner_user, "username", "")
+                            or "Owner"
+                        ),
+                        "phone": str(owner_contact.get("phone") or getattr(owner_user, "phone", "") or ""),
+                        "email": str(owner_contact.get("email") or getattr(owner_user, "email", "") or ""),
+                    }
             membership = _sanitize_membership_settings(institution)
 
             institution_metadata = dict(institution)

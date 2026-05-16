@@ -1123,7 +1123,12 @@ def _bootstrap_health_ops_institution_from_broadcast(
             institution_ids.discard("")
             if clean_hint not in institution_ids:
                 continue
-            selected_role = _resolve_broadcast_membership_role(institution_payload, user)
+            profile_owner_id = str(getattr(getattr(profile, "profile", None), "user_id", "") or "")
+            selected_role = (
+                "owner"
+                if profile_owner_id and profile_owner_id == str(getattr(user, "id", "") or "")
+                else _resolve_broadcast_membership_role(institution_payload, user)
+            )
             if not selected_role:
                 return None, Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
             selected_institution = institution_payload
@@ -1242,7 +1247,12 @@ def _bootstrap_health_ops_context_from_broadcast(user, service_ref: str, institu
             institution_ids.discard("")
             if clean_hint not in institution_ids:
                 continue
-            selected_role = _resolve_broadcast_membership_role(institution_payload, user)
+            profile_owner_id = str(getattr(getattr(profile, "profile", None), "user_id", "") or "")
+            selected_role = (
+                "owner"
+                if profile_owner_id and profile_owner_id == str(getattr(user, "id", "") or "")
+                else _resolve_broadcast_membership_role(institution_payload, user)
+            )
             if not selected_role:
                 return None, Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
             selected_institution = institution_payload

@@ -163,6 +163,11 @@ def _flatten_phone(value: Any) -> str:
 def _resolve_role(user, institution: BroadcastHealthInstitution) -> tuple[str, bool, bool]:
     if str(getattr(institution, "owner_user_id", "") or "") == str(getattr(user, "id", "") or ""):
         return "owner", True, True
+    profile_owner_id = str(
+        getattr(getattr(getattr(institution, "health_profile", None), "profile", None), "user_id", "") or ""
+    )
+    if profile_owner_id and profile_owner_id == str(getattr(user, "id", "") or ""):
+        return "owner", True, True
 
     member_rows = list(institution.member_rows.all())
     for row in member_rows:
@@ -281,6 +286,7 @@ def _iter_accessible_broadcast_institutions(user) -> list[tuple[BroadcastHealthI
     rows = list(
         qs.filter(
             Q(owner_user=user)
+            | Q(health_profile__profile__user=user)
             | Q(member_rows__user=user)
             | (Q(member_rows__phone__isnull=False) if user_phone else Q(pk__in=[]))
         ).distinct()
@@ -317,7 +323,7 @@ def _ensure_dashboard_row(
 ) -> HealthDashboardInstitution:
     defaults = {
         "institution_uid": str(row.institution_uid or "").strip(),
-        "owner_user": row.owner_user,
+        "owner_user": row.owner_user or getattr(getattr(row.health_profile, "profile", None), "user", None),
         "institution_type": _normalize_type(row.institution_type),
         "name": str(row.name or "Health Institution").strip() or "Health Institution",
         "is_active": True,

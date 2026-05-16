@@ -148,6 +148,22 @@ class HealthDashboardLandingPageApiTests(TestCase):
         self.assertTrue(after_row.get("hasLandingPage"))
         self.assertIn(f"/health/institutions/{self.institution_uid}/landing-page/", after_row.get("landingPageUrl", ""))
 
+    def test_profile_owner_can_manage_even_when_owner_user_is_missing(self):
+        self.institution.owner_user = None
+        self.institution.save(update_fields=["owner_user", "updated_at"])
+
+        self.client.force_authenticate(self.owner)
+        create_response = self.client.post(self.landing_url, self._landing_payload(), format="json", secure=True)
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+
+        list_response = self.client.get(self.list_url, secure=True)
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK)
+        row = next(
+            item for item in list_response.data.get("results", []) if item.get("institutionId") == self.institution_uid
+        )
+        self.assertEqual(row.get("role"), "owner")
+        self.assertTrue(row.get("can_manage"))
+
     def test_public_user_can_view_existing_landing_page(self):
         self.client.force_authenticate(self.owner)
         create_response = self.client.post(self.landing_url, self._landing_payload(), format="json", secure=True)
