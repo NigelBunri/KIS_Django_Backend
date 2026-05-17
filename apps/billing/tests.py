@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -23,8 +24,8 @@ BACKEND_BILLING_ROOT = Path(__file__).resolve().parent
 REACT_NATIVE_ROOT = Path("/Users/nigel/dev/KIS")
 
 
-def _api_url(route_name: str) -> str:
-    url = reverse(route_name)
+def _api_url(route_name: str, args=None) -> str:
+    url = reverse(route_name, args=args)
     return url if url.endswith("/") else f"{url}/"
 
 
@@ -49,6 +50,16 @@ class BillingWalletFlowTests(TestCase):
             display_name="Recipient User",
             phone_country_code="+237",
             phone_number="677000111",
+        )
+        self.staff = User.objects.create_user(
+            phone="+237699000222",
+            country="CM",
+            password="pass1234",
+            username="billingstaff",
+            display_name="Billing Staff",
+            phone_country_code="+237",
+            phone_number="699000222",
+            is_staff=True,
         )
 
     @override_settings(KIS_LEGACY_WALLET_TRANSFER_ENABLED=True)
@@ -108,6 +119,293 @@ class BillingWalletFlowTests(TestCase):
 
     def test_amount_cents_passthrough_stays_unchanged(self):
         self.assertEqual(_parse_frontend_money_to_cents({"amount_cents": 1250}), 1250)
+
+    def test_profitability_entitlement_catalog_is_preview_only(self):
+        self.client.force_authenticate(self.sender)
+        res = self.client.get(_api_url("billing-profitability-entitlements"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertFalse(res.data["enforcement_enabled"])
+        self.assertFalse(res.data["billing_live"])
+        self.assertTrue(res.data["policy"]["preview_only"])
+        self.assertFalse(res.data["policy"]["hard_blocks_existing_free_behavior"])
+        self.assertIn("consumer_plus", {item["id"] for item in res.data["plans"]})
+        self.assertIn("creator.channels.limit", res.data["entitlements"])
+        self.assertFalse(res.data["entitlements"]["creator.channels.limit"]["enforced"])
+        self.assertIn("not cash", res.data["policy"]["promotional_credit_safety_copy"])
+
+    def test_profitability_command_center_is_aggregate_placeholder_only(self):
+        self.client.force_authenticate(self.sender)
+        res = self.client.get(_api_url("billing-profitability-command-center"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertFalse(res.data["tracking_live"])
+        self.assertEqual(res.data["privacy_mode"], "aggregate_placeholders_only")
+        self.assertTrue(res.data["guardrails"]["no_private_health_data"])
+        self.assertTrue(res.data["guardrails"]["no_payment_instrument_data"])
+        self.assertIn("commerce", res.data["module_revenue_potential"])
+        self.assertEqual(res.data["conversion_funnel"]["status"], "placeholder_not_tracking")
+
+    def test_profitability_launch_gate_is_no_go_and_non_enforcing(self):
+        self.client.force_authenticate(self.sender)
+        res = self.client.get(_api_url("billing-profitability-launch-gate"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertEqual(res.data["go_no_go"], "no_go_preview_only")
+        self.assertTrue(res.data["guardrails"]["no_live_charges"])
+        self.assertTrue(res.data["guardrails"]["no_entitlement_enforcement"])
+        self.assertTrue(res.data["guardrails"]["promotional_credits_non_cash"])
+        self.assertIn("legal_review", res.data["checklist"])
+        self.assertIn("flutterwave_direct_payment_proof", res.data["checklist"])
+        self.assertIn("production_feature_flag_state", res.data["checklist"])
+        self.assertEqual(res.data["checklist"]["legal_review"]["status"], "evidence_required")
+        self.assertFalse(res.data["profitability_command_center"]["tracking_live"])
+
+    def test_profitability_subscription_lifecycle_is_sandbox_readiness_only(self):
+        self.client.force_authenticate(self.sender)
+        res = self.client.get(_api_url("billing-profitability-subscription-lifecycle"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertEqual(res.data["mode"], "sandbox_readiness_preview_only")
+        self.assertFalse(res.data["payment_instruments_collected"])
+        self.assertFalse(res.data["production_provider_connected"])
+        self.assertTrue(res.data["guardrails"]["no_live_charges"])
+        self.assertTrue(res.data["guardrails"]["no_payment_instrument_collection"])
+        self.assertTrue(res.data["guardrails"]["no_kis_credit_cash_value"])
+        self.assertIn("trial_ready", res.data["subscription_lifecycle_states"])
+        self.assertIn("flutterwave_sandbox_keys", res.data["provider_sandbox_checks"])
+        self.assertIn("promotion_campaign_billing", res.data["one_time_billing_readiness"])
+        self.assertEqual(res.data["launch_gate"]["go_no_go"], "no_go_preview_only")
+
+    def test_profitability_revenue_ops_evidence_console_is_staff_only_read_only(self):
+        self.client.force_authenticate(self.sender)
+        denied = self.client.get(_api_url("billing-profitability-revenue-ops-evidence"), secure=True)
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.staff)
+        res = self.client.get(_api_url("billing-profitability-revenue-ops-evidence"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertEqual(res.data["access"], "staff_read_only")
+        self.assertEqual(res.data["go_no_go"], "no_go_evidence_required")
+        self.assertTrue(res.data["guardrails"]["staff_only"])
+        self.assertTrue(res.data["guardrails"]["read_only"])
+        self.assertTrue(res.data["guardrails"]["no_payment_instrument_collection"])
+        self.assertIn("legal_review", res.data["evidence_areas"])
+        self.assertIn("flutterwave_sandbox_proof", res.data["evidence_areas"])
+        self.assertIn("rollback_proof", res.data["evidence_areas"])
+        self.assertFalse(res.data["evidence_areas"]["legal_review"]["private_data_exposed"])
+
+    def test_profitability_evidence_workflow_plan_is_staff_only_redacted(self):
+        self.client.force_authenticate(self.sender)
+        denied = self.client.get(_api_url("billing-profitability-evidence-workflow-plan"), secure=True)
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.staff)
+        res = self.client.get(_api_url("billing-profitability-evidence-workflow-plan"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertEqual(res.data["access"], "staff_read_only")
+        self.assertEqual(res.data["workflow_mode"], "planned_no_migrations_created")
+        self.assertTrue(res.data["guardrails"]["no_database_migration_created"])
+        self.assertTrue(res.data["guardrails"]["private_media_references_only"])
+        self.assertTrue(res.data["guardrails"]["no_raw_documents"])
+        self.assertIn("approved", res.data["approval_states"])
+        self.assertIn("RevenueLaunchEvidenceRecord", res.data["model_plan"]["model_name"])
+        self.assertIn("raw_provider_payload", res.data["redacted_serializer_contract"]["blocked_fields"])
+        self.assertIn("flutterwave_sandbox_proof", res.data["evidence_areas"])
+        self.assertTrue(res.data["evidence_areas"]["flutterwave_sandbox_proof"]["requires_private_media_reference"])
+
+    def test_revenue_launch_evidence_storage_is_staff_only_redacted_and_audited(self):
+        self.client.force_authenticate(self.sender)
+        denied = self.client.get(_api_url("revenue-launch-evidence-list"), secure=True)
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.staff)
+        blocked = self.client.post(
+            _api_url("revenue-launch-evidence-list"),
+            {
+                "area": "legal_review",
+                "title": "Unsafe provider payload",
+                "redacted_summary": "Should be rejected.",
+                "raw_provider_payload": {"secret": "never-store"},
+            },
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(blocked.status_code, status.HTTP_400_BAD_REQUEST)
+
+        created = self.client.post(
+            _api_url("revenue-launch-evidence-list"),
+            {
+                "area": "legal_review",
+                "title": "Pricing terms review",
+                "owner_role": "legal_counsel",
+                "redacted_summary": "Counsel must approve pricing terms before monetization launch.",
+            },
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(created.data["status"], "draft")
+        self.assertEqual(created.data["area"], "legal_review")
+        self.assertEqual(len(created.data["audit_events"]), 1)
+        self.assertEqual(created.data["audit_events"][0]["event_type"], "evidence_record_created")
+
+        submitted = self.client.post(
+            _api_url("revenue-launch-evidence-submit", [created.data["id"]]),
+            {},
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(submitted.status_code, status.HTTP_200_OK)
+        self.assertEqual(submitted.data["status"], "submitted")
+        self.assertEqual(
+            set(event["event_type"] for event in submitted.data["audit_events"]),
+            {"evidence_record_submitted", "evidence_record_created"},
+        )
+
+    def test_revenue_readiness_scores_and_reviewer_roles_are_enforced(self):
+        self.client.force_authenticate(self.staff)
+        created = self.client.post(
+            _api_url("revenue-launch-evidence-list"),
+            {
+                "area": "legal_review",
+                "title": "Pricing terms review",
+                "owner_role": "legal_counsel",
+                "redacted_summary": "Counsel approval evidence summary.",
+            },
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+
+        denied = self.client.post(
+            _api_url("revenue-launch-evidence-approve", [created.data["id"]]),
+            {},
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(denied.data["code"], "missing_revenue_reviewer_role")
+
+        group = Group.objects.create(name="legal_reviewer")
+        self.staff.groups.add(group)
+        approved = self.client.post(
+            _api_url("revenue-launch-evidence-approve", [created.data["id"]]),
+            {},
+            format="json",
+            secure=True,
+        )
+        self.assertEqual(approved.status_code, status.HTTP_200_OK)
+        self.assertEqual(approved.data["status"], "approved")
+        self.assertEqual(approved.data["required_reviewer_role"], "legal_reviewer")
+
+        summary = self.client.get(_api_url("billing-profitability-revenue-readiness"), secure=True)
+        self.assertEqual(summary.status_code, status.HTTP_200_OK)
+        self.assertEqual(summary.data["ready_count"], 1)
+        self.assertEqual(summary.data["areas"]["legal_review"]["state"], "approved")
+        self.assertTrue(summary.data["areas"]["legal_review"]["can_current_user_review"])
+        self.assertEqual(summary.data["go_no_go"], "no_go_evidence_incomplete")
+
+    def test_staging_monetization_proof_workflows_are_staff_only_and_safe(self):
+        self.client.force_authenticate(self.sender)
+        denied = self.client.get(_api_url("billing-profitability-staging-proof-workflows"), secure=True)
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.staff)
+        res = self.client.get(_api_url("billing-profitability-staging-proof-workflows"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertEqual(res.data["mode"], "staging_evidence_capture_templates_only")
+        self.assertTrue(res.data["guardrails"]["staging_only"])
+        self.assertTrue(res.data["guardrails"]["no_live_charges"])
+        self.assertTrue(res.data["guardrails"]["no_production_provider_calls"])
+        self.assertTrue(res.data["guardrails"]["private_media_references_only"])
+        self.assertIn("flutterwave_sandbox_payment_link", res.data["workflows"])
+        self.assertIn("signed_webhook_replay", res.data["workflows"])
+        self.assertIn("private_media_signed_access", res.data["workflows"])
+        self.assertFalse(res.data["workflows"]["flutterwave_sandbox_payment_link"]["live_provider_call"])
+        self.assertFalse(res.data["workflows"]["signed_webhook_replay"]["stores_raw_payload"])
+
+    def test_production_go_no_go_checks_are_staff_only_and_block_live_launch(self):
+        self.client.force_authenticate(self.sender)
+        denied = self.client.get(_api_url("billing-profitability-production-go-no-go"), secure=True)
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.staff)
+        res = self.client.get(_api_url("billing-profitability-production-go-no-go"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertEqual(res.data["access"], "staff_read_only")
+        self.assertEqual(res.data["go_no_go"], "no_go_production_checks_blocked")
+        self.assertTrue(res.data["guardrails"]["no_live_charges"])
+        self.assertTrue(res.data["guardrails"]["no_production_provider_calls"])
+        self.assertTrue(res.data["checks"]["monetization_flags_disabled"]["ready"])
+        self.assertTrue(res.data["checks"]["legacy_money_flags_disabled"]["ready"])
+        self.assertTrue(res.data["checks"]["flutterwave_live_provider_disabled"]["ready"])
+        self.assertTrue(res.data["checks"]["promotional_credit_legal_safety"]["ready"])
+        self.assertFalse(res.data["checks"]["approved_evidence_coverage"]["ready"])
+        self.assertIn("approved_evidence_coverage", res.data["blocked_checks"])
+
+    def test_beta_launch_plan_is_staff_only_and_live_charges_gated(self):
+        self.client.force_authenticate(self.sender)
+        denied = self.client.get(_api_url("billing-profitability-beta-launch-plan"), secure=True)
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.staff)
+        res = self.client.get(_api_url("billing-profitability-beta-launch-plan"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertEqual(res.data["access"], "staff_read_only")
+        self.assertEqual(res.data["mode"], "limited_beta_plan_live_charges_gated")
+        self.assertEqual(res.data["go_no_go"], "no_go_beta_blocked")
+        self.assertTrue(res.data["guardrails"]["no_live_charges"])
+        self.assertTrue(res.data["guardrails"]["no_production_provider_calls"])
+        self.assertTrue(res.data["guardrails"]["no_entitlement_enforcement"])
+        self.assertTrue(res.data["guardrails"]["no_payment_instrument_collection"])
+        self.assertTrue(res.data["guardrails"]["no_promotion_checkout"])
+        self.assertTrue(res.data["guardrails"]["no_enterprise_lead_capture"])
+        self.assertIn("consumer_plus", res.data["modules"])
+        self.assertIn("creator_channels", res.data["modules"])
+        self.assertIn(res.data["modules"]["consumer_plus"]["state"], {"beta_not_ready", "blocked"})
+        self.assertIn("support_playbooks", res.data)
+        self.assertIn("rollback_playbooks", res.data)
+
+    def test_beta_operations_are_staff_only_and_invites_remain_gated(self):
+        self.client.force_authenticate(self.sender)
+        denied = self.client.get(_api_url("billing-profitability-beta-operations"), secure=True)
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.staff)
+        res = self.client.get(_api_url("billing-profitability-beta-operations"), secure=True)
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["enabled"])
+        self.assertEqual(res.data["access"], "staff_read_only")
+        self.assertEqual(res.data["mode"], "beta_cohort_operations_plan_live_charges_gated")
+        self.assertTrue(res.data["guardrails"]["no_live_charges"])
+        self.assertTrue(res.data["guardrails"]["no_payment_instrument_collection"])
+        self.assertTrue(res.data["guardrails"]["no_entitlement_enforcement"])
+        self.assertTrue(res.data["guardrails"]["no_enterprise_lead_capture"])
+        self.assertIn("consumer_plus", res.data["cohorts"])
+        self.assertIn(res.data["cohorts"]["consumer_plus"]["state"], {"paused", "blocked", "ready"})
+        self.assertFalse(res.data["cohorts"]["consumer_plus"]["invite_policy"]["public_invites_enabled"])
+        self.assertEqual(res.data["cohorts"]["consumer_plus"]["invite_policy"]["mode"], "manual_staff_invite_only")
+        self.assertTrue(res.data["cohorts"]["consumer_plus"]["owner_tracking"]["requires_named_people_before_beta"])
+        self.assertIn("support_templates", res.data)
+        self.assertIn("operations_checklist", res.data)
+        self.assertIn("final_beta_readiness", res.data)
+        self.assertEqual(res.data["final_beta_readiness"]["normal_user_copy_policy"]["state"], "compact_copy_required")
 
     def test_transfer_endpoint_disabled_by_default(self):
         self.client.force_authenticate(self.sender)

@@ -120,6 +120,14 @@ KIS_EDUCATION_DEFAULT_PAYMENT_PROVIDER = os.environ.get("KIS_EDUCATION_DEFAULT_P
 KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED = _env_bool("KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED", False)
 KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER = os.environ.get("KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER", "flutterwave").strip() or "flutterwave"
 
+# Profitability roadmap billing readiness. These flags expose preview metadata
+# only until legal/product/QA approval explicitly turns on live billing.
+KIS_PROFITABILITY_BILLING_ENABLED = _env_bool("KIS_PROFITABILITY_BILLING_ENABLED", False)
+KIS_PROFITABILITY_ENTITLEMENTS_ENFORCED = _env_bool("KIS_PROFITABILITY_ENTITLEMENTS_ENFORCED", False)
+KIS_PROFITABILITY_TRIALS_ENABLED = _env_bool("KIS_PROFITABILITY_TRIALS_ENABLED", False)
+KIS_PROFITABILITY_PROMOTION_CHECKOUT_ENABLED = _env_bool("KIS_PROFITABILITY_PROMOTION_CHECKOUT_ENABLED", False)
+KIS_PROFITABILITY_ENTERPRISE_LEADS_ENABLED = _env_bool("KIS_PROFITABILITY_ENTERPRISE_LEADS_ENABLED", False)
+
 # AI assistance safety. These defaults allow UI/policy placeholders but keep
 # networked provider calls disabled until an approved provider, moderation, and
 # privacy review are complete.

@@ -13,6 +13,8 @@ from .models import (
     DirectPaymentIntent,
     PaymentDispute,
     PromoCode,
+    RevenueLaunchEvidenceAuditEvent,
+    RevenueLaunchEvidenceRecord,
     WalletAccount,
     WalletLedgerEntry,
     WalletTransaction,
@@ -25,6 +27,26 @@ from .promotional_credits import (
 )
 from apps.core.models import HealthcareOrganization, PatientMasterRecord
 from apps.accounts.models import AccountTier, User
+from apps.media.models import MediaAsset
+from .profitability_revenue_readiness import evidence_record_is_expired, REVIEWER_ROLE_BY_AREA
+
+
+REVENUE_EVIDENCE_BLOCKED_KEYS = {
+    "raw_provider_payload",
+    "provider_payload",
+    "raw_callback",
+    "payment_card_data",
+    "card_number",
+    "bank_account_data",
+    "private_health_record",
+    "verification_document_bytes",
+    "document_bytes",
+    "raw_storage_path",
+    "secret",
+    "secret_key",
+    "api_key",
+    "token",
+}
 
 
 class WalletAccountSerializer(serializers.ModelSerializer):
@@ -138,6 +160,168 @@ class DirectPaymentAuditEventSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = fields
+
+
+class RevenueLaunchEvidenceAuditEventSerializer(serializers.ModelSerializer):
+    actor_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RevenueLaunchEvidenceAuditEvent
+        fields = [
+            "id",
+            "event_type",
+            "actor",
+            "actor_display",
+            "redacted_detail",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_actor_display(self, obj):
+        actor = getattr(obj, "actor", None)
+        if not actor:
+            return ""
+        return (
+            str(getattr(actor, "display_name", "") or "").strip()
+            or str(getattr(actor, "username", "") or "").strip()
+            or "KIS staff"
+        )
+
+
+class RevenueLaunchEvidenceRecordSerializer(serializers.ModelSerializer):
+    private_media_asset_id = serializers.PrimaryKeyRelatedField(
+        source="private_media_asset",
+        queryset=MediaAsset.objects.filter(is_deleted=False),
+        required=False,
+        allow_null=True,
+    )
+    reviewer_display = serializers.SerializerMethodField()
+    created_by_display = serializers.SerializerMethodField()
+    is_expired = serializers.SerializerMethodField()
+    required_reviewer_role = serializers.SerializerMethodField()
+    audit_events = RevenueLaunchEvidenceAuditEventSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = RevenueLaunchEvidenceRecord
+        fields = [
+            "id",
+            "area",
+            "title",
+            "status",
+            "owner_role",
+            "reviewer",
+            "reviewer_display",
+            "required_reviewer_role",
+            "private_media_asset_id",
+            "redacted_summary",
+            "expires_at",
+            "is_expired",
+            "submitted_at",
+            "reviewed_at",
+            "created_by",
+            "created_by_display",
+            "audit_events",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "reviewer",
+            "reviewer_display",
+            "required_reviewer_role",
+            "submitted_at",
+            "is_expired",
+            "reviewed_at",
+            "created_by",
+            "created_by_display",
+            "audit_events",
+            "created_at",
+            "updated_at",
+        ]
+
+    def _display_user(self, user):
+        if not user:
+            return ""
+        return (
+            str(getattr(user, "display_name", "") or "").strip()
+            or str(getattr(user, "username", "") or "").strip()
+            or "KIS staff"
+        )
+
+    def get_reviewer_display(self, obj):
+        return self._display_user(getattr(obj, "reviewer", None))
+
+    def get_created_by_display(self, obj):
+        return self._display_user(getattr(obj, "created_by", None))
+
+    def get_is_expired(self, obj):
+        return evidence_record_is_expired(obj)
+
+    def get_required_reviewer_role(self, obj):
+        return REVIEWER_ROLE_BY_AREA.get(getattr(obj, "area", ""), "")
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            blocked = sorted(
+                str(key)
+                for key in data.keys()
+                if str(key).strip().lower() in REVENUE_EVIDENCE_BLOCKED_KEYS
+            )
+            if blocked:
+                raise serializers.ValidationError(
+                    {
+                        "detail": "Revenue evidence stores redacted summaries and private media references only.",
+                        "blocked_fields": blocked,
+                    }
+                )
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        blocked_seen: list[str] = []
+
+        def scan(value, path=""):
+            if isinstance(value, dict):
+                for key, nested in value.items():
+                    normalized = str(key).strip().lower()
+                    if normalized in REVENUE_EVIDENCE_BLOCKED_KEYS:
+                        blocked_seen.append(path + str(key))
+                    scan(nested, f"{path}{key}.")
+            elif isinstance(value, list):
+                for idx, nested in enumerate(value):
+                    scan(nested, f"{path}{idx}.")
+
+        scan(attrs)
+        if blocked_seen:
+            raise serializers.ValidationError(
+                {
+                    "detail": "Revenue evidence stores redacted summaries and private media references only.",
+                    "blocked_fields": sorted(set(blocked_seen)),
+                }
+            )
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        record = RevenueLaunchEvidenceRecord.objects.create(
+            **validated_data,
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+        RevenueLaunchEvidenceAuditEvent.objects.create(
+            evidence_record=record,
+            event_type="evidence_record_created",
+            actor=user if getattr(user, "is_authenticated", False) else None,
+            redacted_detail={"area": record.area, "status": record.status},
+        )
+        if record.private_media_asset_id:
+            RevenueLaunchEvidenceAuditEvent.objects.create(
+                evidence_record=record,
+                event_type="private_media_reference_added",
+                actor=user if getattr(user, "is_authenticated", False) else None,
+                redacted_detail={"private_media_asset_id": str(record.private_media_asset_id)},
+            )
+        return record
 
 
 class CreditAccountSerializer(serializers.ModelSerializer):

@@ -206,6 +206,117 @@ class DirectPaymentAuditEvent(BaseEntity):
         ]
 
 
+class RevenueLaunchEvidenceRecord(BaseEntity):
+    AREA_CHOICES = [
+        ("legal_review", "Legal review"),
+        ("pastoral_child_safety_review", "Pastoral and child-safety review"),
+        ("tax_accounting_review", "Tax and accounting review"),
+        ("flutterwave_sandbox_proof", "Flutterwave sandbox proof"),
+        ("invoice_receipt_proof", "Invoice and receipt proof"),
+        ("refund_support_proof", "Refund and support proof"),
+        ("entitlement_grace_policy", "Entitlement grace policy"),
+        ("promotion_sponsored_label_policy", "Promotion sponsored-label policy"),
+        ("verification_fee_policy", "Verification fee policy"),
+        ("enterprise_contract_policy", "Enterprise contract policy"),
+        ("privacy_analytics_policy", "Privacy analytics policy"),
+        ("rollback_proof", "Rollback proof"),
+    ]
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("submitted", "Submitted"),
+        ("needs_changes", "Needs changes"),
+        ("approved", "Approved"),
+        ("rejected", "Rejected"),
+        ("expired", "Expired"),
+        ("revoked", "Revoked"),
+    ]
+
+    area = models.CharField(max_length=80, choices=AREA_CHOICES, db_index=True)
+    title = models.CharField(max_length=180)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default="draft", db_index=True)
+    owner_role = models.CharField(max_length=80, blank=True)
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="revenue_evidence_reviews",
+    )
+    private_media_asset = models.ForeignKey(
+        "media.MediaAsset",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="revenue_launch_evidence_records",
+    )
+    redacted_summary = models.TextField(blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="revenue_evidence_records_created",
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["area", "status"]),
+            models.Index(fields=["status", "expires_at"]),
+            models.Index(fields=["created_by", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.area}:{self.title}:{self.status}"
+
+
+class RevenueLaunchEvidenceAuditEvent(BaseEntity):
+    EVENT_CHOICES = [
+        ("evidence_record_created", "Evidence record created"),
+        ("evidence_record_updated", "Evidence record updated"),
+        ("evidence_record_submitted", "Evidence record submitted"),
+        ("evidence_record_reviewed", "Evidence record reviewed"),
+        ("evidence_record_approved", "Evidence record approved"),
+        ("evidence_record_rejected", "Evidence record rejected"),
+        ("evidence_record_revoked", "Evidence record revoked"),
+        ("evidence_record_expired", "Evidence record expired"),
+        ("private_media_reference_added", "Private media reference added"),
+        ("private_media_reference_removed", "Private media reference removed"),
+    ]
+
+    evidence_record = models.ForeignKey(
+        RevenueLaunchEvidenceRecord,
+        on_delete=models.CASCADE,
+        related_name="audit_events",
+    )
+    event_type = models.CharField(max_length=80, choices=EVENT_CHOICES, db_index=True)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="revenue_evidence_audit_events",
+    )
+    redacted_detail = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["event_type", "created_at"]),
+            models.Index(fields=["evidence_record", "created_at"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk and RevenueLaunchEvidenceAuditEvent.objects.filter(pk=self.pk).exists():
+            raise ValueError("Revenue launch evidence audit events are immutable.")
+        return super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"{self.event_type}:{self.evidence_record_id}"
+
+
 class PromoCode(BaseEntity):
     code = models.CharField(max_length=64, unique=True)
     description = models.TextField(blank=True)

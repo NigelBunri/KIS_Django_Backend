@@ -37,6 +37,8 @@ from .models import (
     PaymentDispute,
     PromoCode,
     PromoRedemption,
+    RevenueLaunchEvidenceAuditEvent,
+    RevenueLaunchEvidenceRecord,
     WalletAccount,
     WalletLedgerEntry,
     WalletTransaction,
@@ -53,8 +55,23 @@ from .serializers import (
     WalletTransactionSerializer,
     PromoCodeSerializer,
     PricingTierSerializer,
+    RevenueLaunchEvidenceRecordSerializer,
 )
 from .direct_payments import create_direct_payment_intent, reconcile_direct_payment_callback
+from .profitability_entitlements import get_profitability_entitlement_catalog
+from .profitability_analytics import get_profitability_command_center_summary
+from .profitability_beta_launch import get_profitability_beta_launch_plan
+from .profitability_beta_operations import get_profitability_beta_operations_summary
+from .profitability_evidence_workflow import get_revenue_evidence_workflow_plan
+from .profitability_launch_gate import get_profitability_launch_gate_summary
+from .profitability_production_go_no_go import get_profitability_production_go_no_go_summary
+from .profitability_revenue_ops import get_revenue_ops_evidence_console_summary
+from .profitability_revenue_readiness import (
+    get_revenue_launch_readiness_summary,
+    user_can_review_revenue_evidence,
+)
+from .profitability_staging_proof import get_staging_monetization_proof_workflows
+from .profitability_subscription_lifecycle import get_profitability_subscription_lifecycle_summary
 from apps.accounts.serializers import SubscriptionSerializer
 from .documents import build_invoice_urls, build_receipt_urls
 from .services import (
@@ -258,6 +275,7 @@ class IsFinanceAdmin(BasePermission):
             return self._check_organization_ownership(request.user, organization)
         return False
 
+
     def _extract_organization_id(self, request, view):
         org_id = request.query_params.get("organization")
         if org_id:
@@ -328,6 +346,167 @@ class IsFinanceAdmin(BasePermission):
             ).exists()
         except (ValueError, ValidationError):
             return False
+
+
+class ProfitabilityEntitlementCatalogView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(get_profitability_entitlement_catalog(user=request.user))
+
+
+class ProfitabilityCommandCenterView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(get_profitability_command_center_summary(user=request.user))
+
+
+class ProfitabilityLaunchGateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(get_profitability_launch_gate_summary(user=request.user))
+
+
+class ProfitabilitySubscriptionLifecycleView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(get_profitability_subscription_lifecycle_summary(user=request.user))
+
+
+class ProfitabilityRevenueOpsEvidenceView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(get_revenue_ops_evidence_console_summary(user=request.user))
+
+
+class ProfitabilityEvidenceWorkflowPlanView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(get_revenue_evidence_workflow_plan(user=request.user))
+
+
+class ProfitabilityRevenueReadinessView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(get_revenue_launch_readiness_summary(user=request.user))
+
+
+class ProfitabilityStagingProofWorkflowView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(get_staging_monetization_proof_workflows(user=request.user))
+
+
+class ProfitabilityProductionGoNoGoView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(get_profitability_production_go_no_go_summary(user=request.user))
+
+
+class ProfitabilityBetaLaunchPlanView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(get_profitability_beta_launch_plan(user=request.user))
+
+
+class ProfitabilityBetaOperationsView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(get_profitability_beta_operations_summary(user=request.user))
+
+
+class RevenueLaunchEvidenceRecordViewSet(viewsets.ModelViewSet):
+    serializer_class = RevenueLaunchEvidenceRecordSerializer
+    permission_classes = [IsAdminUser]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["area", "status", "owner_role"]
+    ordering_fields = ["created_at", "updated_at", "expires_at"]
+    ordering = ["-created_at"]
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        return (
+            RevenueLaunchEvidenceRecord.objects
+            .filter(is_deleted=False)
+            .select_related("created_by", "reviewer", "private_media_asset")
+            .prefetch_related("audit_events__actor")
+        )
+
+    def perform_update(self, serializer):
+        previous_media_asset_id = str(serializer.instance.private_media_asset_id or "")
+        record = serializer.save()
+        RevenueLaunchEvidenceAuditEvent.objects.create(
+            evidence_record=record,
+            event_type="evidence_record_updated",
+            actor=self.request.user,
+            redacted_detail={"area": record.area, "status": record.status},
+        )
+        next_media_asset_id = str(record.private_media_asset_id or "")
+        if previous_media_asset_id != next_media_asset_id:
+            RevenueLaunchEvidenceAuditEvent.objects.create(
+                evidence_record=record,
+                event_type="private_media_reference_added" if next_media_asset_id else "private_media_reference_removed",
+                actor=self.request.user,
+                redacted_detail={"private_media_asset_id": next_media_asset_id or previous_media_asset_id},
+            )
+
+    def _set_status(self, request, *, status_value: str, event_type: str):
+        record = self.get_object()
+        if status_value in {"approved", "rejected", "needs_changes", "revoked"} and not user_can_review_revenue_evidence(request.user, record.area):
+            return Response(
+                {
+                    "detail": "Your staff account does not have the required revenue evidence reviewer role for this area.",
+                    "code": "missing_revenue_reviewer_role",
+                    "area": record.area,
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        record.status = status_value
+        if status_value == "submitted":
+            record.submitted_at = timezone.now()
+        if status_value in {"approved", "rejected", "needs_changes", "revoked"}:
+            record.reviewer = request.user
+            record.reviewed_at = timezone.now()
+        record.save(update_fields=["status", "submitted_at", "reviewer", "reviewed_at", "updated_at"])
+        RevenueLaunchEvidenceAuditEvent.objects.create(
+            evidence_record=record,
+            event_type=event_type,
+            actor=request.user,
+            redacted_detail={"area": record.area, "status": record.status},
+        )
+        record = self.get_queryset().get(pk=record.pk)
+        serializer = self.get_serializer(record)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"], url_path="submit")
+    def submit(self, request, pk=None):
+        return self._set_status(request, status_value="submitted", event_type="evidence_record_submitted")
+
+    @action(detail=True, methods=["post"], url_path="approve")
+    def approve(self, request, pk=None):
+        return self._set_status(request, status_value="approved", event_type="evidence_record_approved")
+
+    @action(detail=True, methods=["post"], url_path="needs-changes")
+    def needs_changes(self, request, pk=None):
+        return self._set_status(request, status_value="needs_changes", event_type="evidence_record_reviewed")
+
+    @action(detail=True, methods=["post"], url_path="reject")
+    def reject(self, request, pk=None):
+        return self._set_status(request, status_value="rejected", event_type="evidence_record_rejected")
+
+    @action(detail=True, methods=["post"], url_path="revoke")
+    def revoke(self, request, pk=None):
+        return self._set_status(request, status_value="revoked", event_type="evidence_record_revoked")
 
 
 def _current_subscription(user: User) -> Subscription | None:
