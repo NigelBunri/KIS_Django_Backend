@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from io import StringIO
 from uuid import uuid4
 
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -126,6 +128,17 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
         self.assertTrue(serializer.is_valid(), serializer.errors)
         self.assertEqual(serializer.validated_data["total_amount_micro"], 123456)
         self.assertEqual(serializer.validated_data["payable_amount_micro"], 654321)
+
+    def test_verify_health_launch_command_passes_safe_local_defaults(self):
+        output = StringIO()
+
+        call_command("verify_health_launch", stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn("Health launch guardrails ready: True", rendered)
+        self.assertIn("PASS: KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED - disabled", rendered)
+        self.assertIn("PASS: KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER - flutterwave", rendered)
+        self.assertIn("PASS: MEDIA_SAFETY_ENABLED", rendered)
 
     def test_care_summary_exposes_care_plan_vitals_and_workflow_counts(self):
         workflow = ServiceWorkflowSession.objects.create(

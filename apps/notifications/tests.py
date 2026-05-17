@@ -207,6 +207,10 @@ class MainTabBadgeCountsAPITest(APITestCase):
         cases = [
             ("BIBLE_DAILY_MEDITATION", "bible_meditation_post", "bible", "Bible"),
             ("CHANNEL_CONTENT_PUBLISHED", "channel_content", "broadcast", "Broadcast"),
+            ("EDUCATION_COURSE_UPDATE", "education_content", "broadcast", "Broadcast"),
+            ("HEALTH_INSTITUTION_UPDATE", "health_institution", "broadcast", "Broadcast"),
+            ("MARKET_PRODUCT_UPDATE", "product", "broadcast", "Broadcast"),
+            ("MARKET_SERVICE_UPDATE", "shop_service", "broadcast", "Broadcast"),
             ("PARTNER_GROUP_MESSAGE", "partner_group", "partners", "Partners"),
             ("ACCOUNT_SECURITY_ALERT", "account", "profile", "Profile"),
         ]
@@ -224,26 +228,69 @@ class MainTabBadgeCountsAPITest(APITestCase):
                 )
                 self.assertEqual(notification.context_data.get("source"), expected_source)
                 self.assertEqual(notification.context_data.get("badge_source"), expected_source)
+                self.assertEqual(notification.context_data.get("type"), notification_type)
+                self.assertEqual(notification.context_data.get("notification_type"), notification_type)
+                self.assertEqual(notification.context_data.get("target_type"), target_type)
+                self.assertEqual(notification.context_data.get("target_id"), str(target_id))
 
                 response = self.client.get("/api/v1/notifications/main-tab-badge-counts/")
                 self.assertEqual(response.status_code, 200)
                 self.assertGreaterEqual(response.data["counts"][tab_name], 1)
 
-                mark_response = self.client.post(
-                    "/api/v1/notifications/mark-source-read/",
-                    {
-                        "source": expected_source,
-                        "target_type": target_type,
-                        "target_id": str(target_id),
-                    },
-                    format="json",
-                )
+                with patch("apps.notifications.views.notify_main_tab_badges_updated"):
+                    mark_response = self.client.post(
+                        "/api/v1/notifications/mark-source-read/",
+                        {
+                            "source": expected_source,
+                            "target_type": target_type,
+                            "target_id": str(target_id),
+                        },
+                        format="json",
+                    )
                 self.assertEqual(mark_response.status_code, 200)
                 self.assertEqual(mark_response.data["updated"], 1)
 
                 response = self.client.get("/api/v1/notifications/main-tab-badge-counts/")
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.data["counts"][tab_name], 0)
+
+    def test_mark_source_read_accepts_consumer_screen_target_aliases(self):
+        target_id = uuid.uuid4()
+        aliases = [
+            ("BIBLE_DAILY_PASSAGE", "bible", "bible_daily_passage", "bible"),
+            ("CHANNEL_CONTENT_PUBLISHED", "broadcast", "channel_content", "broadcast"),
+            ("EDUCATION_LESSON_UPDATE", "education", "course", "broadcast"),
+            ("HEALTH_APPOINTMENT_REMINDER", "health", "health_appointment", "broadcast"),
+            ("MARKET_PRODUCT_UPDATE", "market", "product", "broadcast"),
+            ("PARTNER_GROUP_MESSAGE", "partners", "partner_group", "partners"),
+        ]
+        with patch("apps.notifications.tasks.process_notification_delivery.delay"):
+            for notification_type, mark_source, mark_target_type, expected_source in aliases:
+                notification = services.create_notification(
+                    user_id=self.user.id,
+                    type=notification_type,
+                    title="Unread",
+                    body="Unread",
+                    target_type=mark_target_type,
+                    target_id=target_id,
+                )
+                self.assertEqual(notification.context_data.get("badge_source"), expected_source)
+
+                with patch("apps.notifications.views.notify_main_tab_badges_updated"):
+                    mark_response = self.client.post(
+                        "/api/v1/notifications/mark-source-read/",
+                        {
+                            "source": mark_source,
+                            "target_type": mark_target_type,
+                            "target_id": str(target_id),
+                        },
+                        format="json",
+                    )
+
+                self.assertEqual(mark_response.status_code, 200)
+                self.assertEqual(mark_response.data["updated"], 1)
+                notification.refresh_from_db()
+                self.assertTrue(notification.is_read)
 
     def test_message_badge_decrements_after_mark_read(self):
         from apps.chat.models import Conversation, ConversationMember, ConversationType, BaseConversationRole

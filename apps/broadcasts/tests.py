@@ -41,6 +41,9 @@ from apps.broadcasts.models import (
     EducationInstitutionBroadcast,
     EducationInstitutionCourse,
     EducationInstitutionEnrollment,
+    EducationInstitutionMembership,
+    EducationInstitutionMembershipRole,
+    EducationInstitutionMembershipStatus,
     EducationInstitutionEvent,
     EducationCourseQuestion,
     EducationCourseReview,
@@ -507,6 +510,39 @@ class BroadcastChannelApiTests(APITestCase):
         self.assertEqual(public_response.data["seo"]["canonical_url"], f"https://kis.example/channels/api-channel/content/{public_content.id}")
         self.assertEqual(private_response.status_code, status.HTTP_404_NOT_FOUND)
         self.assertEqual(child_response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @override_settings(KIS_PUBLIC_WEB_ENABLED=True, KIS_PUBLIC_WEB_BASE_URL="https://kis.example")
+    def test_public_content_landing_sanitizes_private_asset_urls(self):
+        content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type=ChannelContentType.VIDEO,
+            title="Public video",
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            thumbnail_url="private/raw/thumb.jpg",
+            created_by=self.owner,
+        )
+        ChannelContentAsset.objects.create(
+            content=content,
+            asset_type="video",
+            url="private/raw/video.mp4",
+            storage_path="private/raw/video.mp4",
+            thumbnail_url="https://cdn.example.com/private/raw/thumb.jpg",
+            mime_type="video/mp4",
+            metadata={"private_email": "owner@example.com"},
+        )
+
+        response = self.client.get(f"/api/v1/broadcasts/public/contents/{content.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        rendered = json.dumps(response.data)
+        self.assertEqual(response.data["thumbnail_url"], "")
+        self.assertEqual(response.data["asset"]["url"], "")
+        self.assertEqual(response.data["asset"]["thumbnail_url"], "")
+        self.assertNotIn("storage_path", rendered)
+        self.assertNotIn("private/raw", rendered)
+        self.assertNotIn("owner@example.com", rendered)
 
     @override_settings(KIS_PUBLIC_WEB_ENABLED=True, KIS_PUBLIC_WEB_INDEXING_ENABLED=False)
     def test_public_robots_defaults_to_noindex_until_qa(self):
@@ -1060,6 +1096,48 @@ class ChannelEngagementTests(APITestCase):
         self.assertIn('summary', response.data)
         self.assertGreaterEqual(response.data['summary']['views'], 1)
         self.assertTrue(ChannelAnalyticsDailyRollup.objects.filter(channel=self.channel, date=timezone.localdate()).exists())
+
+
+@override_settings(
+    KIS_EMBEDS_ENABLED=False,
+    KIS_PUBLIC_WEB_INDEXING_ENABLED=False,
+    KIS_PUBLIC_REFERRALS_ENABLED=False,
+    LIVE_STREAM_PROVIDER='disabled',
+    LIVE_STREAM_PROVIDER_SANDBOX_ENABLED=False,
+    KIS_CHANNEL_MEDIA_LIVE_PROVIDER_CALLS_ENABLED=False,
+)
+class BroadcastChannelsLaunchProofCommandTests(SimpleTestCase):
+    def test_verify_broadcast_channels_launch_command_passes_safe_defaults(self):
+        output = StringIO()
+
+        call_command('verify_broadcast_channels_launch', stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn('Broadcast/Channels launch guardrails ready: True', rendered)
+        self.assertIn('PASS: broadcast_channel_urls_present', rendered)
+        self.assertIn('PASS: channel_asset_public_serialization', rendered)
+        self.assertIn('PASS: channel_media_safety_gate', rendered)
+        self.assertNotIn('private/raw/video.mp4', rendered)
+
+
+@override_settings(
+    KIS_PUBLIC_WEB_ENABLED=True,
+    KIS_PUBLIC_WEB_INDEXING_ENABLED=False,
+    KIS_PUBLIC_REFERRALS_ENABLED=False,
+    KIS_EMBEDS_ENABLED=False,
+)
+class PublicWebLaunchProofCommandTests(SimpleTestCase):
+    def test_verify_public_web_launch_command_passes_safe_defaults(self):
+        output = StringIO()
+
+        call_command("verify_public_web_launch", stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn("Public web launch guardrails ready: True", rendered)
+        self.assertIn("PASS: public_web_routes_present", rendered)
+        self.assertIn("PASS: public_media_url_sanitizer", rendered)
+        self.assertIn("PASS: public_asset_payload_redaction", rendered)
+        self.assertNotIn("private/raw/video.mp4", rendered)
 
 
 class BroadcastProfileManageTests(APITestCase):
@@ -2509,10 +2587,22 @@ class EducationCourseraCoreTests(APITestCase):
             title='Foundations of Service',
             summary='Learn with excellence.',
             description='A complete course detail.',
+            booking_enabled=True,
             price_amount='15.00',
             price_currency='USD',
             status='published',
         )
+
+    def test_verify_education_launch_command_passes_safe_local_defaults(self):
+        output = StringIO()
+
+        call_command('verify_education_launch', stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn('Education launch guardrails ready: True', rendered)
+        self.assertIn('PASS: KIS_LEGACY_EDUCATION_WALLET_CHECKOUT_ENABLED - disabled', rendered)
+        self.assertIn('PASS: KIS_EDUCATION_DEFAULT_PAYMENT_PROVIDER - flutterwave', rendered)
+        self.assertIn('PASS: MEDIA_SAFETY_ENABLED', rendered)
 
     def test_discovery_exposes_coursera_style_trust_payment_and_safety_summaries(self):
         self.client.force_authenticate(self.learner)
@@ -2566,3 +2656,31 @@ class EducationCourseraCoreTests(APITestCase):
             format='json',
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_paid_content_enrollment_uses_usd_direct_payment_without_wallet(self):
+        EducationInstitutionMembership.objects.create(
+            institution=self.institution,
+            user=self.learner,
+            role=EducationInstitutionMembershipRole.STUDENT,
+            status=EducationInstitutionMembershipStatus.ACTIVE,
+            decided_by=self.owner,
+            decided_at=timezone.now(),
+        )
+        self.client.force_authenticate(self.learner)
+
+        response = self.client.post(
+            f'/api/v1/education/contents/{self.broadcast.id}/enroll/',
+            {},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        booking = response.data['booking']
+        self.assertEqual(booking['currency'], 'USD')
+        self.assertEqual(booking['payment_provider'], 'flutterwave')
+        self.assertEqual(booking['payment_status'], 'pending')
+        self.assertTrue(booking['payment_required'])
+        self.assertIsNone(booking['wallet_transaction_id'])
+        self.assertIsNotNone(booking['payment_intent_id'])
+        intent = DirectPaymentIntent.objects.get(id=booking['payment_intent_id'])
+        self.assertEqual(intent.target_type, DirectPaymentIntent.TARGET_EDUCATION_BOOKING)

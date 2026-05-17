@@ -1,5 +1,7 @@
 from unittest.mock import patch
+from io import StringIO
 
+from django.core.management import call_command
 from django.test import TestCase
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -10,7 +12,9 @@ from apps.chat.models import BaseConversationRole, Conversation, ConversationMem
 from apps.partners.models import (
     Partner,
     PartnerApplication,
+    PartnerAuditEvent,
     PartnerAutomationRule,
+    PartnerIntegration,
     PartnerInvite,
     PartnerJoinConfig,
     PartnerMembership,
@@ -22,8 +26,18 @@ from apps.partners.models import (
     PartnerOrganizationProfile,
     PartnerPost,
     PartnerRole,
+    PartnerWebhook,
+    PartnerWebhookDelivery,
 )
-from apps.partners.serializers import PartnerDetailSerializer, PartnerOrganizationProfileSerializer, PartnerPostSerializer
+from apps.partners.serializers import (
+    PartnerAuditEventSerializer,
+    PartnerDetailSerializer,
+    PartnerIntegrationSerializer,
+    PartnerOrganizationProfileSerializer,
+    PartnerPostSerializer,
+    PartnerWebhookDeliverySerializer,
+    PartnerWebhookSerializer,
+)
 from apps.verification.constants import VerificationBadgeCode, VerificationSubjectType
 from apps.verification.models import VerificationBadge
 from apps.verification.services import current_partner_verification_status, start_partner_verification_case
@@ -106,6 +120,57 @@ class PartnerApiTests(TestCase):
         self.assertTrue(PartnerJoinConfig.objects.filter(partner=partner).exists())
         self.assertTrue(PartnerOrganizationProfile.objects.filter(partner=partner).exists())
         self.assertTrue(PartnerRole.objects.filter(partner=partner, name="Owner").exists())
+
+    def test_verify_partners_launch_command_passes_safe_local_defaults(self):
+        output = StringIO()
+
+        call_command("verify_partners_launch", stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn("Partners launch guardrails ready: True", rendered)
+        self.assertIn("PASS: route:partner_list", rendered)
+        self.assertIn("PASS: partner_secret_redaction", rendered)
+        self.assertIn("PASS: MEDIA_SAFETY_ENABLED", rendered)
+
+    def test_partner_secret_serializers_redact_read_payloads(self):
+        partner = self._create_partner()
+        webhook = PartnerWebhook.objects.create(
+            partner=partner,
+            name="Ops hook",
+            url="https://example.com/hook",
+            events=["member.joined"],
+            secret="super-secret",
+        )
+        delivery = PartnerWebhookDelivery.objects.create(
+            webhook=webhook,
+            event="member.joined",
+            payload={"token": "private-token", "safe": "ok"},
+        )
+        integration = PartnerIntegration.objects.create(
+            partner=partner,
+            kind=PartnerIntegration.KIND_WEBHOOK,
+            provider="example",
+            config={"api_key": "private-key", "safe": "ok"},
+        )
+        audit = PartnerAuditEvent.objects.create(
+            partner=partner,
+            actor=self.owner,
+            action="integration.updated",
+            metadata={"webhook_secret": "private-secret", "safe": "ok"},
+        )
+
+        webhook_payload = PartnerWebhookSerializer(webhook).data
+        delivery_payload = PartnerWebhookDeliverySerializer(delivery).data
+        integration_payload = PartnerIntegrationSerializer(integration).data
+        audit_payload = PartnerAuditEventSerializer(audit).data
+
+        self.assertNotIn("secret", webhook_payload)
+        self.assertEqual(delivery_payload["payload"]["token"], "[redacted]")
+        self.assertEqual(delivery_payload["payload"]["safe"], "ok")
+        self.assertEqual(integration_payload["config"]["api_key"], "[redacted]")
+        self.assertEqual(integration_payload["config"]["safe"], "ok")
+        self.assertEqual(audit_payload["metadata"]["webhook_secret"], "[redacted]")
+        self.assertEqual(audit_payload["metadata"]["safe"], "ok")
 
     def test_partner_verification_start_creates_central_case_with_safe_metadata(self):
         partner = self._create_partner()

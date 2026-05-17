@@ -48,6 +48,35 @@ from common.media_urls import absolutize_backend_media, normalize_image_payload
 from common.rich_text import build_plain_text_document, process_rich_text_document
 
 
+PARTNER_SENSITIVE_KEY_TOKENS = (
+    "secret",
+    "token",
+    "authorization",
+    "password",
+    "credential",
+    "api_key",
+    "apikey",
+    "private_key",
+    "webhook_secret",
+)
+
+
+def redact_partner_sensitive_payload(value):
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            key_text = str(key)
+            key_lower = key_text.lower()
+            if any(token in key_lower for token in PARTNER_SENSITIVE_KEY_TOKENS):
+                redacted[key_text] = "[redacted]"
+            else:
+                redacted[key_text] = redact_partner_sensitive_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_partner_sensitive_payload(item) for item in value[:50]]
+    return value
+
+
 class PartnerImageUrlSerializerMixin:
     image_url_fields = ("avatar_url", "logo_url")
 
@@ -800,6 +829,11 @@ class PartnerAuditEventSerializer(serializers.ModelSerializer):
             return None
         return getattr(actor, "display_name", None) or getattr(actor, "username", None) or str(actor.id)
 
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload["metadata"] = redact_partner_sensitive_payload(payload.get("metadata"))
+        return payload
+
 
 class PartnerIntegrationSerializer(serializers.ModelSerializer):
     class Meta:
@@ -815,6 +849,11 @@ class PartnerIntegrationSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "partner", "created_at", "updated_at"]
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload["config"] = redact_partner_sensitive_payload(payload.get("config"))
+        return payload
 
 
 class PartnerWebhookSerializer(serializers.ModelSerializer):
@@ -836,6 +875,9 @@ class PartnerWebhookSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "partner", "last_sent_at", "last_error", "created_at", "updated_at"]
+        extra_kwargs = {
+            "secret": {"write_only": True, "required": False, "allow_blank": True},
+        }
 
 
 class PartnerWebhookDeliverySerializer(serializers.ModelSerializer):
@@ -855,6 +897,11 @@ class PartnerWebhookDeliverySerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload["payload"] = redact_partner_sensitive_payload(payload.get("payload"))
+        return payload
 
 
 class PartnerAutomationRuleSerializer(serializers.ModelSerializer):

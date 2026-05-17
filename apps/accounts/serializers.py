@@ -10,6 +10,7 @@ from django.core.exceptions import ValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.contrib.auth import authenticate
 from apps.core.phone_utils import to_e164
+from apps.media.safety import validate_upload_file_safety
 from django.utils.translation import gettext_lazy as _
 
 import datetime
@@ -187,6 +188,20 @@ class ProfileSerializer(serializers.ModelSerializer):
 
     def validate_cover_url(self, value):
         return normalize_image_payload(value)
+
+    def validate_avatar_file(self, value):
+        try:
+            validate_upload_file_safety(value, context="profile")
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages)
+        return value
+
+    def validate_cover_file(self, value):
+        try:
+            validate_upload_file_safety(value, context="profile")
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages)
+        return value
 
     def update(self, instance, validated_data):
         result = super().update(instance, validated_data)

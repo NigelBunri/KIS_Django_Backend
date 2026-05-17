@@ -1,11 +1,13 @@
 
 from datetime import timedelta
 from decimal import Decimal
+from io import StringIO
 import json
 import uuid
 
 from django.contrib.auth import get_user_model
 from django.db.models.signals import post_save
+from django.core.management import call_command
 from django.http import QueryDict
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
@@ -20,6 +22,7 @@ from apps.billing.models import DirectPaymentAuditEvent, DirectPaymentIntent
 from apps.billing.services import get_wallet_account
 from .category_catalog import ensure_catalog_categories
 from .services import mark_provider_completed, place_marketplace_order, satisfy_marketplace_order
+from .tasks import auto_satisfy_marketplace_order
 from .availability import DAY_KEYS, normalize_availability_payload
 from .models import (
     CatalogCategory,
@@ -222,8 +225,9 @@ class MarketplaceUsdCheckoutTests(TestCase):
         with self.assertRaises(ValidationError):
             satisfy_marketplace_order(order)
 
+    @patch('apps.notifications.tasks.process_notification_delivery.delay')
     @patch('apps.commerce.services._schedule_marketplace_order_auto_satisfaction')
-    def test_flutterwave_callback_marks_marketplace_order_paid_idempotently(self, schedule_mock):
+    def test_flutterwave_callback_marks_marketplace_order_paid_idempotently(self, schedule_mock, _delivery_mock):
         order = place_marketplace_order(
             buyer=self.buyer,
             shop_id=self.shop.id,
@@ -280,6 +284,47 @@ class MarketplaceUsdCheckoutTests(TestCase):
         self.assertEqual(data['fulfillment_summary']['delivery_status'], 'pending')
         self.assertEqual(data['next_action']['code'], 'open_checkout')
         self.assertEqual(data['currency_label'], 'USD')
+
+    @patch('apps.notifications.tasks.process_notification_delivery.delay')
+    @patch('apps.commerce.services._schedule_marketplace_order_auto_satisfaction')
+    def test_provider_completed_marketplace_order_auto_satisfies_after_window(self, schedule_mock, _delivery_mock):
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+        )
+        intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
+        reconcile_direct_payment_callback(
+            payload={'data': {'tx_ref': intent.tx_ref, 'status': 'successful', 'id': 'flw-auto-001'}},
+            signature='',
+        )
+        order.refresh_from_db()
+
+        mark_provider_completed(order)
+        order.refresh_from_db()
+
+        self.assertEqual(order.status, MarketplaceOrderStatus.AWAITING_SATISFACTION)
+        self.assertIsNotNone(order.metadata.get('awaiting_satisfaction_until'))
+        schedule_mock.assert_called_once()
+
+        result = auto_satisfy_marketplace_order(str(order.id))
+        order.refresh_from_db()
+
+        self.assertEqual(result['status'], 'satisfied')
+        self.assertEqual(order.status, MarketplaceOrderStatus.SATISFIED)
+
+
+class CommerceLaunchProofCommandTests(TestCase):
+    def test_verify_commerce_launch_passes_safe_local_defaults(self):
+        output = StringIO()
+
+        call_command('verify_commerce_launch', stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn('Commerce launch guardrails ready: True', rendered)
+        self.assertIn('PASS: KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED - disabled', rendered)
+        self.assertIn('PASS: MEDIA_SAFETY_ENABLED', rendered)
+        self.assertIn('PASS: payment_payload_redaction', rendered)
 
 
 class CommerceAmazonCoreApiTests(APITestCase):

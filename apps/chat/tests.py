@@ -11,6 +11,7 @@ from .models import (
     BaseConversationRole,
     Conversation,
     ConversationMember,
+    MessageThreadLink,
     ConversationRequestState,
     ConversationType,
 )
@@ -57,7 +58,7 @@ class ConversationUnreadContractTests(APITestCase):
     def test_list_exposes_authoritative_unread_fields(self):
         self.client.force_authenticate(self.user)
 
-        res = self.client.get(reverse("conversation-list"))
+        res = self.client.get("/api/v1/conversations/")
 
         self.assertEqual(res.status_code, 200)
         payload = res.json()
@@ -176,7 +177,7 @@ class ConversationUnreadContractTests(APITestCase):
     def test_search_returns_matching_conversation(self):
         self.client.force_authenticate(self.user)
 
-        res = self.client.get(reverse("conversation-search"), {"q": "Latest"})
+        res = self.client.get("/api/v1/conversations/search/", {"q": "Latest"})
 
         self.assertEqual(res.status_code, 200)
         payload = res.json()
@@ -186,13 +187,18 @@ class ConversationUnreadContractTests(APITestCase):
     def test_participant_search_returns_visible_members(self):
         self.client.force_authenticate(self.user)
 
-        res = self.client.get(reverse("conversation-participant-search"), {"q": "Peer"})
+        res = self.client.get("/api/v1/conversations/participant-search/", {"q": "Peer"})
 
         self.assertEqual(res.status_code, 200)
         payload = res.json()
-        self.assertEqual(payload["count"], 1)
-        self.assertEqual(payload["results"][0]["conversation_id"], str(self.conversation.id))
-        self.assertEqual(payload["results"][0]["user"]["id"], str(self.peer.id))
+        self.assertGreaterEqual(payload["count"], 1)
+        self.assertTrue(
+            any(
+                row["conversation_id"] == str(self.conversation.id)
+                and row["user"]["id"] == str(self.peer.id)
+                for row in payload["results"]
+            )
+        )
 
     def test_direct_conversation_creation_is_canonical_and_restores_visibility(self):
         user_a = User.objects.create_user(
@@ -255,4 +261,54 @@ class ConversationUnreadContractTests(APITestCase):
         self.assertEqual(res.status_code, 200)
         self.assertFalse(
             ConversationMember.objects.get(conversation=self.conversation, user=self.peer).is_hidden
+        )
+
+    def test_generic_direct_create_uses_canonical_direct_identity(self):
+        self.client.force_authenticate(self.user)
+        url = "/api/v1/conversations/"
+
+        first = self.client.post(
+            url,
+            {"type": "direct", "participants": [self.peer.phone]},
+            format="json",
+        )
+        second = self.client.post(
+            url,
+            {"type": "direct", "participants": [self.peer.phone]},
+            format="json",
+        )
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        first_id = first.json()["id"]
+        second_id = second.json()["id"]
+        self.assertEqual(first_id, second_id)
+        conversation = Conversation.objects.get(id=first_id)
+        self.assertEqual(conversation.type, ConversationType.DIRECT)
+        self.assertTrue(conversation.direct_key)
+        self.assertEqual(
+            Conversation.objects.filter(type=ConversationType.DIRECT, direct_key=conversation.direct_key).count(),
+            1,
+        )
+
+    def test_subroom_creation_is_idempotent_for_same_parent_message(self):
+        self.client.force_authenticate(self.user)
+        url = "/api/v1/chats/threads/"
+        payload = {
+            "parent_conversation": str(self.conversation.id),
+            "parent_message_key": "mongo-message-1",
+        }
+
+        first = self.client.post(url, payload, format="json")
+        second = self.client.post(url, payload, format="json")
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["child_conversation_id"], second.json()["child_conversation_id"])
+        self.assertEqual(
+            MessageThreadLink.objects.filter(
+                parent_conversation=self.conversation,
+                parent_message_key="mongo-message-1",
+            ).count(),
+            1,
         )

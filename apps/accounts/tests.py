@@ -1,3 +1,7 @@
+from io import StringIO
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -14,6 +18,7 @@ from .models import (
     User,
     UserContact,
 )
+from .serializers import ProfileSerializer
 from .views import issue_tokens_for_user
 
 
@@ -40,12 +45,31 @@ class FamilyAccessibilityPreferencesTests(APITestCase):
         self.assertEqual(child_response.data["preferences"]["navigation_mode"], "guided")
         self.assertGreaterEqual(child_response.data["accessibility"]["min_touch_target"], 52)
 
+    def test_verify_profile_launch_command_passes_safe_defaults(self):
+        output = StringIO()
+
+        call_command("verify_profile_launch", stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn("Profile launch guardrails ready: True", rendered)
+        self.assertIn("PASS: route:profile_me", rendered)
+        self.assertIn("PASS: profile_media_serializer_validation", rendered)
+        self.assertIn("PASS: family_accessibility_defaults", rendered)
+
+    def test_profile_media_serializer_rejects_blocked_file_types(self):
+        serializer = ProfileSerializer()
+        upload = SimpleUploadedFile("unsafe-profile.svg", b"<svg></svg>", content_type="image/svg+xml")
+
+        with self.assertRaises(Exception):
+            serializer.validate_avatar_file(upload)
+
 
 class AccountsDeviceSessionTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
             phone="+237670000001",
             password="TestPass123!",
+            country="CM",
         )
         self.current_device = Device.objects.create(
             user=self.user,
@@ -136,10 +160,12 @@ class AccountsE2EEBundleTests(APITestCase):
         self.viewer = User.objects.create_user(
             phone="+237670000010",
             password="TestPass123!",
+            country="CM",
         )
         self.target = User.objects.create_user(
             phone="+237670000011",
             password="TestPass123!",
+            country="CM",
         )
         self.viewer_device = Device.objects.create(
             user=self.viewer,

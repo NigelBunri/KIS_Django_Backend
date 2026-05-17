@@ -1,3 +1,6 @@
+from io import StringIO
+
+from django.core.management import call_command
 from django.test import TestCase
 from django.test import override_settings
 from django.contrib.contenttypes.models import ContentType
@@ -242,6 +245,20 @@ class PerformanceOfflinePolicyTests(APITestCase):
         self.assertTrue(response.data["mode"]["low_bandwidth_default"])
 
 
+class SearchDiscoveryLaunchVerifierTests(TestCase):
+    def test_search_discovery_launch_verifier_passes_safe_defaults(self):
+        output = StringIO()
+
+        call_command("verify_search_discovery_launch", stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn("Search/discovery launch guardrails ready: True", rendered)
+        self.assertIn("PASS: route:unified_search", rendered)
+        self.assertIn("PASS: unified_search_blocked_contact_exclusion", rendered)
+        self.assertIn("PASS: recommendation_privacy_contract", rendered)
+        self.assertIn("PASS: offline_low_bandwidth_contract", rendered)
+
+
 class SecurityPrivacyLaunchGateTests(APITestCase):
     def setUp(self):
         self.staff = User.objects.create_user(
@@ -456,6 +473,13 @@ class UnifiedSearchApiTests(APITestCase):
             display_name="Faithful Friend",
             username="faithful_friend",
         )
+        self.blocked = User.objects.create_user(
+            phone="+237670009003",
+            password="StrongPass123",
+            country="CM",
+            display_name="Faith Blocked",
+            username="faith_blocked",
+        )
         self.client.force_authenticate(self.user)
         self.conversation = Conversation.objects.create(
             type=ConversationType.DIRECT,
@@ -492,6 +516,25 @@ class UnifiedSearchApiTests(APITestCase):
             published_at=timezone.now(),
             created_by=self.user,
         )
+        self.blocked_channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.blocked.id,
+            owner_user=self.blocked,
+            handle="faith-blocked-channel",
+            display_name="Faith Blocked Channel",
+            description="Blocked public testimony channel",
+            is_public=True,
+        )
+        self.blocked_content = ChannelContent.objects.create(
+            channel=self.blocked_channel,
+            content_type="text",
+            title="Faith Blocked Teaching",
+            text_plain="This should not show after blocking.",
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.blocked,
+        )
 
     def test_unified_search_returns_grouped_permission_safe_results(self):
         response = self.client.get("/api/v1/core/search/unified/", {"q": "Faith", "groups": "contacts,conversations,channels,channel_content"})
@@ -514,6 +557,19 @@ class UnifiedSearchApiTests(APITestCase):
         response = self.client.get("/api/v1/core/search/unified/", {"q": "Faith"})
 
         self.assertEqual(response.status_code, 401)
+
+    def test_unified_search_excludes_blocked_users_channels_and_content(self):
+        UserBlock.objects.create(blocker=self.user, blocked=self.blocked, reason="search_exclusion")
+
+        response = self.client.get(
+            "/api/v1/core/search/unified/",
+            {"q": "Faith", "groups": "contacts,channels,channel_content"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        serialized = str(response.data)
+        self.assertIn("Faith Channel", serialized)
+        self.assertNotIn("Faith Blocked", serialized)
 
 
 class PatientCanonicalHealthProfileTests(TestCase):

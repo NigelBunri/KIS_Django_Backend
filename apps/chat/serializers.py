@@ -9,6 +9,7 @@ from .models import (
     ConversationSettings,
     MessageThreadLink,
     BaseConversationRole,
+    ConversationType,
 )
 
 
@@ -301,6 +302,7 @@ class ConversationCreateSerializer(ConversationImageUrlSerializerMixin, serializ
 
     def create(self, validated_data):
         from apps.accounts.models import User  # local to avoid circulars
+        from .services import get_or_create_direct_conversation
 
         request = self.context["request"]
         user = request.user
@@ -344,8 +346,6 @@ class ConversationCreateSerializer(ConversationImageUrlSerializerMixin, serializ
         if not isinstance(participants, (list, tuple)):
             participants = []
 
-        print("checking participants now: ", participants)
-
         phone_numbers = [
             str(p).strip()
             for p in participants
@@ -353,7 +353,30 @@ class ConversationCreateSerializer(ConversationImageUrlSerializerMixin, serializ
         ]
         phone_numbers = list(dict.fromkeys(phone_numbers))  # unique
 
-        print("checking phone number: ", phone_numbers)
+        conversation_type = validated_data.get("type") or ConversationType.DIRECT
+        if conversation_type == ConversationType.DIRECT:
+            if len(phone_numbers) != 1:
+                raise serializers.ValidationError(
+                    {"participants": "Direct conversations require exactly one peer participant."}
+                )
+            normalized_phone = User.objects.normalize_phone(phone_numbers[0])
+            try:
+                peer_user = User.objects.get(phone=normalized_phone)
+            except User.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"participants": f"User with phone number {normalized_phone} does not exist."}
+                )
+            if peer_user.id == user.id:
+                raise serializers.ValidationError(
+                    {"participants": "Cannot create a direct chat with yourself."}
+                )
+            conversation, _created = get_or_create_direct_conversation(
+                user,
+                peer_user,
+                initiator=user,
+                use_request_flow=True,
+            )
+            return conversation
 
         # 4) Look up users by phone and create memberships
         if phone_numbers:
@@ -514,63 +537,20 @@ class DirectConversationCreateSerializer(serializers.Serializer):
     
     def create(self, validated_data):
         from apps.accounts.models import User
-        from .models import (
-            Conversation,
-            ConversationMember,
-            ConversationSettings,
-            ConversationType,
-            ConversationRequestState,
-            BaseConversationRole,
-        )
+        from .services import get_or_create_direct_conversation
 
         request = self.context["request"]
         user: User = request.user
         peer_user_id = validated_data["peer_user_id"]
         peer_user = User.objects.get(id=peer_user_id)
 
-        # 1) If a direct conversation between these 2 users already exists, reuse it
-        existing = (
-            Conversation.objects.filter(
-                type=ConversationType.DIRECT,
-                memberships__user=user,
-            )
-            .filter(memberships__user=peer_user)
-            .distinct()
-            .first()
+        conversation, _created = get_or_create_direct_conversation(
+            user,
+            peer_user,
+            initiator=user,
+            use_request_flow=True,
         )
-        if existing:
-            return existing
-
-        # 2) Otherwise create a new direct conversation
-        print("thids is working Nigel 88888888888888888888888888888888888888cs")
-        conv = Conversation.objects.create(
-            type=ConversationType.DIRECT,
-            created_by=user,
-            # ✅ DM request fields – creator is initiator, peer is recipient
-            request_state=ConversationRequestState.PENDING,
-            request_initiator=user,
-            request_recipient=peer_user,
-            # optional title/preview if you like:
-            # title=f"{user.display_name} & {peer_user.display_name}",
-            # last_message_preview="",
-        )
-
-        # 3) Create memberships
-        ConversationMember.objects.create(
-            conversation=conv,
-            user=user,
-            base_role=BaseConversationRole.OWNER,
-        )
-        ConversationMember.objects.create(
-            conversation=conv,
-            user=peer_user,
-            base_role=BaseConversationRole.MEMBER,
-        )
-
-        # 4) Default settings row
-        ConversationSettings.objects.create(conversation=conv)
-
-        return conv
+        return conversation
 
 
 # ---------------------------------------------------------------------------
@@ -605,3 +585,4 @@ class MessageThreadLinkSerializer(serializers.ModelSerializer):
             "created_by",
             "created_at",
         ]
+        validators = []

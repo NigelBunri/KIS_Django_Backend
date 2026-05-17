@@ -56,7 +56,6 @@ DEFAULT_BLOCKED_EXTENSIONS = {
 DEFAULT_ALLOWED_MIME_PREFIXES = ("image/", "video/", "audio/", "text/")
 DEFAULT_ALLOWED_MIME_TYPES = {
     "application/json",
-    "application/octet-stream",
     "application/pdf",
     "application/msword",
     "application/vnd.ms-excel",
@@ -65,6 +64,48 @@ DEFAULT_ALLOWED_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/zip",
+}
+DEFAULT_ALLOWED_EXTENSIONS = {
+    ".aac",
+    ".csv",
+    ".doc",
+    ".docx",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".json",
+    ".m4a",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".pdf",
+    ".png",
+    ".ppt",
+    ".pptx",
+    ".txt",
+    ".wav",
+    ".webm",
+    ".xlsx",
+    ".zip",
+}
+
+MIME_EXTENSION_PREFIXES = {
+    "image/": {".gif", ".jpeg", ".jpg", ".png", ".webp"},
+    "video/": {".m4v", ".mov", ".mp4", ".webm"},
+    "audio/": {".aac", ".m4a", ".mp3", ".ogg", ".wav", ".webm"},
+    "text/": {".csv", ".txt"},
+}
+
+MIME_EXTENSION_TYPES = {
+    "application/json": {".json"},
+    "application/pdf": {".pdf"},
+    "application/msword": {".doc"},
+    "application/vnd.ms-excel": {".xls"},
+    "application/vnd.ms-powerpoint": {".ppt"},
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": {".pptx"},
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {".xlsx"},
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": {".docx"},
+    "application/zip": {".zip"},
 }
 
 USER_SAFE_BLOCK_MESSAGE = (
@@ -123,6 +164,11 @@ def configured_allowed_mime_prefixes() -> tuple[str, ...]:
     return tuple(configured) if configured else DEFAULT_ALLOWED_MIME_PREFIXES
 
 
+def configured_allowed_extensions() -> set[str]:
+    configured = _csv_set(getattr(settings, "MEDIA_SAFETY_ALLOWED_EXTENSIONS", ""))
+    return configured or DEFAULT_ALLOWED_EXTENSIONS
+
+
 def media_safety_enabled() -> bool:
     return str(getattr(settings, "MEDIA_SAFETY_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -168,12 +214,22 @@ def validate_upload_file_safety(upload, *, context: str = "general") -> None:
 
     if ext in configured_blocked_extensions():
         raise ValidationError({"detail": "This file type is not allowed on KIS."})
+    if ext and ext not in configured_allowed_extensions():
+        raise ValidationError({"detail": "This file extension is not allowed on KIS."})
     if getattr(upload, "size", 0) and int(upload.size) > max_bytes:
         raise ValidationError({"detail": "File too large."})
     if not content_type:
         raise ValidationError({"detail": "Unable to identify the upload MIME type."})
+    if content_type == "application/octet-stream":
+        raise ValidationError({"detail": "This generic MIME type is not allowed on KIS."})
     if content_type not in configured_allowed_mime_types() and not content_type.startswith(configured_allowed_mime_prefixes()):
         raise ValidationError({"detail": "This MIME type is not allowed on KIS."})
+    allowed_for_mime = set(MIME_EXTENSION_TYPES.get(content_type, set()))
+    for prefix, extensions in MIME_EXTENSION_PREFIXES.items():
+        if content_type.startswith(prefix):
+            allowed_for_mime.update(extensions)
+    if ext and allowed_for_mime and ext not in allowed_for_mime:
+        raise ValidationError({"detail": "The file extension does not match the MIME type."})
 
 
 def hash_upload(upload) -> str:

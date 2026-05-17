@@ -8,6 +8,7 @@ from .models import (
     VerificationCheck,
     VerificationSubject,
 )
+from .providers import redact_provider_payload
 
 
 RAW_EVIDENCE_KEYS = {
@@ -292,6 +293,7 @@ class StaffVerificationBadgeSerializer(serializers.ModelSerializer):
 class StaffVerificationAuditEventSerializer(serializers.ModelSerializer):
     subject = StaffVerificationSubjectSummarySerializer(read_only=True)
     actor_label = serializers.SerializerMethodField()
+    metadata = serializers.SerializerMethodField()
 
     class Meta:
         model = VerificationAuditEvent
@@ -311,6 +313,9 @@ class StaffVerificationAuditEventSerializer(serializers.ModelSerializer):
     def get_actor_label(self, obj):
         actor = getattr(obj, "actor", None)
         return str(getattr(actor, "email", "") or getattr(actor, "phone", "") or getattr(actor, "username", "") or "") if actor else ""
+
+    def get_metadata(self, obj):
+        return redact_provider_payload(obj.metadata or {})
 
 
 class StaffBadgeIssueSerializer(serializers.Serializer):

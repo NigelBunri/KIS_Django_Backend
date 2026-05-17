@@ -537,6 +537,36 @@ class BibleCoursePrerequisiteSerializer(serializers.ModelSerializer):
         fields = ["id", "course", "required_course", "required_percent"]
 
 
+PRIVATE_ATTACHMENT_KEYS = {
+    "absolute_path",
+    "bucket",
+    "file_path",
+    "local_path",
+    "path",
+    "private_url",
+    "signed_url",
+    "storage_key",
+    "storage_path",
+    "token",
+}
+
+
+def _public_attachment_payload(value):
+    if not isinstance(value, dict):
+        return value
+    return {
+        str(key): _public_attachment_payload(item)
+        for key, item in value.items()
+        if str(key).lower() not in PRIVATE_ATTACHMENT_KEYS
+    }
+
+
+def _public_attachment_list(value):
+    if not isinstance(value, list):
+        return value
+    return [_public_attachment_payload(item) for item in value]
+
+
 class BibleLessonSerializer(serializers.ModelSerializer):
     module_detail = BibleCourseModuleSerializer(source="module", read_only=True)
     completed = serializers.SerializerMethodField()
@@ -599,6 +629,11 @@ class BibleLessonSerializer(serializers.ModelSerializer):
             return 0
         progress = BibleLessonProgress.objects.filter(user=user, lesson=obj).first()
         return progress.last_position_ms if progress else 0
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["attachments"] = _public_attachment_list(data.get("attachments"))
+        return data
 
     def validate(self, attrs):
         validate_attachment_metadata_for_safe_messaging(attrs.get("attachments"))
@@ -687,6 +722,11 @@ class BibleAssignmentSubmissionSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         validate_attachment_metadata_for_safe_messaging(attrs.get("attachments"))
         return super().validate(attrs)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["attachments"] = _public_attachment_list(data.get("attachments"))
+        return data
 
 
 class BiblePeerReviewSerializer(serializers.ModelSerializer):

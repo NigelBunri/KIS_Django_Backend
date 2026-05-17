@@ -66,6 +66,19 @@ def _unified_result(*, kind: str, title: str, subtitle: str = "", target_type: s
     }
 
 
+def _blocked_user_ids_for_search(user) -> set[str]:
+    if not getattr(user, "is_authenticated", False):
+        return set()
+    try:
+        from apps.moderation.models import UserBlock
+
+        made = UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
+        received = UserBlock.objects.filter(blocked=user).values_list("blocker_id", flat=True)
+        return {str(value) for value in made} | {str(value) for value in received}
+    except Exception:
+        return set()
+
+
 def _resolve_patient_for_user(user):
     if not getattr(user, "is_authenticated", False):
         return None
@@ -268,12 +281,16 @@ class UnifiedSearchView(APIView):
         return {item.strip() for item in raw.split(",") if item.strip()}
 
     def _search_contacts(self, request, query: str, limit: int):
+        blocked_user_ids = _blocked_user_ids_for_search(request.user)
         qs = UserModel.objects.filter(is_active=True).filter(
             Q(display_name__icontains=query)
             | Q(username__icontains=query)
             | Q(phone__icontains=query)
             | Q(email__icontains=query)
-        ).exclude(id=request.user.id).order_by("display_name", "username", "phone")[:limit]
+        ).exclude(id=request.user.id)
+        if blocked_user_ids:
+            qs = qs.exclude(id__in=blocked_user_ids)
+        qs = qs.order_by("display_name", "username", "phone")[:limit]
         return [
             _unified_result(
                 kind="contact",
@@ -331,13 +348,16 @@ class UnifiedSearchView(APIView):
             from apps.broadcasts.models import BroadcastChannel
         except Exception:
             return []
+        blocked_user_ids = _blocked_user_ids_for_search(request.user)
         qs = (
             BroadcastChannel.objects.filter(is_deleted=False)
             .filter(Q(is_public=True) | Q(owner_user=request.user) | Q(roles__user=request.user))
             .filter(Q(handle__icontains=query) | Q(display_name__icontains=query) | Q(description__icontains=query))
             .distinct()
-            .order_by("-subscriber_count", "-updated_at")[:limit]
         )
+        if blocked_user_ids:
+            qs = qs.exclude(owner_user_id__in=blocked_user_ids)
+        qs = qs.order_by("-subscriber_count", "-updated_at")[:limit]
         return [
             _unified_result(
                 kind="channel",
@@ -357,6 +377,7 @@ class UnifiedSearchView(APIView):
             from apps.broadcasts.models import ChannelContent
         except Exception:
             return []
+        blocked_user_ids = _blocked_user_ids_for_search(request.user)
         qs = (
             ChannelContent.objects.select_related("channel")
             .filter(is_deleted=False)
@@ -367,8 +388,10 @@ class UnifiedSearchView(APIView):
             )
             .filter(Q(title__icontains=query) | Q(description__icontains=query) | Q(text_plain__icontains=query))
             .distinct()
-            .order_by("-published_at", "-updated_at")[:limit]
         )
+        if blocked_user_ids:
+            qs = qs.exclude(channel__owner_user_id__in=blocked_user_ids).exclude(created_by_id__in=blocked_user_ids)
+        qs = qs.order_by("-published_at", "-updated_at")[:limit]
         return [
             _unified_result(
                 kind="channel_content",

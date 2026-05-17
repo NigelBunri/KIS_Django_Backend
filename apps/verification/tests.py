@@ -2,7 +2,9 @@ import hashlib
 import hmac
 import json
 import uuid
+from io import StringIO
 
+from django.core.management import call_command
 from django.urls import reverse
 from django.test import override_settings
 from rest_framework import status
@@ -252,6 +254,41 @@ class StaffVerificationOperationsTests(APITestCase):
         self.assertEqual(callbacks.status_code, status.HTTP_200_OK)
         self.assertEqual(signals.status_code, status.HTTP_200_OK)
         self.assertIn("many_cases_per_subject", signals.data)
+
+    def test_staff_audit_serializer_redacts_provider_secrets_and_raw_documents(self):
+        VerificationAuditEvent.objects.create(
+            subject=self.subject,
+            case=self.case,
+            action="webhook.mapped",
+            provider="dojah",
+            metadata={
+                "secret": "provider-secret",
+                "token": "provider-token",
+                "document_base64": "data:image/png;base64,secret",
+                "nested": {"passport": "raw-passport", "safe": "ok"},
+            },
+        )
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(reverse("verification:staff-audit-events"), {"action": "webhook.mapped"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = json.dumps(response.data, default=str)
+        self.assertIn("[redacted]", payload)
+        self.assertNotIn("provider-secret", payload)
+        self.assertNotIn("provider-token", payload)
+        self.assertNotIn("raw-passport", payload)
+        self.assertEqual(response.data["results"][0]["metadata"]["nested"]["safe"], "ok")
+
+    def test_verify_verification_launch_command_passes_local_guardrails(self):
+        out = StringIO()
+
+        call_command("verify_verification_launch", stdout=out)
+
+        output = out.getvalue()
+        self.assertIn("Verification launch guardrails ready: True", output)
+        self.assertIn("VERIFICATION_LIVE_PROVIDER_CALLS_ENABLED", output)
+        self.assertIn("provider_payload_redaction", output)
 
     def test_expiry_reminders_and_expire_dry_run(self):
         badge = VerificationBadge.objects.create(

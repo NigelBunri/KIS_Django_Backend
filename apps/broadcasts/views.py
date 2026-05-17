@@ -253,7 +253,8 @@ from apps.billing.services import (
     release_locked_booking_funds,
     refund_locked_booking_funds,
 )
-from apps.billing.models import WalletTransaction
+from apps.billing.direct_payments import create_direct_payment_intent
+from apps.billing.models import DirectPaymentIntent, WalletTransaction
 from apps.bible.certificates import build_certificate_pdf, build_certificate_url, ensure_certificate_file
 from apps.feed_personalization import get_affinity_profile, log_feed_interaction, rank_feed_items
 from common.rich_text import build_plain_text_document
@@ -10884,53 +10885,94 @@ class EducationInstitutionBroadcastBookingPaymentView(APIView):
             booking.save(update_fields=["status", "confirmed_at", "updated_at"])
             return Response({"booking": EducationInstitutionBookingSerializer(booking).data}, status=status.HTTP_200_OK)
 
-        method = str(request.data.get("payment_method") or "kisc").strip().lower()
-        tx_ref = f"education_booking_{uuid.uuid4().hex}"
-        if method not in {"wallet", "wallet_balance", "kisc"}:
-            raise ValidationError({"payment_method": "Education bookings are paid only with KISC wallet balance."})
+        method = str(
+            request.data.get("payment_method")
+            or request.data.get("payment_provider")
+            or getattr(settings, "KIS_EDUCATION_DEFAULT_PAYMENT_PROVIDER", "flutterwave")
+            or "flutterwave"
+        ).strip().lower()
+        if method in {"wallet", "wallet_balance", "kisc", "kis_wallet", "credits"}:
+            if not bool(getattr(settings, "KIS_LEGACY_EDUCATION_WALLET_CHECKOUT_ENABLED", False)):
+                return Response(
+                    {
+                        "detail": "Education wallet/KIS Coin checkout is disabled. Use USD checkout with Flutterwave or another configured payment provider.",
+                        "code": "legacy_education_wallet_checkout_disabled",
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            tx_ref = f"education_booking_{uuid.uuid4().hex}"
+            try:
+                _entry, transaction_obj = lock_wallet_funds_for_booking(
+                    user=request.user,
+                    amount_cents=int(booking.amount_cents or 0),
+                    reference=tx_ref,
+                    meta={
+                        "intent": "education_booking",
+                        "broadcast_id": str(broadcast.id),
+                        "booking_id": str(booking.id),
+                        "institution_id": str(institution.id),
+                        "currency": KIS_COIN_CODE,
+                    },
+                )
+            except ValueError as exc:
+                return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            transaction_obj.method = "education_booking_wallet"
+            transaction_obj.currency = KIS_COIN_CODE
+            transaction_obj.save(update_fields=["method", "currency", "updated_at"])
+            booking.status = EducationBookingStatus.CONFIRMED
+            booking.payment_method = "kisc_wallet"
+            booking.currency = KIS_COIN_CODE
+            booking.wallet_transaction = transaction_obj
+            booking.confirmed_at = timezone.now()
+            metadata = dict(booking.metadata) if isinstance(booking.metadata, dict) else {}
+            metadata["settlement_state"] = "escrow_locked"
+            booking.metadata = metadata
+            booking.save(
+                update_fields=[
+                    "status",
+                    "payment_method",
+                    "currency",
+                    "wallet_transaction",
+                    "confirmed_at",
+                    "metadata",
+                    "updated_at",
+                ]
+            )
+            return Response(
+                {
+                    "booking": EducationInstitutionBookingSerializer(booking).data,
+                    "tx_ref": tx_ref,
+                    "status": "success",
+                    "payment_url": None,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        provider = method or getattr(settings, "KIS_EDUCATION_DEFAULT_PAYMENT_PROVIDER", "flutterwave")
         try:
-            _entry, transaction_obj = lock_wallet_funds_for_booking(
+            intent = create_direct_payment_intent(
                 user=request.user,
-                amount_cents=int(booking.amount_cents or 0),
-                reference=tx_ref,
-                meta={
-                    "intent": "education_booking",
+                target_type=DirectPaymentIntent.TARGET_EDUCATION_BOOKING,
+                target_id=booking.id,
+                provider=provider,
+                idempotency_key=str(request.data.get("idempotency_key") or ""),
+                metadata={
                     "broadcast_id": str(broadcast.id),
-                    "booking_id": str(booking.id),
                     "institution_id": str(institution.id),
-                    "currency": KIS_COIN_CODE,
+                    "currency": "USD",
                 },
             )
-        except ValueError as exc:
+        except (PermissionError, ValueError) as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        transaction_obj.method = "education_booking_wallet"
-        transaction_obj.currency = KIS_COIN_CODE
-        transaction_obj.save(update_fields=["method", "currency", "updated_at"])
-        booking.status = EducationBookingStatus.CONFIRMED
-        booking.payment_method = "kisc_wallet"
-        booking.currency = KIS_COIN_CODE
-        booking.wallet_transaction = transaction_obj
-        booking.confirmed_at = timezone.now()
-        metadata = dict(booking.metadata) if isinstance(booking.metadata, dict) else {}
-        metadata["settlement_state"] = "escrow_locked"
-        booking.metadata = metadata
-        booking.save(
-            update_fields=[
-                "status",
-                "payment_method",
-                "currency",
-                "wallet_transaction",
-                "confirmed_at",
-                "metadata",
-                "updated_at",
-            ]
-        )
+
+        booking.refresh_from_db()
         return Response(
             {
                 "booking": EducationInstitutionBookingSerializer(booking).data,
-                "tx_ref": tx_ref,
-                "status": "success",
-                "payment_url": None,
+                "direct_payment_intent_id": str(intent.id),
+                "payment_reference": intent.tx_ref,
+                "payment_url": intent.payment_url or None,
+                "status": intent.status,
             },
             status=status.HTTP_200_OK,
         )
@@ -13115,6 +13157,19 @@ def _safe_public_description(*values) -> str:
     return text[:260]
 
 
+def _safe_public_media_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    path = (parsed.path or "").lower()
+    if any(marker in path for marker in ("/private/", "/raw/", "/tmp/", "/temp/")):
+        return ""
+    return raw
+
+
 def _content_is_public_web_safe(content: ChannelContent) -> bool:
     metadata = content.metadata if isinstance(content.metadata, dict) else {}
     if metadata.get("child_sensitive") or metadata.get("private_context") or metadata.get("contains_private_data"):
@@ -13142,8 +13197,8 @@ def _safe_public_content_asset(content: ChannelContent) -> dict:
         return {}
     return {
         "asset_type": asset.asset_type,
-        "url": asset.url,
-        "thumbnail_url": asset.thumbnail_url,
+        "url": _safe_public_media_url(asset.url),
+        "thumbnail_url": _safe_public_media_url(asset.thumbnail_url),
         "mime_type": asset.mime_type,
         "caption": asset.caption[:220],
         "width": asset.width,
@@ -13154,7 +13209,7 @@ def _safe_public_content_asset(content: ChannelContent) -> dict:
 
 def _public_content_card(request, content: ChannelContent) -> dict:
     asset = _safe_public_content_asset(content)
-    thumbnail = content.thumbnail_url or asset.get("thumbnail_url") or asset.get("url") or ""
+    thumbnail = _safe_public_media_url(content.thumbnail_url) or asset.get("thumbnail_url") or asset.get("url") or ""
     title = content.title or content.text_plain[:80] or "KIS content"
     return {
         "id": str(content.id),
@@ -13230,7 +13285,7 @@ def _public_content_payload(request, content: ChannelContent) -> dict:
     if not _content_is_public_web_safe(content):
         raise Http404
     asset = _safe_public_content_asset(content)
-    thumbnail = content.thumbnail_url or asset.get("thumbnail_url") or asset.get("url") or ""
+    thumbnail = _safe_public_media_url(content.thumbnail_url) or asset.get("thumbnail_url") or asset.get("url") or ""
     public_url = _public_content_url(request, content)
     title = content.title or content.text_plain[:80] or "KIS content"
     description = _safe_public_description(content.description, content.text_plain)
@@ -13302,8 +13357,8 @@ def _first_public_asset(content: ChannelContent) -> dict:
         return {}
     return {
         "asset_type": asset.asset_type,
-        "url": asset.url,
-        "thumbnail_url": asset.thumbnail_url,
+        "url": _safe_public_media_url(asset.url),
+        "thumbnail_url": _safe_public_media_url(asset.thumbnail_url),
         "mime_type": asset.mime_type,
         "caption": asset.caption,
         "width": asset.width,

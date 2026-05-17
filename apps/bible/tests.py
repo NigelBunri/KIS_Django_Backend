@@ -1,10 +1,13 @@
 import json
 from datetime import timedelta
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from django.core.management import call_command
 from django.db import models
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -20,7 +23,9 @@ from apps.bible.models import (
     BiblePreference,
     BibleReadingPlanEvent,
     BiblePublishStatus,
+    BibleCourse,
     BibleDailyPassage,
+    BibleLesson,
     BibleMeditationPost,
     ReadingHistory,
     BibleTranslation,
@@ -30,6 +35,7 @@ from apps.bible.models import (
     BibleVerse,
 )
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
+from apps.notifications.models import Notification
 from apps.partners.models import Partner
 
 
@@ -287,3 +293,68 @@ class BibleTranslationRegistryTests(TestCase):
         self.assertTrue(response.data["readiness"]["family_safe_journey"])
         self.assertEqual(response.data["safety"]["media_gate"], "enabled")
         self.assertFalse(response.data["safety"]["explicit_content_provider_live_calls"])
+
+    @override_settings(
+        MEDIA_SAFETY_ENABLED=True,
+        MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED=False,
+        KIS_AI_LIVE_PROVIDER_CALLS_ENABLED=False,
+        KIS_PUBLIC_WEB_INDEXING_ENABLED=False,
+    )
+    def test_verify_bible_launch_command_passes_safe_defaults(self):
+        output = StringIO()
+
+        call_command("verify_bible_launch", stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn("Bible/KCAN launch guardrails ready: True", rendered)
+        self.assertIn("PASS: bible_urls_present", rendered)
+        self.assertIn("PASS: bible_attachment_public_serialization", rendered)
+        self.assertIn("PASS: bible_media_safety_gate", rendered)
+        self.assertNotIn("private/bible/raw", rendered)
+
+    def test_bible_lesson_serializer_redacts_private_attachment_fields(self):
+        _, _, _, _ = self._create_public_reader_fixture()
+        course = BibleCourse.objects.create(title="Safe Bible Course", is_bible_course=True, is_public=True, published=True)
+        lesson = BibleLesson.objects.create(
+            course=course,
+            title="Safe lesson",
+            attachments=[
+                {
+                    "url": "https://cdn.example.com/lesson.pdf",
+                    "storage_path": "private/bible/raw/lesson.pdf",
+                    "token": "secret-token",
+                    "metadata": {"path": "/private/raw/lesson.pdf", "safe": "ok"},
+                }
+            ],
+        )
+        self.client.force_authenticate(self.reader)
+
+        response = self.client.get(f"/api/v1/bible/lessons/{lesson.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        rendered = json.dumps(response.data)
+        self.assertIn("https://cdn.example.com/lesson.pdf", rendered)
+        self.assertNotIn("storage_path", rendered)
+        self.assertNotIn("secret-token", rendered)
+        self.assertNotIn("/private/raw/lesson.pdf", rendered)
+
+    def test_bible_reminder_notifications_have_exact_badge_source_and_target(self):
+        translation, _, _, _ = self._create_public_reader_fixture()
+        event = BibleReadingPlanEvent.objects.create(
+            user=self.reader,
+            translation=translation,
+            passage_ref="John 3:16",
+            start_at=timezone.now(),
+            status="scheduled",
+            reminder_offsets=[0],
+            reminder_channels=["in_app"],
+        )
+
+        with patch("apps.notifications.tasks.process_notification_delivery.delay"):
+            call_command("dispatch_bible_reading_reminders", lookback_minutes=5, stdout=StringIO())
+
+        notification = Notification.objects.get(type="BIBLE_READING_REMINDER")
+        self.assertEqual(notification.target_type, "bible_reading_event")
+        self.assertEqual(notification.context_data.get("source"), "bible")
+        self.assertEqual(notification.context_data.get("badge_source"), "bible")
+        self.assertEqual(notification.context_data.get("target_id"), str(event.id))

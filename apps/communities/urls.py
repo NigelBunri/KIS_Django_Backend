@@ -6,6 +6,7 @@ from .views import CommunityViewSet, CommunityPostViewSet
 app_name = "communities"
 
 router = DefaultRouter()
+router.register(r"communities/posts", CommunityPostViewSet, basename="community-post-legacy")
 router.register(r"communities", CommunityViewSet, basename="community")
 router.register(r"posts", CommunityPostViewSet, basename="community-post")
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -13,7 +15,8 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from apps.accounts.models import AccountTier, Subscription
-from apps.billing.models import WalletLedgerEntry, WalletTransaction
+from apps.billing.direct_payments import reconcile_direct_payment_callback, redact_payment_payload
+from apps.billing.models import DirectPaymentAuditEvent, WalletLedgerEntry, WalletTransaction
 from apps.billing.serializers import WalletAccountSerializer, WalletLedgerEntrySerializer
 from apps.billing.services import get_credit_account, get_wallet_account, transfer_balance, upgrade_with_credits
 from apps.billing.views import _parse_frontend_money_to_cents
@@ -447,6 +450,58 @@ class BillingWalletFlowTests(TestCase):
 
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(res.data.get("code"), "legacy_financial_flow_disabled")
+
+    def test_direct_payment_callback_rejects_invalid_signature_with_redacted_audit(self):
+        with override_settings(FLW_WEBHOOK_SECRET="expected-webhook-secret"):
+            ok, result, intent = reconcile_direct_payment_callback(
+                payload={
+                    "data": {
+                        "tx_ref": "kis_direct_missing",
+                        "status": "successful",
+                        "secret": "provider-secret",
+                        "card": {"cvv": "123"},
+                    }
+                },
+                signature="wrong-secret",
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(result, "invalid_signature")
+        self.assertIsNone(intent)
+        event = DirectPaymentAuditEvent.objects.filter(event="callback.signature_invalid").latest("created_at")
+        serialized = str(event.metadata)
+        self.assertNotIn("provider-secret", serialized)
+        self.assertNotIn("wrong-secret", serialized)
+        self.assertEqual(event.metadata["provider"], "flutterwave")
+
+    def test_direct_payment_payload_redaction_covers_sensitive_fields(self):
+        redacted = redact_payment_payload(
+            {
+                "secret": "secret-value",
+                "token": "token-value",
+                "customer_phone": "+15550001111",
+                "nested": {"authorization": "Bearer token", "safe": "ok"},
+                "items": [{"cvv": "123", "amount": 2500}],
+            }
+        )
+
+        self.assertEqual(redacted["secret"], "[redacted]")
+        self.assertEqual(redacted["token"], "[redacted]")
+        self.assertEqual(redacted["customer_phone"], "[redacted]")
+        self.assertEqual(redacted["nested"]["authorization"], "[redacted]")
+        self.assertEqual(redacted["nested"]["safe"], "ok")
+        self.assertEqual(redacted["items"][0]["cvv"], "[redacted]")
+        self.assertEqual(redacted["items"][0]["amount"], 2500)
+
+    def test_verify_payment_launch_command_passes_default_local_guardrails(self):
+        out = StringIO()
+
+        call_command("verify_payment_launch", stdout=out)
+
+        output = out.getvalue()
+        self.assertIn("Payment launch guardrails ready: True", output)
+        self.assertIn("KIS_LEGACY_WALLET_DEPOSIT_ENABLED", output)
+        self.assertIn("payment_payload_redaction", output)
 
     def test_wallet_serializer_reframes_legacy_kisc_fields_as_promotional_credits(self):
         wallet = get_wallet_account(self.sender)

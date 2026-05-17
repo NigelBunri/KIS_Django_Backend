@@ -5095,7 +5095,7 @@ class PaymentBillingSessionStepUpdateView(APIView):
                     available_micro = _cents_to_micro(int(wallet.balance_cents or 0))
                     return Response(
                         {
-                            "detail": "Insufficient KIS Coin wallet balance.",
+                            "detail": "Insufficient legacy wallet balance.",
                             "required_micro": int(charge_micro),
                             "available_micro": int(available_micro),
                             "required_kisc": _micro_to_kisc_text(charge_micro),

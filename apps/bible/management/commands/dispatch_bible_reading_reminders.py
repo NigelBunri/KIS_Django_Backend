@@ -57,8 +57,11 @@ class Command(BaseCommand):
                     title=title,
                     body=body,
                     target_type="bible_reading_event",
+                    source="bible",
                     context={
                         "event_id": str(event.id),
+                        "target_id": str(event.id),
+                        "target_type": "bible_reading_event",
                         "passage_ref": event.passage_ref,
                         "start_at": event.start_at.isoformat(),
                         "offset_minutes": offset,

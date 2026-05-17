@@ -203,6 +203,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
             qs = qs.filter(
                 Q(title__icontains=q)
                 | Q(description__icontains=q)
+                | Q(last_message_preview__icontains=q)
                 | Q(memberships__user__display_name__icontains=q)
                 | Q(memberships__user__phone__icontains=q)
                 | Q(memberships__user__username__icontains=q)

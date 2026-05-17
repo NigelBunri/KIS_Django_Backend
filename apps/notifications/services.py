@@ -122,11 +122,15 @@ def infer_badge_source(notification_type=None, target_type=None, context=None, e
     if source:
         aliases = {
             "education": "broadcast",
+            "course": "broadcast",
+            "lesson": "broadcast",
             "health": "broadcast",
             "market": "broadcast",
             "shop": "broadcast",
             "product": "broadcast",
             "service": "broadcast",
+            "order": "broadcast",
+            "channel_content": "broadcast",
             "community": "partners",
             "partner_group": "partners",
             "account": "profile",
@@ -142,17 +146,22 @@ def infer_badge_source(notification_type=None, target_type=None, context=None, e
     return "profile"
 
 
-def normalize_notification_context(notification_type=None, target_type=None, context=None, source=None) -> dict:
+def normalize_notification_context(notification_type=None, target_type=None, target_id=None, context=None, source=None) -> dict:
     context_data = dict(context or {})
     badge_source = infer_badge_source(notification_type=notification_type, target_type=target_type, context=context_data, explicit_source=source)
     context_data.setdefault("source", badge_source)
     context_data.setdefault("badge_source", badge_source)
+    if notification_type:
+        context_data.setdefault("type", str(notification_type))
+        context_data.setdefault("notification_type", str(notification_type))
     context_data.setdefault(
         "urgency_label",
         infer_urgency_label(notification_type=notification_type, target_type=target_type, context=context_data),
     )
     if target_type:
         context_data.setdefault("target_type", str(target_type))
+    if target_id:
+        context_data.setdefault("target_id", str(target_id))
     return context_data
 
 
@@ -171,6 +180,7 @@ def create_notification(user_id, type, template_key=None, context=None, channel=
     context_data = normalize_notification_context(
         notification_type=type,
         target_type=kwargs.get("target_type"),
+        target_id=kwargs.get("target_id"),
         context=context,
         source=kwargs.get("source"),
     )

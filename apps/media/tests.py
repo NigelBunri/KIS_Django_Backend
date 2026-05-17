@@ -187,6 +187,46 @@ class MediaSafetyUploadTests(APITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(MediaSafetyScan.objects.count(), 0)
 
+    def test_upload_blocks_generic_octet_stream_before_storage(self):
+        upload = SimpleUploadedFile("photo.jpg", b"unsafe generic bytes", content_type="application/octet-stream")
+
+        response = self.client.post(
+            "/uploads/file",
+            {"file": upload, "context": "chat", "visibility": "private"},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("generic MIME type", str(response.data))
+        self.assertEqual(MediaSafetyScan.objects.count(), 0)
+
+    def test_upload_blocks_mismatched_extension_and_mime_before_storage(self):
+        upload = SimpleUploadedFile("photo.pdf", b"fake image bytes", content_type="image/jpeg")
+
+        response = self.client.post(
+            "/uploads/file",
+            {"file": upload, "context": "profile", "visibility": "private"},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("extension does not match", str(response.data))
+        self.assertEqual(MediaSafetyScan.objects.count(), 0)
+
+    @override_settings(MEDIA_SAFETY_MAX_UPLOAD_BYTES=4)
+    def test_upload_blocks_oversized_file_before_storage(self):
+        upload = SimpleUploadedFile("photo.jpg", b"too-large", content_type="image/jpeg")
+
+        response = self.client.post(
+            "/uploads/file",
+            {"file": upload, "context": "profile", "visibility": "private"},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("File too large", str(response.data))
+        self.assertEqual(MediaSafetyScan.objects.count(), 0)
+
     def test_safety_scan_list_is_limited_to_owner(self):
         other = get_user_model().objects.create_user(phone="+237670003202", password="TestPass123!", country="CM")
         own_scan = MediaSafetyScan.objects.create(owner=self.user, upload_id="own", context="chat", status="pending_review")

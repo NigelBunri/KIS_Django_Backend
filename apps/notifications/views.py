@@ -259,12 +259,23 @@ class NotificationViewSet(viewsets.ModelViewSet):
         filters = []
         if target_type:
             target_aliases = {
+                "bible_daily_passage": ("bible_daily_passage", "bible", "daily", "reading"),
+                "bible_meditation_post": ("bible_meditation_post", "bible", "meditation", "devotional"),
+                "bible_reading_event": ("bible_reading_event", "reading", "schedule"),
+                "channel_content": ("channel_content", "channel", "broadcast"),
                 "education_content": ("education_content", "course", "lesson", "education"),
+                "course": ("course", "education_content", "education"),
+                "lesson": ("lesson", "education_content", "education"),
                 "health_institution": ("health_institution", "health", "institution"),
+                "health_appointment": ("health_appointment", "appointment", "health"),
+                "health_session": ("health_session", "session", "health"),
+                "product": ("product", "market_product", "shop_product"),
                 "shop_service": ("shop_service", "service", "market_service"),
+                "service_booking": ("service_booking", "booking", "shop_service"),
                 "shop": ("shop", "market_shop"),
                 "partner_community": ("partner_community", "community", "partner"),
                 "partner_group": ("partner_group", "community_group", "group"),
+                "conversation": ("conversation", "chat", "message"),
             }.get(target_type.lower(), (target_type,))
             target_query = Q()
             for alias in target_aliases:

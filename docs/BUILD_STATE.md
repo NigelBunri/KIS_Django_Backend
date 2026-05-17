@@ -1,5 +1,887 @@
 # BUILD_STATE (Django Backend)
 
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 16 Close-Out
+
+### Scope completed
+
+- Closed the 100% Implementation / 80%+ Global Parity roadmap with an independent feature readiness sweep.
+- Created:
+  - `docs/implementation-parity-roadmap/phase-16-independent-feature-readiness-sweep.md`
+- Re-evaluated KIS by account type and module with backend completeness, frontend completeness, combined implementation completeness, and global parity completeness.
+- Estimated current overall implementation completeness at 78%.
+- Estimated current global parity completeness at 59%.
+- Replaced the Phase 17-style continuation with a single-blocker maintenance prompt so this roadmap does not keep expanding.
+
+### Files changed
+
+- `docs/implementation-parity-roadmap/phase-16-independent-feature-readiness-sweep.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- Document-only analysis phase. No app code was changed.
+- Evidence used:
+  - completed Phase 00-15 implementation-parity docs;
+  - `docs/implementation-parity-roadmap/phase-00-launch-scope-lock.md`;
+  - `docs/kis-120-roadmap/status.md`;
+  - `docs/feed-channels-roadmap/status.md`;
+  - `docs/profitability-roadmap/phase-27-final-close-out.md`;
+  - current backend module implementation evidence from accounts, broadcasts, commerce, partners, verification, health, Bible, chat, notifications, media safety, and public web work.
+
+### Final readiness summary
+
+- Current overall implementation completeness: 78%.
+- Current global parity completeness: 59%.
+- Recommended posture: controlled launch only, with risky features gated.
+- No Phase 17 should be added to this roadmap unless a new roadmap is explicitly started.
+
+### Highest-risk blockers remaining
+
+- Production secrets/env, `DEBUG=False`, hosts/origins, Redis/cache, private media, and staff-only access proof.
+- Flutterwave staging payment links, signed callbacks, receipts/refunds/support, and rollback proof.
+- Real-device messaging restart/cache/history/call/media QA.
+- Media safety proof across every upload producer.
+- Verification provider sandbox and webhook replay proof.
+- Notification producer/read-state proof across all main tabs and source types.
+- Owner/admin permission QA for shops, education institutions, health institutions, partners, and channels.
+- Public web share-card, embed allowlist, abuse-report, indexing, and rollback proof.
+- Backup/restore and production rollback evidence.
+
+### Final maintenance prompt
+
+```text
+Please continue KIS launch preparation without starting a new roadmap or adding new phases. Focus only on closing the highest-risk blocker from docs/implementation-parity-roadmap/phase-16-independent-feature-readiness-sweep.md and docs/BUILD_STATE.md. Use no git commands. Pick one blocker, run the safest validation available, record exact evidence or blockers, preserve existing UI/API behavior, do not expose secrets/private data/payment/health/verification documents/private media paths, and update docs/BUILD_STATE.md with the result and the next single blocker to close.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 15
+
+### Scope completed
+
+- Tightened Public Web, Embeds, SEO, Sharing, And External Growth Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_public_web_launch`
+  - `python3 manage.py verify_public_web_launch --strict`
+  - `python3 manage.py verify_public_web_launch --include-counts`
+- Confirmed route contracts for public channel landing, public content landing, public embeds, oEmbed, signed embed tokens, share events, abuse reports, robots policy, sitemap planning, and public trust summaries.
+- Hardened public/embed asset output so only safe `http` / `https` media URLs are exposed.
+- Blocked raw/private/temp media path exposure from public landing and embed payload helpers.
+- Confirmed child-sensitive, private-context, contains-private-data, private/unlisted, deleted, and draft content is not public-web safe.
+- Confirmed public indexing, referrals, and embeds remain disabled or noindex by default unless explicit launch evidence is approved.
+
+### Files changed
+
+- `apps/broadcasts/management/commands/verify_public_web_launch.py`
+- `apps/broadcasts/views.py`
+- `apps/broadcasts/tests.py`
+- `docs/implementation-parity-roadmap/phase-15-public-web-embeds-seo-sharing-growth-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/broadcasts/management/commands/verify_public_web_launch.py apps/broadcasts/views.py apps/broadcasts/tests.py` passed.
+- `python3 manage.py verify_public_web_launch --strict` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.broadcasts.tests.BroadcastChannelApiTests apps.broadcasts.tests.ChannelEmbedTests apps.broadcasts.tests.PublicWebLaunchProofCommandTests --noinput --keepdb` passed.
+  - PostgreSQL-backed focused suite: 24 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- React Native `npx eslint src/services/publicGrowthService.ts src/screens/broadcast/channels/embed/embedUtils.ts src/utils/shareCompletion.ts src/screens/broadcast/channels/ChannelHomePage.tsx src/screens/broadcast/channels/ChannelContentDetailPage.tsx --quiet` passed.
+- Nest `pnpm tsc --noEmit` passed.
+
+### Validation warnings
+
+- `python3 manage.py verify_public_web_launch --include-counts` passed guardrails but could not read optional aggregate public-web counts locally due `OperationalError`; staging must rerun with real database access.
+- Real share-card screenshots, embed domain allowlist proof, public abuse-report proof, public indexing QA, and rollback drills were not executed in this local session.
+
+### Remaining risks
+
+- Staging must run `python3 manage.py verify_public_web_launch --strict --include-counts`.
+- Public indexing must remain disabled until privacy, child-safety, SEO, and abuse-report QA evidence is approved.
+- Embeds must remain disabled in production unless domain allowlist, signed-token, oEmbed, and private/unlisted embed QA evidence is attached.
+- Real share-card screenshots are needed for iOS, Android, web, WhatsApp, Telegram, Facebook, and browser previews.
+- Abuse-report proof is needed for public channel/content pages and embedded content.
+- Rollback proof is needed for disabling public web, indexing, referrals, and embeds without breaking in-app channels.
+
+### Next prompt
+
+```text
+Please implement Phase 16 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Final Production Go/No-Go, Release Cut, And Launch Operations Proof. Use Phase 00-15 evidence to consolidate all launch blockers, feature flags, staging validation, provider evidence, rollback drills, backup/restore proof, incident runbooks, staff/admin access, mobile release readiness, public web exposure, payments, verification, media safety, messaging, notifications, and module-specific go/no-go status into one final launch decision system. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, provider sandboxes, or environment setup blocks validation, record exact blockers and move on. Preserve existing UI/API behavior, do not expose secrets/private data/payment/health/verification documents/private media paths, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the final production launch execution prompt.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 14
+
+### Scope completed
+
+- Tightened Search, Discovery, Recommendations, And Low-Bandwidth Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_search_discovery_launch`
+  - `python3 manage.py verify_search_discovery_launch --strict`
+  - `python3 manage.py verify_search_discovery_launch --include-counts`
+- Confirmed route contracts for unified search, recommendation foundation, offline policy, messaging search, participant search, profile/contact discovery, broadcast feed/channels, partner channels, education discovery, commerce discovery, health discovery, partner discovery, Bible search, and feed personalization events.
+- Hardened unified search so blocked-user exclusions apply to contact, channel, and channel-content results.
+- Confirmed recommendation foundation declares privacy-safe output, blocked-user exclusion, child/youth-safe defaults, Christian-content-safe ranking, and no private health/payment/verification/raw-storage exposure.
+- Confirmed offline policy declares stale-while-revalidate, request dedupe, retry/backoff, cursor preference, legacy limit/offset compatibility, and privacy-safe telemetry.
+- Confirmed feed personalization remains bounded to broadcast/community/partner affinity events and bounded sampling.
+
+### Files changed
+
+- `apps/core/management/commands/verify_search_discovery_launch.py`
+- `apps/core/views.py`
+- `apps/core/tests.py`
+- `docs/implementation-parity-roadmap/phase-14-search-discovery-recommendations-low-bandwidth-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/management/commands/verify_search_discovery_launch.py apps/core/views.py apps/core/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_search_discovery_launch --strict` passed.
+- `python3 manage.py test apps.core.tests.UnifiedSearchApiTests apps.core.tests.SocialRecommendationFoundationTests apps.core.tests.PerformanceOfflinePolicyTests apps.core.tests.SearchDiscoveryLaunchVerifierTests --noinput --keepdb` passed.
+  - PostgreSQL-backed focused suite: 8 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- React Native `npx eslint src/services/unifiedSearchService.ts src/services/performanceOfflineService.ts src/services/socialRecommendationService.ts src/screens/broadcast/channels/ChannelsDiscoverPage.tsx src/screens/broadcast/feeds/FeedsDiscoverPage.tsx src/screens/broadcast/education/hooks/useEducationDiscovery.ts src/components/partners/PartnerDiscoveryPanel.tsx --quiet` passed.
+- Nest `pnpm tsc --noEmit` passed.
+
+### Validation warnings
+
+- `python3 manage.py verify_search_discovery_launch --include-counts` passed guardrails but could not read optional aggregate discovery/search counts locally due `OperationalError`; staging must rerun with real database access.
+- Real-device search speed and exact result-navigation QA was not executed in this local session.
+- Search index/load testing was not executed locally.
+- Offline/low-bandwidth behavior was verified by policy contract only, not by device network throttling.
+
+### Remaining risks
+
+- Staging must run `python3 manage.py verify_search_discovery_launch --strict --include-counts`.
+- Real-device QA is still required for unified search, messaging search, contact search, channel/feed discovery, education discovery, commerce discovery, health discovery, partner discovery, Bible search, and exact result navigation.
+- Search privacy QA must prove blocked/muted/hidden exclusions across real app flows.
+- Low-bandwidth/offline QA must be run with device network throttling and cache refresh behavior.
+- Search performance/load proof is still required for launch-scale data.
+- Product/privacy review is still required for public user fields in contact/profile discovery results.
+- Rollback drill is still required for disabling recommendation/personalization surfaces while keeping module search alive.
+
+### Next prompt
+
+```text
+Please implement Phase 15 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Public Web, Embeds, SEO, Sharing, And External Growth Launch Proof. Use Phase 00-14 evidence to verify public channel/content landing pages, oEmbed/embed endpoints, signed private/unlisted embed tokens, public trust badges, safe share-card metadata, robots/sitemap policy, referral/invite placeholders, abuse reporting, child-sensitive/public visibility protections, monetization-safe public copy, and rollback evidence. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI/API behavior, do not expose private/unlisted content, child-sensitive content, private media paths, secrets, payment data, health data, or verification documents, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 16.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 13
+
+### Scope completed
+
+- Tightened Profile, Account, Settings, Family, Accessibility, And User Trust Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_profile_launch`
+  - `python3 manage.py verify_profile_launch --strict`
+  - `python3 manage.py verify_profile_launch --include-counts`
+- Confirmed route contracts for profile overview/detail/public view, profile privacy, articles, preferences, languages, showcases, family/accessibility preferences, current user account surface, device sessions, 2FA, user verification/trust, notification preferences, badge counts, mark-source-read, user blocks, media assets, and media safety scans.
+- Added central media-safety validation to profile avatar and cover file uploads before save.
+- Confirmed unsafe SVG/script-style profile media is rejected by serializer validation.
+- Confirmed child and older-adult family/accessibility defaults force safer recommendations, guardian review controls, larger tap targets, and guided/simplified defaults where appropriate.
+- Confirmed verifier output avoids private profile payloads, raw media paths, private verification documents, and secrets.
+
+### Files changed
+
+- `apps/accounts/management/__init__.py`
+- `apps/accounts/management/commands/__init__.py`
+- `apps/accounts/management/commands/verify_profile_launch.py`
+- `apps/accounts/serializers.py`
+- `apps/accounts/tests.py`
+- `docs/implementation-parity-roadmap/phase-13-profile-account-settings-family-accessibility-user-trust-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/accounts/management/commands/verify_profile_launch.py apps/accounts/serializers.py apps/accounts/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_profile_launch --strict` passed.
+- `python3 manage.py test apps.accounts.tests.FamilyAccessibilityPreferencesTests apps.accounts.tests.AccountsDeviceSessionTests --noinput --keepdb` passed.
+  - PostgreSQL-backed focused suite: 7 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- React Native `npx eslint src/screens/tabs/ProfileScreen.tsx src/screens/tabs/profile src/screens/tabs/profile-screen src/screens/profile src/services/familyAccessibilityService.ts --quiet` passed.
+- Nest `pnpm tsc --noEmit` passed.
+
+### Validation warnings
+
+- `python3 manage.py verify_profile_launch --include-counts` passed guardrails but could not read optional aggregate profile/account/block counts locally due `OperationalError`; staging must rerun with real database access.
+- The verifier reports `profile_media_safe_extensions` as a warning because `.webp` is not confirmed in the local allowed-extension set.
+- Real-device profile/settings/family/accessibility QA was not executed in this local session.
+- Rollback drills for mistaken profile visibility, blocked-user, verification badge, and account setting changes were not executed locally.
+
+### Remaining risks
+
+- Staging must run `python3 manage.py verify_profile_launch --strict --include-counts`.
+- Real-device QA is still required for profile overview/editing, avatar/cover upload, profile privacy, notification preferences, family/accessibility preferences, blocked/muted/hidden state, and trust badges.
+- Profile media QA must prove unsafe/quarantined media cannot publish or expose private storage paths.
+- Profile visibility and blocked-user state must be verified across search, feeds, messaging, partners, channels, and public profile preview surfaces.
+- Product must decide whether `.webp` should be enabled for profile images before launch.
+- Rollback drills are still required for profile privacy mistakes, account session revocation, and verification badge revocation.
+
+### Next prompt
+
+```text
+Please implement Phase 14 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Search, Discovery, Recommendations, And Low-Bandwidth Launch Proof. Use Phase 00-13 evidence to verify global search, messaging search, profile/contact discovery, channel/feed discovery, education/health/market/partner discovery, privacy-safe recommendation placeholders, blocked/muted/hidden exclusions, child/youth-safe ranking defaults, pagination/cursor behavior, offline/low-bandwidth fallbacks, and rollback evidence. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not expose private relationships, health/payment/verification data, private media paths, or secrets, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 15.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 12
+
+### Scope completed
+
+- Tightened Partners, Workspaces, Communities, Roles, Events, And Group Messaging Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_partners_launch`
+  - `python3 manage.py verify_partners_launch --strict`
+  - `python3 manage.py verify_partners_launch --include-counts`
+- Confirmed route contracts for partner discovery, public hubs, compact Discord-style summaries, roles, role assignments, members, moderation, audit events, invites, onboarding, organization apps, server categories, server layout, partner posts, partner post comment rooms, communities, community members, community join, community posts, chat conversations, and subroom threads.
+- Restored compatibility for legacy community post clients by adding `/api/v1/communities/posts/...` while preserving normalized `/api/v1/posts/...`.
+- Hardened partner read serializers so webhook secrets, integration credentials, webhook delivery payload secrets, and audit metadata secrets are redacted.
+- Confirmed central media safety is enabled for partner upload flows, live explicit-content provider calls remain disabled by default, executable/script uploads are blocked, and common partner media/document types are allowed.
+
+### Files changed
+
+- `apps/communities/urls.py`
+- `apps/partners/management/commands/verify_partners_launch.py`
+- `apps/partners/serializers.py`
+- `apps/partners/tests.py`
+- `docs/implementation-parity-roadmap/phase-12-partners-workspaces-communities-roles-events-group-messaging-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/partners/management/commands/verify_partners_launch.py apps/partners/serializers.py apps/partners/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_partners_launch` passed.
+- `python3 manage.py test apps.partners.tests.PartnerApiTests apps.communities.tests.CommunityPostDiscussionTests --noinput --keepdb` passed.
+  - PostgreSQL-backed focused suite: 22 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- React Native `npx eslint src/components/partners src/screens/tabs/PartnersScreen.tsx src/screens/tabs/partners src/screens/tabs/CommunitiesTab.tsx --quiet` passed.
+- Nest `pnpm tsc --noEmit` passed.
+
+### Validation warnings
+
+- `python3 manage.py verify_partners_launch --include-counts` passed guardrails but could not read optional aggregate partner/community/message counts locally due `OperationalError`; staging must rerun with real database access.
+- Real-device partner QA was not executed in this local session.
+- Redis/realtime unread badge proof was not executed in this local session.
+
+### Remaining risks
+
+- Staging must run `python3 manage.py verify_partners_launch --strict --include-counts`.
+- Real-device QA is still required for partner discovery, workspace open, role/member views, onboarding, invites, announcements/posts, group messages, subrooms, events, and community comment rooms.
+- Realtime unread badge proof is still required for partner group/community messages.
+- Partner upload QA must prove unsafe/quarantined media cannot publish or expose private storage paths.
+- Moderation/audit reviewer workflows and rollback of mistaken moderation actions still require staging proof.
+- Low-bandwidth QA is still required for public hub and Discord-style summary payloads.
+
+### Next prompt
+
+```text
+Please implement Phase 13 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Profile, Account, Settings, Family, Accessibility, And User Trust Launch Proof. Use Phase 00-12 evidence to verify profile overview/editing, account security surfaces, family/age/accessibility preferences, verification/trust badge display, notification preferences, media/profile upload safety, profile dashboards, privacy controls, blocked/muted/hidden user state, low-bandwidth placeholders, and rollback evidence. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not expose secrets/private media paths/private profile data, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 14.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 11
+
+### Scope completed
+
+- Tightened Health And Care, Institutions, Appointments, Sessions, And Patient Experience Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_health_launch`
+  - `python3 manage.py verify_health_launch --strict`
+  - `python3 manage.py verify_health_launch --include-counts`
+- Confirmed health route contracts for institutions, services, care summary, care plans, vitals, workflow sessions, billing sessions, video sessions, secure messaging sessions, reminders, health dashboard landing pages, and broadcast health cards.
+- Confirmed USD-only/direct-provider guardrails:
+  - legacy health wallet/KIS-credit checkout disabled;
+  - wallet deposit/transfer/conversion/upgrade flags disabled;
+  - health default provider is `flutterwave`;
+  - direct provider links disabled locally by default;
+  - mock payments disabled;
+  - payment payload redaction passes for provider secrets, payment data, and private health-record style keys.
+- Strengthened shared direct-payment redaction for health-sensitive keys:
+  - `patient_phone`;
+  - `patient_health_record`;
+  - `health_record`;
+  - `medical_record`;
+  - `private_health_record`.
+- Confirmed health media safety policy covers common image, video, audio, and PDF health materials and blocks executable/script uploads.
+- Added PostgreSQL-backed regression proof for care summary, care plans, vitals, workflow runtime, expired billing gates, USD direct health billing, disabled wallet checkout, payment callback reconciliation, and safe verifier output.
+
+### Files changed
+
+- `apps/billing/direct_payments.py`
+- `apps/health_ops/management/commands/verify_health_launch.py`
+- `apps/health_ops/tests/test_workflow_runtime.py`
+- `docs/implementation-parity-roadmap/phase-11-health-care-institutions-appointments-sessions-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/health_ops/management/commands/verify_health_launch.py apps/health_ops/tests/test_workflow_runtime.py apps/health_ops/views.py apps/health_ops/serializers.py apps/health_dashboard/views.py` passed.
+- `python3 -m py_compile apps/billing/direct_payments.py apps/health_ops/management/commands/verify_health_launch.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_health_launch` passed.
+- `python3 manage.py verify_health_launch --include-counts` passed guardrails with 0 failures and 1 warning.
+- `python3 manage.py test apps.health_ops.tests.test_workflow_runtime.HealthOpsWorkflowRuntimeTests --noinput --keepdb` passed.
+  - PostgreSQL-backed: 10 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- React Native `npx eslint src/screens/health src/network/routes/healthRoutes.ts src/theme/health --quiet` passed.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+
+### Validation warnings
+
+- `verify_health_launch --include-counts` could not read optional health/payment counts locally due `OperationalError`; staging must rerun with real database access.
+- Flutterwave sandbox payment-link creation and signed callback replay were not executed locally because live provider calls remain disabled by default.
+- Real-device health QA was not executed in this local session.
+
+### Remaining risks
+
+- Staging must run `python3 manage.py verify_health_launch --strict --include-counts`.
+- Flutterwave sandbox proof is still required for health billing payment links and signed callback replay.
+- Real-device health QA is still required for institution discovery/detail, service/session start, care summary, care plans, vitals, reminders, secure messaging, video consultation handoff, checkout return refresh, and pending/failed/cancelled UI.
+- Health media QA must prove unsafe/quarantined attachments never publish, send, or expose private storage paths.
+- Privacy review is still required for health record summaries, patient/provider messaging hooks, and low-bandwidth cache behavior.
+- Medical/legal review is still required to confirm health copy avoids diagnosis, prescription, or emergency-care claims outside approved provider workflows.
+
+### Next prompt
+
+```text
+Please implement Phase 12 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Partners, Workspaces, Communities, Roles, Events, And Group Messaging Launch Proof. Use Phase 00-11 evidence to verify partner workspace discovery, membership/onboarding, roles/permissions, channels/subrooms, group messaging, announcements, events, moderation/audit tools, unread counts/badges, partner dashboards, media safety for partner uploads, low-bandwidth placeholders, and rollback evidence. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not expose secrets/private media paths/private group data, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 13.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 10
+
+### Scope completed
+
+- Tightened Education Courses, Institutions, Enrollment, And Learning Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_education_launch`
+  - `python3 manage.py verify_education_launch --strict`
+  - `python3 manage.py verify_education_launch --include-counts`
+- Confirmed education route contracts for discovery, progress, catalog, institutions, hub, content detail, reviews, questions, certificates, enrollment, institution courses, lessons, materials, bookings, and enrollments.
+- Confirmed USD-only/direct-provider guardrails:
+  - legacy education wallet/KIS-credit checkout disabled;
+  - wallet deposit/transfer/conversion/upgrade flags disabled;
+  - education default provider is `flutterwave`;
+  - direct provider links disabled locally by default;
+  - mock payments disabled;
+  - payment payload redaction passes.
+- Confirmed education media safety policy covers common image, video, audio, and PDF learning materials and blocks executable/script uploads.
+- Added PostgreSQL-backed regression proof for education discovery summaries, review/Q&A access control, verifier output, and paid course enrollment creating a USD direct-payment intent without wallet settlement.
+
+### Files changed
+
+- `apps/broadcasts/management/commands/verify_education_launch.py`
+- `apps/broadcasts/tests.py`
+- `docs/implementation-parity-roadmap/phase-10-education-courses-institutions-enrollment-learning-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/broadcasts/management/commands/verify_education_launch.py apps/broadcasts/tests.py apps/broadcasts/views.py apps/broadcasts/serializers.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_education_launch` passed.
+- `python3 manage.py verify_education_launch --include-counts` passed guardrails with 0 failures and 1 warning.
+- `python3 manage.py test apps.broadcasts.tests.EducationCourseraCoreTests --noinput --keepdb` passed.
+  - PostgreSQL-backed: 5 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- React Native `npx eslint src/screens/broadcast/education src/screens/tabs/profile-screen/EducationManagementModal.tsx --quiet` passed.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+
+### Validation warnings
+
+- `verify_education_launch --include-counts` could not read optional education/payment counts locally due `OperationalError`; staging must rerun with real database access.
+- Flutterwave sandbox link creation and signed callback replay were not executed locally because live provider calls remain disabled by default.
+- Real-device education QA was not executed in this local session.
+
+### Remaining risks
+
+- Staging must run `python3 manage.py verify_education_launch --strict --include-counts`.
+- Flutterwave sandbox proof is still required for paid education booking/payment links and signed callback replay.
+- Real-device education QA is still required for discovery, institution profile, course detail, module/lesson/material access, enrollment, checkout return refresh, pending/failed/cancelled UI, certificate view/share, reviews, and Q&A.
+- Education upload QA must prove unsafe/quarantined lesson/material/course media never publishes or exposes private storage paths.
+- Education notification badge proof is still required for institution/course/lesson/certificate updates and exact mark-read behavior.
+- Certificate legal/product sign-off is still required for wording, shareability, issuer trust, and revocation rules.
+
+### Next prompt
+
+```text
+Please implement Phase 11 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Health And Care, Institutions, Appointments, Sessions, And Patient Experience Launch Proof. Use Phase 00-10 evidence to verify health institution discovery, provider trust badges, service/session/appointment management, booking/payment state, care-plan and health-record summaries, patient/provider messaging hooks, reminders, media safety for health uploads, notification badge read-state, low-bandwidth placeholders, and rollback/audit evidence. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, Flutterwave sandbox, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, avoid medical-diagnosis claims, do not enable live charges or legacy wallet/KIS-credit-as-money flows, do not expose secrets/private media paths/payment/health data, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 12.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 09
+
+### Scope completed
+
+- Tightened Commerce, Market, Shops, And Service Booking Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_commerce_launch`
+  - `python3 manage.py verify_commerce_launch --strict`
+  - `python3 manage.py verify_commerce_launch --include-counts`
+- Confirmed commerce route contracts for discovery, shops, products, reviews/questions, shop services, service bookings, complaints, carts, marketplace orders, and provider orders.
+- Confirmed USD-only/direct-provider guardrails:
+  - legacy commerce wallet/KIS-credit checkout disabled;
+  - wallet deposit/transfer/conversion/upgrade flags disabled;
+  - commerce default provider is `flutterwave`;
+  - direct provider links disabled locally by default;
+  - mock payments disabled;
+  - payment payload redaction passes.
+- Confirmed commerce media safety policy covers product/service/complaint upload paths and blocks executable/script uploads.
+- Added PostgreSQL-backed regression proof for marketplace USD checkout, service booking USD checkout, disabled wallet checkout, idempotent Flutterwave callbacks, seller trust/detail summaries, reviews/questions, cart subtotal sync, historical KISC compatibility labels, and marketplace auto-satisfaction after the 3-day complaint window.
+
+### Files changed
+
+- `apps/commerce/management/commands/verify_commerce_launch.py`
+- `apps/commerce/tests.py`
+- `docs/implementation-parity-roadmap/phase-09-commerce-market-shops-service-booking-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/commerce/management/commands/verify_commerce_launch.py apps/commerce/tests.py apps/commerce/services.py apps/commerce/views.py apps/commerce/serializers.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_commerce_launch` passed.
+- `python3 manage.py verify_commerce_launch --include-counts` passed guardrails with 0 failures and 1 warning.
+- `python3 manage.py test apps.commerce.tests.CommerceLaunchProofCommandTests apps.commerce.tests.MarketplaceUsdCheckoutTests apps.commerce.tests.ServiceBookingMoneyNormalizationTests apps.commerce.tests.CommerceAmazonCoreApiTests --noinput --keepdb` passed.
+  - PostgreSQL-backed: 13 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- React Native `npx eslint src/screens/broadcast/market src/screens/market src/components/broadcast/MarketStudioSection.tsx --quiet` passed.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+
+### Validation warnings
+
+- `verify_commerce_launch --include-counts` could not read optional commerce/payment counts locally due `OperationalError`; staging must rerun with real database access.
+- Flutterwave sandbox link creation and signed callback replay were not executed locally because live provider calls remain disabled by default.
+- The first focused commerce test run hit local Redis/Celery result-backend retries from notification side effects; tests were tightened to mock notification delivery enqueue and then passed.
+
+### Remaining risks
+
+- Staging must run `python3 manage.py verify_commerce_launch --strict --include-counts`.
+- Flutterwave sandbox proof is still required for marketplace order and service booking payment links.
+- Signed webhook replay proof is still required for successful, failed, cancelled, duplicate, and unmatched commerce payments.
+- Real-device commerce QA is still required for discovery, product/service details, cart/order/service booking, checkout return refresh, provider completion, buyer satisfaction, complaints, and badge decrements.
+- Celery/Redis staging proof is still required for marketplace auto-satisfaction and complaint-window behavior.
+- Commerce media QA must prove unsafe/quarantined product, service, and complaint attachments never publish or expose private storage paths.
+
+### Next prompt
+
+```text
+Please implement Phase 10 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Education Courses, Institutions, Enrollment, And Learning Launch Proof. Use Phase 00-09 evidence to verify education discovery, institution/course/module/lesson management, enrollment/payment state, certificates, reviews/Q&A, institution trust badges, media safety for education uploads, notification badge read-state, offline/low-bandwidth learning placeholders, and rollback/audit evidence. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, Flutterwave sandbox, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not enable live charges or legacy wallet/KIS-credit-as-money flows, do not expose secrets/private media paths/payment data, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 11.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 08
+
+### Scope completed
+
+- Tightened Bible, Spiritual Growth, And KCAN Vision Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_bible_launch`
+  - `python3 manage.py verify_bible_launch --strict`
+- Confirmed Bible reader, translation, plan, note, highlight, course, daily meditation, prayer, KCAN audit, credential, and spiritual growth URL contracts resolve.
+- Tightened Bible reading reminder notification metadata so exact source/target metadata is present for badge lifecycle:
+  - `source=bible`;
+  - `badge_source=bible`;
+  - `target_type=bible_reading_event`;
+  - exact reading event `target_id` in context metadata.
+- Redacted private attachment fields from Bible lesson and assignment submission API output.
+- Confirmed public Bible translations require public/licensed/valid metadata.
+- Confirmed Bible media safety and AI/provider launch flags remain safe by default.
+
+### Files changed
+
+- `apps/bible/management/commands/verify_bible_launch.py`
+- `apps/bible/management/commands/dispatch_bible_reading_reminders.py`
+- `apps/bible/serializers.py`
+- `apps/bible/tests.py`
+- `docs/implementation-parity-roadmap/phase-08-bible-spiritual-growth-kcan-vision-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/bible/management/commands/verify_bible_launch.py apps/bible/management/commands/dispatch_bible_reading_reminders.py apps/bible/serializers.py apps/bible/tests.py apps/bible/views.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_bible_launch --include-counts` passed launch guardrails with 8 pass / 0 fail / 1 warning.
+- `python3 manage.py test apps.bible.tests.BibleTranslationRegistryTests --noinput --keepdb` passed.
+  - PostgreSQL-backed: 10 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- React Native `npx eslint src/screens/tabs/BibleScreen.tsx src/screens/tabs/bible/useBibleData.ts src/components/Bible src/services/bibleOfflineCache.ts src/services/biblePreferenceStore.ts src/services/bibleUserPersistence.ts src/components/broadcast/KcanVisionModal.tsx --quiet` passed.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+
+### Validation warnings
+
+- `verify_bible_launch --include-counts` could not read Bible/KCAN database counts locally due `OperationalError`.
+- The first reminder test run hit local Redis/Celery result-store retries at `10.114.180.99:6379`; the test was adjusted to mock delivery enqueue and then passed. Staging still needs real Celery/Redis proof.
+
+### Remaining risks
+
+- Staging must run `python3 manage.py verify_bible_launch --strict --include-counts` with database access.
+- Real-device Bible reader QA is still required for tabs, sticky tab behavior, verse navigation, highlight/comment filter navigation, notes, bookmarks, memory verses, and dark/light contrast.
+- Real-device daily meditation, prayer calendar, reading plan reminder, badge decrement, and offline/low-bandwidth QA are still required.
+- KCAN Our Vision page QA is still required, including image fullscreen/zoom behavior and close affordance on small devices.
+- Staging must prove Bible/KCAN reminder notifications refresh badges through Django/Nest/React Native.
+- Final licensing/legal review is required for imported translations and audio/devotional content.
+
+### Next prompt
+
+```text
+Please implement Phase 09 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Commerce, Market, Shops, And Service Booking Launch Proof. Use Phase 00-08 evidence to verify marketplace discovery, shop/product/service management, buyer-facing product/service detail, cart/order/service-booking reliability, seller trust badges, USD-only direct-payment readiness, fulfillment/completion/complaint windows, reviews/questions safety, media safety for product/service images, notification badge read-state, and rollback/audit evidence. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, Flutterwave sandbox, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not enable live charges or legacy wallet/KIS-credit-as-money flows, do not expose secrets/private media paths/payment data, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 10.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 07
+
+### Scope completed
+
+- Tightened Broadcast/Channels, Feeds, And Public Content Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_broadcast_channels_launch`
+  - `python3 manage.py verify_broadcast_channels_launch --strict`
+- Confirmed channel/feed/public/embed URL contracts resolve.
+- Confirmed launch-risk feature defaults:
+  - embeds disabled by default;
+  - public indexing disabled by default;
+  - public referrals disabled by default;
+  - live stream provider disabled by default;
+  - channel media live provider calls disabled by default.
+- Confirmed asset serializers do not expose raw storage paths.
+- Confirmed quarantined/unsafe assets are blocked before channel content publish or broadcast.
+- Confirmed focused channel API tests cover creation, channel-scoped content, legacy feed compatibility, subscribe/bell, playlists, comments, saves, watch history, broadcast/unbroadcast, visibility, embeds/oEmbed, moderation, and analytics.
+
+### Files changed
+
+- `apps/broadcasts/management/commands/verify_broadcast_channels_launch.py`
+- `apps/broadcasts/tests.py`
+- `docs/implementation-parity-roadmap/phase-07-broadcast-channels-feeds-public-content-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/broadcasts/management/commands/verify_broadcast_channels_launch.py apps/broadcasts/tests.py apps/broadcasts/media_pipeline.py apps/broadcasts/serializers.py apps/broadcasts/views.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_broadcast_channels_launch --include-counts` passed launch guardrails with 11 pass / 0 fail / 1 warning.
+- `python3 manage.py test apps.broadcasts.tests.BroadcastChannelsLaunchProofCommandTests apps.broadcasts.tests.BroadcastChannelApiTests apps.broadcasts.tests.ChannelEmbedTests apps.broadcasts.tests.ChannelEngagementTests --noinput --keepdb` passed.
+  - PostgreSQL-backed: 27 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- React Native `npx eslint src/screens/broadcast/channels src/components/broadcast src/network/routes/broadcastRoutes.ts src/types/broadcast.ts --quiet` passed.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+
+### Validation warnings
+
+- `verify_broadcast_channels_launch --include-counts` could not read channel/feed database counts locally due `OperationalError`.
+- The first focused React Native lint command used stale path `src/services/channelContentApi.ts`; the corrected focused lint command passed.
+- Focused channel tests logged local realtime bridge connection refused messages while emitting badge events. The API tests passed, but staging must prove Django-to-Nest realtime delivery.
+
+### Remaining risks
+
+- Staging must run `python3 manage.py verify_broadcast_channels_launch --strict --include-counts` with database access.
+- Real-device QA is still required for channel creation, selected-channel content creation, publish, broadcast/unbroadcast, archive/delete, subscriptions/bell state, comments, saves, watch history, and legacy feed compatibility.
+- Embed/oEmbed staging proof is still required for allowed domain, blocked domain, public content, private/unlisted signed token, and no raw storage path exposure.
+- Public indexing, referrals, and live streaming should stay gated until privacy, abuse, provider, player, and moderation evidence is approved.
+- Channel trust badges need product approval on inherited trust versus dedicated channel/creator verification subject types.
+
+### Next prompt
+
+```text
+Please implement Phase 08 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Bible, Spiritual Growth, And KCAN Vision Launch Proof. Use Phase 00-07 evidence to verify Bible reader UX, plans, streaks/reminders, highlights, notes, comments, daily meditations, offline/low-bandwidth scripture access, KCAN/partner ministry publishing, Our Vision page behavior, child/family-safe spiritual content controls, notification badge read-state, and moderation/media safety for devotional content. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not expose private data or secrets, keep unproven content publishing/public indexing flagged unless evidence exists, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 09.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 06
+
+### Scope completed
+
+- Tightened Verification, Trust Badges, And Identity Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_verification_launch`
+  - `python3 manage.py verify_verification_launch --strict`
+- Confirmed live verification provider calls are disabled by default.
+- Confirmed provider sandbox network calls are disabled by default.
+- Confirmed provider readiness output for Dojah, Sumsub, and Smile ID does not print secrets.
+- Confirmed required first-launch subject types exist:
+  - user;
+  - shop;
+  - partner;
+  - health institution;
+  - education institution.
+- Hardened staff audit event serialization so provider secrets/raw document fields are redacted at API output time.
+- Confirmed public trust summaries exclude private verification payloads.
+- Confirmed staff queue, staff audit, provider callback inspection, suspicious signal, badge issue/revoke, and expiry actions are staff-only through focused tests.
+- Recorded channel/creator and Bible/KCAN publisher verification as launch warnings to resolve by inherited trust or future subject types.
+
+### Files changed
+
+- `apps/verification/serializers.py`
+- `apps/verification/tests.py`
+- `apps/verification/management/commands/verify_verification_launch.py`
+- `docs/implementation-parity-roadmap/phase-06-verification-trust-identity-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/verification/serializers.py apps/verification/tests.py apps/verification/management/commands/verify_verification_launch.py apps/verification/views.py apps/verification/services.py apps/verification/providers.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_verification_launch --include-counts` passed launch guardrails with 8 pass / 0 fail / 4 warnings.
+- `python3 manage.py verification_provider_readiness` passed and showed provider live calls disabled for Dojah, Sumsub, and Smile ID.
+- `python3 manage.py test apps.verification.tests.UserVerificationFlowTests apps.verification.tests.StaffVerificationOperationsTests --noinput --keepdb` passed.
+  - PostgreSQL-backed: 21 tests.
+- React Native `npm run typecheck -- --pretty false` passed.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+
+### Validation warnings
+
+- `VERIFICATION_WEBHOOK_SECRET` is not configured in the local command environment. Staging/production must configure it and prove signed callback replay.
+- `verify_verification_launch --include-counts` could not read verification database counts locally due `OperationalError`.
+- Channel/creator verification is not a dedicated first-launch subject type yet.
+- Bible/KCAN publisher verification is not a dedicated first-launch subject type yet.
+
+### Remaining risks
+
+- Dojah/Sumsub/Smile sandbox proof is still required for one user and one institution subject.
+- Private media signed-access proof is still required for real verification evidence assets.
+- Real-device/staging badge display QA is still required across profile, shops, partners, health, education, channels, and Bible/KCAN publisher surfaces.
+- Product must decide whether channel/creator and Bible/KCAN publisher trust should inherit user/partner/institution verification for launch or receive dedicated subject types later.
+
+### Next prompt
+
+```text
+Please implement Phase 07 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Broadcast/Channels, Feeds, And Public Content Launch Proof. Use Phase 00-06 evidence to verify channel creation, channel-scoped content creation, legacy broadcast feed compatibility, subscribe/bell behavior, playlists, comments, saves, watch history, broadcast/unbroadcast state, public/private/unlisted visibility, embeds/oEmbed safety, channel trust badge display, media safety gating before publish, and report/moderation hooks. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not expose private media paths or secrets, keep risky live streaming/public indexing features flagged unless launch evidence exists, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 08.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 05
+
+### Scope completed
+
+- Tightened Payments And USD-Only Commerce Launch Proof.
+- Added read-only launch verifier:
+  - `python3 manage.py verify_payment_launch`
+  - `python3 manage.py verify_payment_launch --strict`
+- Confirmed default launch guardrails keep legacy wallet-as-money flows disabled:
+  - wallet deposit;
+  - peer transfer;
+  - cash/credit conversion;
+  - wallet upgrade;
+  - promotional cash bonus;
+  - commerce wallet checkout;
+  - education wallet checkout;
+  - health wallet checkout.
+- Confirmed profitability/live monetization flags remain disabled.
+- Confirmed direct payment defaults use Flutterwave for commerce, education, and health.
+- Updated education broadcast booking payment to create USD direct payment intents by default instead of locking KIS wallet funds.
+- Kept explicit education wallet checkout blocked behind `KIS_LEGACY_EDUCATION_WALLET_CHECKOUT_ENABLED`.
+- Added direct-payment callback redaction tests and verifier coverage.
+- Removed active public copy implying market broadcast transactions settle in credits.
+- Removed one active legacy health response phrase that described KIS Coin as a wallet balance.
+
+### Files changed
+
+- `apps/billing/management/commands/verify_payment_launch.py`
+- `apps/billing/tests.py`
+- `apps/broadcasts/views.py`
+- `apps/health_ops/views.py`
+- `/Users/nigel/dev/KIS/src/components/broadcast/MarketStudioSection.tsx`
+- `docs/implementation-parity-roadmap/phase-05-payments-usd-commerce-launch-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/billing/direct_payments.py apps/billing/management/commands/verify_payment_launch.py apps/billing/tests.py apps/broadcasts/views.py` passed.
+- `python3 -m py_compile apps/health_ops/views.py apps/broadcasts/views.py apps/billing/management/commands/verify_payment_launch.py apps/billing/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py verify_payment_launch --include-counts` passed launch guardrails with 22 pass / 0 fail / 1 warning.
+- React Native `npx eslint src/components/broadcast/MarketStudioSection.tsx --quiet` passed.
+- React Native `npm run typecheck -- --pretty false` passed.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+
+### Validation blockers
+
+- Focused payment regression run reached the payment assertions but ended with one education booking detail `404` after callback.
+- The same test run was delayed by unavailable local Redis/Celery: `Error 61 connecting to 10.11.19.99:6379`.
+- `verify_payment_launch --include-counts` could not read direct-payment database counts in this local command context due `OperationalError`.
+
+### Remaining risks
+
+- Flutterwave sandbox payment-link evidence is still required for marketplace order, service booking, education booking, and health billing.
+- Signed webhook replay evidence is still required for successful, failed, cancelled, duplicate, unmatched, and invalid-signature callbacks.
+- Real-device React Native checkout handoff and return/polling QA is still required.
+- Provider dashboard callback URL proof, payment rollback drill, redacted receipt/audit proof, and staging `verify_payment_launch --strict --include-counts` are still required.
+
+### Next prompt
+
+```text
+Please implement Phase 06 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Verification, Trust Badges, And Identity Launch Proof. Use Phase 00-05 evidence to verify user, shop, partner, health institution, education institution, channel/creator, and publisher verification flows. Confirm provider live calls are disabled by default, private media evidence uses references only, public badge summaries are safe, badge issue/revoke/expiry states work, staff review queues are staff-only, and verification audit logs do not expose secrets/raw documents. Prefer PostgreSQL-backed Django tests; if Postgres, Redis, or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not enable live provider calls or expose secrets/raw documents, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 07.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 04
+
+### Scope completed
+
+- Tightened Media Safety And Christian Moderation Production Proof.
+- Added central allowed-extension policy for launch media uploads:
+  - `MEDIA_SAFETY_ALLOWED_EXTENSIONS`.
+- Removed generic `application/octet-stream` from the default allowed MIME policy and explicitly blocks it before storage.
+- Added MIME/extension compatibility checks to prevent mismatched uploaded file metadata.
+- Preserved existing upload behavior for normal image, video, audio, text, PDF, Office document, and archive types.
+- Preserved quarantine/review behavior for production-style explicit scan mode.
+- Confirmed quarantined uploads do not receive public URLs.
+- Confirmed upload safety audit context avoids raw storage paths and secrets.
+- Confirmed moderation staff queue and staff approve/block workflow still cover media safety scans.
+- Added a read-only launch verifier:
+  - `python3 manage.py verify_media_safety_launch`
+  - `python3 manage.py verify_media_safety_launch --strict`
+
+### Files changed
+
+- `apps/media/safety.py`
+- `apps/media/tests.py`
+- `apps/media/management/commands/verify_media_safety_launch.py`
+- `config/settings/base.py`
+- `.env.example`
+- `docs/implementation-parity-roadmap/phase-04-media-safety-production-proof.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/media/safety.py apps/media/views.py apps/media/tests.py apps/media/management/commands/verify_media_safety_launch.py config/settings/base.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.media.tests.PrivateMediaAccessTests apps.media.tests.MediaSafetyUploadTests apps.moderation.tests.ModerationAccessBoundaryTests --noinput --keepdb` passed.
+  - PostgreSQL-backed: 16 tests.
+- `python3 manage.py verify_media_safety_launch` passed with 0 fail / 1 warning.
+- React Native `npx eslint src/services/mediaSafety.ts --quiet` passed.
+- React Native `npm run typecheck -- --pretty false` passed.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+
+### Validation note
+
+- The local media launch verifier warning was `Media safety scan queue summary unavailable: OperationalError`. This happened while reading the configured live database in this sandboxed command context. Focused PostgreSQL-backed tests passed, and staging should rerun `python3 manage.py verify_media_safety_launch --strict` with deployed database access.
+
+### Remaining risks
+
+- Staging must prove every real upload entry point uses the central media gate or validates before storage.
+- Live explicit-content provider calls remain disabled by default. Production launch must either rely on quarantine/manual-review mode or attach provider evidence before enabling live calls.
+- Real-device QA must prove quarantined media is not displayed/sent in DMs, channels, partner groups, commerce, education, health, profile, verification, or public embeds.
+- Staff moderation queue needs real staging upload/reviewer evidence.
+
+### Next prompt
+
+```text
+Please implement Phase 05 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Payments And USD-Only Commerce Launch Proof. Use the Phase 00 launch scope and Phase 01-04 evidence to verify and tighten USD-only direct-provider payment readiness across Commerce/Market, service bookings, Education, Health, subscriptions/upgrades placeholders, receipts, and historical wallet/KIS promotional-credit displays. Confirm KIS promotional credits remain non-cash, non-transferable, non-withdrawable, and not exchange-rated; confirm legacy wallet checkout/deposit/transfer/conversion flags remain disabled; verify Flutterwave/direct-payment intent status handling, callback/webhook idempotency, audit logs, and rollback evidence where safe. Prefer PostgreSQL-backed Django tests; if Postgres or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not enable live charges or expose secrets, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 06.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 03
+
+### Scope completed
+
+- Hardened main-tab notification badge accuracy across Messages, Bible, Broadcast/Channels, Partners, Profile, Commerce/Market, Education, and Health.
+- Added stable notification metadata into `context_data` for new notifications:
+  - `source`
+  - `badge_source`
+  - `type`
+  - `notification_type`
+  - `target_type`
+  - `target_id`
+- Expanded badge source inference for education, health, market, product, service, order, course, lesson, and channel-content notifications.
+- Expanded `/api/v1/notifications/mark-source-read/` target aliases so consumer screens can mark exact sources read/viewed.
+- Confirmed React Native badge runtime fetches `/api/v1/notifications/main-tab-badge-counts/`, listens for `main_tab_badges.updated`, refreshes on local notification/message/channel/Bible/partner events, and keeps fallback inference when the endpoint is unavailable.
+- Confirmed key consumer screens already mark exact source read for Bible, broadcast market, market product detail, education detail, health institution detail, partner community, and partner group views.
+
+### Files changed
+
+- `apps/notifications/services.py`
+- `apps/notifications/views.py`
+- `apps/notifications/tests.py`
+- `docs/implementation-parity-roadmap/phase-03-notification-badge-accuracy.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/notifications/services.py apps/notifications/views.py apps/notifications/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.notifications.tests.MainTabBadgeCountsAPITest apps.notifications.tests.NotificationAPITest --noinput --keepdb` passed.
+  - PostgreSQL-backed: 9 tests.
+- React Native `npx eslint src/services/mainTabNotificationBadges.ts src/navigation/AppNavigator.tsx --quiet` passed.
+- React Native `npm run typecheck -- --pretty false` passed.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+
+### Remaining risks
+
+- Staging still needs real producer proof for every notification source, not only synthetic regression notifications.
+- End-to-end realtime proof is still needed with Django -> Nest signed internal callback -> React Native refresh.
+- Real-device QA must confirm badge decrement timing across Bible, Broadcast, Market, Education, Health, Partner, Message, and Profile surfaces.
+- Profile badge currently counts total unread in-app notifications. Product should decide if this should remain broad or become profile/account-only.
+
+### Next prompt
+
+```text
+Please implement Phase 04 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Media Safety And Christian Moderation Production Proof. Use the Phase 00 launch scope and Phase 01-03 evidence to prove and tighten the central media safety gate across DMs, group/partner messages, feeds/channels, comments, profile media, commerce, education, health, verification, and public embeds. Ensure MIME/extension/size validation, private-media handling, quarantine/review states, explicit-content provider flags disabled by default, staff moderation queues, report/appeal hooks, child/youth-safe defaults, audit logs, and user-safe blocked/review messages are wired where safe. Prefer PostgreSQL-backed Django tests; if Postgres or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not expose secrets or raw storage paths, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 05.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 02
+
+### Scope completed
+
+- Hardened messaging launch reliability across Django and React Native.
+- Routed generic direct conversation creation through the canonical direct conversation service so direct rooms get stable `direct_key` values and cannot duplicate via generic create.
+- Preserved request-flow behavior for direct messages.
+- Made subroom creation idempotent for a parent message by allowing the view to return the existing `MessageThreadLink` instead of failing serializer unique validation.
+- Fixed conversation search so `last_message_preview` is included in the base queryset search path.
+- Hardened React Native chat auth bootstrap so chat rooms can recover current user identity from durable user/profile cache when legacy `AUTH_CACHE/USER_KEY` is empty.
+- Updated chat tests away from stale reverse names to actual mounted API paths.
+
+### Files changed
+
+- `apps/chat/serializers.py`
+- `apps/chat/views.py`
+- `apps/chat/tests.py`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/hooks/useChatAuth.ts`
+- `docs/implementation-parity-roadmap/phase-02-messaging-launch-reliability.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/messaging-platform-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/chat/views.py apps/chat/serializers.py apps/chat/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 manage.py test apps.chat.tests.ConversationUnreadContractTests --noinput --keepdb` passed.
+  - PostgreSQL-backed: 11 tests.
+- Nest `pnpm tsc --noEmit --pretty false --incremental false` passed.
+- React Native `npx eslint src/Module/ChatRoom/hooks/useChatAuth.ts src/Module/ChatRoom/normalizeConversation.ts src/screens/tabs/MessagesScreen.tsx --quiet` passed.
+- React Native `npm run typecheck -- --pretty false` passed.
+
+### Remaining risks
+
+- Real-device iOS/Android QA is still required for restart sender alignment, long conversation history, bidirectional latency, media attachments, calls, statuses/updates, and push/realtime unread badges.
+- E2EE fallback/history behavior still needs production policy sign-off.
+- Partner messaging and main chat list integration still need final product QA.
+
+### Next prompt
+
+```text
+Please implement Phase 03 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Notification And Badge Accuracy. Use the Phase 00 launch scope, Phase 01 security evidence, and Phase 02 messaging reliability work to make main-tab notification badges exact and production-ready. Verify backend producers and read-state lifecycle for Messages, Bible, Broadcast/Channels, Partners, Profile, Commerce/Market, Education, and Health. Ensure every badge-counted source has consistent source/type/target_type/target_id metadata, every consumer screen marks the exact source read/viewed, realtime `main_tab_badges.updated` events trigger refresh, and counts decrement immediately when content is consumed. Prefer PostgreSQL-backed Django tests; if Postgres or environment setup blocks validation, record the exact blocker and move on. Preserve existing UI behavior, run safe Django/Nest/React Native validation, update docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 04.
+```
+
 ## 2026-05-17 - KIS Profitability 80%+ Roadmap Phase 27 Final Close-Out
 
 ### Scope completed
@@ -8625,3 +9507,91 @@ Please implement Phase 05 of KIS Feed Channels in React Native without using git
 ### Required local step
 
 - Run `python3 manage.py migrate` before testing the selected-chat pin/delete-for-me buttons against the Django backend.
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 01
+
+### Scope completed
+
+- Added Phase 01 production security and environment evidence document.
+- Added a redacted, read-only production evidence checker:
+  - `scripts/security/implementation_parity_phase01_check.py`
+- Confirmed the checker validates:
+  - launch/security/runbook docs exist;
+  - risky launch flags are not enabled in the current environment;
+  - Django deployment verifier exists;
+  - Nest `security:env-check` exists;
+  - React Native launch validation scripts exist;
+  - remaining provider evidence gaps are warnings, not secret output.
+- Added PostgreSQL-first launch testing rule:
+  - launch-critical backend tests should use PostgreSQL, not SQLite;
+  - if PostgreSQL or local test environment blocks validation, record the exact blocker and move on.
+- Updated the Phase 02 prompt to include PostgreSQL-backed validation preference.
+
+### Files changed
+
+- `scripts/security/implementation_parity_phase01_check.py`
+- `docs/implementation-parity-roadmap/phase-01-production-security-evidence.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile scripts/security/implementation_parity_phase01_check.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed.
+- `python3 scripts/security/implementation_parity_phase01_check.py` passed with 16 pass, 8 warning/evidence-needed, 0 fail.
+- Current Django DB engine is PostgreSQL: `django.db.backends.postgresql`, database `kis_dev_db`.
+- PostgreSQL-backed focused media/security tests passed:
+  - `python3 manage.py test apps.media.tests.PrivateMediaAccessTests apps.media.tests.MediaSafetyUploadTests --noinput --keepdb`
+  - 9 tests passed.
+- React Native `npm run typecheck:launch` passed.
+- React Native `npm run lint:launch` passed.
+
+### Recorded blockers
+
+- `python3 manage.py verify_deployment_security --target-production` correctly reports local/dev production-gate failures because this session is not running real production settings/env values.
+- Nest `npm run security:env-check` correctly reports local/dev production-gate failures because the current Nest env is not production-grade.
+- Production env values, backup/restore proof, rollback proof, private media proof, Firebase/admin credential proof, React Native real-device QA, Flutterwave staging proof, and PostgreSQL-backed launch-critical suite evidence remain required before go-live.
+
+### Next prompt
+
+```text
+Please implement Phase 02 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on Messaging 100% Launch Reliability. Use the Phase 00 launch scope and Phase 01 security evidence to complete and prove the launch-safe messaging core: direct conversation identity, duplicate direct/subroom prevention, conversation list persistence, sender/receiver alignment after restart, fast bidirectional delivery, invisible retry, unread counts, selected-chat actions, safe media attachments through the media safety gate, and basic calls/status/update QA evidence. Prefer PostgreSQL-backed Django tests instead of SQLite for launch-critical behavior; if PostgreSQL or any test environment blocks validation, record the exact blocker and move on. Preserve existing UI behavior, do not expose secrets, run safe Django/Nest/React Native validation, record blockers in docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 03.
+```
+
+## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 00
+
+### Scope completed
+
+- Created the Phase 00 launch scope lock for the KIS 100% implementation and 80%+ global parity roadmap.
+- Separated each major product area into:
+  - launchable;
+  - launchable with evidence;
+  - hidden / flagged;
+  - post-launch global-parity work.
+- Covered Messaging, Broadcast/Channels, Bible, Profile, Partners, Commerce, Education, Health, Verification, Notifications, Payments, Media Safety, Search, Public Web, Admin/Ops, Accessibility, family modes, offline, and performance.
+- Registered existing feature flags and production config checks that should control go-live exposure.
+- Added a master blocker register with P0/P1 launch evidence needs.
+- Locked the first-launch policy: KIS Coins as money, live production subscriptions, production live verification provider calls, production live AI provider calls, live streaming, public indexing/referrals, and experimental parity features should remain off until explicit evidence/sign-off exists.
+
+### Files changed
+
+- `docs/implementation-parity-roadmap/phase-00-launch-scope-lock.md`
+- `docs/implementation-parity-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- Documentation-only phase. Runtime behavior was not changed.
+- `python3 manage.py check` passed.
+- `python3 manage.py makemigrations --check --dry-run` passed with `No changes detected`.
+
+### Remaining risks
+
+- Production environment values still need provider/deployment evidence.
+- Flutterwave staging proof, backup/restore proof, rollback proof, media safety producer proof, real-device messaging QA, notification read-state proof, verification sandbox proof, and institution owner/admin access QA remain launch blockers.
+
+### Next prompt
+
+```text
+Please implement Phase 01 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on production security and environment proof. Use the Phase 00 launch scope lock to verify production-safe settings and launch gates for Django, Nest, and React Native: DEBUG=False, ALLOWED_HOSTS, CORS/CSRF, Socket.IO origins, Redis/cache throttling, private media, admin/docs staff-only access, production secrets, Firebase/admin credentials, backup/restore, rollback, and staff-only surfaces. Add or update safe verification scripts/docs where needed without exposing secrets, preserve local development, run safe validation, record blockers in docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 02.
+```

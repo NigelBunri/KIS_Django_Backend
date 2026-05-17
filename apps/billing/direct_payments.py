@@ -29,6 +29,11 @@ SENSITIVE_KEYS = {
     "flw_ref",
     "account_number",
     "customer_phone",
+    "patient_phone",
+    "patient_health_record",
+    "health_record",
+    "medical_record",
+    "private_health_record",
 }
 
 
