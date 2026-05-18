@@ -475,3 +475,47 @@ class StatusViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_201_CREATED,
         )
+
+    @action(detail=True, methods=["post"], url_path="reply")
+    def reply(self, request, pk=None):
+        try:
+            status_item = self._base_status_queryset().get(id=pk)
+        except StatusItem.DoesNotExist:
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if status_item.reply_permission == "NOBODY":
+            return Response({"detail": "Replies disabled for this status."}, status=status.HTTP_403_FORBIDDEN)
+
+        text = (request.data.get("text") or "").strip()
+        if not text:
+            return Response({"detail": "Reply text is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from apps.chat.models import Conversation, ConversationMember, Message
+        from apps.chat.services import get_or_create_direct_conversation
+
+        try:
+            conversation = get_or_create_direct_conversation(
+                user_a=request.user,
+                user_b_id=status_item.user_id,
+            )
+        except Exception:
+            return Response({"detail": "Could not open conversation."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        msg = Message.objects.create(
+            conversation=conversation,
+            sender_id=request.user.id,
+            kind="text",
+            text=text,
+            metadata={"status_reply_id": str(status_item.id)},
+        )
+        AuditLog.objects.create(
+            actor_id=request.user.id,
+            action="status.reply",
+            target_type="STATUS",
+            target_id=status_item.id,
+            metadata={"message_id": str(msg.id), "text_len": len(text)},
+        )
+        return Response(
+            {"replied": True, "message_id": str(msg.id), "conversation_id": str(conversation.id)},
+            status=status.HTTP_201_CREATED,
+        )

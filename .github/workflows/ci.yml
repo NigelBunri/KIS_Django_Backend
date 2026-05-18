@@ -1,0 +1,71 @@
+name: Django CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: kis_test
+          POSTGRES_USER: kis
+          POSTGRES_PASSWORD: kis_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DJANGO_SETTINGS_MODULE: config.settings.base
+      DATABASE_URL: postgres://kis:kis_test_password@localhost:5432/kis_test
+      REDIS_URL: redis://localhost:6379/0
+      SECRET_KEY: ci-test-secret-key-not-for-production-use-at-all
+      JWT_SECRET: ci-test-jwt-secret-not-for-production-use-at-all
+      LOG_LEVEL: WARNING
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-django pytest-cov
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          flake8 . --count --max-line-length=120 --exclude=migrations,__pycache__,.venv --statistics
+
+      - name: Run tests
+        run: pytest --cov=apps --cov=common --cov-report=term-missing -q
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: .coverage

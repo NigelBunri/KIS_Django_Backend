@@ -35,14 +35,24 @@ if os.environ.get("VERIFICATION_LIVE_PROVIDER_CALLS_ENABLED", "").strip().lower(
 if os.environ.get("VERIFICATION_PROVIDER_SANDBOX_NETWORK_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
     raise ImproperlyConfigured("Verification sandbox network calls must not be enabled in production.")
 
-# Database from DATABASE_URL env var.
-DATABASES["default"] = dj_database_url.parse(os.environ["DATABASE_URL"], conn_max_age=600)
+# Database — must be PostgreSQL in production; SQLite is not supported.
+_db_url = os.environ.get("DATABASE_URL", "").strip()
+if not _db_url:
+    raise ImproperlyConfigured("DATABASE_URL must be set in production.")
+if _db_url.startswith("sqlite"):
+    raise ImproperlyConfigured(
+        "DATABASE_URL must point to PostgreSQL in production, not SQLite."
+    )
+DATABASES["default"] = dj_database_url.parse(_db_url, conn_max_age=600, ssl_require=True)
 
-# Use redis for cache in production
+# Redis cache — REDIS_URL must be set explicitly; no dev-IP fallback allowed.
+_redis_url = os.environ.get("REDIS_URL", "").strip()
+if not _redis_url:
+    raise ImproperlyConfigured("REDIS_URL must be set in production.")
 CACHES = {
     "default": {
         "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": os.environ.get("REDIS_URL", "redis://10.14.20.99:6379/0"),
+        "LOCATION": _redis_url,
         "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
     }
 }
@@ -58,6 +68,21 @@ DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@example.com"
 
 # Logging: structured and less verbose
 LOGGING["root"]["level"] = os.environ.get("LOG_LEVEL", "INFO")
+
+# Sentry error tracking — optional; no-op if SENTRY_DSN is not set
+_sentry_dsn = os.environ.get("SENTRY_DSN", "").strip()
+if _sentry_dsn:
+    import sentry_sdk
+    from sentry_sdk.integrations.django import DjangoIntegration
+    from sentry_sdk.integrations.celery import CeleryIntegration
+    from sentry_sdk.integrations.redis import RedisIntegration
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        integrations=[DjangoIntegration(), CeleryIntegration(), RedisIntegration()],
+        traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+        send_default_pii=False,
+        environment="production",
+    )
 
 # Strict deploy security defaults
 SECURE_SSL_REDIRECT = True

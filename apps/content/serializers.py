@@ -42,7 +42,9 @@ class CommentSerializer(serializers.ModelSerializer):
         fields = ("id", "content", "author", "text", "parent_comment", "language", "edited_at", "is_pinned", "moderation_state", "replies_count", "created_at")
 
     def get_replies_count(self, obj):
-        return obj.replies.count()
+        # Use annotated value when available (set by CommentViewSet queryset)
+        annotated = getattr(obj, "replies_count", None)
+        return annotated if annotated is not None else obj.replies.count()
 
 class ReactionSerializer(serializers.ModelSerializer):
     user = serializers.StringRelatedField(read_only=True)

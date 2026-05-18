@@ -28,6 +28,7 @@ import uuid
 import secrets
 import hashlib
 import hmac
+import ipaddress
 
 from common.media_urls import normalize_image_payload
 import datetime
@@ -539,15 +540,25 @@ class ApiToken(BaseEntity):
             return None
         if api_token.is_expired():
             return None
-        # optional IP restriction enforcement
+        # IP restriction enforcement — supports both literal IPs and CIDR blocks.
         if api_token.ip_restrictions:
-            # naive check: treat ip_restrictions as an allowlist of literal IPs or CIDRs
-            # For production use, replace with netaddr/ipaddress CIDR-safe checks
-            if ip_address and (ip_address not in api_token.ip_restrictions):
-                # fail if not allowed
-                return None
             if not ip_address:
-                # if token has restrictions but no ip was given, deny
+                # Token has restrictions but no IP was provided — deny.
+                return None
+            try:
+                caller = ipaddress.ip_address(ip_address)
+            except ValueError:
+                return None
+            allowed = False
+            for entry in api_token.ip_restrictions:
+                try:
+                    network = ipaddress.ip_network(entry, strict=False)
+                    if caller in network:
+                        allowed = True
+                        break
+                except ValueError:
+                    continue
+            if not allowed:
                 return None
         # update last used
         api_token.last_used_at = timezone.now()

@@ -66,6 +66,8 @@ from .views import (
     SocialRecommendationFoundationView,
     UnifiedPlatformDashboardSummaryView,
     UnifiedSearchView,
+    LinkPreviewView,
+    TranslateView,
 )
 
 app_name = "core"
@@ -139,6 +141,8 @@ urlpatterns = [
     path("core/admin/security-launch-gate/", SecurityPrivacyLaunchGateView.as_view(), name="core-admin-security-launch-gate"),
     path("core/monetization/safety-summary/", MonetizationSafetySummaryView.as_view(), name="core-monetization-safety-summary"),
     path("core/ai/safety-policy/", AIAssistanceSafetyPolicyView.as_view(), name="core-ai-safety-policy"),
+    path("link-preview/", LinkPreviewView.as_view(), name="link-preview"),
+    path("translate/", TranslateView.as_view(), name="translate"),
 ]
 
 # Optional: add schema / docs routes (uncomment if you use drf-yasg or drf-spectacular)

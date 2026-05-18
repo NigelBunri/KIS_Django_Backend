@@ -35,7 +35,7 @@ from apps.communities.models import (
     CommunityVisibility,
 )
 from apps.accounts.models import User
-from apps.partners.models import PartnerMembership, PartnerMembershipStatus
+from apps.partners.models import Partner as PartnerModel, PartnerMembership, PartnerMembershipStatus
 from apps.chat.models import (
     BaseConversationRole,
     Conversation,
@@ -77,21 +77,52 @@ class CommunityViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """
-        For now:
-        - Return communities where:
-          - the user is the owner, OR
-          - the user is an active member of the community.
+        - Return public communities when ?public=true is passed (for discovery).
+        - Otherwise return communities where the user is the owner or active member.
+        - Supports ?search=, ?ordering=-member_count.
         """
         user = self.request.user
         qs = Community.objects.select_related("partner", "owner", "main_conversation")
         partner_id = self.request.query_params.get("partner")
+
+        # Public discovery mode
+        is_public_filter = self.request.query_params.get("public", "").lower() in ("true", "1")
+        if is_public_filter:
+            qs = qs.filter(
+                is_active=True,
+                visibility=CommunityVisibility.PUBLIC,
+            )
+            search = self.request.query_params.get("search", "").strip()
+            if search:
+                qs = qs.filter(
+                    models.Q(name__icontains=search) | models.Q(description__icontains=search)
+                )
+            ordering = self.request.query_params.get("ordering", "")
+            if ordering == "-member_count":
+                qs = qs.annotate(
+                    member_count=models.Count(
+                        "memberships",
+                        filter=models.Q(memberships__left_at__isnull=True, memberships__is_banned=False),
+                    )
+                ).order_by("-member_count")
+            if partner_id:
+                qs = qs.filter(partner_id=partner_id)
+            return qs.distinct()
+
         if partner_id:
-            is_partner_member = PartnerMembership.objects.filter(
-                partner_id=partner_id,
-                user=user,
-                status=PartnerMembershipStatus.MEMBER,
-            ).exists()
-            if is_partner_member:
+            is_privileged = False
+            try:
+                partner_obj = PartnerModel.objects.only("owner_id").get(pk=partner_id)
+                is_privileged = str(partner_obj.owner_id) == str(user.pk)
+            except PartnerModel.DoesNotExist:
+                pass
+            if not is_privileged:
+                is_privileged = PartnerMembership.objects.filter(
+                    partner_id=partner_id,
+                    user=user,
+                    status=PartnerMembershipStatus.MEMBER,
+                ).exists()
+            if is_privileged:
                 return qs.filter(partner_id=partner_id).distinct()
 
         qs = qs.filter(

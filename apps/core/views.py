@@ -2252,3 +2252,89 @@ class AIAssistanceSafetyPolicyView(APIView):
             ai_assistance_safety_policy(request.user),
             status=status.HTTP_200_OK,
         )
+
+
+class LinkPreviewView(APIView):
+    """
+    GET /api/v1/link-preview/?url=<url>
+    Fetches OG metadata for a URL and returns title, description, image, site_name.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        url = request.query_params.get("url", "").strip()
+        if not url:
+            return Response({"detail": "url param is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            import requests as _requests
+            from html.parser import HTMLParser
+
+            class _OGParser(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.og = {}
+
+                def handle_starttag(self, tag, attrs):
+                    if tag == "meta":
+                        attr_dict = dict(attrs)
+                        prop = attr_dict.get("property") or attr_dict.get("name") or ""
+                        content = attr_dict.get("content") or ""
+                        if prop.startswith("og:") and content:
+                            self.og[prop[3:]] = content
+
+            resp = _requests.get(url, timeout=5, headers={"User-Agent": "KISBot/1.0"})
+            resp.raise_for_status()
+            parser = _OGParser()
+            parser.feed(resp.text[:50000])  # cap parse size
+            og = parser.og
+            return Response({
+                "title": og.get("title", ""),
+                "description": og.get("description", ""),
+                "image": og.get("image", ""),
+                "site_name": og.get("site_name", ""),
+            }, status=status.HTTP_200_OK)
+        except Exception:
+            return Response({
+                "title": "",
+                "description": "",
+                "image": "",
+                "site_name": "",
+            }, status=status.HTTP_200_OK)
+
+
+class TranslateView(APIView):
+    """
+    POST /api/v1/translate/
+    Body: { text: str, target_lang: str }
+    Returns: { translated: str }
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        import os
+
+        text = request.data.get("text", "")
+        target_lang = request.data.get("target_lang", "en")
+
+        if not text:
+            return Response({"translated": "", "note": "No text provided."}, status=status.HTTP_200_OK)
+
+        api_key = os.environ.get("GOOGLE_TRANSLATE_API_KEY", "")
+        if not api_key:
+            return Response({"translated": text, "note": "Translation not configured"}, status=status.HTTP_200_OK)
+
+        try:
+            import requests as _requests
+            resp = _requests.post(
+                "https://translation.googleapis.com/language/translate/v2",
+                params={"key": api_key},
+                json={"q": text, "target": target_lang, "format": "text"},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            translated = data["data"]["translations"][0]["translatedText"]
+            return Response({"translated": translated}, status=status.HTTP_200_OK)
+        except Exception:
+            return Response({"translated": text, "note": "Translation failed"}, status=status.HTTP_200_OK)

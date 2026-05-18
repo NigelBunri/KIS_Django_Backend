@@ -7,7 +7,7 @@ from django.db.models import Prefetch
 from django.http import HttpResponse
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
-from rest_framework import generics, status, viewsets
+from rest_framework import generics, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -2104,3 +2104,197 @@ class BibleCourseShareView(APIView):
             raise PermissionDenied("Course is private.")
         BibleCourseShare.objects.create(course=course, user=request.user)
         return Response({"shared": True}, status=status.HTTP_200_OK)
+
+
+# ─── KCAN Books & Messages views ─────────────────────────────────────────────
+
+from .models import KCANBook, KCANMessageTopic, KCANMinister, KCANMessage
+
+
+
+class _KCANBookSerializer(serializers.ModelSerializer):
+    cover_image_url = serializers.SerializerMethodField()
+    pdf_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = KCANBook
+        fields = [
+            "id", "title", "author", "description", "genre", "cover_image_url",
+            "pdf_url", "page_count", "language", "status", "sort_order",
+        ]
+
+    def get_cover_image_url(self, obj):
+        request = self.context.get("request")
+        if obj.cover_image:
+            url = obj.cover_image.url
+            return request.build_absolute_uri(url) if request else url
+        return None
+
+    def get_pdf_url(self, obj):
+        request = self.context.get("request")
+        if obj.pdf_file:
+            url = obj.pdf_file.url
+            return request.build_absolute_uri(url) if request else url
+        return None
+
+
+class _KCANMessageTopicSerializer(serializers.ModelSerializer):
+    cover_image_url = serializers.SerializerMethodField()
+    minister_count = serializers.SerializerMethodField()
+    message_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = KCANMessageTopic
+        fields = ["id", "name", "slug", "description", "cover_image_url", "status", "sort_order", "minister_count", "message_count"]
+
+    def get_cover_image_url(self, obj):
+        request = self.context.get("request")
+        if obj.cover_image:
+            url = obj.cover_image.url
+            return request.build_absolute_uri(url) if request else url
+        return None
+
+    def get_minister_count(self, obj):
+        return obj.ministers.filter(status="published").count()
+
+    def get_message_count(self, obj):
+        return obj.messages.filter(status="published").count()
+
+
+class _KCANMinisterSerializer(serializers.ModelSerializer):
+    photo_url = serializers.SerializerMethodField()
+    message_count = serializers.SerializerMethodField()
+    topic_ids = serializers.SerializerMethodField()
+
+    class Meta:
+        model = KCANMinister
+        fields = ["id", "name", "title", "bio", "photo_url", "status", "sort_order", "message_count", "topic_ids"]
+
+    def get_photo_url(self, obj):
+        request = self.context.get("request")
+        if obj.photo:
+            url = obj.photo.url
+            return request.build_absolute_uri(url) if request else url
+        return None
+
+    def get_message_count(self, obj):
+        return obj.messages.filter(status="published").count()
+
+    def get_topic_ids(self, obj):
+        return list(obj.topics.values_list("id", flat=True))
+
+
+class _KCANMessageSerializer(serializers.ModelSerializer):
+    thumbnail_url_resolved = serializers.SerializerMethodField()
+    minister_name = serializers.SerializerMethodField()
+    topic_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = KCANMessage
+        fields = [
+            "id", "title", "description", "video_type", "youtube_url", "youtube_video_id",
+            "video_url", "thumbnail_url_resolved", "duration_seconds", "scripture_reference",
+            "tags", "status", "sort_order", "view_count", "topic_id", "minister_id",
+            "minister_name", "topic_name", "created_at",
+        ]
+
+    def get_thumbnail_url_resolved(self, obj):
+        if obj.thumbnail_url:
+            return obj.thumbnail_url
+        request = self.context.get("request")
+        if obj.thumbnail:
+            url = obj.thumbnail.url
+            return request.build_absolute_uri(url) if request else url
+        if obj.youtube_video_id:
+            return f"https://img.youtube.com/vi/{obj.youtube_video_id}/hqdefault.jpg"
+        return None
+
+    def get_minister_name(self, obj):
+        return obj.minister.name if obj.minister_id else None
+
+    def get_topic_name(self, obj):
+        return obj.topic.name if obj.topic_id else None
+
+
+class KCANBookListView(KCANPublishedContentMixin, viewsets.ModelViewSet):
+    serializer_class = _KCANBookSerializer
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def _base_queryset(self):
+        return KCANBook.objects.select_related("partner").all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        genre = self.request.query_params.get("genre")
+        if genre:
+            qs = qs.filter(genre=genre)
+        q = self.request.query_params.get("q")
+        if q:
+            qs = qs.filter(title__icontains=q) | qs.filter(author__icontains=q)
+        return qs
+
+    def perform_create(self, serializer):
+        partner = require_manage_kcan_content(self.request.user)
+        serializer.save(partner=partner, created_by=self.request.user)
+
+
+class KCANMessageTopicListView(KCANPublishedContentMixin, viewsets.ModelViewSet):
+    serializer_class = _KCANMessageTopicSerializer
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def _base_queryset(self):
+        return KCANMessageTopic.objects.all()
+
+    def perform_create(self, serializer):
+        partner = require_manage_kcan_content(self.request.user)
+        serializer.save(partner=partner)
+
+
+class KCANMinisterListView(KCANPublishedContentMixin, viewsets.ModelViewSet):
+    serializer_class = _KCANMinisterSerializer
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def _base_queryset(self):
+        return KCANMinister.objects.prefetch_related("topics").all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        topic_id = self.request.query_params.get("topic")
+        if topic_id:
+            qs = qs.filter(topics__id=topic_id)
+        return qs
+
+    def perform_create(self, serializer):
+        partner = require_manage_kcan_content(self.request.user)
+        serializer.save(partner=partner)
+
+
+class KCANMessageListView(KCANPublishedContentMixin, viewsets.ModelViewSet):
+    serializer_class = _KCANMessageSerializer
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def _base_queryset(self):
+        return KCANMessage.objects.select_related("topic", "minister", "partner").all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        topic_id = self.request.query_params.get("topic")
+        if topic_id:
+            qs = qs.filter(topic_id=topic_id)
+        minister_id = self.request.query_params.get("minister")
+        if minister_id:
+            qs = qs.filter(minister_id=minister_id)
+        q = self.request.query_params.get("q")
+        if q:
+            qs = qs.filter(title__icontains=q)
+        return qs
+
+    def perform_create(self, serializer):
+        partner = require_manage_kcan_content(self.request.user)
+        serializer.save(partner=partner, created_by=self.request.user)
+
+    @action(detail=True, methods=["post"], url_path="view")
+    def record_view(self, request, pk=None):
+        msg = self.get_object()
+        KCANMessage.objects.filter(pk=msg.pk).update(view_count=models.F("view_count") + 1)
+        return Response({"view_count": msg.view_count + 1})

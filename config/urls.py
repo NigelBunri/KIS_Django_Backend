@@ -15,6 +15,31 @@ from apps.media.views import UploadFileView
 
 from django.conf import settings
 from django.conf.urls.static import static
+from django.http import JsonResponse
+from django.db import connection
+from django.core.cache import cache
+
+
+def health_check(request):
+    checks = {}
+    ok = True
+
+    try:
+        connection.ensure_connection()
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = str(exc)
+        ok = False
+
+    try:
+        cache.set("_health_probe", "1", timeout=5)
+        checks["cache"] = "ok"
+    except Exception as exc:
+        checks["cache"] = str(exc)
+        ok = False
+
+    status_code = 200 if ok else 503
+    return JsonResponse({"status": "ok" if ok else "error", "checks": checks}, status=status_code)
 
 
 class StaffOnlySpectacularAPIView(SpectacularAPIView):
@@ -40,6 +65,7 @@ DocsSwaggerView = SpectacularSwaggerView if settings.DEBUG else StaffOnlySpectac
 DocsRedocView = SpectacularRedocView if settings.DEBUG else StaffOnlySpectacularRedocView
 
 urlpatterns = [
+    path("health/", health_check, name="health-check"),
     path("admin/", admin.site.urls),
     path("control/admin/", include("admin_control.urls")),
 

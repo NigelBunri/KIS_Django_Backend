@@ -829,6 +829,39 @@ class WalletViewSet(viewsets.ViewSet):
         html_url, pdf_url = build_receipt_urls(request, tx)
         return Response({"receipt_url": html_url, "receipt_pdf_url": pdf_url}, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=["post"], url_path="refund")
+    def refund(self, request):
+        tx_ref = request.data.get("tx_ref")
+        reason = str(request.data.get("reason") or "Customer requested refund")[:255]
+        if not tx_ref:
+            return Response({"detail": "tx_ref required"}, status=status.HTTP_400_BAD_REQUEST)
+        tx = WalletTransaction.objects.filter(user=request.user, tx_ref=tx_ref, is_deleted=False).first()
+        if not tx:
+            return Response({"detail": "Transaction not found"}, status=status.HTTP_404_NOT_FOUND)
+        if tx.status != "success":
+            return Response({"detail": "Only successful transactions can be refunded"}, status=status.HTTP_400_BAD_REQUEST)
+        if not tx.provider_ref:
+            return Response({"detail": "No provider reference — contact support"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            _ensure_payments_ready()
+            resp = requests.post(
+                f"{FLW_BASE_URL}/transactions/{tx.provider_ref}/refund",
+                json={"amount": tx.amount_cents / 100, "comments": reason},
+                headers=_flutterwave_headers(),
+                timeout=30,
+            )
+            data = resp.json() if resp.content else {}
+            if resp.status_code >= 300:
+                raise ValueError(data.get("message") or "Refund failed")
+            tx.status = "cancelled"
+            tx.meta = {**tx.meta, "refund_reason": reason, "refund_response": data}
+            tx.save(update_fields=["status", "meta", "updated_at"])
+            return Response({"detail": "Refund initiated", "provider_response": data})
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            return Response({"detail": "Refund service unavailable"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
     @action(detail=False, methods=["get"], url_path="invoice")
     def invoice(self, request):
         sub_id = request.query_params.get("subscription_id")

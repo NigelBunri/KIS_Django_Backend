@@ -44,20 +44,30 @@ class Content(BaseEntity):
         self.save(update_fields=["is_published", "published_at", "updated_at"])
 
     def recalc_metrics(self):
-        from django.db.models import Count, Sum
-        metrics, created = ContentMetrics.objects.get_or_create(content=self)
-        metrics.views_count = ContentView.objects.filter(content=self, is_unique=True).count()
-        metrics.shares_count = Share.objects.filter(content=self).count()
-        metrics.comments_count = Comment.objects.filter(content=self, is_deleted=False).count()
-        metrics.reactions_count = Reaction.objects.filter(content=self).count()
-        metrics.trending_score = ContentMetrics.compute_trending_score(
-            views=metrics.views_count,
-            shares=metrics.shares_count,
-            comments=metrics.comments_count,
-            reactions=metrics.reactions_count,
-            content=self
+        from django.db.models import Count, Q
+        agg = Content.objects.filter(pk=self.pk).aggregate(
+            views=Count("views", filter=Q(views__is_unique=True)),
+            shares=Count("shares"),
+            comments=Count("comments", filter=Q(comments__is_deleted=False)),
+            reactions=Count("reactions"),
         )
-        metrics.save()
+        views = agg["views"] or 0
+        shares = agg["shares"] or 0
+        comments = agg["comments"] or 0
+        reactions = agg["reactions"] or 0
+        trending_score = ContentMetrics.compute_trending_score(
+            views=views, shares=shares, comments=comments, reactions=reactions, content=self
+        )
+        metrics, _ = ContentMetrics.objects.update_or_create(
+            content=self,
+            defaults={
+                "views_count": views,
+                "shares_count": shares,
+                "comments_count": comments,
+                "reactions_count": reactions,
+                "trending_score": trending_score,
+            },
+        )
         return metrics
 
 class Comment(BaseEntity):

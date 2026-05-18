@@ -228,3 +228,22 @@ class ChannelViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="analytics")
+    def analytics(self, request, pk=None):
+        """
+        GET /api/v1/channels/{id}/analytics/
+        Returns basic channel metrics: subscriber count, message count.
+        """
+        channel = self.get_object()
+        subscriber_count = ConversationMember.objects.filter(
+            conversation=channel.conversation,
+            left_at__isnull=True,
+        ).count()
+        # message_count is tracked as a monotonic sequence on the conversation
+        message_count = getattr(channel.conversation, "last_message_seq", 0) if channel.conversation_id else 0
+        return Response({
+            "channel_id": str(channel.id),
+            "subscriber_count": subscriber_count,
+            "message_count": message_count,
+        }, status=status.HTTP_200_OK)

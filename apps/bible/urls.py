@@ -2,6 +2,10 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    KCANBookListView,
+    KCANMessageTopicListView,
+    KCANMinisterListView,
+    KCANMessageListView,
     TranslationListView,
     BibleTranslationMetadataViewSet,
     BookListView,
@@ -120,6 +124,10 @@ router.register("bible/highlights", BibleHighlightViewSet, basename="bible-highl
 router.register("bible/memory", MemoryVerseViewSet, basename="bible-memory")
 router.register("bible/preferences", BiblePreferenceViewSet, basename="bible-preferences")
 router.register("bible/cross-references", BibleCrossReferenceViewSet, basename="bible-cross-references")
+router.register("bible/kcan-books", KCANBookListView, basename="kcan-books")
+router.register("bible/kcan-message-topics", KCANMessageTopicListView, basename="kcan-message-topics")
+router.register("bible/kcan-ministers", KCANMinisterListView, basename="kcan-ministers")
+router.register("bible/kcan-messages", KCANMessageListView, basename="kcan-messages")
 
 urlpatterns = [
     path("bible/translations/", TranslationListView.as_view(), name="bible-translations"),

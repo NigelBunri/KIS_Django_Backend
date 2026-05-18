@@ -25,7 +25,7 @@ import pyotp
 
 from rest_framework import viewsets, mixins, filters, status, serializers, permissions
 from rest_framework.decorators import action
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -1288,6 +1288,18 @@ class UserViewSet(viewsets.ModelViewSet):
     def me(self, request):
         phone = (request.query_params.get("phone") or "").strip()
         if not request.user.is_authenticated and phone:
+            # Phone-based lookup is only permitted when the caller supplied an
+            # Authorization header (even if the token was stale or expired).
+            # This prevents anonymous enumeration of whether a phone is registered.
+            has_auth_attempt = bool(
+                request.headers.get("Authorization")
+                or request.headers.get("authorization")
+            )
+            if not has_auth_attempt:
+                return Response(
+                    {"detail": "Authentication credentials were not provided."},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
             country_hint = str(request.query_params.get("country") or "CM").strip().upper() or "CM"
             candidates = _phone_variants(phone, country_hint)
             digit_candidates = [_digits_only(value) for value in candidates]
@@ -1312,6 +1324,26 @@ class UserViewSet(viewsets.ModelViewSet):
         user = self.get_object()
         score = user.recalc_trust_score()
         return Response({"trust_score": score})
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAdminUser], authentication_classes=JWT_AUTH, url_path="suspend")
+    def suspend(self, request, pk=None):
+        target = self.get_object()
+        reason = str(request.data.get("reason") or "Admin suspension")[:255]
+        target.status = "suspended"
+        target.save(update_fields=["status"])
+        try:
+            from apps.moderation.models import AuditLog
+            AuditLog.objects.create(
+                actor_id=request.user.id,
+                action="admin.user.suspend",
+                target_type="USER",
+                target_id=target.id,
+                metadata={"reason": reason},
+                ip_address=request.META.get("REMOTE_ADDR"),
+            )
+        except Exception:
+            pass
+        return Response({"detail": "User suspended", "status": target.status})
 
     @action(
         detail=False,

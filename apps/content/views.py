@@ -1,5 +1,6 @@
 # content/views.py
 from rest_framework import viewsets, permissions, status, mixins
+from django.db.models import Count
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
@@ -100,7 +101,7 @@ except Exception:
 # ----------------------------------------
 
 class ContentViewSet(viewsets.ModelViewSet):
-    queryset = Content.objects.select_related("author").all()
+    queryset = Content.objects.select_related("author").prefetch_related("content_tags__tag", "metrics")
     serializer_class = ContentSerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsAuthorOrReadOnly]
 
@@ -171,7 +172,7 @@ class ContentViewSet(viewsets.ModelViewSet):
         return Response(ContentMetricsSerializer(metrics).data)
 
 class CommentViewSet(viewsets.ModelViewSet):
-    queryset = Comment.objects.select_related("author", "content").all()
+    queryset = Comment.objects.select_related("author", "content").annotate(replies_count=Count("replies"))
     serializer_class = CommentSerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsAuthorOrReadOnly]
 

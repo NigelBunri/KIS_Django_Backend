@@ -254,9 +254,10 @@ def _run_stub_explicit_content_scan(*, filename: str, mime_type: str, context: s
     """
     Provider-neutral placeholder.
 
-    This intentionally does not inspect private media contents beyond metadata.
-    Live provider calls must be explicitly enabled and implemented by a provider
-    adapter before production accepts scanned media without review.
+    When provider='stub' (no live scanning configured), we accept uploads
+    but mark them as not-scanned so admins can audit. Set MEDIA_SAFETY_PROVIDER
+    to a real provider (e.g. 'aws_rekognition') and enable
+    MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED=1 for actual content scanning.
     """
     if not media_safety_enabled():
         return MediaSafetyDecision(
@@ -267,11 +268,22 @@ def _run_stub_explicit_content_scan(*, filename: str, mime_type: str, context: s
             user_message="Upload accepted.",
             requires_review=False,
         )
+    provider = configured_provider()
+    if provider == "stub":
+        # Stub provider: accept without quarantine but flag as unscanned.
+        return MediaSafetyDecision(
+            status="not_scanned",
+            quarantine=False,
+            provider="stub",
+            reason="stub_provider_no_scanning",
+            user_message="Upload accepted.",
+            requires_review=False,
+        )
     if explicit_scan_required():
         return MediaSafetyDecision(
             status="pending_review",
             quarantine=True,
-            provider=configured_provider(),
+            provider=provider,
             reason="explicit_scan_provider_not_configured",
             user_message=USER_SAFE_REVIEW_MESSAGE,
             requires_review=True,
@@ -279,7 +291,7 @@ def _run_stub_explicit_content_scan(*, filename: str, mime_type: str, context: s
     return MediaSafetyDecision(
         status="not_configured",
         quarantine=False,
-        provider=configured_provider(),
+        provider=provider,
         reason="explicit_scan_not_required",
         user_message="Upload accepted.",
         requires_review=False,

@@ -949,3 +949,180 @@ class BibleCourseCredential(models.Model):
     badge_name = models.CharField(max_length=200, default="Course Certificate")
     share_token = models.CharField(max_length=64, unique=True)
     issued_at = models.DateTimeField(auto_now_add=True)
+
+
+# ─── KCAN Books & Messages ───────────────────────────────────────────────────
+
+KCAN_CONTENT_STATUS = (
+    ("draft", "Draft"),
+    ("published", "Published"),
+    ("archived", "Archived"),
+)
+
+
+class KCANBook(models.Model):
+    GENRE_CHOICES = (
+        ("theology", "Theology"),
+        ("devotional", "Devotional"),
+        ("biography", "Biography"),
+        ("ministry", "Ministry"),
+        ("prophecy", "Prophecy"),
+        ("prayer", "Prayer"),
+        ("family", "Family"),
+        ("leadership", "Leadership"),
+        ("missions", "Missions"),
+        ("other", "Other"),
+    )
+    partner = models.ForeignKey(
+        "partners.Partner",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="kcan_books",
+    )
+    title = models.CharField(max_length=300)
+    author = models.CharField(max_length=300, blank=True)
+    description = models.TextField(blank=True)
+    genre = models.CharField(max_length=40, choices=GENRE_CHOICES, default="theology")
+    cover_image = models.ImageField(upload_to="kcan/books/covers/", null=True, blank=True)
+    pdf_file = models.FileField(upload_to="kcan/books/pdfs/", null=True, blank=True)
+    page_count = models.PositiveIntegerField(null=True, blank=True)
+    language = models.CharField(max_length=20, default="en")
+    status = models.CharField(max_length=20, choices=KCAN_CONTENT_STATUS, default="draft")
+    sort_order = models.PositiveIntegerField(default=0)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="kcan_books_created",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "-created_at"]
+
+    def __str__(self):
+        return self.title
+
+
+class KCANMessageTopic(models.Model):
+    partner = models.ForeignKey(
+        "partners.Partner",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="kcan_message_topics",
+    )
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=200, unique=True)
+    description = models.TextField(blank=True)
+    cover_image = models.ImageField(upload_to="kcan/topics/covers/", null=True, blank=True)
+    status = models.CharField(max_length=20, choices=KCAN_CONTENT_STATUS, default="draft")
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
+class KCANMinister(models.Model):
+    partner = models.ForeignKey(
+        "partners.Partner",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="kcan_ministers",
+    )
+    topics = models.ManyToManyField(
+        KCANMessageTopic,
+        related_name="ministers",
+        blank=True,
+    )
+    name = models.CharField(max_length=300)
+    title = models.CharField(max_length=200, blank=True, help_text="e.g. Pastor, Bishop, Dr.")
+    bio = models.TextField(blank=True)
+    photo = models.ImageField(upload_to="kcan/ministers/photos/", null=True, blank=True)
+    status = models.CharField(max_length=20, choices=KCAN_CONTENT_STATUS, default="published")
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
+class KCANMessage(models.Model):
+    VIDEO_TYPE_CHOICES = (
+        ("youtube", "YouTube Embed"),
+        ("direct", "Direct Video File"),
+    )
+    partner = models.ForeignKey(
+        "partners.Partner",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="kcan_messages",
+    )
+    topic = models.ForeignKey(
+        KCANMessageTopic,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="messages",
+    )
+    minister = models.ForeignKey(
+        KCANMinister,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="messages",
+    )
+    title = models.CharField(max_length=300)
+    description = models.TextField(blank=True)
+    video_type = models.CharField(max_length=20, choices=VIDEO_TYPE_CHOICES, default="youtube")
+    youtube_url = models.URLField(blank=True, help_text="Full YouTube URL or embed URL")
+    youtube_video_id = models.CharField(max_length=20, blank=True, help_text="Auto-extracted YouTube video ID")
+    video_url = models.URLField(blank=True, help_text="Direct video file URL")
+    thumbnail = models.ImageField(upload_to="kcan/messages/thumbnails/", null=True, blank=True)
+    thumbnail_url = models.URLField(blank=True, help_text="External thumbnail URL")
+    duration_seconds = models.PositiveIntegerField(null=True, blank=True)
+    scripture_reference = models.CharField(max_length=200, blank=True)
+    tags = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=20, choices=KCAN_CONTENT_STATUS, default="draft")
+    sort_order = models.PositiveIntegerField(default=0)
+    view_count = models.PositiveIntegerField(default=0)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="kcan_messages_created",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "-created_at"]
+
+    def save(self, *args, **kwargs):
+        if self.youtube_url and not self.youtube_video_id:
+            import re
+            patterns = [
+                r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, self.youtube_url)
+                if match:
+                    self.youtube_video_id = match.group(1)
+                    break
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.title

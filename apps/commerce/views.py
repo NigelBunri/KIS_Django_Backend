@@ -879,6 +879,15 @@ class ProductViewSet(viewsets.ModelViewSet):
             validate_upload_file_safety(upload, context="commerce")
         super().perform_update(serializer)
 
+    def perform_destroy(self, instance):
+        shop = getattr(instance, 'shop', None)
+        if shop and shop.owner_id != self.request.user.pk and not self.request.user.is_staff:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only the shop owner can delete this product.")
+        instance.is_deleted = True
+        instance.is_active = False
+        instance.save(update_fields=["is_deleted", "is_active"])
+
     def update(self, request, *args, **kwargs):
         return super().update(request, *args, **kwargs)
 

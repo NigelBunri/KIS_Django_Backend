@@ -31,7 +31,7 @@ from apps.groups.models import (
     GroupBan,
 )
 from apps.accounts.models import User
-from apps.partners.models import PartnerMembership, PartnerMembershipStatus
+from apps.partners.models import Partner as PartnerModel, PartnerMembership, PartnerMembershipStatus
 from apps.communities.models import CommunityMembership, CommunityRole
 from apps.chat.models import ConversationMember, BaseConversationRole
 
@@ -164,12 +164,19 @@ class GroupViewSet(viewsets.ModelViewSet):
         partner_id = self.request.query_params.get("partner")
 
         if partner_id and not community_id:
-            is_partner_member = PartnerMembership.objects.filter(
-                partner_id=partner_id,
-                user=user,
-                status=PartnerMembershipStatus.MEMBER,
-            ).exists()
-            if is_partner_member:
+            is_privileged = False
+            try:
+                partner_obj = PartnerModel.objects.only("owner_id").get(pk=partner_id)
+                is_privileged = str(partner_obj.owner_id) == str(user.pk)
+            except PartnerModel.DoesNotExist:
+                pass
+            if not is_privileged:
+                is_privileged = PartnerMembership.objects.filter(
+                    partner_id=partner_id,
+                    user=user,
+                    status=PartnerMembershipStatus.MEMBER,
+                ).exists()
+            if is_privileged:
                 qs = qs.filter(partner_id=partner_id)
                 channel_id = self.request.query_params.get("channel")
                 if channel_id:

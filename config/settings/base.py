@@ -255,18 +255,13 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "whitenoise.middleware.WhiteNoiseMiddleware",
-
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "django.middleware.common.CommonMiddleware",
-
-    # Common middleware
     "common.middleware.RequestLoggingMiddleware",
     "admin_control.activity.middleware.AdminControlActivityMiddleware",
     "admin_control.security.middleware.AdminSecurityHeadersMiddleware",
@@ -464,6 +459,8 @@ CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", f"redis://{DEV_S
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
+CELERY_TASK_SOFT_TIME_LIMIT = 300   # seconds — raises SoftTimeLimitExceeded for graceful cleanup
+CELERY_TASK_TIME_LIMIT = 360        # hard kill after 6 minutes
 
 # NEW: media-service URL for background removal microservice
 # This is what your Celery task uses to call the external service.
@@ -497,7 +494,7 @@ NEST_INTERNAL_TOKEN = os.environ.get(
 # When the frontend resolves backend assets, it should reuse the API server's host instead of the chat/Nest host.
 NEST_API_BASE_URL = API_BASE_URL
 
-# Logging - keep it verbose for dev, JSON-friendly for prod
+# Logging — JSON structured output so log aggregators (Datadog, CloudWatch, etc.) can parse fields
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -505,12 +502,12 @@ LOGGING = {
         "sensitive_data": {"()": "common.security_redaction.SensitiveDataFilter"},
     },
     "formatters": {
-        "simple": {"format": "%(levelname)s %(asctime)s %(name)s %(message)s"},
+        "json": {"()": "common.logging_formatters.JsonRequestFormatter"},
     },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
-            "formatter": "simple",
+            "formatter": "json",
             "filters": ["sensitive_data"],
         },
     },

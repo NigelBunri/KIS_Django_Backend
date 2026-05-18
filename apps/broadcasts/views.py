@@ -7817,7 +7817,7 @@ class BroadcastFeedView(APIView):
                         "source_id": str(entry.get("id") or item.source_id),
                     "title": service_name,
                     "text": service_description,
-                    "text_doc": entry.get("text_doc") or entry.get("text") or service_description,
+                    "text_doc": _extract_rich_text_doc(entry),
                     "text_plain": service_description,
                     "text_preview": entry.get("text_preview") or service_description[:200],
                     "attachments": attachments,
@@ -7851,7 +7851,7 @@ class BroadcastFeedView(APIView):
                     "source_id": str(entry.get("id") or item.source_id),
                     "title": entry.get("title") or profile_name,
                     "text": text_plain,
-                    "text_doc": entry.get("text_doc") or entry.get("text") or entry.get("summary") or "",
+                    "text_doc": _extract_rich_text_doc(entry),
                     "text_plain": text_plain,
                     "text_preview": entry.get("text_preview") or text_plain[:200],
                     "attachments": attachments,
@@ -12603,6 +12603,14 @@ def _parse_media_options(value: object | None) -> dict:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _extract_rich_text_doc(entry: dict) -> dict | None:
+    for key in ("text_doc", "text"):
+        candidate = entry.get(key)
+        if isinstance(candidate, dict) and candidate.get("type") == "doc":
+            return candidate
+    return None
 
 
 def _parse_json_payload(value: object | None, fallback):
