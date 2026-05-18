@@ -1,3 +1,45 @@
+
+## 2026-05-18 - Device Compatibility Roadmap Phase 01
+
+### Scope completed
+
+- Started a new KIS device compatibility roadmap for watch-size, compact phone, phone, tablet, large tablet, and orientation-aware layouts.
+- Added a shared React Native responsive foundation in the frontend:
+  - device class detection;
+  - page gutters;
+  - touch target sizing;
+  - responsive title/body/label sizing;
+  - tablet/large-tablet column hints.
+- Updated global navigation chrome so the main tab bar adapts on tiny screens and compact phones.
+- Updated shared main-tab page headers and state blocks so titles, subtitles, padding, radius, and actions adapt to very small and large screens.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/theme/responsive.ts`
+- `/Users/nigel/dev/KIS/src/components/common/MainTabScaffold.tsx`
+- `/Users/nigel/dev/KIS/src/navigation/AppNavigator.tsx`
+- `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+Passed in `/Users/nigel/dev/KIS`:
+
+```bash
+npx eslint src/theme/responsive.ts src/components/common/MainTabScaffold.tsx src/navigation/AppNavigator.tsx --quiet
+npm run typecheck -- --pretty false
+```
+
+### Remaining risk
+
+- This phase only hardens the responsive foundation and global chrome. Individual screens still contain many fixed heights, dense rows, hard-coded media sizes, and large management modals that need per-module responsive passes.
+
+### Best prompt for Phase 02
+
+```text
+Please implement Phase 02 of the KIS Device Compatibility Roadmap without using git commands. Focus on Messaging device compatibility. Use the new `/Users/nigel/dev/KIS/src/theme/responsive.ts` foundation to make MessagesScreen, AddContacts, ChatRoomPage, MessageBubble, MessageComposer, attachment previews, calls, updates/status, and chat info screens work cleanly on watch-size/very small widths, compact phones, normal phones, tablets, and landscape/tablet split widths. Remove fixed-size assumptions where safe, make rows wrap or hide nonessential labels on tiny devices, preserve existing messaging behavior, run focused lint and `npm run typecheck -- --pretty false`, update `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md` and `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`, and give the best prompt for Phase 03.
+```
+
 # BUILD_STATE (Django Backend)
 
 ## 2026-05-17 - 100% Implementation / 80%+ Global Parity Phase 16 Close-Out
@@ -9595,3 +9637,300 @@ Please implement Phase 02 of the KIS 100% Implementation and 80%+ Global Parity 
 ```text
 Please implement Phase 01 of the KIS 100% Implementation and 80%+ Global Parity roadmap without using git commands. Focus on production security and environment proof. Use the Phase 00 launch scope lock to verify production-safe settings and launch gates for Django, Nest, and React Native: DEBUG=False, ALLOWED_HOSTS, CORS/CSRF, Socket.IO origins, Redis/cache throttling, private media, admin/docs staff-only access, production secrets, Firebase/admin credentials, backup/restore, rollback, and staff-only surfaces. Add or update safe verification scripts/docs where needed without exposing secrets, preserve local development, run safe validation, record blockers in docs/implementation-parity-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 02.
 ```
+
+
+## 2026-05-18 - Device Compatibility Roadmap Phase 02
+
+### Scope completed
+
+- Implemented the messaging device compatibility slice using `/Users/nigel/dev/KIS/src/theme/responsive.ts`.
+- Made the Messages screen header, search/filter row, tab bar labels, overflow menu position, and floating add button adapt to watch-size, compact phone, phone, tablet, and landscape widths.
+- Made Add Contacts use responsive page gutters and compact header/list/form spacing.
+- Made Chat Room UI edges responsive without changing messaging behavior:
+  - composer icons/send button scale by device class;
+  - nonessential camera shortcut hides while typing on tiny widths;
+  - message bubbles and attachment media use responsive max widths;
+  - attachment preview modal reduces padding and list height on tiny screens.
+- Made call overlay controls and Calls tab rows adapt for compact devices.
+- Added safe responsive foundations in updates/status and chat info screens.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/screens/tabs/MessagesScreen.tsx`
+- `/Users/nigel/dev/KIS/src/Module/AddContacts/AddContactsPage.tsx`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/componets/main/MessageComposer.tsx`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/componets/MessageBubble.tsx`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/componets/main/ForAttachments/AttachmentPreviewPage.tsx`
+- `/Users/nigel/dev/KIS/src/components/calls/CallOverlay.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/MesssagingSubTabs/CallsTab.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/MesssagingSubTabs/UpdatesTab.tsx`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/ChatInfoPage.tsx`
+- `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && npx eslint src/screens/tabs/MessagesScreen.tsx src/Module/AddContacts/AddContactsPage.tsx src/Module/ChatRoom/componets/main/MessageComposer.tsx src/Module/ChatRoom/componets/MessageBubble.tsx src/Module/ChatRoom/componets/main/ForAttachments/AttachmentPreviewPage.tsx src/components/calls/CallOverlay.tsx src/screens/tabs/MesssagingSubTabs/CallsTab.tsx src/screens/tabs/MesssagingSubTabs/UpdatesTab.tsx src/Module/ChatRoom/ChatInfoPage.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risks
+
+- Manual device QA is still required for watch-size simulation, compact phones, tablet landscape, split-width tablet windows, keyboard overlap, camera handoff, attachment preview ergonomics, and call overlay controls.
+- No backend behavior was changed in this phase.
+
+### Next prompt
+
+```text
+Please implement Phase 03 of the KIS Device Compatibility Roadmap without using git commands. Focus on Broadcast/Channels device compatibility. Use `/Users/nigel/dev/KIS/src/theme/responsive.ts` to make Broadcast main tabs, feed cards, filter/search/header rows, see-all vertical lists, feed detail swipe view, ChannelsDiscoverPage, ChannelHomePage, ChannelContentDetailPage, Channel Studio/workspace, KcanVisionModal, broadcast market/education/health surfaces, channel selector, playlists, comments, and broadcast action buttons work cleanly on watch-size/very small widths, compact phones, normal phones, tablets, and landscape/tablet split widths. Remove fixed-size assumptions where safe, make horizontal rails wrap or remain scrollable without clipping, hide nonessential labels on tiny devices, preserve existing broadcast/channel behavior and legacy feed compatibility, run focused lint and `npm run typecheck -- --pretty false`, update `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md` and `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`, and give the best prompt for Phase 04.
+```
+
+
+## 2026-05-18 - Device Compatibility Roadmap Phase 03
+
+### Scope completed
+
+- Implemented the Broadcast/Channels device compatibility slice using `/Users/nigel/dev/KIS/src/theme/responsive.ts`.
+- Made Broadcast main header/search/filter/tabs, KCAN vision entry, and cart overlay adapt to watch-size, compact phone, normal phone, tablet, and landscape widths.
+- Made shared feed cards, feed section video controls, channel discovery, channel home, channel content detail, channel studio, KCAN vision modal, and market product cards more resilient across compact and wide screens.
+- Preserved existing feed/channel behavior, legacy broadcast compatibility, channel studio workflows, comments/playlists, broadcast/unbroadcast actions, and market behavior.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/screens/tabs/BroadcastScreen.tsx`
+- `/Users/nigel/dev/KIS/src/components/broadcast/BroadcastHeaderBar.tsx`
+- `/Users/nigel/dev/KIS/src/components/broadcast/BroadcastMainTabs.tsx`
+- `/Users/nigel/dev/KIS/src/components/broadcast/BroadcastSearchRow.tsx`
+- `/Users/nigel/dev/KIS/src/components/broadcast/BroadcastFeedCard.tsx`
+- `/Users/nigel/dev/KIS/src/components/broadcast/BroadcastFeedSection.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/channels/ChannelsDiscoverPage.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/channels/ChannelHomePage.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/channels/ChannelContentDetailPage.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/channels/studio/ChannelStudioScreen.tsx`
+- `/Users/nigel/dev/KIS/src/components/broadcast/KcanVisionModal.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/market/components/MarketProductCard.tsx`
+- `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && npx eslint src/screens/tabs/BroadcastScreen.tsx src/components/broadcast/BroadcastHeaderBar.tsx src/components/broadcast/BroadcastMainTabs.tsx src/components/broadcast/BroadcastSearchRow.tsx src/components/broadcast/BroadcastFeedCard.tsx src/components/broadcast/BroadcastFeedSection.tsx src/screens/broadcast/channels/ChannelsDiscoverPage.tsx src/screens/broadcast/channels/ChannelHomePage.tsx src/screens/broadcast/channels/ChannelContentDetailPage.tsx src/screens/broadcast/channels/studio/ChannelStudioScreen.tsx src/components/broadcast/KcanVisionModal.tsx src/screens/broadcast/market/components/MarketProductCard.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risks
+
+- Manual device QA is still required for horizontal rails, channel studio controls, KCAN vision image/zoom, feed detail video controls, and market card CTA wrapping on very small screens and tablet split widths.
+- This phase did not update every education/health/market sub-detail screen under Broadcast; Phase 06 will cover commerce/education/health forms and dashboards more deeply.
+
+### Next prompt
+
+```text
+Please implement Phase 04 of the KIS Device Compatibility Roadmap without using git commands. Focus on Bible device compatibility. Use `/Users/nigel/dev/KIS/src/theme/responsive.ts` to make the Bible main screen, sticky tabs, reader, chapter/verse controls, highlights, notes, comments, daily meditations, plans, streaks, prayer, search/filter sheets, verse detail modals, audio/devotional surfaces, and offline/low-bandwidth scripture views work cleanly on watch-size/very small widths, compact phones, normal phones, tablets, and landscape/tablet split widths. Preserve the current sticky-tab behavior where the top Bible section can disappear and the tab section remains sticky, remove fixed-size assumptions where safe, make verse tools wrap or hide nonessential labels on tiny devices, keep dark/light highlight contrast correct, preserve existing Bible APIs/UI behavior, run focused lint and `npm run typecheck -- --pretty false`, update `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md` and `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`, and give the best prompt for Phase 05 here in chat.
+```
+
+## 2026-05-18 - Device Compatibility Roadmap Phase 04
+
+### Scope completed
+
+- Implemented the Bible device compatibility slice using `/Users/nigel/dev/KIS/src/theme/responsive.ts`.
+- Made the Bible main screen responsive for page gutters, sticky-tab chip spacing/labels, floating filter sizing, and content spacing while preserving the current collapsible top-section/sticky-tabs behavior.
+- Made the Bible reader responsive for filter sheets, verse action modals, compact swipe hints, reader header wrapping, offline download controls, and verse typography.
+- Made Bible panels more resilient across watch-size, compact phone, phone, tablet, and landscape/tablet split widths: daily devotions, meditations, prayer, reading planner, lessons, settings, books, and KCAN messages.
+- Preserved dark/light highlight contrast and existing Bible data/API behavior.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/screens/tabs/BibleScreen.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/BibleReaderPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/BibleSectionCard.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/DailyDevotionsPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/MeditationPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/PrayerPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/BiblePlansPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/BibleLessonsPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/BibleSettingsPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/BibleBooksPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/Bible/BibleMessagesPanel.tsx`
+- `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && npx eslint src/screens/tabs/BibleScreen.tsx src/components/Bible/BibleReaderPanel.tsx src/components/Bible/DailyDevotionsPanel.tsx src/components/Bible/MeditationPanel.tsx src/components/Bible/BiblePlansPanel.tsx src/components/Bible/PrayerPanel.tsx src/components/Bible/BibleLessonsPanel.tsx src/components/Bible/BibleSettingsPanel.tsx src/components/Bible/BibleBooksPanel.tsx src/components/Bible/BibleMessagesPanel.tsx src/components/Bible/BibleSectionCard.tsx --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risks
+
+- Manual device QA is still required for sticky-tab feel, filter sheets, verse action modals, prayer calendar day cells, books/messages grids, and lesson media controls across tiny devices and tablet split widths.
+- No backend behavior was changed in this phase.
+
+### Next prompt
+
+```text
+Please implement Phase 05 of the KIS Device Compatibility Roadmap without using git commands. Focus on Profile and Partners device compatibility. Use `/Users/nigel/dev/KIS/src/theme/responsive.ts` to make Profile main page, profile overview/edit sections, settings, verification/trust badges, family/accessibility preferences, feed/profile management modals, partner workspace main page, partner center panes, side account selector, channels/subrooms, roles/members, announcements/events, moderation/audit panels, partner sheets/modals, and dashboard cards work cleanly on watch-size/very small widths, compact phones, normal phones, tablets, and landscape/tablet split widths. Remove fixed-size assumptions where safe, make dashboard grids collapse or widen by device class, hide nonessential labels on tiny devices, preserve existing profile/partner APIs/UI behavior, run focused lint and `npm run typecheck -- --pretty false`, update `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md` and `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`, and give the best prompt for Phase 06 here in chat.
+```
+
+## 2026-05-18 - Device Compatibility Roadmap Phase 05
+
+### Scope completed
+
+- Implemented the Profile/Partners device compatibility slice using `/Users/nigel/dev/KIS/src/theme/responsive.ts`.
+- Made the Profile main page and dashboard blocks more resilient across watch-size, compact phone, phone, tablet, and landscape/tablet split widths.
+- Made profile bottom sheets and management panels use responsive gutters/widths instead of fixed assumptions where safe.
+- Made the Partners left rail, center pane, settings sheet, messages pane, and slide-in panels adapt to compact/tiny widths and large tablet widths while preserving existing behavior.
+- Preserved existing Profile and Partners APIs, navigation, verification, settings, partner messaging, and workspace behavior.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile/profile.styles.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile/components/dashboard/ProfileDashboardBlocks.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile/sheets/BottomSheet.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/PartnersScreen.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/PartnerLayout.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnersLeftRail.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnersCenterPane.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnerSheet.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnersMessagesPane.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/partnersStyles.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerSettingsPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerCreatePanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerDiscoveryPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerRecruitmentPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerAuditPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerPolicyPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerComplaintsPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerReportsPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerLinksPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerAutomationPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerIntegrationsPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerGovernancePanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerFeaturePanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerCoursesPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerOrganizationAppsPanel.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/partners/usePartnerOrgProfilePanel.ts`
+- `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && npx eslint src/screens/tabs/ProfileScreen.tsx src/screens/tabs/profile/profile.styles.ts src/screens/tabs/profile/components/dashboard/ProfileDashboardBlocks.tsx src/screens/tabs/profile/sheets/BottomSheet.tsx src/screens/tabs/PartnersScreen.tsx src/screens/tabs/partners/PartnerLayout.tsx src/components/partners/PartnersLeftRail.tsx src/components/partners/PartnersCenterPane.tsx src/components/partners/PartnerSheet.tsx src/components/partners/PartnersMessagesPane.tsx src/components/partners/partnersStyles.ts src/screens/tabs/partners/usePartnerSettingsPanel.ts src/screens/tabs/partners/usePartnerCreatePanel.ts src/screens/tabs/partners/usePartnerDiscoveryPanel.ts src/screens/tabs/partners/usePartnerRecruitmentPanel.ts src/screens/tabs/partners/usePartnerAuditPanel.ts src/screens/tabs/partners/usePartnerPolicyPanel.ts src/screens/tabs/partners/usePartnerComplaintsPanel.ts src/screens/tabs/partners/usePartnerReportsPanel.ts src/screens/tabs/partners/usePartnerLinksPanel.ts src/screens/tabs/partners/usePartnerAutomationPanel.ts src/screens/tabs/partners/usePartnerIntegrationsPanel.ts src/screens/tabs/partners/usePartnerGovernancePanel.ts src/screens/tabs/partners/usePartnerFeaturePanel.ts src/screens/tabs/partners/usePartnerCoursesPanel.ts src/screens/tabs/partners/usePartnerOrganizationAppsPanel.ts src/screens/tabs/partners/usePartnerOrgProfilePanel.ts --quiet` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risks
+
+- Manual device QA is still required for profile hero cropping, bottom sheet keyboard behavior, partner rail ergonomics, settings panel widths, partner message pane peek/drag behavior, and admin panels on tiny devices, tablets, landscape, and split-width windows.
+- No backend behavior was changed in this phase.
+
+### Next prompt
+
+```text
+Please implement Phase 06 of the KIS Device Compatibility Roadmap without using git commands. Focus on Commerce, Education, and Health device compatibility. Use `/Users/nigel/dev/KIS/src/theme/responsive.ts` to make Market/commerce product lists, product/service detail screens, carts, order/booking flows, shop management, education discovery/course/lesson/enrollment/institution dashboards, health dashboards, appointment/session/service booking, provider/institution management, payment state surfaces, forms, drawers, sheets, and admin panels work cleanly on watch-size/very small widths, compact phones, normal phones, tablets, and landscape/tablet split widths. Remove fixed-size assumptions where safe, make form grids collapse, make media/cards/buttons wrap without clipping, hide nonessential labels on tiny devices, preserve existing commerce/education/health APIs/UI behavior, run focused lint and `npm run typecheck -- --pretty false`, update `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md` and `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`, and give the best prompt for Phase 07 here in chat.
+```
+
+## 2026-05-18 - Device Compatibility Roadmap Phase 06
+
+### Scope completed
+
+- Implemented the Commerce/Education/Health device compatibility slice using `/Users/nigel/dev/KIS/src/theme/responsive.ts`.
+- Made market product/service/shop editor drawers responsive for tiny devices, compact phones, tablets, and split-width layouts.
+- Made education cards and detail/enrollment sheets adapt media sizes, button rows, metadata chips, and sheet gutters without changing education APIs or behavior.
+- Made health dashboard cards/module panels and health institution management layouts wrap/cap widths by device class.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/screens/market/ProductEditorDrawer.tsx`
+- `/Users/nigel/dev/KIS/src/screens/market/ServiceEditorDrawer.tsx`
+- `/Users/nigel/dev/KIS/src/screens/market/ShopEditorDrawer.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/education/components/CourseCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/education/components/EducationContentCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/education/components/EducationEnrollmentSheet.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/education/components/EducationDetailSheet.tsx`
+- `/Users/nigel/dev/KIS/src/features/health-dashboard/ui/InstitutionDashboardShell.tsx`
+- `/Users/nigel/dev/KIS/src/features/health-dashboard/ui/TypeSpecificModulesPanel.tsx`
+- `/Users/nigel/dev/KIS/src/screens/health/HealthInstitutionManagementScreen.tsx`
+- `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/status.md`
+- `docs/BUILD_STATE.md`
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && npx eslint src/screens/health/HealthInstitutionManagementScreen.tsx src/screens/market/ProductEditorDrawer.tsx src/screens/market/ServiceEditorDrawer.tsx src/screens/market/ShopEditorDrawer.tsx src/screens/broadcast/education/components/CourseCard.tsx src/screens/broadcast/education/components/EducationContentCard.tsx src/screens/broadcast/education/components/EducationEnrollmentSheet.tsx src/screens/broadcast/education/components/EducationDetailSheet.tsx src/features/health-dashboard/ui/InstitutionDashboardShell.tsx src/features/health-dashboard/ui/TypeSpecificModulesPanel.tsx` passed with inline-style warnings only.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+
+### Remaining risks
+
+- Manual device QA is still required for carts, order details, service booking details, lesson media/PDF previews, enrollment payment states, health appointment/session flows, provider dashboards, and admin panels on very small screens and tablets.
+- No backend APIs, payment state machines, booking flows, or enrollment state machines were changed in this phase.
+
+## 2026-05-18 - Device Compatibility Roadmap Phase 07 Close-Out
+
+### Scope completed
+
+- Closed the KIS Device Compatibility Roadmap with a device-lab QA checklist and static responsive smoke check.
+- Added `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/phase-07-device-lab-qa.md` for real-device/simulator launch QA across Messaging, Broadcast/Channels, Bible, Profile, Partners, Commerce, Education, and Health.
+- Added `/Users/nigel/dev/KIS/scripts/qa/device-compatibility-smoke.cjs` and `npm run qa:device-compatibility` to verify responsive breakpoints and phase coverage.
+- Preserved all existing app behavior; no backend API, payment, booking, messaging, enrollment, verification, or navigation state machine was changed.
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && npm run qa:device-compatibility` passed.
+- `cd /Users/nigel/dev/KIS && npm run typecheck -- --pretty false` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint scripts/qa/device-compatibility-smoke.cjs` passed.
+- `cd /Users/nigel/dev/KIS && npx eslint src/theme/responsive.ts scripts/qa/device-compatibility-smoke.cjs src/components/common/MainTabScaffold.tsx src/screens/tabs/MessagesScreen.tsx src/screens/tabs/BroadcastScreen.tsx src/screens/tabs/BibleScreen.tsx src/screens/tabs/ProfileScreen.tsx src/screens/tabs/PartnersScreen.tsx src/screens/market/ProductEditorDrawer.tsx src/screens/broadcast/education/components/EducationDetailSheet.tsx src/features/health-dashboard/ui/InstitutionDashboardShell.tsx` completed with warnings only and no errors.
+
+### Remaining risks
+
+- Manual device-lab QA remains required using `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/phase-07-device-lab-qa.md`.
+- Remaining warnings are inline-style/no-void warnings in existing UI-heavy files, not launch-blocking responsive errors.
+- Release should be no-go if manual QA finds unreachable close/submit controls, clipped checkout/booking/messaging actions, broken tab navigation, or unreadable media/detail surfaces on supported device classes.
+
+## 2026-05-18 - Device Compatibility Maintenance Sweep
+
+### Scope completed
+
+- Ran the device compatibility maintenance sweep without git commands.
+- Verified responsive breakpoint and phase coverage with `npm run qa:device-compatibility`.
+- Verified React Native TypeScript with `npm run typecheck -- --pretty false`.
+- Ran targeted lint for the responsive foundation and representative launch surfaces. Lint completed with warnings only and no errors.
+- No confirmed responsive regression was found from automated validation, so no UI/API behavior was changed.
+
+### Remaining blockers
+
+- Manual real-device/simulator QA remains required with `/Users/nigel/dev/KIS/docs/device-compatibility-roadmap/phase-07-device-lab-qa.md`.
+- Capture evidence across watch-size/very small, compact phone, normal phone, tablet portrait, tablet landscape, split-width tablet, and foldable-like pane.
+- No-go conditions remain: unreachable close/submit controls, clipped checkout/booking/messaging actions, broken navigation, scroll traps, or unreadable media/detail surfaces on launch-supported devices.
+
+## 2026-05-18 - iOS Device-Lab Launch Command
+
+### Scope completed
+
+- Added `/Users/nigel/dev/KIS/scripts/run-ios-device-lab.sh`.
+- Added `npm run ios:device-lab` to `/Users/nigel/dev/KIS/package.json`.
+- The command creates/boots two iPhones and two iPads, starts Metro, installs/runs KIS on iPhone/iPad simulators, and boots Apple Watch simulators only if watchOS runtime exists.
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && bash -n scripts/run-ios-device-lab.sh` passed.
+- `cd /Users/nigel/dev/KIS && npm run qa:device-compatibility` passed.
+
+### Notes
+
+- Installed simulator runtime discovered during setup: iOS 26.0.
+- No watchOS runtime was available during setup, and KIS does not currently include a watchOS app target. Watches can be booted for environment visibility after installing watchOS runtime, but app install on watches requires a future watchOS target.
+- Launch command: `cd /Users/nigel/dev/KIS && npm run ios:device-lab`.
+
+## 2026-05-18 - Small iOS Device-Lab Launch Command
+
+### Scope completed
+
+- Added `/Users/nigel/dev/KIS/scripts/run-ios-small-device-lab.sh`.
+- Added `npm run ios:small-lab` to `/Users/nigel/dev/KIS/package.json`.
+- The command starts a small compatibility lab with one small iPhone simulator and one small iPad simulator.
+
+### Validation
+
+- `cd /Users/nigel/dev/KIS && bash -n scripts/run-ios-small-device-lab.sh` passed.
+
+### Launch command
+
+- `cd /Users/nigel/dev/KIS && npm run ios:small-lab`
+
