@@ -9973,3 +9973,21 @@ Please implement Phase 06 of the KIS Device Compatibility Roadmap without using 
 
 - Supabase free storage/bandwidth is suitable for test and early validation only, not heavy public video traffic.
 - Private bucket display depends on app surfaces honoring `downloadUrl`/signed access; public channel/feed media should use public visibility for easiest display during free testing.
+
+
+## 2026-05-19 - Profile Upload Storage Compatibility
+
+- Updated `/Users/nigel/dev/backend/kis/apps/media/storage_backends.py` so Supabase Storage config can tolerate the Supabase S3 endpoint ending in `/s3` by normalizing it to the REST Storage API internally.
+- Updated `/Users/nigel/dev/backend/kis/.env.example` to use the actual test bucket name `kis-uploads`.
+- Improved `/Users/nigel/dev/KIS/src/screens/tabs/profile/useProfileController.ts` error extraction so profile avatar/cover upload failures show the exact backend field or storage error instead of only the generic `Unable to update profile details` message.
+
+### Validation
+
+- `python3 -m py_compile /Users/nigel/dev/backend/kis/apps/media/storage_backends.py` passed.
+- `python3 manage.py check` passed.
+- `npx eslint src/screens/tabs/profile/useProfileController.ts` passed with existing `no-void` warnings only.
+- `pnpm run typecheck` passed.
+
+### Render note
+
+- For the current backend, use `SUPABASE_STORAGE_API_URL=https://jzmamwdatswzglpkdwoi.supabase.co/storage/v1` if possible. If the S3 endpoint is accidentally pasted, the backend now normalizes it, but the REST URL remains the clearest setting.

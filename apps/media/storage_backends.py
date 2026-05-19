@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from io import BytesIO
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from django.conf import settings
@@ -22,6 +22,20 @@ from django.utils.deconstruct import deconstructible
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def _normalize_supabase_storage_api_url(value: str) -> str:
+    """Accept either Supabase REST or S3 endpoint and use REST internally."""
+    raw = str(value or "").strip().rstrip("/")
+    if not raw:
+        return raw
+    if raw.endswith("/storage/v1/s3"):
+        raw = raw[: -len("/s3")]
+    parsed = urlparse(raw)
+    if parsed.netloc.endswith(".storage.supabase.co") and parsed.path.rstrip("/") == "/storage/v1":
+        project_ref = parsed.netloc.split(".storage.supabase.co", 1)[0]
+        return f"https://{project_ref}.supabase.co/storage/v1"
+    return raw
 
 
 @deconstructible
@@ -41,7 +55,7 @@ class SupabaseStorage(Storage):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         base_url = _env("SUPABASE_STORAGE_API_URL") or f"{_env('SUPABASE_URL').rstrip('/')}/storage/v1"
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _normalize_supabase_storage_api_url(base_url)
         self.bucket = _env("SUPABASE_STORAGE_BUCKET", "kis-media")
         self.service_key = _env("SUPABASE_SERVICE_ROLE_KEY")
         self.public_bucket = _env("SUPABASE_STORAGE_PUBLIC_BUCKET", "false").lower() in {"1", "true", "yes", "on"}
@@ -104,7 +118,15 @@ class SupabaseStorage(Storage):
         return File(ContentFile(response.content, name=os.path.basename(name)), name=name)
 
     def exists(self, name: str) -> bool:
-        response = requests.head(self._object_url(name), headers=self._headers(), timeout=self.timeout)
+        try:
+            response = requests.head(self._object_url(name), headers=self._headers(), timeout=self.timeout)
+        except requests.RequestException:
+            return False
+        if response.status_code == 405:
+            try:
+                response = requests.get(self._object_url(name), headers=self._headers(), timeout=self.timeout, stream=True)
+            except requests.RequestException:
+                return False
         return response.status_code == 200
 
     def delete(self, name: str) -> None:
@@ -117,6 +139,8 @@ class SupabaseStorage(Storage):
 
     def size(self, name: str) -> int:
         response = requests.head(self._object_url(name), headers=self._headers(), timeout=self.timeout)
+        if response.status_code == 405:
+            response = requests.get(self._object_url(name), headers=self._headers(), timeout=self.timeout, stream=True)
         if response.status_code >= 400:
             raise FileNotFoundError(name)
         return int(response.headers.get("content-length") or 0)
