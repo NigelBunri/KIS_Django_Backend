@@ -269,16 +269,6 @@ def _run_stub_explicit_content_scan(*, filename: str, mime_type: str, context: s
             requires_review=False,
         )
     provider = configured_provider()
-    if provider == "stub":
-        # Stub provider: accept without quarantine but flag as unscanned.
-        return MediaSafetyDecision(
-            status="not_scanned",
-            quarantine=False,
-            provider="stub",
-            reason="stub_provider_no_scanning",
-            user_message="Upload accepted.",
-            requires_review=False,
-        )
     if explicit_scan_required():
         return MediaSafetyDecision(
             status="pending_review",
@@ -287,6 +277,17 @@ def _run_stub_explicit_content_scan(*, filename: str, mime_type: str, context: s
             reason="explicit_scan_provider_not_configured",
             user_message=USER_SAFE_REVIEW_MESSAGE,
             requires_review=True,
+        )
+    if provider == "stub":
+        # Stub provider: accept locally when scanning is not required, but mark
+        # the scan provider as not configured so launch checks remain honest.
+        return MediaSafetyDecision(
+            status="not_configured",
+            quarantine=False,
+            provider="stub",
+            reason="stub_provider_no_scanning",
+            user_message="Upload accepted.",
+            requires_review=False,
         )
     return MediaSafetyDecision(
         status="not_configured",

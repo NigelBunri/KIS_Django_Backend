@@ -9934,3 +9934,42 @@ Please implement Phase 06 of the KIS Device Compatibility Roadmap without using 
 
 - `cd /Users/nigel/dev/KIS && npm run ios:small-lab`
 
+## 2026-05-19 - Django Test Deployment Database Target
+
+- Render Django staging/test environment should use Supabase PostgreSQL through `DATABASE_URL`.
+- Safe template recorded in `.env.example`: `postgresql://postgres:YOUR-PASSWORD@db.jzmamwdatswzglpkdwoi.supabase.co:5432/postgres`.
+- Real Supabase password must be stored only in Render environment secrets, not committed to repo files.
+
+## 2026-05-19 - Full Live Environment Template
+
+- Expanded `/Users/nigel/dev/backend/kis/.env.example` into a full live deployment checklist for Render Django, Supabase PostgreSQL, Redis/Celery, NestJS/MongoDB Atlas coordination, Flutterwave, Firebase, Infobip, SMTP, Sentry, media safety/storage, verification providers, AI providers, public web/embeds, live streaming, health/calendar controls, throttling, and frontend URL mirrors.
+- All provider values remain placeholders; real keys, passwords, JSON credentials, webhook secrets, and tokens must be stored only in Render/provider secret settings.
+- Object-storage variables are marked as planned placeholders because the current backend still uses Django `default_storage`/`MEDIA_ROOT` unless an object-storage backend is configured.
+
+## 2026-05-19 - Render Test Env Local `.env` Update
+
+- Updated local backend `.env` for Render test deployment mode with production settings, generated strong Django/JWT/internal tokens, Supabase PostgreSQL `DATABASE_URL`, secure cookie/proxy flags, and live-risk feature flags kept disabled.
+- Secret values and the Supabase password are intentionally not repeated in this document. Rotate all test secrets before final production.
+- Redis remains a required production deployment variable in `config.settings.production`; configure `REDIS_URL`, `CELERY_BROKER_URL`, and `CELERY_RESULT_BACKEND` in Render before redeploying.
+
+
+
+## 2026-05-19 - Supabase Media Upload Storage Readiness
+
+- Added `/Users/nigel/dev/backend/kis/apps/media/storage_backends.py` with a dependency-light Supabase Storage backend using the existing `requests` package.
+- `OBJECT_STORAGE_PROVIDER=supabase` now switches Django `default_storage` to Supabase Storage while local development remains unchanged by default.
+- `/uploads/file` now creates a linked `MediaAsset` plus `MediaSafetyScan` for each upload and returns `assetId`/`mediaAssetId`, public URLs for safe public uploads, and short-lived signed download URLs for safe private uploads.
+- Updated `/Users/nigel/dev/backend/kis/.env.example` with Supabase Storage variables and removed the accidental concrete Supabase password from the template.
+- Added `/Users/nigel/dev/backend/kis/docs/media-storage-supabase-runbook.md` with Render/Supabase setup and smoke-test steps.
+
+### Validation
+
+- `python3 -m py_compile /Users/nigel/dev/backend/kis/apps/media/storage_backends.py /Users/nigel/dev/backend/kis/apps/media/views.py /Users/nigel/dev/backend/kis/apps/media/safety.py` passed after fixing a storage backend escape typo.
+- `python3 manage.py check` passed.
+- `python3 manage.py test apps.media --noinput` first exposed two media-safety stub expectation failures; the stub was corrected so scan-required uploads quarantine as `pending_review` and non-required stub uploads report `not_configured`.
+- A second focused test run recreated the test DB but produced no further output for over a minute, so it was stopped and recorded as a local test-run blocker rather than a code blocker.
+
+### Remaining risks
+
+- Supabase free storage/bandwidth is suitable for test and early validation only, not heavy public video traffic.
+- Private bucket display depends on app surfaces honoring `downloadUrl`/signed access; public channel/feed media should use public visibility for easiest display during free testing.

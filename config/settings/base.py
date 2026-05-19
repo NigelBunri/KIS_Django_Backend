@@ -329,11 +329,18 @@ USE_TZ = True
 
 # Static and media
 STATIC_URL = "/static/"
-MEDIA_URL = "/media/"
+MEDIA_URL = os.environ.get("MEDIA_URL", "/media/")
 STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_ROOT = BASE_DIR / "media"
 SITE_URL = os.environ.get("SITE_URL", _dev_host_url(port=DEV_SERVER_PORT)).rstrip("/")
 API_BASE_URL = os.environ.get("API_BASE_URL", SITE_URL)
+
+OBJECT_STORAGE_PROVIDER = os.environ.get("OBJECT_STORAGE_PROVIDER", "").strip().lower()
+if OBJECT_STORAGE_PROVIDER == "supabase":
+    STORAGES = {
+        "default": {"BACKEND": "apps.media.storage_backends.SupabaseStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    }
 
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

@@ -320,6 +320,13 @@ class MediaSafetyScanViewSet(viewsets.ReadOnlyModelViewSet):
         return qs.filter(owner=user)
 
 
+def _safe_storage_url(name: str) -> str:
+    try:
+        return default_storage.url(name)
+    except Exception:
+        return ""
+
+
 def _guess_attachment_kind(mime_type: str | None) -> str:
     if not mime_type:
         return "other"
@@ -364,13 +371,35 @@ class UploadFileView(APIView):
         relative_path = f"uploads/{identifier}/{filename}"
         saved_path = default_storage.save(relative_path, upload)
         sanitized_path = saved_path.replace("\\", "/")
-        media_root_url = settings.MEDIA_URL.rstrip("/")
-        public_url = request.build_absolute_uri(f"{media_root_url}/{sanitized_path.lstrip('/')}")
         visibility = str(request.data.get("visibility") or "private").strip().lower()
         is_public_upload = visibility in PUBLIC_VISIBILITY_VALUES
+        public_url = _safe_storage_url(sanitized_path) if is_public_upload and not decision.quarantine else ""
         scan_status = decision.status
+        asset_status = "pending" if decision.quarantine or decision.requires_review else "ready"
+        storage_provider = getattr(settings, "OBJECT_STORAGE_PROVIDER", "") or "default"
+        media_asset = MediaAsset.objects.create(
+            owner=request.user if request.user.is_authenticated else None,
+            type=_guess_attachment_kind(mime_type),
+            bucket_key=sanitized_path,
+            canonical_url=public_url or None,
+            mime_type=mime_type,
+            bytes=upload.size or 0,
+            checksum=checksum,
+            status=asset_status,
+            storage={
+                "provider": storage_provider,
+                "visibility": "public" if is_public_upload else "private",
+                "scan_status": scan_status,
+            },
+            metadata={
+                "upload_id": identifier,
+                "original_name": filename,
+                "context": context,
+            },
+        )
 
         safety_scan = MediaSafetyScan.objects.create(
+            asset=media_asset,
             owner=request.user if request.user.is_authenticated else None,
             upload_id=identifier,
             context=context,
@@ -400,9 +429,19 @@ class UploadFileView(APIView):
         except Exception:
             pass
 
+        signed_download_url = ""
+        if not is_public_upload and not decision.quarantine:
+            signed_token = _sign_media_asset(media_asset)
+            signed_path = f"/api/v1/assets/{media_asset.id}/download/?token={quote(signed_token)}"
+            signed_download_url = request.build_absolute_uri(signed_path)
+
         attachment = {
             "id": identifier,
+            "assetId": str(media_asset.id),
+            "mediaAssetId": str(media_asset.id),
             "url": public_url if (settings.DEBUG and not decision.quarantine) or (is_public_upload and not decision.quarantine) else "",
+            "publicUrl": public_url if is_public_upload and not decision.quarantine else "",
+            "downloadUrl": signed_download_url,
             "localUrl": public_url if settings.DEBUG else "",
             "originalName": filename,
             "mimeType": mime_type,
