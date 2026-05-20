@@ -1,7 +1,9 @@
 # chat/views.py
 import logging
 import os
+import re
 import uuid
+import phonenumbers as _phonenumbers
 from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -112,6 +114,69 @@ def _resolve_partner_from_conversation(conversation: Conversation) -> Partner | 
     return None
 
 
+def _phone_variants(phone: str) -> tuple[list[str], list[str]]:
+    """Return (phone_variants, digit_variants) for a loose phone lookup.
+
+    Handles every common format a React Native contact can arrive in:
+      "+237676139884"  →  exact, digits-only, national ("676139884")
+      "676139884"      →  exact, e164 ("+237676139884"), national
+      "00237676139884" →  same as the +237 form
+    """
+    raw = (phone or "").strip()
+    digits = re.sub(r"\D", "", raw)
+
+    phones: list[str] = [raw]
+    if digits:
+        phones.append(digits)
+        phones.append(f"+{digits}")
+        if digits.startswith("00") and len(digits) > 2:
+            intl = digits[2:]
+            phones.extend([intl, f"+{intl}"])
+        if digits.startswith("0") and len(digits) > 1:
+            stripped = digits[1:]
+            phones.extend([stripped, f"+{stripped}"])
+
+    # Try e164 and extract national number for local-only DB entries
+    for candidate in (raw, digits):
+        if not candidate:
+            continue
+        for region in ("CM", None):
+            try:
+                parsed = _phonenumbers.parse(candidate, region)
+                if _phonenumbers.is_possible_number(parsed):
+                    e164 = _phonenumbers.format_number(parsed, _phonenumbers.PhoneNumberFormat.E164)
+                    phones.append(e164)
+                    phones.append(e164.lstrip("+"))
+                    national = str(parsed.national_number)
+                    if national:
+                        phones.append(national)
+                    break
+            except Exception:
+                continue
+
+    seen: set[str] = set()
+    unique_phones: list[str] = []
+    for v in phones:
+        v = v.strip()
+        if v and v not in seen:
+            seen.add(v)
+            unique_phones.append(v)
+
+    unique_digits = list({re.sub(r"\D", "", v) for v in unique_phones if re.sub(r"\D", "", v)})
+    return unique_phones, unique_digits
+
+
+def _lookup_user_by_phone(phone: str, exclude_id: str | None = None) -> "User | None":
+    """Find a KIS user by phone regardless of storage format."""
+    phone_variants, digit_variants = _phone_variants(phone)
+    qs = User.objects.filter(
+        Q(phone__in=phone_variants) | Q(phone_number__in=digit_variants)
+    )
+    if exclude_id:
+        qs = qs.exclude(id=exclude_id)
+    return qs.first()
+
+
 def _resolve_peer_user(request_user: User, raw_data: dict) -> User:
     """
     Resolves the peer user for a direct chat.
@@ -138,9 +203,8 @@ def _resolve_peer_user(request_user: User, raw_data: dict) -> User:
 
     # For direct chat, use the first phone only
     first_phone = phones[0]
-    try:
-        peer = User.objects.get(phone=first_phone)
-    except User.DoesNotExist:
+    peer = _lookup_user_by_phone(first_phone, exclude_id=str(request_user.id))
+    if not peer:
         raise ValidationError({"participants": f"User with phone number {first_phone} does not exist."})
 
     if peer.id == request_user.id:
