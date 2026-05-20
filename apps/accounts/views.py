@@ -22,6 +22,7 @@ from apps.core.phone_utils import to_e164
 from common.media_urls import absolutize_backend_media
 from django.utils.translation import gettext_lazy as _
 import pyotp
+import phonenumbers as _phonenumbers
 
 from rest_framework import viewsets, mixins, filters, status, serializers, permissions
 from rest_framework.decorators import action
@@ -1469,7 +1470,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"], permission_classes=[IsAuthenticated], authentication_classes=JWT_AUTH)
     def me(self, request):
         ensure_default_account_tiers()
-        profile = Profile.objects.select_related("user").get(user=request.user)
+        profile, _ = Profile.objects.select_related("user").get_or_create(user=request.user)
         payload = _build_profile_payload(profile, request.user, request=request)
         payload["privacy"] = ProfileFieldVisibilitySerializer(
             ProfileFieldVisibility.objects.filter(user=request.user), many=True
@@ -1879,6 +1880,17 @@ class CheckContact(APIView):
                 continue
             variants.append(e164)
             variants.append(e164[1:] if e164.startswith("+") else e164)
+            # Also add the national (local) number so we can match users whose
+            # phone field was stored without a country code prefix (e.g. "676139884"
+            # vs the input "+237676139884"). Without this, digit_to_uid keyed by
+            # phone_number (local-only) would never be hit for an international input.
+            try:
+                parsed_num = _phonenumbers.parse(e164, None)
+                national = str(parsed_num.national_number)
+                if national:
+                    variants.append(national)
+            except Exception:
+                pass
 
         seen = set()
         ordered = []

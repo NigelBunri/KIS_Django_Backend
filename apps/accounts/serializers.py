@@ -1119,9 +1119,30 @@ class LoginSerializer(serializers.Serializer):
                 user = None
 
         if user is None:
-            raise serializers.ValidationError({"detail": _("Invalid credentials.")})
+            # Distinguish phone-not-found from wrong-password so the app can show a specific message.
+            candidates_nonempty = [c for c in login_candidates if c]
+            phone_registered = (
+                User.objects.filter(phone__in=candidates_nonempty).exists()
+                if candidates_nonempty else False
+            )
+            if not phone_registered and phone_number:
+                phone_registered = User.objects.filter(phone_number=phone_number).exists()
+
+            if phone_registered:
+                raise serializers.ValidationError({
+                    "detail": _("Incorrect password."),
+                    "error_code": "wrong_password",
+                })
+            raise serializers.ValidationError({
+                "detail": _("This phone number is not registered."),
+                "error_code": "phone_not_found",
+            })
+
         if not user.is_active:
-            raise serializers.ValidationError({"detail": _("User account is disabled.")})
+            raise serializers.ValidationError({
+                "detail": _("This account has been disabled."),
+                "error_code": "account_disabled",
+            })
 
         if not phone_e164:
             try:
