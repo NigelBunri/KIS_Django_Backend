@@ -2039,3 +2039,79 @@ class CheckContact(APIView):
             "phone": user.phone,
             "chatId": chat_id,
         })
+
+    def post(self, request, *args, **kwargs):
+        """
+        POST /api/v1/users/check-contacts/
+        Body: { "phones": ["+237676...", ...] }  max 500 per request
+
+        Returns: { "results": { "+237676...": { "registered": bool, "user_id": int|null } } }
+
+        Single bulk DB query (both phone fields are indexed) — does NOT run
+        the full-table-scan digits fallback used by the single-phone GET path.
+        """
+        phones_raw = request.data.get("phones")
+        if not isinstance(phones_raw, list) or not phones_raw:
+            return Response({"detail": "phones must be a non-empty list"}, status=400)
+
+        # Normalise and cap input
+        phones: list[str] = [str(p).strip() for p in phones_raw[:500] if p and str(p).strip()]
+        if not phones:
+            return Response({"detail": "No valid phones provided"}, status=400)
+
+        country_hint: str = str(getattr(request.user, "country", None) or "CM").strip().upper() or "CM"
+
+        # Build variant map and collect all variants in one pass
+        phone_to_variants: dict[str, list[str]] = {}
+        all_phone_variants: set[str] = set()
+        all_digit_variants: set[str] = set()
+
+        for phone in phones:
+            variants = self._normalized_variants(phone, country_hint)
+            phone_to_variants[phone] = variants
+            for v in variants:
+                all_phone_variants.add(v)
+                d = self._digits_only(v)
+                if d:
+                    all_digit_variants.add(d)
+
+        # Single bulk DB query — O(index scan), not O(table scan)
+        matched_users = (
+            User.objects
+            .filter(Q(phone__in=all_phone_variants) | Q(phone_number__in=all_digit_variants))
+            .exclude(id=request.user.id)
+            .only("id", "phone", "phone_number")
+        )
+
+        # Build in-memory lookup maps from the query results
+        phone_to_uid: dict[str, int] = {}
+        digit_to_uid: dict[str, int] = {}
+        for u in matched_users:
+            if u.phone:
+                phone_to_uid[str(u.phone)] = u.id
+            if u.phone_number:
+                digit_to_uid[str(u.phone_number)] = u.id
+
+        # Resolve each input phone against the lookup maps
+        results: dict[str, dict] = {}
+        for phone in phones:
+            variants = phone_to_variants.get(phone, [])
+            user_id: int | None = None
+
+            for v in variants:
+                uid = phone_to_uid.get(v)
+                if uid:
+                    user_id = uid
+                    break
+
+            if user_id is None:
+                for v in variants:
+                    d = self._digits_only(v)
+                    uid = digit_to_uid.get(d) if d else None
+                    if uid:
+                        user_id = uid
+                        break
+
+            results[phone] = {"registered": user_id is not None, "user_id": user_id}
+
+        return Response({"results": results})
