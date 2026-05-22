@@ -2,6 +2,9 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import date as ddate, datetime, time as dtime, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 from uuid import UUID, uuid4
+import hashlib
+import hmac as _hmac
+import time as _time
 
 from django.core.cache import cache
 from django.conf import settings
@@ -503,8 +506,17 @@ def _append_emergency_tracking_event(
 
 
 def _issue_video_tokens(video_session: VideoConsultationSession, *, ttl_minutes: int = 90):
-    video_session.host_join_token = f"host_{uuid4().hex}"
-    video_session.participant_join_token = f"participant_{uuid4().hex}"
+    secret = (getattr(settings, 'SECRET_KEY', '') or '').encode()
+    exp_ts = int(_time.time()) + max(10, ttl_minutes) * 60
+    session_id = str(video_session.id)
+
+    def _make_token(role: str) -> str:
+        payload = f"{role}:{session_id}:{exp_ts}"
+        sig = _hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()[:24]
+        return f"{payload}:{sig}"
+
+    video_session.host_join_token = _make_token('host')
+    video_session.participant_join_token = _make_token('participant')
     video_session.token_expires_at = timezone.now() + timedelta(minutes=max(10, ttl_minutes))
 
 
@@ -1411,7 +1423,7 @@ class HealthInstitutionListCreateView(APIView):
             Q(owner=request.user)
             | Q(memberships__user=request.user, memberships__is_active=True)
         ).distinct().order_by("-created_at")
-        return Response({"results": HealthInstitutionSerializer(qs, many=True).data}, status=status.HTTP_200_OK)
+        return Response({"results": HealthInstitutionSerializer(qs, many=True, context={"request": request}).data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
     def post(self, request):
@@ -1423,7 +1435,7 @@ class HealthInstitutionListCreateView(APIView):
             user=request.user,
             defaults={"role": MembershipRole.OWNER, "is_active": True},
         )
-        return Response({"institution": HealthInstitutionSerializer(institution).data}, status=status.HTTP_201_CREATED)
+        return Response({"institution": HealthInstitutionSerializer(institution, context={"request": request}).data}, status=status.HTTP_201_CREATED)
 
 
 class HealthInstitutionDetailView(APIView):
@@ -1437,7 +1449,7 @@ class HealthInstitutionDetailView(APIView):
         )
         if error_response:
             return error_response
-        return Response({"institution": HealthInstitutionSerializer(institution).data}, status=status.HTTP_200_OK)
+        return Response({"institution": HealthInstitutionSerializer(institution, context={"request": request}).data}, status=status.HTTP_200_OK)
 
 
 class HealthCareSummaryView(APIView):
@@ -1461,8 +1473,8 @@ class HealthCareSummaryView(APIView):
                     "recentVitalCount": HealthVitalReading.objects.filter(user=request.user).count(),
                     "providerMessagingReady": SecureMessagingSession.objects.filter(user=request.user).exists(),
                     "videoCareReady": VideoConsultationSession.objects.filter(user=request.user).exists(),
-                    "lowBandwidthReady": True,
-                    "familySafeCare": True,
+                    "lowBandwidthReady": bool(getattr(settings, 'HEALTH_LOW_BANDWIDTH_READY', True)),
+                    "familySafeCare": bool(getattr(settings, 'HEALTH_FAMILY_SAFE_CARE', False)),
                 },
                 "care_plans": HealthCarePlanSerializer(active_care_plans[:20], many=True).data,
                 "latest_vitals": HealthVitalReadingSerializer(latest_vitals, many=True).data,
@@ -1826,14 +1838,19 @@ class WorkflowSessionStartView(APIView):
         if owner_preview and institution.owner_id != request.user.id:
             return Response({"detail": "Owner preview is only available to the institution owner."}, status=status.HTTP_403_FORBIDDEN)
         try:
+            requested_auto_debit = bool(serializer.validated_data.get("auto_debit", False))
+            legacy_wallet_disabled = requested_auto_debit and not _health_wallet_checkout_enabled()
             workflow = _start_workflow_session(
                 user=request.user,
                 institution=institution,
                 service=service,
-                auto_debit=(False if owner_preview else serializer.validated_data.get("auto_debit", True)),
+                auto_debit=(False if owner_preview or legacy_wallet_disabled else requested_auto_debit),
                 bypass_payment=owner_preview,
                 assessment_payload=serializer.validated_data.get("assessment_payload", {}),
-                metadata_extra={"owner_preview": owner_preview} if owner_preview else None,
+                metadata_extra={
+                    **({"owner_preview": True} if owner_preview else {}),
+                    **({"legacy_health_wallet_checkout_disabled": True, "payment_mode": "provider_pending"} if legacy_wallet_disabled else {}),
+                } or None,
             )
         except WorkflowStartFailure as exc:
             return Response(exc.payload, status=exc.status_code)

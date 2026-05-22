@@ -14,7 +14,7 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.shortcuts import get_object_or_404
-from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 from apps.accounts.jwt_auth import DeviceBoundJWTAuthentication
 
 from .models import MediaAsset, MediaVariant, ProcessingJob, MediaMetrics, MediaSafetyScan
@@ -369,7 +369,10 @@ class UploadFileView(APIView):
         mime_type = upload.content_type or ""
         decision = scan_upload_for_explicit_content(filename=filename, mime_type=mime_type, context=context)
         relative_path = f"uploads/{identifier}/{filename}"
-        saved_path = default_storage.save(relative_path, upload)
+        try:
+            saved_path = default_storage.save(relative_path, upload)
+        except Exception:
+            raise APIException("Unable to store this upload right now. Please retry.")
         sanitized_path = saved_path.replace("\\", "/")
         visibility = str(request.data.get("visibility") or "private").strip().lower()
         is_public_upload = visibility in PUBLIC_VISIBILITY_VALUES
@@ -435,11 +438,17 @@ class UploadFileView(APIView):
             signed_path = f"/api/v1/assets/{media_asset.id}/download/?token={quote(signed_token)}"
             signed_download_url = request.build_absolute_uri(signed_path)
 
+        display_url = ""
+        if not decision.quarantine:
+            display_url = public_url or signed_download_url
+
         attachment = {
             "id": identifier,
             "assetId": str(media_asset.id),
             "mediaAssetId": str(media_asset.id),
-            "url": public_url if (settings.DEBUG and not decision.quarantine) or (is_public_upload and not decision.quarantine) else "",
+            "mediaAssetRef": str(media_asset.id),
+            "url": display_url,
+            "displayUrl": display_url,
             "publicUrl": public_url if is_public_upload and not decision.quarantine else "",
             "downloadUrl": signed_download_url,
             "localUrl": public_url if settings.DEBUG else "",
@@ -454,6 +463,12 @@ class UploadFileView(APIView):
             "requiresReview": decision.requires_review,
             "safetyScanId": str(safety_scan.id),
             "safety": user_safe_upload_response(decision),
+            "asset": {
+                "id": str(media_asset.id),
+                "type": media_asset.type,
+                "status": media_asset.status,
+                "private": not is_public_upload,
+            },
         }
 
         return Response({"attachment": attachment}, status=status.HTTP_201_CREATED)

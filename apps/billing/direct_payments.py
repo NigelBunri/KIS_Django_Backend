@@ -90,6 +90,14 @@ def _flutterwave_headers() -> dict[str, str]:
     }
 
 
+def _provider_links_enabled(provider: str) -> bool:
+    return (
+        provider == "flutterwave"
+        and getattr(settings, "KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED", False)
+        and bool(getattr(settings, "FLW_SECRET_KEY", ""))
+    )
+
+
 def _create_flutterwave_payment_link(intent: DirectPaymentIntent) -> tuple[str, dict]:
     user = intent.user
     amount = (Decimal(int(intent.amount_cents or 0)) / Decimal("100")).quantize(Decimal("0.01"))
@@ -119,6 +127,26 @@ def _create_flutterwave_payment_link(intent: DirectPaymentIntent) -> tuple[str, 
         raise ValueError(str(data.get("message") or "Failed to create payment link"))
     link = str((data.get("data") or {}).get("link") or "")
     return link, redact_payment_payload(data)
+
+
+def _ensure_provider_payment_link(intent: DirectPaymentIntent, *, actor=None) -> DirectPaymentIntent:
+    if intent.payment_url or not _provider_links_enabled(intent.provider):
+        return intent
+    try:
+        payment_url, provider_payload = _create_flutterwave_payment_link(intent)
+    except Exception as exc:  # pragma: no cover - live provider path is disabled in local validation.
+        write_direct_payment_audit(
+            event="intent.provider_link_failed",
+            intent=intent,
+            actor=actor,
+            metadata={"error": str(exc)},
+        )
+        return intent
+    intent.payment_url = payment_url
+    intent.provider_payload = provider_payload
+    intent.save(update_fields=["payment_url", "provider_payload", "updated_at"])
+    write_direct_payment_audit(event="intent.provider_link_created", intent=intent, actor=actor)
+    return intent
 
 
 def _target_owner_and_amount(target_type: str, target_id: uuid.UUID | str) -> tuple[Any, int, str, Any]:
@@ -188,6 +216,7 @@ def create_direct_payment_intent(
         if changed_fields:
             existing.save(update_fields=[*changed_fields, "updated_at"])
             write_direct_payment_audit(event="intent.updated", intent=existing, actor=user)
+        existing = _ensure_provider_payment_link(existing, actor=user)
         _attach_intent_to_target(existing, target)
         return existing
 
@@ -207,25 +236,9 @@ def create_direct_payment_intent(
     write_direct_payment_audit(event="intent.created", intent=intent, actor=user)
     _attach_intent_to_target(intent, target)
 
-    if (
-        provider == "flutterwave"
-        and getattr(settings, "KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED", False)
-        and getattr(settings, "FLW_SECRET_KEY", "")
-    ):
-        try:
-            payment_url, provider_payload = _create_flutterwave_payment_link(intent)
-        except Exception as exc:  # pragma: no cover - network path is disabled in local validation.
-            write_direct_payment_audit(
-                event="intent.provider_link_failed",
-                intent=intent,
-                actor=user,
-                metadata={"error": str(exc)},
-            )
-        else:
-            intent.payment_url = payment_url
-            intent.provider_payload = provider_payload
-            intent.save(update_fields=["payment_url", "provider_payload", "updated_at"])
-            write_direct_payment_audit(event="intent.provider_link_created", intent=intent, actor=user)
+    intent = _ensure_provider_payment_link(intent, actor=user)
+    if intent.payment_url:
+        _attach_intent_to_target(intent, target)
     return intent
 
 
@@ -241,6 +254,7 @@ def _attach_intent_to_target(intent: DirectPaymentIntent, target: Any | None = N
             "payment_provider": intent.provider,
             "payment_required": True,
             "payment_reference": intent.tx_ref,
+            "payment_url": intent.payment_url or "",
             "direct_payment_intent_id": str(intent.id),
         }
     )
@@ -279,7 +293,7 @@ def _attach_intent_to_target(intent: DirectPaymentIntent, target: Any | None = N
 
 def reconcile_direct_payment_callback(*, payload: dict, signature: str = "") -> tuple[bool, str, DirectPaymentIntent | None]:
     secret = getattr(settings, "FLW_WEBHOOK_SECRET", "")
-    if secret and signature != secret:
+    if not secret or signature != secret:
         write_direct_payment_audit(event="callback.signature_invalid", metadata={"provider": "flutterwave"})
         return False, "invalid_signature", None
     body = payload if isinstance(payload, dict) else {}
@@ -332,6 +346,7 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
         "payment_reference": intent.tx_ref,
         "provider_transaction_id": str(data.get("id") or data.get("transaction_id") or ""),
         "paid_at": timezone.now().isoformat(),
+        "payment_url": intent.payment_url or "",
         "direct_payment_intent_id": str(intent.id),
     }
     if intent.target_type == DirectPaymentIntent.TARGET_MARKETPLACE_ORDER:
@@ -379,6 +394,7 @@ def _mark_target_failed(intent: DirectPaymentIntent, status_value: str) -> None:
         "payment_provider": intent.provider,
         "payment_required": True,
         "payment_reference": intent.tx_ref,
+        "payment_url": intent.payment_url or "",
         "direct_payment_intent_id": str(intent.id),
     }
     if intent.target_type == DirectPaymentIntent.TARGET_MARKETPLACE_ORDER:

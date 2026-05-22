@@ -594,6 +594,9 @@ class ServiceSerializer(serializers.ModelSerializer):
         model = Service
         fields = [
             "id",
+            "owner",
+            "owner_user_id",
+            "ownerUserId",
             "name",
             "description",
             "is_default",
@@ -771,6 +774,9 @@ class EducationInstitutionMembershipSerializer(serializers.ModelSerializer):
 
 class EducationInstitutionSerializer(serializers.ModelSerializer):
     memberships = EducationInstitutionMembershipSerializer(many=True, read_only=True)
+    owner = serializers.PrimaryKeyRelatedField(read_only=True)
+    owner_user_id = serializers.SerializerMethodField()
+    ownerUserId = serializers.SerializerMethodField()
     active_member_count = serializers.SerializerMethodField()
     pending_application_count = serializers.SerializerMethodField()
     current_membership = serializers.SerializerMethodField()
@@ -787,6 +793,9 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
         model = EducationInstitution
         fields = [
             "id",
+            "owner",
+            "owner_user_id",
+            "ownerUserId",
             "name",
             "description",
             "institution_type",
@@ -827,11 +836,33 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
             return sum(1 for row in rows if row.status == "pending")
         return obj.memberships.filter(status="pending").count()
 
+    def get_owner_user_id(self, obj: EducationInstitution) -> str:
+        return str(obj.owner_id) if obj.owner_id else ""
+
+    def get_ownerUserId(self, obj: EducationInstitution) -> str:
+        return self.get_owner_user_id(obj)
+
     def get_current_membership(self, obj: EducationInstitution):
         request = self.context.get("request")
         user = getattr(request, "user", None)
         if not user or not getattr(user, "is_authenticated", False):
             return None
+        if obj.owner_id == user.id:
+            membership = obj.memberships.filter(user=user).select_related("user").first()
+            if membership:
+                return EducationInstitutionMembershipSerializer(membership).data
+            return {
+                "id": None,
+                "user_id": str(user.id),
+                "display_name": getattr(user, "display_name", "") or getattr(user, "username", "") or "",
+                "phone": getattr(user, "phone", ""),
+                "email": getattr(user, "email", ""),
+                "role": "owner",
+                "status": "active",
+                "title": "Owner",
+                "permissions": ["manage_all"],
+                "metadata": {"source": "owner_field"},
+            }
         prefetched = getattr(obj, "_prefetched_objects_cache", {})
         rows = prefetched.get("memberships")
         if rows is not None:
@@ -1302,6 +1333,10 @@ class EducationInstitutionMaterialSerializer(serializers.ModelSerializer):
     lesson_ids = serializers.SerializerMethodField()
     class_session_ids = serializers.SerializerMethodField()
     assessment_ids = serializers.SerializerMethodField()
+    safe_resource_url = serializers.SerializerMethodField()
+    private_media_ref = serializers.SerializerMethodField()
+    media_safety_status = serializers.SerializerMethodField()
+    media_review_required = serializers.SerializerMethodField()
 
     class Meta:
         model = EducationInstitutionMaterial
@@ -1325,6 +1360,10 @@ class EducationInstitutionMaterialSerializer(serializers.ModelSerializer):
             "resource_name",
             "resource_mime_type",
             "storage_path",
+            "safe_resource_url",
+            "private_media_ref",
+            "media_safety_status",
+            "media_review_required",
             "is_downloadable",
             "status",
             "metadata",
@@ -1335,6 +1374,8 @@ class EducationInstitutionMaterialSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         payload = super().to_representation(instance)
         payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        payload["storage_path"] = ""
+        safe_resource_url = payload.get("safe_resource_url") or ""
         return _attach_education_detail_summary(
             payload,
             _education_detail_summary(
@@ -1346,16 +1387,17 @@ class EducationInstitutionMaterialSerializer(serializers.ModelSerializer):
                 highlights=[
                     _education_detail_item("Kind", _education_humanize(payload.get("kind"))),
                     _education_detail_item("Downloadable", payload.get("is_downloadable")),
-                    _education_detail_item("Resource", payload.get("resource_name") or payload.get("resource_url")),
+                    _education_detail_item("Resource", payload.get("resource_name") or safe_resource_url),
+                    _education_detail_item("Safety", _education_humanize(payload.get("media_safety_status"))),
                 ],
                 sections=[
                     _education_detail_section(
                         "Resource",
                         [
                             _education_detail_item("Name", payload.get("resource_name")),
-                            _education_detail_item("URL", payload.get("resource_url")),
+                            _education_detail_item("URL", safe_resource_url),
                             _education_detail_item("MIME type", payload.get("resource_mime_type")),
-                            _education_detail_item("Storage path", payload.get("storage_path")),
+                            _education_detail_item("Safety status", _education_humanize(payload.get("media_safety_status"))),
                         ],
                     ),
                     _education_detail_section(
@@ -1371,6 +1413,29 @@ class EducationInstitutionMaterialSerializer(serializers.ModelSerializer):
                 ],
             ),
         )
+
+    def _media_safety(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        safety = metadata.get("media_safety") if isinstance(metadata.get("media_safety"), dict) else {}
+        return safety
+
+    def get_safe_resource_url(self, obj):
+        safety = self._media_safety(obj)
+        if safety.get("quarantined") or safety.get("blocked"):
+            return ""
+        return getattr(obj, "resource_url", "") or ""
+
+    def get_private_media_ref(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(metadata.get("private_media_ref") or metadata.get("private_media_id") or "") or None
+
+    def get_media_safety_status(self, obj):
+        safety = self._media_safety(obj)
+        return str(safety.get("status") or safety.get("scan_status") or "not_configured")
+
+    def get_media_review_required(self, obj):
+        safety = self._media_safety(obj)
+        return bool(safety.get("requires_review") or safety.get("quarantined") or safety.get("blocked"))
 
     def get_program_ids(self, obj):
         ids = list(obj.program_links.values_list("id", flat=True))
@@ -1859,6 +1924,8 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
     payment_status = serializers.SerializerMethodField()
     payment_required = serializers.SerializerMethodField()
     payment_intent_id = serializers.SerializerMethodField()
+    direct_payment_intent_id = serializers.SerializerMethodField()
+    payment_reference = serializers.SerializerMethodField()
     payment_url = serializers.SerializerMethodField()
 
     class Meta:
@@ -1882,6 +1949,8 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
             "payment_status",
             "payment_required",
             "payment_intent_id",
+            "direct_payment_intent_id",
+            "payment_reference",
             "payment_url",
             "wallet_transaction_id",
             "provider_credit_transaction_id",
@@ -1931,6 +2000,13 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
     def get_payment_intent_id(self, obj):
         metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
         return str(metadata.get("direct_payment_intent_id") or "") or None
+
+    def get_direct_payment_intent_id(self, obj):
+        return self.get_payment_intent_id(obj)
+
+    def get_payment_reference(self, obj):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(metadata.get("payment_reference") or metadata.get("provider_reference") or "") or None
 
     def get_payment_url(self, obj):
         metadata = obj.metadata if isinstance(obj.metadata, dict) else {}

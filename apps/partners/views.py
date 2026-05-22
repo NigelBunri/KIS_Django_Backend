@@ -1273,6 +1273,90 @@ class PartnerViewSet(viewsets.ModelViewSet):
             return Response(PartnerReportSnapshotSerializer(snapshot).data, status=status.HTTP_201_CREATED)
         return Response(summary, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["get"], url_path="analytics")
+    def analytics(self, request, pk=None):
+        """
+        Lightweight real-time analytics summary for a partner.
+        Requires partner_insight feature flag.
+        """
+        from django.db.models import Avg, Count, Q, Sum
+
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.reports.view")
+        self._require_partner_feature(request.user, "partner_insight")
+
+        window_days = int(request.query_params.get("days") or 30)
+        window_days = min(max(window_days, 1), 365)
+        since = timezone.now() - timedelta(days=window_days)
+
+        # Members
+        all_members_qs = PartnerMembership.objects.filter(partner=partner)
+        total_members = all_members_qs.count()
+        active_members = all_members_qs.filter(
+            status=PartnerMembershipStatus.MEMBER,
+        ).count()
+
+        # Posts and engagement
+        posts_qs = PartnerPost.objects.filter(partner=partner)
+        total_posts = posts_qs.count()
+        recent_posts = posts_qs.filter(created_at__gte=since).count()
+        recent_reactions = PartnerPostReaction.objects.filter(
+            post__partner=partner, created_at__gte=since
+        ).count()
+        recent_comments = PartnerPostComment.objects.filter(
+            post__partner=partner, created_at__gte=since
+        ).count()
+
+        # Marketplace revenue: aggregate MarketplaceOrder totals for shops owned
+        # by partner members.
+        revenue_data: dict = {}
+        try:
+            from apps.commerce.models import MarketplaceOrder, MarketplaceOrderStatus
+
+            member_user_ids = list(
+                all_members_qs.values_list("user_id", flat=True)
+            )
+            completed_orders = MarketplaceOrder.objects.filter(
+                shop__owner_id__in=member_user_ids,
+                status__in=[
+                    MarketplaceOrderStatus.SATISFIED,
+                    MarketplaceOrderStatus.COMPLETED,
+                ],
+                created_at__gte=since,
+            )
+            agg = completed_orders.aggregate(
+                total=Sum("total_amount"),
+                order_count=Count("id"),
+            )
+            revenue_data = {
+                "period_revenue": float(agg["total"] or 0),
+                "period_order_count": agg["order_count"] or 0,
+                "currency": "USD",
+            }
+        except Exception:
+            revenue_data = {"period_revenue": None, "period_order_count": None}
+
+        return Response(
+            {
+                "partner_id": str(partner.id),
+                "window_days": window_days,
+                "members": {
+                    "total": total_members,
+                    "active": active_members,
+                },
+                "posts": {
+                    "total": total_posts,
+                    "period_new": recent_posts,
+                },
+                "engagement": {
+                    "period_reactions": recent_reactions,
+                    "period_comments": recent_comments,
+                },
+                "revenue": revenue_data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
     @action(detail=True, methods=["get", "post"], url_path="exports")
     def exports(self, request, pk=None):
         partner = self.get_object()
@@ -3167,7 +3251,12 @@ class PartnerViewSet(viewsets.ModelViewSet):
             action_type=action_type,
             reason=reason,
             expires_at=expires_at,
-            metadata={"request": request.data},
+            metadata={
+                "action": action_type,
+                "target_user_id": str(membership.user_id),
+                "has_reason": bool(reason),
+                "expires_at": expires_at.isoformat() if expires_at else None,
+            },
         )
         log_partner_audit(
             partner=partner,

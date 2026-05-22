@@ -9,5 +9,5 @@ class SlackAdapter:
         return resp.data
 
     def fetch_thread(self, channel, ts):
-        # use conversations.replies
-        pass
+        resp = self.client.conversations_replies(channel=channel, ts=ts)
+        return resp.data

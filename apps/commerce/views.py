@@ -746,21 +746,27 @@ class CommerceDiscoveryView(APIView):
             product_qs = product_qs.filter(Q(name__icontains=query) | Q(description__icontains=query) | Q(shop__name__icontains=query))
             service_qs = service_qs.filter(Q(name__icontains=query) | Q(description__icontains=query) | Q(shop__name__icontains=query))
             shop_qs = shop_qs.filter(Q(name__icontains=query) | Q(description__icontains=query))
-        product_qs = product_qs.order_by('-is_featured', '-created_at')[:12]
+        trending_qs = product_qs.filter(is_featured=True).order_by('-created_at')[:12]
+        if trending_qs.count() < 6:
+            trending_qs = product_qs.order_by('-created_at')[:12]
+        popular_shops_qs = shop_qs.filter(is_verified=True).order_by('-followers_count', '-rating_avg')[:8]
+        if popular_shops_qs.count() < 3:
+            popular_shops_qs = shop_qs.order_by('-followers_count', '-rating_avg')[:8]
         service_qs = service_qs.order_by('-is_featured', '-created_at')[:8]
-        shop_qs = shop_qs.order_by('-is_verified', '-rating_avg', '-followers_count')[:8]
+        trending_data = ProductSerializer(trending_qs, many=True, context={'request': request}).data
+        shops_data = ShopSerializer(popular_shops_qs, many=True, context={'request': request}).data
         return Response({
             'currency': 'USD',
             'payment_provider': _commerce_default_payment_provider(),
             'legacy_wallet_checkout_enabled': _commerce_wallet_checkout_enabled(),
+            'trending_products': trending_data,
+            'popular_shops': shops_data,
+            'drops': [],
+            'featured_drop': None,
             'sections': {
-                'featured_products': ProductSerializer(product_qs, many=True, context={'request': request}).data,
-                'trusted_shops': ShopSerializer(shop_qs, many=True, context={'request': request}).data,
+                'featured_products': trending_data,
+                'trusted_shops': shops_data,
                 'service_spotlight': ShopServiceSerializer(service_qs, many=True, context={'request': request}).data,
-            },
-            'recommendation_context': {
-                'status': 'placeholder',
-                'reason': 'Personalized commerce recommendations will use verified seller, category, availability, and safe engagement signals.',
             },
         })
 
@@ -769,6 +775,7 @@ class CommerceDiscoveryView(APIView):
 class ShopVerificationRequestViewSet(viewsets.ModelViewSet):
     queryset = ShopVerificationRequest.objects.all().order_by('-created_at')
     serializer_class = ShopVerificationRequestSerializer
+    permission_classes = [permissions.IsAdminUser]
 
     @doc_decorator(
         summary="Review shop verification request",
@@ -948,101 +955,241 @@ class ProductViewSet(viewsets.ModelViewSet):
 
 @class_doc_decorator('Product Authenticity Checks')
 class ProductAuthenticityCheckViewSet(viewsets.ModelViewSet):
-    queryset = ProductAuthenticityCheck.objects.all().order_by('-created_at')
     serializer_class = ProductAuthenticityCheckSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = ProductAuthenticityCheck.objects.all().order_by('-created_at')
+        if self.request.user.is_staff:
+            return qs
+        return qs.filter(requested_by=self.request.user)
 
 
 @class_doc_decorator('Orders')
 class OrderViewSet(viewsets.ModelViewSet):
-    queryset = Order.objects.all().order_by('-created_at')
     serializer_class = OrderSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = Order.objects.select_related('shop', 'user').order_by('-created_at')
+        if self.request.user.is_staff:
+            return qs
+        return qs.filter(user=self.request.user)
+
+    def get_object(self):
+        obj = super().get_object()
+        if obj.user_id != self.request.user.id and not self.request.user.is_staff:
+            raise PermissionDenied("You do not have access to this order.")
+        return obj
 
     @doc_decorator(
-        summary="Pay for order",
-        description="Create a payment for an order and mark it paid (free-tier stub). Triggers async fraud evaluation.",
-        request=PaymentSerializer,
-        responses={200: OpenApiResponse(description="Paid") if SPECTACULAR else "Paid"}
+        summary="Initiate payment for an order",
+        description="Creates a Flutterwave DirectPaymentIntent and returns the checkout URL.",
+        request=None,
+        responses={200: OpenApiResponse(description="Payment initiated") if SPECTACULAR else "Payment initiated"},
     )
     @action(detail=True, methods=['post'])
     def pay(self, request, pk=None):
         order = self.get_object()
-        payment = Payment.objects.create(order=order, provider=request.data.get('provider', 'local'), method=request.data.get('method', 'card'), amount=order.total, currency=order.currency)
-        # For free tier: mark success instantly (stub)
-        payment.status = 'SUCCESS'
-        payment.captured_at = timezone.now()
-        payment.save()
-        order.status = 'PAID'
-        order.paid_at = timezone.now()
-        order.save()
-        # run fraud evaluation async
+
+        if order.user_id != request.user.id:
+            raise PermissionDenied("You can only pay for your own orders.")
+
+        if order.status != OrderStatus.TEMPORAL:
+            return Response(
+                {'detail': f'Order is in {order.status} state and cannot be paid again.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Idempotency: return existing pending intent if present
+        meta = order.metadata or {}
+        if meta.get('direct_payment_intent_id') and meta.get('payment_url'):
+            return Response({
+                'status': 'pending',
+                'payment_url': meta['payment_url'],
+                'tx_ref': meta.get('payment_reference', ''),
+                'direct_payment_intent_id': meta['direct_payment_intent_id'],
+            })
+
+        amount_cents = int(order.total_cents or 0)
+        if amount_cents <= 0:
+            return Response({'detail': 'Order has no payable amount.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        provider = str(
+            request.data.get('provider')
+            or getattr(settings, 'KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER', 'flutterwave')
+        ).strip().lower()
+
+        try:
+            intent = create_direct_payment_intent(
+                user=request.user,
+                target_type='order',
+                target_id=order.id,
+                provider=provider,
+                idempotency_key=str(order.id),
+                metadata={'source': 'order', 'shop_id': str(order.shop_id)},
+            )
+        except Exception as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Persist intent reference for webhook reconciliation
+        order.metadata = {
+            **meta,
+            'payment_reference': intent.tx_ref,
+            'direct_payment_intent_id': str(intent.id),
+            'payment_url': intent.payment_url,
+            'payment_status': 'pending',
+            'payment_provider': intent.provider,
+        }
+        order.save(update_fields=['metadata', 'updated_at'])
+
+        # Create audit Payment record in pending state
+        amount_decimal = Decimal(amount_cents) / Decimal('100')
+        Payment.objects.create(
+            order=order,
+            provider=intent.provider or provider,
+            method='provider_checkout',
+            amount=amount_decimal,
+            currency=order.currency,
+            status='pending',
+            role='buyer',
+            provider_ref=intent.tx_ref,
+            notes=f'DirectPaymentIntent {intent.id}',
+        )
+
         evaluate_fraud_score.delay(str(order.id))
-        return Response({'status': 'paid', 'payment_id': payment.id})
+
+        return Response({
+            'status': 'pending',
+            'payment_url': intent.payment_url,
+            'tx_ref': intent.tx_ref,
+            'direct_payment_intent_id': str(intent.id),
+        })
 
 
 @class_doc_decorator('Payments')
-class PaymentViewSet(viewsets.ModelViewSet):
-    queryset = Payment.objects.all().order_by('-created_at')
+class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
+    """Read-only — payments are created automatically via order.pay."""
     serializer_class = PaymentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = Payment.objects.select_related('order').order_by('-created_at')
+        if self.request.user.is_staff:
+            return qs
+        return qs.filter(order__user=self.request.user)
 
 
 @class_doc_decorator('Promotions')
 class PromotionViewSet(viewsets.ModelViewSet):
-    queryset = Promotion.objects.all().order_by('-created_at')
     serializer_class = PromotionSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        return Promotion.objects.filter(is_deleted=False).order_by('-created_at')
+
+    def perform_create(self, serializer):
+        if not self.request.user.is_staff:
+            raise PermissionDenied("Only staff can create promotions.")
+        serializer.save()
+
+    def perform_update(self, serializer):
+        if not self.request.user.is_staff:
+            raise PermissionDenied("Only staff can update promotions.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not self.request.user.is_staff:
+            raise PermissionDenied("Only staff can delete promotions.")
+        instance.delete()
 
 
 @class_doc_decorator('Subscriptions')
 class SubscriptionViewSet(viewsets.ModelViewSet):
-    queryset = Subscription.objects.all().order_by('-created_at')
     serializer_class = SubscriptionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = Subscription.objects.order_by('-created_at')
+        if self.request.user.is_staff:
+            return qs
+        return qs.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
 
 
 @class_doc_decorator('Loyalty')
-class LoyaltyPointViewSet(viewsets.ModelViewSet):
-    queryset = LoyaltyPoint.objects.all().order_by('-created_at')
+class LoyaltyPointViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = LoyaltyPointSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = LoyaltyPoint.objects.order_by('-created_at')
+        if self.request.user.is_staff:
+            return qs
+        return qs.filter(user=self.request.user)
 
 
 @class_doc_decorator('Follows')
 class ShopFollowViewSet(viewsets.ModelViewSet):
-    queryset = ShopFollow.objects.all()
     serializer_class = ShopFollowSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return ShopFollow.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
 
 
 @class_doc_decorator('Shares')
 class ProductShareViewSet(viewsets.ModelViewSet):
-    queryset = ProductShare.objects.all()
     serializer_class = ProductShareSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return ProductShare.objects.filter(user=self.request.user).order_by('-created_at')
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
 
 
 @class_doc_decorator('Recommendations')
-class AIRecommendationViewSet(viewsets.ModelViewSet):
-    queryset = AIRecommendation.objects.all()
+class AIRecommendationViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = AIRecommendationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = AIRecommendation.objects.order_by('-created_at')
+        if self.request.user.is_staff:
+            return qs
+        return qs.filter(user_id=self.request.user.id)
 
     @doc_decorator(
         summary="Compute recommendations",
-        description="Enqueue recommendation computation for a user (async).",
-        request=AIRecommendationSerializer,
-        responses={200: OpenApiResponse(description="Enqueued") if SPECTACULAR else "Enqueued"}
+        description="Enqueue personalised recommendation computation for the current user.",
+        request=None,
+        responses={200: OpenApiResponse(description="Enqueued") if SPECTACULAR else "Enqueued"},
     )
     @action(detail=False, methods=['post'])
     def compute(self, request):
-        user_id = request.data.get('user_id')
-        compute_recommendations.delay(user_id)
+        compute_recommendations.delay(str(request.user.id))
         return Response({'status': 'enqueued'})
 
 
 @class_doc_decorator('Audit Logs')
-class AuditLogViewSet(viewsets.ModelViewSet):
+class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = AuditLog.objects.all().order_by('-created_at')
     serializer_class = AuditLogSerializer
+    permission_classes = [permissions.IsAdminUser]
 
 
 @class_doc_decorator('Fraud Signals')
-class FraudSignalViewSet(viewsets.ModelViewSet):
+class FraudSignalViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = FraudSignal.objects.all().order_by('-created_at')
     serializer_class = FraudSignalSerializer
+    permission_classes = [permissions.IsAdminUser]
 
 
 class CartViewSet(viewsets.ModelViewSet):

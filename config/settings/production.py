@@ -84,6 +84,17 @@ if _sentry_dsn:
         environment="production",
     )
 
+# Object storage — require Supabase in production to prevent silent fallback to local disk.
+# Set OBJECT_STORAGE_PROVIDER=supabase and the matching SUPABASE_* env vars.
+# If you intentionally use an alternate cloud provider, set OBJECT_STORAGE_PROVIDER_OVERRIDE_ALLOWED=true.
+_storage_provider = os.environ.get("OBJECT_STORAGE_PROVIDER", "").strip().lower()
+_storage_override = os.environ.get("OBJECT_STORAGE_PROVIDER_OVERRIDE_ALLOWED", "").strip().lower() in ("1", "true", "yes")
+if _storage_provider != "supabase" and not _storage_override:
+    raise ImproperlyConfigured(
+        "OBJECT_STORAGE_PROVIDER must be set to 'supabase' in production. "
+        "Set OBJECT_STORAGE_PROVIDER_OVERRIDE_ALLOWED=true to explicitly allow another provider."
+    )
+
 # Strict deploy security defaults
 SECURE_SSL_REDIRECT = True
 SESSION_COOKIE_SECURE = True

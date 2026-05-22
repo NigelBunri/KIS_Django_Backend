@@ -9,7 +9,7 @@ from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, serializers, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework.response import Response
@@ -909,8 +909,12 @@ class BiblePreferenceViewSet(viewsets.ModelViewSet):
 
 
 class BibleCrossReferenceViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
     serializer_class = BibleCrossReferenceSerializer
+
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            return [IsAuthenticated()]
+        return [IsAdminUser()]
 
     def get_queryset(self):
         verse_id = self.request.query_params.get("verse")
@@ -929,6 +933,17 @@ class BibleStatsView(APIView):
         highlights = BibleHighlight.objects.filter(user=request.user).count()
         notes = BibleNote.objects.filter(user=request.user).count()
         plans = ReadingPlanEnrollment.objects.filter(user=request.user).count()
+        today = timezone.now().date()
+        unique_days = {
+            v.date() if hasattr(v, "date") else v
+            for v in ReadingHistory.objects.filter(user=request.user).values_list("updated_at", flat=True)
+            if v
+        }
+        streak = 0
+        cursor = today
+        while cursor in unique_days:
+            streak += 1
+            cursor -= timedelta(days=1)
         return Response(
             {
                 "reading_sessions": history_count,
@@ -936,7 +951,7 @@ class BibleStatsView(APIView):
                 "highlights": highlights,
                 "notes": notes,
                 "active_plans": plans,
-                "streak": max(history_count, 1),
+                "streak": streak,
             }
         )
 
@@ -1237,9 +1252,9 @@ class BibleCourseViewSet(viewsets.ModelViewSet):
             or partner_name
             or "KIS"
         )
-        completed_at = getattr(enrollment, "completed_at", None)
+        completed_at = enrollment.completed_at
         if not completed_at:
-            completed_at = timezone.now()
+            return Response({"detail": "Course not yet completed."}, status=status.HTTP_400_BAD_REQUEST)
         issued_on = completed_at.date()
         credential_id = (
             BibleCourseCredential.objects.filter(enrollment=enrollment)
@@ -1420,9 +1435,13 @@ class BibleQuizViewSet(viewsets.ModelViewSet):
                     if selected_ids and selected_ids[0] in correct_ids:
                         score += question.points
             else:
-                # short_answer manual grading later
-                pass
-        passed = max_score > 0 and int((score / max_score) * 100) >= quiz.pass_score
+                user_answer["_pending_grading"] = True
+        has_pending = any(a.get("_pending_grading") for a in answers)
+        graded_max = sum(
+            q.points for q in quiz.questions.all()
+            if q.kind not in ["short_answer"]
+        ) or max_score
+        passed = (not has_pending) and graded_max > 0 and int((score / graded_max) * 100) >= quiz.pass_score
         attempt = BibleQuizAttempt.objects.create(
             quiz=quiz,
             user=request.user,
@@ -1839,7 +1858,7 @@ class BibleCourseCredentialShareView(APIView):
         enrollment = credential.enrollment
         data = {
             "course": enrollment.course.title,
-            "user": enrollment.user.display_name or enrollment.user.phone,
+            "user": enrollment.user.display_name or "",
             "badge_name": credential.badge_name,
             "issued_at": credential.issued_at,
         }
@@ -1877,7 +1896,9 @@ class BibleCourseEnrollmentViewSet(viewsets.ModelViewSet):
         enrollment = self.get_object()
         enrollment.status = "completed"
         enrollment.progress_percent = 100
-        enrollment.save(update_fields=["status", "progress_percent"])
+        if not enrollment.completed_at:
+            enrollment.completed_at = timezone.now()
+        enrollment.save(update_fields=["status", "progress_percent", "completed_at"])
         return Response(BibleCourseEnrollmentSerializer(enrollment).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="purchase")

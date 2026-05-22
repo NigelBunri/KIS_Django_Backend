@@ -5,10 +5,12 @@ import os
 import re
 import subprocess
 import urllib.request
-from urllib.parse import unquote, urlparse
+from html import escape as html_escape
+from urllib.parse import quote, unquote, urlparse
 import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 import requests
 
@@ -720,7 +722,7 @@ def _education_manage_roles() -> set[str]:
 
 def _education_institution_qs_for_user(user: User):
     return (
-        EducationInstitution.objects.filter(memberships__user=user)
+        EducationInstitution.objects.filter(Q(owner=user) | Q(memberships__user=user))
         .prefetch_related("memberships__user")
         .distinct()
         .order_by("-updated_at")
@@ -743,6 +745,21 @@ def _get_public_education_institution_or_404(institution_id: str) -> EducationIn
 
 
 def _get_institution_membership(user: User, institution: EducationInstitution) -> EducationInstitutionMembership | None:
+    if institution.owner_id == user.id:
+        prefetched = getattr(institution, "_prefetched_objects_cache", {})
+        rows = prefetched.get("memberships")
+        membership = next((row for row in rows if row.user_id == user.id), None) if rows is not None else institution.memberships.filter(user=user).first()
+        if membership:
+            return membership
+        return SimpleNamespace(
+            id=None,
+            user=user,
+            user_id=user.id,
+            institution=institution,
+            institution_id=institution.id,
+            role=EducationInstitutionMembershipRole.OWNER,
+            status=EducationInstitutionMembershipStatus.ACTIVE,
+        )
     prefetched = getattr(institution, "_prefetched_objects_cache", {})
     rows = prefetched.get("memberships")
     if rows is not None:
@@ -750,7 +767,9 @@ def _get_institution_membership(user: User, institution: EducationInstitution) -
     return institution.memberships.filter(user=user).first()
 
 
-def _require_manage_institution_membership(user: User, institution: EducationInstitution) -> EducationInstitutionMembership:
+def _require_manage_institution_membership(user: User, institution: EducationInstitution) -> EducationInstitutionMembership | None:
+    if institution.owner_id == user.id:
+        return _get_institution_membership(user, institution)
     membership = _get_institution_membership(user, institution)
     if not membership or membership.status != EducationInstitutionMembershipStatus.ACTIVE:
         raise PermissionDenied("You do not belong to this institution.")
@@ -799,6 +818,36 @@ def _normalize_material_kind(value: object, default: str = EducationMaterialKind
     if raw in EducationMaterialKind.values:
         return raw
     return default
+
+
+def _education_material_media_payload(data) -> tuple[str, str, str, str, dict]:
+    resource_url = str(data.get("resource_url") or "").strip()
+    resource_name = str(data.get("resource_name") or "").strip()
+    resource_mime_type = str(data.get("resource_mime_type") or "").strip()
+    storage_path = str(data.get("storage_path") or "").strip()
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    metadata = dict(metadata)
+    if resource_url.startswith(("file://", "content://", "data:")):
+        raise ValidationError({"resource_url": "Upload the material first and send the returned private media URL/reference, not a local file path."})
+    if storage_path:
+        raise ValidationError({"storage_path": "Raw storage paths are not accepted for education materials."})
+    attachment = data.get("resource_attachment") or data.get("attachment")
+    if isinstance(attachment, dict):
+        resource_url = str(attachment.get("url") or resource_url or "").strip()
+        resource_name = str(attachment.get("name") or resource_name or "").strip()
+        resource_mime_type = str(attachment.get("mime_type") or attachment.get("mimeType") or resource_mime_type or "").strip()
+        media_ref = str(attachment.get("id") or attachment.get("media_asset_id") or attachment.get("mediaAssetId") or attachment.get("safety_scan_id") or "").strip()
+        if media_ref:
+            metadata["private_media_ref"] = media_ref
+        safety = attachment.get("safety") if isinstance(attachment.get("safety"), dict) else {}
+        metadata["media_safety"] = {"status": attachment.get("scan_status") or safety.get("status") or "not_configured", "quarantined": bool(attachment.get("quarantined") or safety.get("quarantined")), "requires_review": bool(attachment.get("requires_review") or safety.get("requires_review")), "safety_scan_id": str(attachment.get("safety_scan_id") or ""), "context": "education_material"}
+    else:
+        metadata.setdefault("media_safety", {"status": "metadata_only", "context": "education_material"})
+    safety = metadata.get("media_safety") if isinstance(metadata.get("media_safety"), dict) else {}
+    if safety.get("quarantined") or safety.get("blocked"):
+        resource_url = ""
+        metadata["blocked_user_message"] = "This learning material is under safety review."
+    return resource_url, resource_name, resource_mime_type, "", metadata
 
 
 def _normalize_event_type(value: object, default: str = EducationInstitutionEventType.EVENT) -> str:
@@ -10101,6 +10150,7 @@ class EducationInstitutionMaterialListView(APIView):
             class_sessions=class_sessions,
             assessments=assessments,
         )
+        resource_url, resource_name, resource_mime_type, storage_path, material_metadata = _education_material_media_payload(request.data)
         material = EducationInstitutionMaterial.objects.create(
             institution=institution,
             program=programs[0] if programs else None,
@@ -10112,13 +10162,13 @@ class EducationInstitutionMaterialListView(APIView):
             summary=str(request.data.get("summary") or "").strip(),
             cover_image_url=_education_cover_image_from_payload(request.data),
             kind=_normalize_material_kind(request.data.get("kind")),
-            resource_url=str(request.data.get("resource_url") or "").strip(),
-            resource_name=str(request.data.get("resource_name") or "").strip(),
-            resource_mime_type=str(request.data.get("resource_mime_type") or "").strip(),
-            storage_path=str(request.data.get("storage_path") or "").strip(),
+            resource_url=resource_url,
+            resource_name=resource_name,
+            resource_mime_type=resource_mime_type,
+            storage_path=storage_path,
             is_downloadable=_to_bool(request.data.get("is_downloadable"), default=True),
             status=_normalize_academic_status(request.data.get("status")),
-            metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
+            metadata=material_metadata,
         )
         _assign_material_link_sets(
             material,
@@ -10222,14 +10272,16 @@ class EducationInstitutionMaterialDetailView(APIView):
         )
         if "kind" in request.data:
             material.kind = _normalize_material_kind(request.data.get("kind"), material.kind)
-        if "resource_url" in request.data:
-            material.resource_url = str(request.data.get("resource_url") or "").strip()
-        if "resource_name" in request.data:
-            material.resource_name = str(request.data.get("resource_name") or "").strip()
-        if "resource_mime_type" in request.data:
-            material.resource_mime_type = str(request.data.get("resource_mime_type") or "").strip()
-        if "storage_path" in request.data:
-            material.storage_path = str(request.data.get("storage_path") or "").strip()
+        if any(key in request.data for key in ("resource_url", "resource_name", "resource_mime_type", "storage_path", "resource_attachment", "attachment", "metadata")):
+            resource_url, resource_name, resource_mime_type, storage_path, material_metadata = _education_material_media_payload(request.data)
+            if "resource_url" in request.data or "resource_attachment" in request.data or "attachment" in request.data:
+                material.resource_url = resource_url
+            if "resource_name" in request.data or "resource_attachment" in request.data or "attachment" in request.data:
+                material.resource_name = resource_name
+            if "resource_mime_type" in request.data or "resource_attachment" in request.data or "attachment" in request.data:
+                material.resource_mime_type = resource_mime_type
+            material.storage_path = storage_path
+            material.metadata = material_metadata
         if "is_downloadable" in request.data:
             material.is_downloadable = _to_bool(request.data.get("is_downloadable"), default=material.is_downloadable)
         if "status" in request.data:
@@ -11625,8 +11677,8 @@ class EducationContentEnrollmentView(APIView):
                     status=EducationBookingStatus.PENDING,
                     seat_count=seat_count,
                     amount_cents=amount_cents,
-                    currency=KIS_COIN_CODE,
-                    metadata={"created_from": "education_discovery"},
+                    currency="USD",
+                    metadata={"created_from": "education_discovery", "legacy_wallet_disabled": True},
                 )
             payment_view = EducationInstitutionBroadcastBookingPaymentView()
             response = payment_view.post(request, str(institution.id), str(broadcast.id), str(booking.id))
@@ -13002,8 +13054,8 @@ def _channel_broadcast_metadata(channel: BroadcastChannel) -> dict[str, Any]:
         "handle": channel.handle,
         "display_name": channel.display_name,
         "description": channel.description,
-        "avatar_url": channel.avatar_url,
-        "banner_url": channel.banner_url,
+        "avatar_url": _safe_public_media_url(channel.avatar_url),
+        "banner_url": _safe_public_media_url(channel.banner_url),
         "category": channel.category,
         "subscriber_count": int(channel.subscriber_count or 0),
         "content_count": int(channel.content_count or 0),
@@ -13256,8 +13308,8 @@ def _public_channel_payload(request, channel: BroadcastChannel, *, include_conte
         "handle": channel.handle,
         "display_name": channel.display_name,
         "description": description,
-        "avatar_url": channel.avatar_url,
-        "banner_url": channel.banner_url,
+        "avatar_url": _safe_public_media_url(channel.avatar_url),
+        "banner_url": _safe_public_media_url(channel.banner_url),
         "category": channel.category,
         "language": channel.language,
         "country": channel.country,
@@ -13274,7 +13326,7 @@ def _public_channel_payload(request, channel: BroadcastChannel, *, include_conte
         "share_card": {
             "title": channel.display_name,
             "description": description,
-            "image": channel.banner_url or channel.avatar_url,
+            "image": _safe_public_media_url(channel.banner_url) or _safe_public_media_url(channel.avatar_url),
             "url": public_url,
         },
         "growth": {
@@ -13412,9 +13464,10 @@ def _check_embed_access(request, content: ChannelContent):
 def _embed_content_payload(request, content: ChannelContent, *, oembed: bool = False) -> dict:
     base_url = _embed_public_base_url(request)
     token = str(request.query_params.get("token") or "").strip()
-    token_query = f"?token={token}" if token else ""
+    token_query = f"?token={quote(token)}" if token else ""
     embed_src = f"{base_url}/embed/content/{content.id}{token_query}"
-    thumbnail = content.thumbnail_url or ""
+    safe_embed_src = html_escape(embed_src, quote=True)
+    thumbnail = _safe_public_media_url(content.thumbnail_url)
     asset = _first_public_asset(content)
     if not thumbnail:
         thumbnail = asset.get("thumbnail_url") or asset.get("url") or ""
@@ -13431,7 +13484,7 @@ def _embed_content_payload(request, content: ChannelContent, *, oembed: bool = F
             "width": asset.get("width") or 560,
             "height": asset.get("height") or 315,
             "html": (
-                f'<iframe src="{embed_src}" width="560" height="315" '
+                f'<iframe src="{safe_embed_src}" width="560" height="315" '
                 'frameborder="0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>'
             ),
         }
@@ -13448,7 +13501,7 @@ def _embed_content_payload(request, content: ChannelContent, *, oembed: bool = F
         "dimensions": {"width": asset.get("width") or 560, "height": asset.get("height") or 315},
         "embed_url": embed_src,
         "embed_html": (
-            f'<iframe src="{embed_src}" width="560" height="315" '
+            f'<iframe src="{safe_embed_src}" width="560" height="315" '
             'frameborder="0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>'
         ),
     }
@@ -14059,6 +14112,8 @@ class ChannelLiveStreamListCreateView(APIView):
         return Response({"results": ChannelLiveStreamSerializer(rows, many=True, context={"request": request}).data})
 
     def post(self, request, channel_id):
+        from .live_stream_providers import LiveStreamProviderError, get_live_stream_provider
+
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
         if not _user_can_edit_content(request.user, ChannelContent(channel=channel)):
             raise PermissionDenied("You cannot schedule live streams for this channel.")
@@ -14070,21 +14125,35 @@ class ChannelLiveStreamListCreateView(APIView):
         )
         stream_uuid = uuid.uuid4()
         dev_payload = _safe_live_dev_payload(channel.id, stream_uuid)
+
+        # Call the live-streaming provider when enabled and not in sandbox/dev mode
+        provider_payload: dict = {}
+        provider_name = _live_stream_provider()
+        if provider_name != "disabled" and not dev_payload:
+            lsp = get_live_stream_provider(provider_name)
+            if lsp:
+                try:
+                    provider_payload = lsp.create_live_stream()
+                except LiveStreamProviderError as exc:
+                    raise ValidationError({"provider": str(exc)})
+
+        merged = provider_payload or dev_payload
         stream_key = f"{channel.id}:{stream_uuid}:{uuid.uuid4()}"
         live = ChannelLiveStream.objects.create(
             channel=channel,
             title=title[:220],
             description=str(request.data.get("description") or "").strip(),
             scheduled_start_at=scheduled_at,
-            provider=dev_payload.get("provider") or _live_stream_provider(),
-            provider_stream_id=dev_payload.get("provider_stream_id") or str(stream_uuid),
-            ingest_url=dev_payload.get("ingest_url", ""),
+            provider=merged.get("provider") or provider_name,
+            provider_stream_id=merged.get("provider_stream_id") or str(stream_uuid),
+            ingest_url=merged.get("ingest_url", ""),
             stream_key_hash=_hash_stream_key(stream_key),
-            playback_url=dev_payload.get("playback_url", ""),
+            playback_url=merged.get("playback_url", ""),
             thumbnail_url=str(request.data.get("thumbnail_url") or request.data.get("thumbnailUrl") or "").strip(),
             metadata={
                 "provider_calls_enabled": _live_provider_sandbox_enabled(),
                 "raw_stream_key_returned": False,
+                **({"provider_raw": merged.get("raw")} if merged.get("raw") else {}),
                 **(request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {}),
             },
             created_by=request.user,
@@ -14160,21 +14229,73 @@ class ChannelLiveStreamWebhookView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request, provider):
-        configured_secret = str(getattr(settings, "LIVE_STREAM_WEBHOOK_SECRET", os.getenv("LIVE_STREAM_WEBHOOK_SECRET", "")) or "")
-        supplied = request.headers.get("X-Live-Webhook-Secret") or request.headers.get("X-KIS-Live-Secret") or ""
-        if configured_secret and supplied != configured_secret:
-            return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
-        provider_stream_id = str(request.data.get("provider_stream_id") or request.data.get("stream_id") or "").strip()
-        status_value = str(request.data.get("status") or "").strip().lower()
-        live = ChannelLiveStream.objects.filter(provider=str(provider).strip().lower(), provider_stream_id=provider_stream_id).first()
+        from .live_stream_providers import get_live_stream_provider
+
+        provider_name = str(provider).strip().lower()
+
+        # Provider-specific signature verification
+        lsp = get_live_stream_provider(provider_name)
+        if lsp and hasattr(lsp, "verify_webhook_signature"):
+            sig_header = (
+                request.headers.get("Mux-Signature")
+                or request.headers.get("X-Mux-Signature")
+                or ""
+            )
+            raw_body = request.body if hasattr(request, "body") else b""
+            if sig_header and not lsp.verify_webhook_signature(raw_body, sig_header):
+                return Response({"detail": "Invalid webhook signature."}, status=status.HTTP_403_FORBIDDEN)
+        else:
+            # Generic shared-secret fallback
+            configured_secret = str(getattr(settings, "LIVE_STREAM_WEBHOOK_SECRET", os.getenv("LIVE_STREAM_WEBHOOK_SECRET", "")) or "")
+            supplied = request.headers.get("X-Live-Webhook-Secret") or request.headers.get("X-KIS-Live-Secret") or ""
+            if configured_secret and supplied != configured_secret:
+                return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
+
+        payload = request.data if isinstance(request.data, dict) else {}
+
+        # Extract provider_stream_id — handle Mux's event envelope shape
+        if lsp and hasattr(lsp, "extract_webhook_stream_id"):
+            provider_stream_id = lsp.extract_webhook_stream_id(payload)
+        else:
+            provider_stream_id = str(payload.get("provider_stream_id") or payload.get("stream_id") or "").strip()
+
+        if not provider_stream_id:
+            return Response({"matched": False, "reason": "no_stream_id"}, status=status.HTTP_202_ACCEPTED)
+
+        # Map provider event type to KIS status
+        event_type = str(payload.get("type") or "").strip()
+        if lsp and event_type and hasattr(lsp, "map_webhook_status"):
+            mapped_status = lsp.map_webhook_status(event_type)
+        else:
+            mapped_status = str(payload.get("status") or "").strip().lower() or None
+
+        live = ChannelLiveStream.objects.filter(provider=provider_name, provider_stream_id=provider_stream_id).first()
         if not live:
             return Response({"matched": False}, status=status.HTTP_202_ACCEPTED)
-        if status_value in ChannelLiveStream.Status.values:
-            live.status = status_value
-        live.viewer_count = int(request.data.get("viewer_count") or live.viewer_count or 0)
-        live.peak_viewer_count = max(live.peak_viewer_count, live.viewer_count)
-        live.metadata = {**(live.metadata or {}), "last_webhook": {"provider": provider, "status": status_value}}
-        live.save(update_fields=["status", "viewer_count", "peak_viewer_count", "metadata", "updated_at"])
+
+        if mapped_status and mapped_status in ChannelLiveStream.Status.values:
+            live.status = mapped_status
+            if mapped_status == "live" and not live.started_at:
+                live.started_at = timezone.now()
+            elif mapped_status in ("ended", "cancelled") and not live.ended_at:
+                live.ended_at = timezone.now()
+
+        # Update viewer count
+        viewer_count = live.viewer_count or 0
+        if lsp and hasattr(lsp, "extract_viewer_count"):
+            vc = lsp.extract_viewer_count(payload)
+            if vc is not None:
+                viewer_count = vc
+        else:
+            viewer_count = int(payload.get("viewer_count") or viewer_count)
+        live.viewer_count = viewer_count
+        live.peak_viewer_count = max(live.peak_viewer_count or 0, viewer_count)
+
+        live.metadata = {
+            **(live.metadata or {}),
+            "last_webhook": {"provider": provider_name, "event_type": event_type, "status": mapped_status},
+        }
+        live.save(update_fields=["status", "viewer_count", "peak_viewer_count", "metadata", "started_at", "ended_at", "updated_at"])
         return Response({"matched": True, "id": str(live.id), "status": live.status})
 
 

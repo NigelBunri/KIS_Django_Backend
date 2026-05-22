@@ -1042,6 +1042,31 @@ class TwoFactorDisableView(APIView):
         return Response({"enabled": False}, status=status.HTTP_200_OK)
 
 
+@extend_schema(summary="Get 2FA status for the authenticated user", tags=["Auth"])
+class TwoFactorStatusView(APIView):
+    authentication_classes = (DeviceBoundJWTAuthentication,)
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        tf = TwoFactor.objects.filter(user=request.user, type="totp").first()
+        return Response({"enabled": bool(tf and tf.enabled)}, status=status.HTTP_200_OK)
+
+
+@extend_schema(summary="Get OTP status for the authenticated user", tags=["Auth"])
+class OTPStatusView(APIView):
+    authentication_classes = (DeviceBoundJWTAuthentication,)
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        from apps.otp.models import PhoneOTP
+        phone = getattr(request.user, "phone", None)
+        has_pending = False
+        if phone:
+            recent = PhoneOTP.objects.filter(phone=phone).order_by("-created_at").first()
+            has_pending = bool(recent and recent.expires_at > timezone.now())
+        return Response({"has_pending": has_pending}, status=status.HTTP_200_OK)
+
+
 @extend_schema(
     summary="Register E2EE keys for this device",
     request=E2EERegisterSerializer,
@@ -1540,9 +1565,11 @@ class ProfileArticleViewSet(viewsets.ModelViewSet):
         qs = ProfileArticle.objects.all().prefetch_related("allow_targets")
         if not user:
             return qs.filter(status="published", visibility="public")
-        if self.action == "list":
-            return qs.filter(user=user)
-        return qs
+        if user.is_staff or user.is_superuser:
+            return qs
+        if self.action in ("retrieve",):
+            return qs.filter(status="published", visibility="public") | qs.filter(user=user)
+        return qs.filter(user=user)
 
     def perform_create(self, serializer):
         require_feature(self.request.user, "profile_articles")

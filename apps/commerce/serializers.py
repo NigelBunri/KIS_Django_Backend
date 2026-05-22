@@ -1916,6 +1916,8 @@ class ServiceBookingPaymentSerializer(serializers.ModelSerializer):
     payment_provider = serializers.SerializerMethodField()
     payment_required = serializers.SerializerMethodField()
     payment_intent_id = serializers.SerializerMethodField()
+    direct_payment_intent_id = serializers.SerializerMethodField()
+    payment_reference = serializers.SerializerMethodField()
     payment_url = serializers.SerializerMethodField()
     currency_label = serializers.SerializerMethodField()
 
@@ -1932,6 +1934,8 @@ class ServiceBookingPaymentSerializer(serializers.ModelSerializer):
             'payment_provider',
             'payment_required',
             'payment_intent_id',
+            'direct_payment_intent_id',
+            'payment_reference',
             'payment_url',
             'payment_status',
             'paid_at',
@@ -2545,6 +2549,8 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
     payment_provider = serializers.SerializerMethodField()
     payment_required = serializers.SerializerMethodField()
     payment_intent_id = serializers.SerializerMethodField()
+    direct_payment_intent_id = serializers.SerializerMethodField()
+    payment_reference = serializers.SerializerMethodField()
     payment_url = serializers.SerializerMethodField()
     fulfillment_summary = serializers.SerializerMethodField()
     seller_trust = serializers.SerializerMethodField()
@@ -2568,6 +2574,8 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
             'payment_provider',
             'payment_required',
             'payment_intent_id',
+            'direct_payment_intent_id',
+            'payment_reference',
             'payment_url',
             'fulfillment_summary',
             'seller_trust',
@@ -2627,6 +2635,13 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
     def get_payment_intent_id(self, obj):
         meta = obj.metadata if isinstance(obj.metadata, dict) else {}
         return str(meta.get('direct_payment_intent_id') or '') or None
+
+    def get_direct_payment_intent_id(self, obj):
+        return self.get_payment_intent_id(obj)
+
+    def get_payment_reference(self, obj):
+        meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+        return str(meta.get('payment_reference') or meta.get('tx_ref') or '') or None
 
     def get_payment_url(self, obj):
         meta = obj.metadata if isinstance(obj.metadata, dict) else {}

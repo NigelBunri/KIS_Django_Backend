@@ -78,6 +78,13 @@ DEBUG = _env_bool("DEBUG", False)
 ALLOWED_HOSTS = _env_csv("ALLOWED_HOSTS", f"{DEV_SERVER_HOST},10.0.2.2")
 CSRF_TRUSTED_ORIGINS = _env_csv("CSRF_TRUSTED_ORIGINS", "")
 
+# CORS — django-cors-headers
+# In production, set CORS_ALLOWED_ORIGINS to comma-separated list of allowed origins.
+# The mobile app (React Native) does not use browsers, so CORS is primarily for the web client.
+CORS_ALLOWED_ORIGINS = _env_csv("CORS_ALLOWED_ORIGINS", f"http://{DEV_SERVER_HOST}:{DEV_SERVER_PORT}")
+CORS_ALLOW_CREDENTIALS = _env_bool("CORS_ALLOW_CREDENTIALS", False)
+CORS_ALLOW_ALL_ORIGINS = _env_bool("CORS_ALLOW_ALL_ORIGINS", False)
+
 # Security defaults (override with env if needed)
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = os.environ.get("SECURE_REFERRER_POLICY", "strict-origin-when-cross-origin")
@@ -211,6 +218,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
 
     # Third-party
+    "corsheaders",
     "rest_framework",
     # "rest_framework.authtoken",  # optional: remove if no longer using opaque tokens
     "drf_spectacular",
@@ -256,6 +264,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",

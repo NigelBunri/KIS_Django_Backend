@@ -146,12 +146,38 @@ class FeatureFlagViewSet(StaffOnlyModelViewSet):
     @extend_schema(summary="Evaluate a feature flag for a target", request=None, responses={200: OpenApiResponse(description="flag evaluation result")}, tags=["FeatureFlags"])
     @action(detail=True, methods=['post'], url_path='evaluate', permission_classes=[IsAuthenticated])
     def evaluate(self, request, pk=None):
+        import hashlib as _hashlib
         flag = self.get_object()
-        # naive evaluation stub
-        target = request.data.get('target')
-        enabled = flag.enabled
-        # more complex audience checks would go here
-        return Response({'key': flag.key, 'enabled': enabled, 'target': target})
+        target = request.data.get('target') or {}
+
+        if not flag.enabled:
+            return Response({'key': flag.key, 'enabled': False, 'target': target, 'reason': 'flag_disabled'})
+
+        audience = flag.audience or {}
+        if not audience:
+            return Response({'key': flag.key, 'enabled': True, 'target': target, 'reason': 'global'})
+
+        target_user_id = str(target.get('user_id') or target.get('userId') or '')
+
+        # Explicit user allowlist
+        allowed_user_ids = [str(uid) for uid in (audience.get('user_ids') or [])]
+        if allowed_user_ids and target_user_id and target_user_id in allowed_user_ids:
+            return Response({'key': flag.key, 'enabled': True, 'target': target, 'reason': 'user_allowlist'})
+
+        # Tier/group allowlist
+        target_tier = str(target.get('tier') or target.get('account_tier') or '').lower()
+        allowed_tiers = [str(t).lower() for t in (audience.get('tiers') or [])]
+        if allowed_tiers and target_tier and target_tier in allowed_tiers:
+            return Response({'key': flag.key, 'enabled': True, 'target': target, 'reason': 'tier_match'})
+
+        # Percentage rollout via consistent bucket hashing
+        rollout_pct = float(audience.get('rollout_percentage') or audience.get('percentage') or 0)
+        if rollout_pct > 0 and target_user_id:
+            bucket = int(_hashlib.md5(f"{flag.key}:{target_user_id}".encode()).hexdigest(), 16) % 100
+            if bucket < rollout_pct:
+                return Response({'key': flag.key, 'enabled': True, 'target': target, 'reason': 'rollout'})
+
+        return Response({'key': flag.key, 'enabled': False, 'target': target, 'reason': 'not_in_audience'})
 
 @extend_schema_view(
     list=extend_schema(summary="List Alerts", responses={200: AlertSerializer(many=True)}, tags=["Alerts"]),

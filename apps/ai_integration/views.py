@@ -214,9 +214,9 @@ class QnASessionViewSet(viewsets.ModelViewSet):
 
     @doc_decorator(
         summary="Send a message to QnA session",
-        description="Post a message to an active QnA session. The message will be processed asynchronously by creating an AIJob of type CUSTOM (QNA).",
+        description="Post a message to an active QnA session. Short messages receive a synchronous response; longer jobs are queued.",
         request=None,
-        responses={200: OpenApiResponse(description="Queued") if SPECTACULAR else "Queued"}
+        responses={200: OpenApiResponse(description="Message response") if SPECTACULAR else "Message response"}
     )
     @action(detail=True, methods=['post'])
     def message(self, request, pk=None):
@@ -224,16 +224,43 @@ class QnASessionViewSet(viewsets.ModelViewSet):
             if not consume_quota(request.user, "ai_queries_per_day", 1):
                 return Response({"detail": "AI daily quota exceeded"}, status=429)
         session = self.get_object()
-        user_message = request.data.get('message')
-        # For free tier: forward to a local or community model microservice stub
-        # Here we create an AIJob of type CUSTOM to process the message asynchronously
-        job = AIJob.objects.create(job_type='CUSTOM', input_ref_type='QNA', input_ref_id=session.id,
-                                   metadata={'message': user_message}, triggered_by=str(request.user.id) if request.user.is_authenticated else 'ANONYMOUS')
-        enqueue_ai_job.delay(str(job.id))
-        # use timezone.now() for a proper timestamp
-        session.last_interaction_at = timezone.now()
-        session.save()
-        return Response({'status': 'queued', 'job_id': job.id})
+        user_message = request.data.get('message') or ''
+        triggered_by = str(request.user.id) if request.user.is_authenticated else 'ANONYMOUS'
+
+        job = AIJob.objects.create(
+            job_type='CUSTOM',
+            input_ref_type='QNA',
+            input_ref_id=session.id,
+            metadata={'message': user_message},
+            triggered_by=triggered_by,
+        )
+
+        # Synchronous path for short messages (better UX; falls back to async on timeout)
+        from .services import handle_qna
+        try:
+            job.status = 'RUNNING'
+            job.started_at = timezone.now()
+            job.save(update_fields=['status', 'started_at'])
+
+            result = handle_qna(job)
+
+            job.status = 'COMPLETED'
+            job.completed_at = timezone.now()
+            job.save(update_fields=['status', 'completed_at', 'result_ref'])
+
+            session.last_interaction_at = timezone.now()
+            session.save(update_fields=['last_interaction_at'])
+
+            answer = result.get('payload', {}).get('answer', '')
+            return Response({'status': 'ok', 'job_id': job.id, 'answer': answer})
+        except Exception:
+            # Fall back to async processing
+            job.status = 'PENDING'
+            job.save(update_fields=['status'])
+            enqueue_ai_job.delay(str(job.id))
+            session.last_interaction_at = timezone.now()
+            session.save(update_fields=['last_interaction_at'])
+            return Response({'status': 'queued', 'job_id': job.id})
 
 
 @class_doc_decorator('AI Feedback')

@@ -119,6 +119,19 @@ class HealthInstitutionVerificationTests(APITestCase):
         self.assertIn(VerificationBadgeCode.LICENSED_PROVIDER, codes)
         self.assertTrue(current_health_institution_verification_status(self.institution)["verified"])
 
+    def test_owner_without_membership_gets_manage_access_in_health_ops_payload(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.get(
+            reverse("health-ops-institution-detail", kwargs={"institution_id": self.institution.id}),
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        institution = response.data["institution"]
+        self.assertEqual(institution["owner_user_id"], str(self.owner.id))
+        self.assertEqual(institution["viewer"]["role"], "owner")
+        self.assertTrue(institution["can_manage"])
+
     def test_health_institution_serializer_exposes_verification_summary(self):
         case = start_health_institution_verification_case(institution=self.institution, actor=self.owner, evidence_metadata={})
         review_health_institution_case(case=case, actor=self.staff, action="approve")

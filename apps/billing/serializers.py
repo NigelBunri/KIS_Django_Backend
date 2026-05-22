@@ -117,6 +117,10 @@ class WalletAccountSerializer(serializers.ModelSerializer):
 
 class DirectPaymentIntentSerializer(serializers.ModelSerializer):
     amount_usd_label = serializers.SerializerMethodField()
+    direct_payment_intent_id = serializers.SerializerMethodField()
+    payment_reference = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    payment_provider = serializers.SerializerMethodField()
 
     class Meta:
         model = DirectPaymentIntent
@@ -129,8 +133,12 @@ class DirectPaymentIntentSerializer(serializers.ModelSerializer):
             "amount_usd_label",
             "currency",
             "status",
+            "payment_status",
             "tx_ref",
+            "payment_reference",
             "provider_ref",
+            "payment_provider",
+            "direct_payment_intent_id",
             "payment_url",
             "metadata",
             "processed_at",
@@ -141,6 +149,18 @@ class DirectPaymentIntentSerializer(serializers.ModelSerializer):
 
     def get_amount_usd_label(self, obj):
         return f"${(int(obj.amount_cents or 0) / 100):,.2f}"
+
+    def get_direct_payment_intent_id(self, obj):
+        return str(obj.id)
+
+    def get_payment_reference(self, obj):
+        return str(obj.tx_ref or "")
+
+    def get_payment_status(self, obj):
+        return str(obj.status or "")
+
+    def get_payment_provider(self, obj):
+        return str(obj.provider or "")
 
 
 class DirectPaymentAuditEventSerializer(serializers.ModelSerializer):
@@ -540,8 +560,12 @@ class WalletTransactionSerializer(serializers.ModelSerializer):
             "amount_usd_compact",
             "currency",
             "status",
+            "payment_status",
             "tx_ref",
+            "payment_reference",
             "provider_ref",
+            "payment_provider",
+            "direct_payment_intent_id",
             "payment_url",
             "meta",
             "created_at",

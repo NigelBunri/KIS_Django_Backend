@@ -173,7 +173,7 @@ def _commerce_recommendations(user, blocked_user_ids: set[str], limit: int, pref
     return rows
 
 
-def _education_recommendations(user, limit: int) -> list[dict]:
+def _education_recommendations(user, blocked_user_ids: set[str], limit: int) -> list[dict]:
     try:
         from apps.broadcasts.models import EducationInstitutionCourse, EducationInstitutionEnrollment, EducationAcademicRecordStatus
     except Exception:
@@ -181,9 +181,9 @@ def _education_recommendations(user, limit: int) -> list[dict]:
     enrolled_course_ids = set(EducationInstitutionEnrollment.objects.filter(user=user, course_id__isnull=False).values_list("course_id", flat=True))
     qs = (
         EducationInstitutionCourse.objects.select_related("institution")
-        .filter(institution__is_active=True)
+        .filter(institution__is_active=True, status=EducationAcademicRecordStatus.PUBLISHED)
         .exclude(id__in=enrolled_course_ids)
-        .exclude(status=EducationAcademicRecordStatus.ARCHIVED)
+        .exclude(institution__owner_id__in=blocked_user_ids)
         .order_by("-updated_at", "title")[:limit]
     )
     return [
@@ -195,9 +195,58 @@ def _education_recommendations(user, limit: int) -> list[dict]:
             target_id=course.id,
             route="EducationCourse",
             score=58,
-            metadata={"institution_id": str(course.institution_id), "reason": "Education course you are not enrolled in."},
+            metadata={"institution_id": str(course.institution_id), "reason": "Published education course you are not enrolled in."},
         )
         for course in qs
+    ]
+
+
+def _health_recommendations(user, blocked_user_ids: set[str], limit: int) -> list[dict]:
+    try:
+        from apps.broadcasts.models import BroadcastHealthInstitution
+    except Exception:
+        return []
+    qs = BroadcastHealthInstitution.objects.exclude(owner_user_id__in=blocked_user_ids).order_by("-membership_open", "-updated_at")[:limit]
+    return [
+        _item(
+            kind="health_institution",
+            title=row.name,
+            subtitle=_safe_text(row.institution_type, "Health institution"),
+            target_type="health_institution",
+            target_id=row.id,
+            route="HealthInstitution",
+            score=54 + (8 if row.membership_open else 0),
+            metadata={"institution_type": row.institution_type, "reason": "Public health institution metadata only."},
+        )
+        for row in qs
+    ]
+
+
+def _partner_recommendations(user, blocked_user_ids: set[str], limit: int) -> list[dict]:
+    try:
+        from apps.partners.models import Partner, PartnerJoinConfig, PartnerMembership
+    except Exception:
+        return []
+    joined_ids = set(PartnerMembership.objects.filter(user=user).values_list("partner_id", flat=True))
+    public_ids = PartnerJoinConfig.objects.filter(allow_public_listing=True).values_list("partner_id", flat=True)
+    qs = (
+        Partner.objects.filter(is_active=True, id__in=public_ids)
+        .exclude(id__in=joined_ids)
+        .exclude(owner_id__in=blocked_user_ids)
+        .order_by("name")[:limit]
+    )
+    return [
+        _item(
+            kind="partner",
+            title=partner.name,
+            subtitle="Partner workspace",
+            target_type="partner",
+            target_id=partner.id,
+            route="Partners",
+            score=56,
+            metadata={"slug": partner.slug, "reason": "Public partner workspace you have not joined."},
+        )
+        for partner in qs
     ]
 
 
@@ -248,10 +297,10 @@ def privacy_safe_social_recommendation_foundation(user, *, limit: int = 8) -> di
         "people": _people_recommendations(user, blocked_user_ids, contact_user_ids, limit),
         "channels": _channel_recommendations(user, blocked_user_ids, limit),
         "commerce": _commerce_recommendations(user, blocked_user_ids, limit, family_preferences),
-        "education": _education_recommendations(user, limit),
+        "education": _education_recommendations(user, blocked_user_ids, limit),
         "bible": _bible_recommendations(user, limit),
-        "health": [],
-        "partners": [],
+        "health": _health_recommendations(user, blocked_user_ids, limit),
+        "partners": _partner_recommendations(user, blocked_user_ids, limit),
     }
     return {
         "generated_at": timezone.now().isoformat(),
@@ -282,8 +331,5 @@ def privacy_safe_social_recommendation_foundation(user, *, limit: int = 8) -> di
             "uses_verification_evidence": False,
         },
         "sections": sections,
-        "placeholders": {
-            "health": "Health recommendations require explicit patient/provider consent and should use public institution metadata only.",
-            "partners": "Partner recommendations should use public membership and workspace interest signals only.",
-        },
+        "placeholders": {},
     }

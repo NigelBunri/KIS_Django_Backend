@@ -470,6 +470,21 @@ class BroadcastChannelApiTests(APITestCase):
         self.assertNotIn("storage_path", serialized)
         self.assertNotIn("secret", serialized)
 
+    @override_settings(KIS_PUBLIC_WEB_ENABLED=True, KIS_PUBLIC_WEB_INDEXING_ENABLED=False, KIS_PUBLIC_WEB_BASE_URL="https://kis.example")
+    def test_public_channel_landing_sanitizes_private_profile_media_urls(self):
+        self.channel.avatar_url = "https://cdn.example.com/private/raw/avatar.png"
+        self.channel.banner_url = "https://cdn.example.com/private/raw/banner.png"
+        self.channel.save(update_fields=["avatar_url", "banner_url", "updated_at"])
+
+        response = self.client.get("/api/v1/broadcasts/public/channels/api-channel/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        rendered = json.dumps(response.data)
+        self.assertEqual(response.data["avatar_url"], "")
+        self.assertEqual(response.data["banner_url"], "")
+        self.assertEqual(response.data["share_card"]["image"], "")
+        self.assertNotIn("private/raw", rendered)
+
     @override_settings(KIS_PUBLIC_WEB_ENABLED=True, KIS_PUBLIC_WEB_BASE_URL="https://kis.example")
     def test_public_content_landing_hides_private_and_child_sensitive_content(self):
         public_content = ChannelContent.objects.create(
@@ -963,6 +978,34 @@ class ChannelEmbedTests(APITestCase):
         self.assertEqual(response.data.get('version'), '1.0')
         self.assertEqual(response.data.get('provider_name'), 'KIS')
         self.assertIn(str(self.content.id), response.data.get('html') or '')
+
+    def test_embed_payload_sanitizes_private_thumbnail_and_escapes_token_query(self):
+        self.content.thumbnail_url = 'https://cdn.example.com/private/raw/thumb.jpg'
+        self.content.save(update_fields=['thumbnail_url', 'updated_at'])
+        self.content.assets.update(
+            url='https://cdn.example.com/private/raw/video.mp4',
+            thumbnail_url='https://cdn.example.com/private/raw/asset-thumb.jpg',
+        )
+        unsafe_token = 'bad"><script>alert(1)</script>'
+
+        response = self.client.get(
+            f'/api/v1/broadcasts/embed/contents/{self.content.id}/',
+            {'token': unsafe_token},
+            HTTP_ORIGIN='https://trusted.example.com',
+        )
+        oembed = self.client.get(
+            f'/api/v1/broadcasts/embed/contents/{self.content.id}/oembed/',
+            {'token': unsafe_token},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(oembed.status_code, status.HTTP_200_OK, oembed.data)
+        rendered = json.dumps(response.data) + json.dumps(oembed.data)
+        self.assertEqual(response.data.get('thumbnail_url'), '')
+        self.assertEqual(oembed.data.get('thumbnail_url'), '')
+        self.assertNotIn('private/raw', rendered)
+        self.assertNotIn('<script', rendered.lower())
+        self.assertIn('bad%22%3E%3Cscript%3Ealert%281%29%3C/script%3E', rendered)
 
     def test_blocked_domain_is_denied(self):
         ChannelEmbedPolicy.objects.create(channel=self.channel, blocked_domains=['blocked.example.com'])
@@ -1998,6 +2041,28 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         )
         self.client.force_authenticate(user=self.user)
 
+    def test_direct_owner_without_membership_can_manage_education_institution(self):
+        institution = EducationInstitution.objects.create(
+            owner=self.user,
+            name="Direct Owner Academy",
+            institution_type="academy",
+            membership_policy="application",
+        )
+
+        detail_response = self.client.get(f"/api/v1/broadcasts/education/institutions/{institution.id}/")
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK, detail_response.data)
+        detail = detail_response.data["institution"]
+        self.assertEqual(detail["owner_user_id"], str(self.user.id))
+        self.assertEqual(detail["current_membership"]["role"], "owner")
+        self.assertTrue(detail["can_manage"])
+
+        course_response = self.client.post(
+            f"/api/v1/broadcasts/education/institutions/{institution.id}/courses/",
+            {"title": "Owner Launch Course"},
+            format="json",
+        )
+        self.assertEqual(course_response.status_code, status.HTTP_201_CREATED, course_response.data)
+
     def test_manager_can_start_education_verification_with_safe_metadata(self):
         create_response = self.client.post(
             "/api/v1/broadcasts/education/institutions/",
@@ -2149,6 +2214,7 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
             "http://10.112.162.99:8000/media/education/orientation.jpg",
         )
 
+    @override_settings(FLW_WEBHOOK_SECRET="test-webhook-secret")
     def test_education_paid_booking_defaults_to_usd_provider_pending(self):
         create_response = self.client.post(
             "/api/v1/broadcasts/education/institutions/",
@@ -2202,17 +2268,17 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
 
         ok, result, _intent = reconcile_direct_payment_callback(
             payload={"data": {"tx_ref": intent.tx_ref, "status": "successful", "id": "flw-education-001"}},
-            signature="",
+            signature="test-webhook-secret",
         )
         self.assertTrue(ok)
         self.assertEqual(result, "paid")
-        refreshed = self.client.get(
-            f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/{broadcast_id}/bookings/{booking['id']}/",
-            format="json",
-        )
-        self.assertEqual(refreshed.status_code, status.HTTP_200_OK, refreshed.data)
-        self.assertEqual(refreshed.data["booking"]["payment_status"], "paid")
-        self.assertEqual(refreshed.data["booking"]["status"], "confirmed")
+        from apps.broadcasts.models import EducationInstitutionBooking, EducationBookingStatus
+
+        refreshed = EducationInstitutionBooking.objects.get(id=booking["id"])
+        self.assertEqual(str(refreshed.metadata.get("payment_status")), "paid")
+        self.assertEqual(refreshed.status, EducationBookingStatus.CONFIRMED)
+        self.assertEqual(refreshed.payment_method, "flutterwave")
+        self.assertEqual(refreshed.currency, "USD")
 
     def test_education_wallet_checkout_is_disabled_by_default(self):
         create_response = self.client.post(
@@ -2684,3 +2750,52 @@ class EducationCourseraCoreTests(APITestCase):
         self.assertIsNotNone(booking['payment_intent_id'])
         intent = DirectPaymentIntent.objects.get(id=booking['payment_intent_id'])
         self.assertEqual(intent.target_type, DirectPaymentIntent.TARGET_EDUCATION_BOOKING)
+        self.assertEqual(booking['direct_payment_intent_id'], booking['payment_intent_id'])
+        self.assertIn('payment_reference', booking)
+
+    def test_education_material_rejects_local_file_paths_and_raw_storage_paths(self):
+        self.client.force_authenticate(self.owner)
+        url = f'/api/v1/broadcasts/education/institutions/{self.institution.id}/materials/'
+
+        local_response = self.client.post(
+            url,
+            {'title': 'Local file', 'resource_url': 'file:///private/tmp/course.pdf'},
+            format='json',
+        )
+        self.assertEqual(local_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        storage_response = self.client.post(
+            url,
+            {'title': 'Raw path', 'resource_url': 'https://cdn.example.com/course.pdf', 'storage_path': 'private/raw/course.pdf'},
+            format='json',
+        )
+        self.assertEqual(storage_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_education_material_preserves_safe_private_media_reference_without_exposing_storage_path(self):
+        self.client.force_authenticate(self.owner)
+        url = f'/api/v1/broadcasts/education/institutions/{self.institution.id}/materials/'
+        response = self.client.post(
+            url,
+            {
+                'title': 'Workbook',
+                'kind': 'document',
+                'course_ids': [str(self.course.id)],
+                'resource_attachment': {
+                    'url': 'https://media.example.com/private-signed/workbook.pdf',
+                    'name': 'workbook.pdf',
+                    'mime_type': 'application/pdf',
+                    'safety_scan_id': 'scan-education-1',
+                    'scan_status': 'allowed',
+                    'quarantined': False,
+                    'requires_review': False,
+                },
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        material = response.data['material']
+        self.assertEqual(material['private_media_ref'], 'scan-education-1')
+        self.assertEqual(material['media_safety_status'], 'allowed')
+        self.assertFalse(material['media_review_required'])
+        self.assertEqual(material['storage_path'], '')
+        self.assertEqual(material['safe_resource_url'], 'https://media.example.com/private-signed/workbook.pdf')

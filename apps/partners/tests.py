@@ -422,13 +422,15 @@ class PartnerApiTests(TestCase):
         target_membership.refresh_from_db()
         self.assertTrue(target_membership.is_banned)
         self.assertEqual(target_membership.status, PartnerMembershipStatus.REMOVED)
-        self.assertTrue(
-            PartnerModerationAction.objects.filter(
-                partner=partner,
-                user=self.member,
-                action_type="ban",
-            ).exists()
+        action = PartnerModerationAction.objects.get(
+            partner=partner,
+            user=self.member,
+            action_type="ban",
         )
+        self.assertNotIn("request", action.metadata)
+        self.assertEqual(action.metadata["action"], "ban")
+        self.assertEqual(action.metadata["target_user_id"], str(self.member.id))
+        self.assertTrue(action.metadata["has_reason"])
 
     def test_banned_member_cannot_subscribe_or_apply_again(self):
         partner = self._create_partner()

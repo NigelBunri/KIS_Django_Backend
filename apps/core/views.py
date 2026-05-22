@@ -31,6 +31,7 @@ from .performance_offline import performance_offline_policy
 from .platform_dashboards import unified_platform_dashboard_summary
 from .safety_command_center import staff_safety_command_center_summary
 from .security_launch_gate import security_privacy_child_safety_launch_gate
+from .launch_ops import staff_launch_operations_summary
 from .social_recommendations import privacy_safe_social_recommendation_foundation
 
 # Convenience user model
@@ -277,8 +278,30 @@ class UnifiedSearchView(APIView):
     def _groups(self, request):
         raw = _search_text(request.query_params.get("groups") or request.query_params.get("group") or "all").lower()
         if not raw or raw == "all":
-            return {"contacts", "conversations", "channels", "channel_content", "bible", "health", "notifications", "verification"}
-        return {item.strip() for item in raw.split(",") if item.strip()}
+            return {
+                "contacts",
+                "conversations",
+                "channels",
+                "channel_content",
+                "bible",
+                "health",
+                "market",
+                "education",
+                "partners",
+                "notifications",
+                "verification",
+            }
+        aliases = {
+            "people": "contacts",
+            "chat": "conversations",
+            "chats": "conversations",
+            "feeds": "channel_content",
+            "commerce": "market",
+            "shops": "market",
+            "courses": "education",
+            "partner": "partners",
+        }
+        return {aliases.get(item.strip(), item.strip()) for item in raw.split(",") if item.strip()}
 
     def _search_contacts(self, request, query: str, limit: int):
         blocked_user_ids = _blocked_user_ids_for_search(request.user)
@@ -451,13 +474,17 @@ class UnifiedSearchView(APIView):
             from apps.broadcasts.models import BroadcastHealthInstitution
         except Exception:
             return []
+        blocked_user_ids = _blocked_user_ids_for_search(request.user)
         qs = BroadcastHealthInstitution.objects.filter(
             Q(name__icontains=query)
             | Q(owner_name__icontains=query)
             | Q(owner_phone__icontains=query)
             | Q(owner_email__icontains=query)
             | Q(institution_type__icontains=query)
-        ).order_by("-updated_at", "-created_at")[:limit]
+        )
+        if blocked_user_ids:
+            qs = qs.exclude(owner_user_id__in=blocked_user_ids)
+        qs = qs.order_by("-updated_at", "-created_at")[:limit]
         return [
             _unified_result(
                 kind="health_institution",
@@ -470,6 +497,129 @@ class UnifiedSearchView(APIView):
                 metadata={},
             )
             for row in qs
+        ]
+
+    def _search_market(self, request, query: str, limit: int):
+        try:
+            from apps.commerce.models import Product, Shop
+        except Exception:
+            return []
+        blocked_user_ids = _blocked_user_ids_for_search(request.user)
+        rows = []
+        shop_qs = Shop.objects.filter(is_deleted=False).filter(
+            Q(name__icontains=query) | Q(description__icontains=query) | Q(slug__icontains=query)
+        )
+        if blocked_user_ids:
+            shop_qs = shop_qs.exclude(owner_id__in=blocked_user_ids)
+        for shop in shop_qs.order_by("-is_verified", "-rating_avg", "-updated_at")[:limit]:
+            rows.append(
+                _unified_result(
+                    kind="market_shop",
+                    title=shop.name,
+                    subtitle="Verified seller" if getattr(shop, "is_verified", False) else "Marketplace shop",
+                    target_type="shop",
+                    target_id=shop.id,
+                    route="Market/Shop",
+                    score=74 + (10 if getattr(shop, "is_verified", False) else 0),
+                    metadata={"slug": shop.slug, "verified": bool(getattr(shop, "is_verified", False))},
+                )
+            )
+        remaining = max(limit - len(rows), 0)
+        if remaining:
+            product_qs = Product.objects.select_related("shop").filter(is_deleted=False, is_active=True).filter(
+                Q(name__icontains=query) | Q(description__icontains=query) | Q(sku__icontains=query) | Q(shop__name__icontains=query)
+            )
+            if blocked_user_ids:
+                product_qs = product_qs.exclude(shop__owner_id__in=blocked_user_ids)
+            for product in product_qs.order_by("-is_featured", "-updated_at")[:remaining]:
+                rows.append(
+                    _unified_result(
+                        kind="market_product",
+                        title=product.name,
+                        subtitle=_search_text(getattr(product.shop, "name", ""),) or "Marketplace product",
+                        target_type="product",
+                        target_id=product.id,
+                        route="Market/Product",
+                        score=72 + (10 if getattr(product, "is_featured", False) else 0),
+                        metadata={"shop_id": str(product.shop_id), "currency": "USD"},
+                    )
+                )
+        return rows
+
+    def _search_education(self, request, query: str, limit: int):
+        try:
+            from apps.broadcasts.models import EducationAcademicRecordStatus, EducationInstitution, EducationInstitutionCourse
+        except Exception:
+            return []
+        blocked_user_ids = _blocked_user_ids_for_search(request.user)
+        rows = []
+        institution_qs = EducationInstitution.objects.filter(is_active=True).filter(
+            Q(name__icontains=query) | Q(description__icontains=query) | Q(institution_type__icontains=query)
+        )
+        if blocked_user_ids:
+            institution_qs = institution_qs.exclude(owner_id__in=blocked_user_ids)
+        for institution in institution_qs.order_by("-updated_at")[:limit]:
+            rows.append(
+                _unified_result(
+                    kind="education_institution",
+                    title=institution.name,
+                    subtitle=_search_text(institution.institution_type) or "Education institution",
+                    target_type="education_institution",
+                    target_id=institution.id,
+                    route="Education/Institution",
+                    score=73,
+                    metadata={"institution_type": institution.institution_type},
+                )
+            )
+        remaining = max(limit - len(rows), 0)
+        if remaining:
+            course_qs = EducationInstitutionCourse.objects.select_related("institution").filter(
+                institution__is_active=True,
+                status=EducationAcademicRecordStatus.PUBLISHED,
+            ).filter(
+                Q(title__icontains=query) | Q(summary__icontains=query) | Q(description__icontains=query) | Q(code__icontains=query) | Q(institution__name__icontains=query)
+            )
+            if blocked_user_ids:
+                course_qs = course_qs.exclude(institution__owner_id__in=blocked_user_ids)
+            for course in course_qs.order_by("-updated_at", "title")[:remaining]:
+                rows.append(
+                    _unified_result(
+                        kind="education_course",
+                        title=course.title,
+                        subtitle=_search_text(getattr(course.institution, "name", "")) or "Education course",
+                        target_type="education_course",
+                        target_id=course.id,
+                        route="Education/Course",
+                        score=71,
+                        metadata={"institution_id": str(course.institution_id), "status": course.status},
+                    )
+                )
+        return rows
+
+    def _search_partners(self, request, query: str, limit: int):
+        try:
+            from apps.partners.models import Partner, PartnerJoinConfig
+        except Exception:
+            return []
+        blocked_user_ids = _blocked_user_ids_for_search(request.user)
+        public_partner_ids = PartnerJoinConfig.objects.filter(allow_public_listing=True).values_list("partner_id", flat=True)
+        qs = Partner.objects.filter(is_active=True, id__in=public_partner_ids).filter(
+            Q(name__icontains=query) | Q(slug__icontains=query) | Q(description__icontains=query)
+        )
+        if blocked_user_ids:
+            qs = qs.exclude(owner_id__in=blocked_user_ids)
+        return [
+            _unified_result(
+                kind="partner",
+                title=row.name,
+                subtitle="Partner workspace",
+                target_type="partner",
+                target_id=row.id,
+                route="Partners/Workspace",
+                score=69,
+                metadata={"slug": row.slug},
+            )
+            for row in qs.order_by("name")[:limit]
         ]
 
     def _search_notifications(self, request, query: str, limit: int):
@@ -531,6 +681,9 @@ class UnifiedSearchView(APIView):
             "channel_content": self._search_channel_content,
             "bible": self._search_bible,
             "health": self._search_health,
+            "market": self._search_market,
+            "education": self._search_education,
+            "partners": self._search_partners,
             "notifications": self._search_notifications,
             "verification": self._search_verification,
         }
@@ -2230,6 +2383,16 @@ class SecurityPrivacyLaunchGateView(APIView):
     def get(self, request):
         return Response(
             security_privacy_child_safety_launch_gate(),
+            status=status.HTTP_200_OK,
+        )
+
+
+class LaunchOperationsReadinessView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        return Response(
+            staff_launch_operations_summary(),
             status=status.HTTP_200_OK,
         )
 

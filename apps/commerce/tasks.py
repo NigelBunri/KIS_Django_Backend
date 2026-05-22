@@ -83,7 +83,10 @@ def enqueue_product_auth_check(self, check_id):
 
 @shared_task
 def evaluate_fraud_score(order_id):
-    order = Order.objects.get(id=order_id)
+    from .models import OrderStatus
+    order = Order.objects.select_related('user').prefetch_related('items').filter(id=order_id).first()
+    if not order:
+        return {'error': 'order_not_found'}
     score, details = compute_fraud_for_order(order)
     FraudSignal.objects.create(
         source='fraud_engine',
@@ -92,10 +95,25 @@ def evaluate_fraud_score(order_id):
         score=score,
         details=details,
     )
-    if score > 0.8:
-        order.status = 'PENDING'
-        order.save()
-    return {'score': score}
+    if score >= 0.75:
+        # Auto-hold: cancel and flag for manual review
+        order.status = OrderStatus.CANCELLED
+        order.metadata = {
+            **(order.metadata or {}),
+            'fraud_hold': True,
+            'fraud_score': score,
+            'fraud_details': details,
+        }
+        order.save(update_fields=['status', 'metadata', 'updated_at'])
+    elif score >= 0.50:
+        # Flag for manual review without cancelling
+        order.metadata = {
+            **(order.metadata or {}),
+            'fraud_review_required': True,
+            'fraud_score': score,
+        }
+        order.save(update_fields=['metadata', 'updated_at'])
+    return {'score': score, 'action': 'hold' if score >= 0.75 else 'review' if score >= 0.50 else 'pass'}
 
 
 @shared_task
@@ -119,15 +137,19 @@ def delete_cancelled_marketplace_order(order_id: str):
     from .models import MarketplaceOrder, MarketplaceOrderStatus
 
     try:
-        order = MarketplaceOrder.objects.get(id=order_id, status=MarketplaceOrderStatus.CANCELLED)
+        order = MarketplaceOrder.objects.get(
+            id=order_id,
+            status__in=[MarketplaceOrderStatus.CANCELLED, MarketplaceOrderStatus.SATISFIED],
+        )
         order.delete()
+        return {'status': 'deleted'}
     except MarketplaceOrder.DoesNotExist:
-        pass
+        return {'status': 'missing'}
 
 
 @shared_task
 def auto_satisfy_marketplace_order(order_id: str):
-    from .models import MarketplaceOrder, MarketplaceOrderStatus
+    from .models import MarketplaceComplaint, MarketplaceOrder, MarketplaceOrderStatus
 
     try:
         order = MarketplaceOrder.objects.get(id=order_id)
@@ -135,9 +157,24 @@ def auto_satisfy_marketplace_order(order_id: str):
         return {'status': 'missing'}
     if order.status != MarketplaceOrderStatus.AWAITING_SATISFACTION:
         return {'status': 'skipped', 'current_status': order.status}
+    if MarketplaceComplaint.objects.filter(order=order).exists():
+        return {'status': 'skipped', 'current_status': 'complaint'}
+    metadata = order.metadata if isinstance(order.metadata, dict) else {}
+    deadline_raw = metadata.get('awaiting_satisfaction_until') or metadata.get('satisfaction_deadline')
+    deadline = None
+    if deadline_raw:
+        try:
+            deadline = timezone.datetime.fromisoformat(str(deadline_raw).replace('Z', '+00:00'))
+            if timezone.is_naive(deadline):
+                deadline = timezone.make_aware(deadline, timezone.get_current_timezone())
+        except ValueError:
+            deadline = None
+    if deadline and deadline > timezone.now():
+        return {'status': 'pending_window', 'available_at': deadline.isoformat()}
     try:
         satisfy_marketplace_order(order)
-        return {'status': 'satisfied'}
+        order.delete()
+        return {'status': 'satisfied_deleted'}
     except ValidationError as exc:
         logger.warning('Auto satisfaction failed for order %s: %s', order_id, exc)
         return {'status': 'failed', 'error': str(exc)}

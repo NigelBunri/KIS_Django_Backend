@@ -92,21 +92,69 @@ def run_product_auth_check(pac: ProductAuthenticityCheck) -> Dict[str, Any]:
 
 def compute_fraud_for_order(order: Order) -> (float, Dict[str, Any]): # type: ignore
     """
-    Simple fraud scoring combining heuristics:
-    - high order value relative to average
-    - new account / little history
-    - mismatched shipping & billing
-    Returns score 0..1 and detail dict
+    Multi-signal fraud scoring. Returns (score 0..1, details dict).
+    score >= 0.75 → auto-hold; 0.50-0.74 → manual review; <0.50 → pass.
     """
+    from django.utils import timezone as _tz
+    import math as _math
+
     score = 0.0
-    details = {}
-    # heuristic: large orders
-    if float(order.total) > 1000000:
-        score += 0.5
-        details['large_order'] = True
-    # new account heuristic placeholder
-    # TODO integrate with user profile
-    score = min(1.0, score)
+    details: Dict[str, Any] = {}
+
+    # --- Signal 1: High absolute order value ---
+    amount_cents = int(order.total_cents or 0)
+    usd_amount = amount_cents / 100.0
+    if usd_amount > 5000:
+        increment = min(0.35, 0.1 + (usd_amount - 5000) / 50000)
+        score += increment
+        details['high_value'] = {'amount_usd': round(usd_amount, 2), 'increment': round(increment, 3)}
+
+    # --- Signal 2: New account (< 7 days old) ---
+    user = order.user
+    if user and hasattr(user, 'date_joined') and user.date_joined:
+        account_age_days = (_tz.now() - user.date_joined).days
+        if account_age_days < 1:
+            score += 0.35
+            details['new_account'] = {'age_days': account_age_days, 'increment': 0.35}
+        elif account_age_days < 7:
+            increment = round(0.20 * (1 - account_age_days / 7), 3)
+            score += increment
+            details['new_account'] = {'age_days': account_age_days, 'increment': increment}
+
+    # --- Signal 3: Velocity — multiple orders within 1 hour ---
+    one_hour_ago = _tz.now() - _tz.timedelta(hours=1)
+    recent_count = Order.objects.filter(
+        user=user,
+        created_at__gte=one_hour_ago,
+    ).exclude(id=order.id).count()
+    if recent_count >= 5:
+        score += 0.30
+        details['velocity'] = {'recent_orders_1h': recent_count, 'increment': 0.30}
+    elif recent_count >= 2:
+        increment = round(0.10 * recent_count / 5, 3)
+        score += increment
+        details['velocity'] = {'recent_orders_1h': recent_count, 'increment': increment}
+
+    # --- Signal 4: No prior completed/satisfied orders (first-order risk) ---
+    prior_completed = Order.objects.filter(
+        user=user,
+        status__in=[OrderStatus.SATISFIED, OrderStatus.COMPLETED],
+    ).exclude(id=order.id).exists()
+    if not prior_completed:
+        score += 0.10
+        details['first_order'] = True
+
+    # --- Signal 5: Unusually large single-item quantity ---
+    try:
+        max_qty = max((item.quantity for item in order.items.all()), default=0)
+        if max_qty > 50:
+            score += 0.15
+            details['bulk_quantity'] = {'max_qty': max_qty, 'increment': 0.15}
+    except Exception:
+        pass
+
+    score = round(min(1.0, score), 4)
+    details['total_score'] = score
     return score, details
 
 

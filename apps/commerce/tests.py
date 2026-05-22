@@ -17,7 +17,7 @@ from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
 
-from apps.billing.direct_payments import reconcile_direct_payment_callback
+from apps.billing.direct_payments import create_direct_payment_intent, reconcile_direct_payment_callback
 from apps.billing.models import DirectPaymentAuditEvent, DirectPaymentIntent
 from apps.billing.services import get_wallet_account
 from .category_catalog import ensure_catalog_categories
@@ -194,6 +194,8 @@ class MarketplaceUsdCheckoutTests(TestCase):
         self.assertEqual(data['payment_status'], 'pending')
         self.assertEqual(data['payment_provider'], 'flutterwave')
         self.assertIsNotNone(data['payment_intent_id'])
+        self.assertEqual(data['direct_payment_intent_id'], data['payment_intent_id'])
+        self.assertTrue(data['payment_reference'])
 
         intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
         self.assertEqual(intent.target_type, DirectPaymentIntent.TARGET_MARKETPLACE_ORDER)
@@ -201,6 +203,39 @@ class MarketplaceUsdCheckoutTests(TestCase):
         self.assertEqual(intent.amount_cents, 1000)
         self.assertEqual(intent.status, DirectPaymentIntent.STATUS_PENDING)
         self.assertEqual(intent.payment_url, '')
+        self.assertEqual(order.metadata.get('payment_url'), '')
+        self.assertEqual(order.metadata.get('payment_reference'), intent.tx_ref)
+
+    @override_settings(KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED=True, FLW_SECRET_KEY='test-secret')
+    @patch('apps.billing.direct_payments.requests.post')
+    def test_direct_payment_provider_link_is_idempotent_and_attached_to_order(self, post_mock):
+        post_mock.return_value.status_code = 200
+        post_mock.return_value.content = b'{}'
+        post_mock.return_value.json.return_value = {'data': {'link': 'https://checkout.example/kis-direct'}}
+
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+        )
+        intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
+
+        self.assertEqual(intent.payment_url, 'https://checkout.example/kis-direct')
+        self.assertEqual(order.metadata.get('payment_url'), 'https://checkout.example/kis-direct')
+        self.assertEqual(order.metadata.get('payment_reference'), intent.tx_ref)
+        self.assertEqual(post_mock.call_count, 1)
+
+        same_intent = create_direct_payment_intent(
+            user=self.buyer,
+            target_type=DirectPaymentIntent.TARGET_MARKETPLACE_ORDER,
+            target_id=order.id,
+            provider='flutterwave',
+            idempotency_key='same-order-retry',
+        )
+        order.refresh_from_db()
+        self.assertEqual(same_intent.id, intent.id)
+        self.assertEqual(order.metadata.get('payment_url'), 'https://checkout.example/kis-direct')
+        self.assertEqual(post_mock.call_count, 1)
 
     def test_wallet_marketplace_checkout_is_disabled_by_default(self):
         with self.assertRaises(ValidationError) as ctx:
@@ -225,6 +260,7 @@ class MarketplaceUsdCheckoutTests(TestCase):
         with self.assertRaises(ValidationError):
             satisfy_marketplace_order(order)
 
+    @override_settings(FLW_WEBHOOK_SECRET='test-webhook-secret')
     @patch('apps.notifications.tasks.process_notification_delivery.delay')
     @patch('apps.commerce.services._schedule_marketplace_order_auto_satisfaction')
     def test_flutterwave_callback_marks_marketplace_order_paid_idempotently(self, schedule_mock, _delivery_mock):
@@ -236,7 +272,7 @@ class MarketplaceUsdCheckoutTests(TestCase):
         intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
         payload = {'data': {'tx_ref': intent.tx_ref, 'status': 'successful', 'id': 'flw-test-001'}}
 
-        ok, result, paid_intent = reconcile_direct_payment_callback(payload=payload, signature='')
+        ok, result, paid_intent = reconcile_direct_payment_callback(payload=payload, signature='test-webhook-secret')
         self.assertTrue(ok)
         self.assertEqual(result, 'paid')
         self.assertEqual(paid_intent.status, DirectPaymentIntent.STATUS_PAID)
@@ -249,7 +285,7 @@ class MarketplaceUsdCheckoutTests(TestCase):
         self.assertEqual(order.status, MarketplaceOrderStatus.AWAITING_SATISFACTION)
         schedule_mock.assert_called_once()
 
-        ok, result, _paid_intent = reconcile_direct_payment_callback(payload=payload, signature='')
+        ok, result, _paid_intent = reconcile_direct_payment_callback(payload=payload, signature='test-webhook-secret')
         self.assertTrue(ok)
         self.assertEqual(result, 'paid')
         self.assertEqual(DirectPaymentAuditEvent.objects.filter(intent=intent, event='callback.paid').count(), 1)
@@ -285,6 +321,7 @@ class MarketplaceUsdCheckoutTests(TestCase):
         self.assertEqual(data['next_action']['code'], 'open_checkout')
         self.assertEqual(data['currency_label'], 'USD')
 
+    @override_settings(FLW_WEBHOOK_SECRET='test-webhook-secret')
     @patch('apps.notifications.tasks.process_notification_delivery.delay')
     @patch('apps.commerce.services._schedule_marketplace_order_auto_satisfaction')
     def test_provider_completed_marketplace_order_auto_satisfies_after_window(self, schedule_mock, _delivery_mock):
@@ -296,7 +333,7 @@ class MarketplaceUsdCheckoutTests(TestCase):
         intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
         reconcile_direct_payment_callback(
             payload={'data': {'tx_ref': intent.tx_ref, 'status': 'successful', 'id': 'flw-auto-001'}},
-            signature='',
+            signature='test-webhook-secret',
         )
         order.refresh_from_db()
 
@@ -307,11 +344,20 @@ class MarketplaceUsdCheckoutTests(TestCase):
         self.assertIsNotNone(order.metadata.get('awaiting_satisfaction_until'))
         schedule_mock.assert_called_once()
 
-        result = auto_satisfy_marketplace_order(str(order.id))
+        early_result = auto_satisfy_marketplace_order(str(order.id))
         order.refresh_from_db()
+        self.assertEqual(early_result['status'], 'pending_window')
+        self.assertEqual(order.status, MarketplaceOrderStatus.AWAITING_SATISFACTION)
 
-        self.assertEqual(result['status'], 'satisfied')
-        self.assertEqual(order.status, MarketplaceOrderStatus.SATISFIED)
+        metadata = dict(order.metadata or {})
+        metadata['awaiting_satisfaction_until'] = (timezone.now() - timedelta(seconds=1)).isoformat()
+        order.metadata = metadata
+        order.save(update_fields=['metadata'])
+
+        result = auto_satisfy_marketplace_order(str(order.id))
+
+        self.assertEqual(result['status'], 'satisfied_deleted')
+        self.assertFalse(order.__class__.objects.filter(id=order.id).exists())
 
 
 class CommerceLaunchProofCommandTests(TestCase):

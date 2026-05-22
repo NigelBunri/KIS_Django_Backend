@@ -2,7 +2,13 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from rest_framework import serializers
-from apps.core.money import KISC_MICRO_PER_KISC, KISC_MICRO_PER_USD_CENT, frontend_kisc_major_to_micro
+from apps.core.money import (
+    KISC_MICRO_PER_KISC,
+    KISC_MICRO_PER_USD_CENT,
+    USD_CENTS_PER_DOLLAR,
+    frontend_kisc_major_to_micro,
+    parse_decimal_amount,
+)
 
 from .models import (
     AdmissionBedSession,
@@ -20,6 +26,7 @@ from .models import (
     EngineStepProgress,
     HealthInstitution,
     HealthInstitutionMembership,
+    MembershipRole,
     HomeLogisticsSession,
     HomeLogisticsStatus,
     HealthService,
@@ -72,6 +79,26 @@ def _micro_to_usd_label(micro_value) -> str:
     cents = (Decimal(max(0, micro)) / Decimal(KISC_MICRO_PER_USD_CENT)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return f"${(cents / Decimal('100')).quantize(Decimal('0.01'))}"
 
+def _micro_to_usd_text(micro_value) -> str:
+    try:
+        micro = int(micro_value or 0)
+    except (TypeError, ValueError):
+        micro = 0
+    cents = (Decimal(max(0, micro)) / Decimal(KISC_MICRO_PER_USD_CENT)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    amount = (cents / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return format(amount, "f")
+
+
+def _usd_to_micro_or_none(value) -> int | None:
+    parsed = parse_decimal_amount(value)
+    if parsed is None:
+        return None
+    if parsed < 0:
+        raise serializers.ValidationError("USD amount cannot be negative.")
+    cents = (parsed * USD_CENTS_PER_DOLLAR).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    micro = (cents * KISC_MICRO_PER_USD_CENT).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(micro)
+
 
 def _kisc_to_micro_or_none(value) -> int | None:
     if value in (None, ""):
@@ -106,12 +133,20 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
     trust_summary = serializers.SerializerMethodField()
     care_summary = serializers.SerializerMethodField()
     media_safety_summary = serializers.SerializerMethodField()
+    owner_user_id = serializers.SerializerMethodField()
+    ownerUserId = serializers.SerializerMethodField()
+    current_membership = serializers.SerializerMethodField()
+    viewer = serializers.SerializerMethodField()
+    can_manage = serializers.SerializerMethodField()
+    canManage = serializers.SerializerMethodField()
 
     class Meta:
         model = HealthInstitution
         fields = [
             "id",
             "owner",
+            "owner_user_id",
+            "ownerUserId",
             "name",
             "slug",
             "institution_type",
@@ -122,10 +157,67 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
             "trust_summary",
             "care_summary",
             "media_safety_summary",
+            "current_membership",
+            "viewer",
+            "can_manage",
+            "canManage",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["owner", "slug", "created_at", "updated_at"]
+
+
+    def _request_user(self):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user and getattr(user, "is_authenticated", False):
+            return user
+        return None
+
+    def _viewer_membership(self, obj):
+        user = self._request_user()
+        if not user:
+            return None
+        if obj.owner_id == user.id:
+            return {
+                "role": MembershipRole.OWNER,
+                "is_active": True,
+                "source": "owner",
+            }
+        membership = obj.memberships.filter(user=user, is_active=True).first()
+        if not membership:
+            return None
+        return {
+            "id": str(membership.id),
+            "role": membership.role,
+            "is_active": bool(membership.is_active),
+            "source": "membership",
+        }
+
+    def get_owner_user_id(self, obj):
+        return str(obj.owner_id) if obj.owner_id else ""
+
+    def get_ownerUserId(self, obj):
+        return self.get_owner_user_id(obj)
+
+    def get_current_membership(self, obj):
+        return self._viewer_membership(obj)
+
+    def get_viewer(self, obj):
+        membership = self._viewer_membership(obj) or {}
+        role = str(membership.get("role") or "").lower()
+        can_manage = role in {MembershipRole.OWNER, MembershipRole.ADMIN, MembershipRole.MANAGER}
+        return {
+            "role": role or "unassigned",
+            "can_manage": can_manage,
+            "canManage": can_manage,
+        }
+
+    def get_can_manage(self, obj):
+        return bool(self.get_viewer(obj).get("can_manage"))
+
+    def get_canManage(self, obj):
+        return self.get_can_manage(obj)
 
     def get_verification_summary(self, obj):
         from apps.verification.services import current_health_institution_verification_status
@@ -474,7 +566,7 @@ class ServiceWorkflowSessionSerializer(serializers.ModelSerializer):
 class WorkflowStartSerializer(serializers.Serializer):
     institution_id = serializers.UUIDField()
     service_id = serializers.UUIDField()
-    auto_debit = serializers.BooleanField(default=True)
+    auto_debit = serializers.BooleanField(default=False)
     owner_preview = serializers.BooleanField(default=False)
     assessment_payload = serializers.JSONField(required=False, default=dict)
 
@@ -509,8 +601,16 @@ class EngineContentBlockSerializer(serializers.ModelSerializer):
 
 
 class InstitutionEngineManagedItemSerializer(serializers.ModelSerializer):
+    amount_usd = serializers.SerializerMethodField()
     amount_kisc = serializers.SerializerMethodField()
     image_url = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    amount_usd_input = serializers.DecimalField(
+        max_digits=20,
+        decimal_places=2,
+        required=False,
+        min_value=0,
+        write_only=True,
+    )
     amount_kisc_input = serializers.DecimalField(
         max_digits=20,
         decimal_places=5,
@@ -531,6 +631,8 @@ class InstitutionEngineManagedItemSerializer(serializers.ModelSerializer):
             "name",
             "description",
             "amount_micro",
+            "amount_usd",
+            "amount_usd_input",
             "amount_kisc",
             "amount_kisc_input",
             "quantity",
@@ -547,10 +649,15 @@ class InstitutionEngineManagedItemSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
 
+    def get_amount_usd(self, obj):
+        return _micro_to_usd_text(getattr(obj, "amount_micro", 0))
+
     def get_amount_kisc(self, obj):
         return _micro_to_kisc_text(getattr(obj, "amount_micro", 0))
 
     def validate(self, attrs):
+        if "amount_usd_input" in attrs and "amount_micro" not in attrs:
+            attrs["amount_micro"] = _usd_to_micro_or_none(attrs.get("amount_usd_input")) or 0
         if "amount_kisc_input" in attrs and "amount_micro" not in attrs:
             attrs["amount_micro"] = _kisc_to_micro_or_none(attrs.get("amount_kisc_input")) or 0
         if "image_url" in attrs:
@@ -1255,6 +1362,10 @@ PAYMENT_BILLING_STEP_CHOICES = (
 
 
 class PaymentBillingSessionSerializer(serializers.ModelSerializer):
+    total_amount_usd = serializers.SerializerMethodField()
+    insurance_coverage_usd = serializers.SerializerMethodField()
+    payable_amount_usd = serializers.SerializerMethodField()
+    amount_paid_usd = serializers.SerializerMethodField()
     total_amount_kisc = serializers.SerializerMethodField()
     insurance_coverage_kisc = serializers.SerializerMethodField()
     payable_amount_kisc = serializers.SerializerMethodField()
@@ -1266,6 +1377,7 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
     payment_status = serializers.SerializerMethodField()
     currency_label = serializers.SerializerMethodField()
     payment_intent_id = serializers.SerializerMethodField()
+    direct_payment_intent_id = serializers.SerializerMethodField()
     payment_url = serializers.SerializerMethodField()
     next_action = serializers.SerializerMethodField()
 
@@ -1280,21 +1392,26 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
             "user",
             "status",
             "total_amount_micro",
-            "total_amount_kisc",
+            "total_amount_usd",
             "total_amount_usd_label",
+            "total_amount_kisc",
             "insurance_coverage_micro",
-            "insurance_coverage_kisc",
+            "insurance_coverage_usd",
             "insurance_coverage_usd_label",
+            "insurance_coverage_kisc",
             "payable_amount_micro",
-            "payable_amount_kisc",
+            "payable_amount_usd",
             "payable_amount_usd_label",
+            "payable_amount_kisc",
             "amount_paid_micro",
-            "amount_paid_kisc",
+            "amount_paid_usd",
             "amount_paid_usd_label",
+            "amount_paid_kisc",
             "payment_provider",
             "payment_status",
             "currency_label",
             "payment_intent_id",
+            "direct_payment_intent_id",
             "payment_url",
             "next_action",
             "payment_reference",
@@ -1323,6 +1440,18 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_total_amount_usd(self, obj):
+        return _micro_to_usd_text(getattr(obj, "total_amount_micro", 0))
+
+    def get_insurance_coverage_usd(self, obj):
+        return _micro_to_usd_text(getattr(obj, "insurance_coverage_micro", 0))
+
+    def get_payable_amount_usd(self, obj):
+        return _micro_to_usd_text(getattr(obj, "payable_amount_micro", 0))
+
+    def get_amount_paid_usd(self, obj):
+        return _micro_to_usd_text(getattr(obj, "amount_paid_micro", 0))
 
     def get_total_amount_kisc(self, obj):
         return _micro_to_kisc_text(getattr(obj, "total_amount_micro", 0))
@@ -1357,6 +1486,9 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
         metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
         return str(metadata.get("direct_payment_intent_id") or "") or None
 
+    def get_direct_payment_intent_id(self, obj):
+        return self.get_payment_intent_id(obj)
+
     def get_payment_url(self, obj):
         metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
         return str(metadata.get("payment_url") or "") or None
@@ -1387,21 +1519,30 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
 class PaymentBillingStartSerializer(serializers.Serializer):
     workflow_session_id = serializers.UUIDField()
     total_amount_micro = serializers.IntegerField(required=False, min_value=0)
+    total_amount_usd = serializers.DecimalField(max_digits=20, decimal_places=2, required=False, min_value=0)
     total_amount_kisc = serializers.DecimalField(max_digits=20, decimal_places=5, required=False, min_value=0)
     insurance_coverage_micro = serializers.IntegerField(required=False, min_value=0)
+    insurance_coverage_usd = serializers.DecimalField(max_digits=20, decimal_places=2, required=False, min_value=0)
     insurance_coverage_kisc = serializers.DecimalField(max_digits=20, decimal_places=5, required=False, min_value=0)
     payable_amount_micro = serializers.IntegerField(required=False, min_value=0)
+    payable_amount_usd = serializers.DecimalField(max_digits=20, decimal_places=2, required=False, min_value=0)
     payable_amount_kisc = serializers.DecimalField(max_digits=20, decimal_places=5, required=False, min_value=0)
     payment_provider = serializers.CharField(max_length=40, required=False, allow_blank=True, default="")
     payload = serializers.JSONField(required=False, default=dict)
     metadata = serializers.JSONField(required=False, default=dict)
 
     def validate(self, attrs):
-        # Optional KISC aliases are normalized to micro for canonical storage.
+        # Optional USD aliases are normalized to micro for canonical storage. Legacy KISC aliases remain accepted for old clients.
+        if "total_amount_usd" in attrs and "total_amount_micro" not in attrs:
+            attrs["total_amount_micro"] = _usd_to_micro_or_none(attrs.get("total_amount_usd"))
         if "total_amount_kisc" in attrs and "total_amount_micro" not in attrs:
             attrs["total_amount_micro"] = _kisc_to_micro_or_none(attrs.get("total_amount_kisc"))
+        if "insurance_coverage_usd" in attrs and "insurance_coverage_micro" not in attrs:
+            attrs["insurance_coverage_micro"] = _usd_to_micro_or_none(attrs.get("insurance_coverage_usd"))
         if "insurance_coverage_kisc" in attrs and "insurance_coverage_micro" not in attrs:
             attrs["insurance_coverage_micro"] = _kisc_to_micro_or_none(attrs.get("insurance_coverage_kisc"))
+        if "payable_amount_usd" in attrs and "payable_amount_micro" not in attrs:
+            attrs["payable_amount_micro"] = _usd_to_micro_or_none(attrs.get("payable_amount_usd"))
         if "payable_amount_kisc" in attrs and "payable_amount_micro" not in attrs:
             attrs["payable_amount_micro"] = _kisc_to_micro_or_none(attrs.get("payable_amount_kisc"))
         provider = str(attrs.get("payment_provider") or getattr(settings, "KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER", "flutterwave") or "flutterwave").strip().lower()

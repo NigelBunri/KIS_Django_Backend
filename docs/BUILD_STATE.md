@@ -9991,3 +9991,556 @@ Please implement Phase 06 of the KIS Device Compatibility Roadmap without using 
 ### Render note
 
 - For the current backend, use `SUPABASE_STORAGE_API_URL=https://jzmamwdatswzglpkdwoi.supabase.co/storage/v1` if possible. If the S3 endpoint is accidentally pasted, the backend now normalizes it, but the REST URL remains the clearest setting.
+
+
+## 2026-05-21 - Code-Level 100% Completion Roadmap Phase 01 Started
+
+- Created `docs/code-completion-roadmap/status.md` with the full phase division to move KIS from roughly 79% to 100% code-level completion.
+- Started Phase 01 by renaming visible health engine price helpers from KISC terminology to USD terminology in React Native screens while keeping compatibility aliases in the shared service.
+- Live/provider/payment behavior was not changed in this slice.
+
+### Phase 01 validation update
+
+- Added canonical USD aliases to health managed-item and payment-billing serializers while preserving legacy KISC compatibility fields for old clients.
+- Focused frontend lint passed for health engine manager pricing screens.
+- React Native `pnpm run typecheck` passed.
+- `python3 -m py_compile apps/health_ops/serializers.py` passed.
+- `python3 manage.py check` passed.
+
+## 2026-05-21 - Code-Level 100% Completion Roadmap Phase 01 Continued
+
+- Removed normal-user profitability/revenue preview cards from the Health service-session screen and Education management modal so the app feels like a working product, not a roadmap reader.
+- Replaced the Education Institution quick-action `Coming soon` branch with real navigation to existing tabs for Live Class, Issue Certificate, and Publish Landing actions.
+- Added selectable course chips in Partner Courses for lesson, quiz, assignment, live session, bundle-item, and seat-pool workflows while keeping manual ID entry as a compatibility fallback.
+- Changed the Health billing confirmation payload key from `amount_paid_kisc` to `amount_paid_usd` in the React Native session flow.
+
+### Validation
+
+- `npx eslint src/screens/health/HealthServiceSessionScreen.tsx src/screens/tabs/profile-screen/EducationManagementModal.tsx src/screens/broadcast/education/EducationInstitutionManagementScreen.tsx src/components/partners/PartnerCoursesPanel.tsx --quiet` passed.
+- `pnpm run typecheck` passed.
+- `python3 manage.py check` passed.
+
+### Remaining Phase 01 risks
+
+- The five audited screens still contain many legitimate `TextInput` placeholders. These are not incomplete UI by themselves, but future slices should continue checking visible buttons/cards that open no action or expose roadmap copy.
+- Some deeper health, education, and partner workflows may still require backend domain QA in later roadmap phases even though this visible-copy slice is clean.
+
+## 2026-05-21 - Code-Level 100% Completion Phase 02
+
+### Scope completed
+
+- Completed the launch-critical messaging slice for direct identity, duplicate prevention, restart persistence, search, selected actions, unread/read-state validation, safe media wiring, and basic calls/status/update QA evidence.
+- Added/verified NestJS `GET /messages/search` as the backend route already called by the ChatRoom search UI.
+- Hardened React Native chat storage identity matching so optimistic local messages are promoted to server-backed rows instead of duplicating after socket echo or app restart.
+- Preserved placeholder-to-real conversation message history when a new-contact chat becomes a backend conversation.
+- Reconfirmed existing selected chat/message actions and safe media gate integration remain connected.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/Storage/chatStorage.ts`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/ChatRoomPage.tsx`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/hooks/useChatPersistence.ts`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/hooks/useConversationBootstrap.ts`
+- `/Users/nigel/dev/backend/Nestjs/src/chat/features/search/search.controller.ts`
+- `/Users/nigel/dev/backend/Nestjs/src/chat/features/search/search.module.ts`
+- `/Users/nigel/dev/backend/Nestjs/src/chat/features/search/search.service.ts`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `npx eslint src/Module/ChatRoom/Storage/chatStorage.ts src/Module/ChatRoom/hooks/useChatPersistence.ts src/Module/ChatRoom/hooks/useConversationBootstrap.ts src/Module/ChatRoom/ChatRoomPage.tsx src/screens/tabs/MessagesScreen.tsx --quiet` passed.
+- `npm run typecheck -- --pretty false` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+- `python3 manage.py check` passed in `/Users/nigel/dev/backend/kis`.
+- `python3 manage.py test apps.chat --noinput --keepdb` passed: 11 tests.
+
+### Blockers
+
+- Nest focused ESLint is blocked by local ESLint/AJV runtime failure before project files are loaded: `Cannot set properties of undefined (setting 'defaultMeta')`.
+- Real-device QA is still needed for two-device restart alignment, large-conversation message search jump/highlight, media attachment safety states, calls, and updates/status behavior.
+
+### Best prompt for Phase 03
+
+```text
+Please implement Phase 03 of the KIS Code-Level 100% Completion Roadmap without using git commands. Focus on Upload/media storage completion. Complete and validate Supabase-backed uploads across profile, messaging, channels, partners, commerce, education, health, comments, and verification evidence references. Ensure private media references, signed access where needed, media safety gate before publish/send, no raw storage paths or secrets in logs, consistent frontend asset display, and user-safe upload error/retry states. Preserve existing APIs/UI behavior, run focused Django/Nest/React Native validation, update docs/code-completion-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 04.
+```
+
+## 2026-05-21 - Code-Level 100% Completion Phase 03
+
+### Scope completed
+
+- Hardened central upload/media storage behavior for Supabase-ready private/public media handling.
+- `/uploads/file` now returns durable media references plus safe display URLs: `assetId`, `mediaAssetId`, `mediaAssetRef`, `displayUrl`, `downloadUrl`, and `publicUrl` where appropriate.
+- Private, ready uploads use the KIS signed download endpoint for display instead of exposing raw Supabase/local storage paths.
+- Non-staff `MediaAsset` API responses no longer expose `bucket_key`; owner/staff display access is provided through signed `display_url`.
+- React Native upload helpers and message attachment renderers now consistently consume `displayUrl`, `downloadUrl`, and `publicUrl`, so private signed media can display in chat without raw storage paths.
+- Upload failures now show safe retry messages instead of raw provider/XHR output.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/media/views.py`
+- `/Users/nigel/dev/backend/kis/apps/media/serializers.py`
+- `/Users/nigel/dev/backend/kis/apps/media/tests.py`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/uploadFileToBackend.ts`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/ChatRoomHandlers.tsx`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/componets/MessageBubble.tsx`
+- `/Users/nigel/dev/KIS/src/Module/ChatRoom/componets/main/MessageList.tsx`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/media/views.py apps/media/serializers.py apps/media/safety.py apps/media/tests.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py test apps.media --noinput --keepdb` passed: 15 tests.
+- `npx eslint src/Module/ChatRoom/uploadFileToBackend.ts src/Module/ChatRoom/ChatRoomHandlers.tsx src/Module/ChatRoom/componets/MessageBubble.tsx src/Module/ChatRoom/componets/main/MessageList.tsx --quiet` passed.
+- `npm run typecheck -- --pretty false` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+### Blockers / staging QA still required
+
+- Real Supabase Storage proof must be run in staging with Render env values and the real `kis-uploads` bucket.
+- Manual module QA remains required for profile, messaging, channels, partners, commerce, education, health, comments, and verification evidence uploads.
+- Large video/channel processing remains provider-ready but not live-provider validated in this local phase.
+
+### Best prompt for Phase 04
+
+```text
+Please implement Phase 04 of the KIS Code-Level 100% Completion Roadmap without using git commands. Focus on Payments/orders/bookings completion. Complete and validate Flutterwave/direct-provider payment intent creation, callback/webhook reconciliation, idempotency, receipt/audit visibility, and paid-state transitions across commerce orders, service bookings, education enrollments/bookings, health appointments/sessions/billing, and account upgrades where safe. Keep KIS promotional credits non-cash, non-transferable, non-withdrawable, and not exchange-rated; keep legacy wallet checkout/deposit/transfer/conversion disabled by default. Preserve existing APIs/UI behavior, run focused Django/Nest/React Native validation, update docs/code-completion-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 05.
+```
+
+## 2026-05-21 - Code-Level 100% Completion Phase 04
+
+### Scope completed
+
+- Completed direct-provider payment compatibility for marketplace orders, service booking payments, education bookings, and health billing sessions.
+- Added stable payment aliases to direct payment intent responses: `direct_payment_intent_id`, `payment_reference`, `payment_status`, and `payment_provider`.
+- Ensured generated Flutterwave checkout URLs are attached back to target metadata for order/detail/receipt views.
+- Kept live provider links disabled by default unless explicit Flutterwave flags and secrets are configured.
+- Preserved KIS promotional credits as non-cash, non-transferable, non-withdrawable, and not exchange-rated.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/billing/direct_payments.py`
+- `/Users/nigel/dev/backend/kis/apps/billing/serializers.py`
+- `/Users/nigel/dev/backend/kis/apps/billing/views.py`
+- `/Users/nigel/dev/backend/kis/apps/commerce/tests.py`
+- `/Users/nigel/dev/backend/kis/apps/broadcasts/tests.py`
+- `/Users/nigel/dev/backend/kis/apps/health_ops/tests/test_workflow_runtime.py`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/billing/direct_payments.py apps/billing/serializers.py apps/billing/views.py apps/commerce/tests.py apps/broadcasts/tests.py apps/health_ops/tests/test_workflow_runtime.py` passed.
+- `python3 manage.py check` passed.
+- `python3 manage.py verify_payment_launch` passed.
+- Focused Django payment tests passed: 11 tests.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+- `npm run typecheck -- --pretty false` passed in `/Users/nigel/dev/KIS`.
+
+### Blockers / staging QA still required
+
+- Real Flutterwave sandbox checkout and signed webhook replay still need staging proof before live payment enablement.
+- Real-device payment-return refresh QA is still required across commerce, service booking, education, health, and account upgrades.
+
+## 2026-05-21 - Code-Level 100% Completion Phase 05
+
+### Scope completed
+
+- Completed owner/admin permission fixes for the highest-risk institution access paths.
+- Health institution API responses now include owner/viewer/can-manage metadata, and health serializers receive request context for list/detail/create responses.
+- Frontend health profile state now merges authoritative health-ops institutions, preventing newly-created health institution owner controls from remaining disabled because of stale profile payloads.
+- Health frontend role resolution now recognizes direct owner ids, owner relationship metadata, and current-membership/viewer roles.
+- Education institution backend helpers now allow direct owners without membership rows to access owner management flows safely; serializers expose owner ids and synthetic owner membership metadata.
+- Added focused regression tests for health and education direct-owner access.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/health_ops/serializers.py`
+- `/Users/nigel/dev/backend/kis/apps/health_ops/views.py`
+- `/Users/nigel/dev/backend/kis/apps/health_ops/tests/test_verification.py`
+- `/Users/nigel/dev/backend/kis/apps/broadcasts/views.py`
+- `/Users/nigel/dev/backend/kis/apps/broadcasts/serializers.py`
+- `/Users/nigel/dev/backend/kis/apps/broadcasts/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/healthRoutes.ts`
+- `/Users/nigel/dev/KIS/src/screens/health/accessControl.ts`
+- `/Users/nigel/dev/KIS/src/services/healthProfileService.ts`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/health_ops/serializers.py apps/health_ops/views.py apps/broadcasts/serializers.py apps/broadcasts/views.py apps/health_ops/tests/test_verification.py apps/broadcasts/tests.py` passed.
+- `../env/bin/python manage.py check` passed.
+- Focused Django owner/admin regression tests passed: 2 tests.
+- `pnpm exec eslint src/screens/health/accessControl.ts src/services/healthProfileService.ts src/network/routes/healthRoutes.ts --max-warnings=0` passed.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+### Blockers / follow-up QA
+
+- `pnpm run typecheck -- --pretty false` is not compatible with the frontend package script because it forwards an invalid standalone `--` to `tsc`; `pnpm run typecheck` is the working validation command.
+- Manual real-device QA is still required for newly-created shop, health institution, education institution, partner workspace, and channel owner/admin controls.
+
+## 2026-05-21 - Code-Level 100% Completion Phase 06
+
+### Scope completed
+
+- Completed the marketplace commerce lifecycle slice for USD direct-provider order checkout, provider completion, buyer satisfaction, complaint windows, receipt readiness, and provider order UI state.
+- Marketplace order serializers now expose `direct_payment_intent_id` and `payment_reference` alongside the existing payment handoff fields.
+- Auto-satisfaction now respects the 3-day satisfaction deadline, skips complained orders, and deletes no-complaint paid orders after satisfaction is released.
+- Provider received-orders UI now shows payment status and only exposes completion for paid temporal orders.
+- Buyer order detail UI is scrollable and no longer contains the duplicate satisfaction-state declaration.
+- USD-only payment behavior is preserved; legacy wallet/KIS-credit commerce checkout remains disabled by default.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/commerce/serializers.py`
+- `/Users/nigel/dev/backend/kis/apps/commerce/tasks.py`
+- `/Users/nigel/dev/backend/kis/apps/commerce/tests.py`
+- `/Users/nigel/dev/KIS/src/screens/market/orders/MarketplaceOrderDetailPage.tsx`
+- `/Users/nigel/dev/KIS/src/screens/market/orders/ProviderOrdersPage.tsx`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/commerce/services.py apps/commerce/tasks.py apps/commerce/serializers.py apps/commerce/views.py apps/commerce/tests.py` passed.
+- `../env/bin/python manage.py check` passed.
+- `../env/bin/python manage.py verify_commerce_launch` passed.
+- Focused Django commerce tests passed: 5 tests.
+- `pnpm exec eslint src/screens/market/orders/MarketplaceOrderDetailPage.tsx src/screens/market/orders/ProviderOrdersPage.tsx --quiet` passed.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+### Blockers / follow-up QA
+
+- Staging still needs real Flutterwave sandbox checkout and signed webhook replay proof.
+- Real-device QA is still needed for buyer checkout return-refresh, seller completion, complaint upload, receipt open, cart checkout, product/service detail, and seller dashboard flows.
+- Celery/beat scheduling must be verified in staging for the 3-day auto-satisfaction and cleanup task.
+
+## 2026-05-22 - Code-Level 100% Completion Phase 07
+
+### Scope completed
+
+- Completed the launch-critical education completion slice for safe material media references and USD-first paid enrollment metadata.
+- Education material serializers now expose `safe_resource_url`, `private_media_ref`, `media_safety_status`, and `media_review_required` while suppressing raw `storage_path` output.
+- Education material create/update now rejects local device paths and raw storage paths, accepts safe upload attachment metadata, and stores private media/safety references in metadata.
+- React Native education material upload now sends the backend media-safety attachment metadata with the material payload.
+- Paid education content enrollment now creates new bookings as USD/direct-provider-first before payment handoff.
+- Education booking serializers now expose `direct_payment_intent_id` and `payment_reference` aliases for frontend handoff compatibility.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/broadcasts/serializers.py`
+- `/Users/nigel/dev/backend/kis/apps/broadcasts/views.py`
+- `/Users/nigel/dev/backend/kis/apps/broadcasts/tests.py`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile-screen/EducationManagementModal.tsx`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/broadcasts/serializers.py apps/broadcasts/views.py apps/broadcasts/tests.py` passed.
+- `../env/bin/python manage.py test apps.broadcasts.tests.EducationCourseraCoreTests --keepdb` passed: 7 tests.
+- `pnpm exec eslint src/screens/tabs/profile-screen/EducationManagementModal.tsx --quiet` passed.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/KIS`.
+
+### Blockers / follow-up QA
+
+- `pnpm run typecheck -- --pretty false` remains incompatible with the frontend package script; `pnpm run typecheck` is the working command and passed.
+- Staging still needs real Supabase/private media material upload proof, paid education Flutterwave sandbox checkout/callback proof, certificate open/share QA, and real-device instructor/learner flow QA.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+## 2026-05-22 - Code-Level 100% Completion Phase 08
+
+### Scope completed
+
+- Completed the launch-critical health completion slice for USD-safe workflow starts, billing handoff aliases, low-bandwidth care summary readiness, and safe health dashboard image uploads.
+- Health workflow starts now default away from legacy wallet auto-debit. Paid service workflows lock for provider payment rather than silently debiting wallet balances.
+- Old clients that send `auto_debit: true` are coerced to provider-pending mode while `KIS_LEGACY_HEALTH_WALLET_CHECKOUT_ENABLED` is disabled, with metadata recording that legacy wallet checkout was blocked.
+- Health billing serializers now expose `direct_payment_intent_id` for frontend handoff compatibility.
+- Health care summary now defaults `lowBandwidthReady` to true unless explicitly disabled.
+- Health profile editor image uploads now require a safe remote media URL and reject quarantined/review-required or local fallback paths.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/health_ops/serializers.py`
+- `/Users/nigel/dev/backend/kis/apps/health_ops/views.py`
+- `/Users/nigel/dev/backend/kis/apps/health_ops/tests/test_workflow_runtime.py`
+- `/Users/nigel/dev/KIS/src/screens/health/InstitutionProfileEditorScreen.tsx`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/health_ops/serializers.py apps/health_ops/views.py apps/health_ops/tests/test_workflow_runtime.py` passed.
+- `../env/bin/python manage.py check` passed.
+- `../env/bin/python manage.py test apps.health_ops.tests.test_workflow_runtime.HealthOpsWorkflowRuntimeTests --keepdb` passed: 12 tests.
+- `pnpm exec eslint src/screens/health/InstitutionProfileEditorScreen.tsx --quiet` passed.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+### Blockers / follow-up QA
+
+- Staging still needs real Supabase/private media health image upload proof and health Flutterwave sandbox checkout/callback proof.
+- Manual real-device QA is still needed for appointment booking, reschedule/cancel, ICS open, billing checkout return-refresh, reminders, care plans, provider dashboard controls, trust badges, and patient/provider session surfaces.
+- Medical-safety/legal review is still required for final public health copy before launch.
+
+
+## 2026-05-22 - Code-Level 100% Completion Phase 09
+
+### Scope completed
+
+- Completed the launch-critical partner completion slice for workspace UX clarity, safe moderation audit metadata, and USD-safe partner course billing handoff.
+- Removed normal-user monetization/profitability preview cards from partner workspace center, messages, audit, reports, organization apps, and settings sheet surfaces so visible partner UI behaves like working app UI instead of roadmap/readiness UI.
+- Sanitized `PartnerModerationAction.metadata` to avoid storing raw request payloads while preserving useful audit facts.
+- Replaced partner course `wallet.open` / `add_kisc` billing handoff with provider USD checkout behavior when a payment URL exists and safe USD-provider fallback copy otherwise.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/partners/views.py`
+- `/Users/nigel/dev/backend/kis/apps/partners/tests.py`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnersCenterPane.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnerAuditPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnersMessagesPane.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnerOrganizationAppsPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnerReportsPanel.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/PartnerSheet.tsx`
+- `/Users/nigel/dev/KIS/src/components/partners/center/PartnerCoursesSection.tsx`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/partners/views.py apps/partners/serializers.py apps/partners/tests.py` passed.
+- `../env/bin/python manage.py check` passed.
+- `../env/bin/python manage.py test apps.partners.tests.PartnerApiTests --keepdb` passed: 20 tests.
+- `pnpm exec eslint src/components/partners/PartnersCenterPane.tsx src/components/partners/PartnerAuditPanel.tsx src/components/partners/PartnersMessagesPane.tsx src/components/partners/PartnerOrganizationAppsPanel.tsx src/components/partners/PartnerReportsPanel.tsx src/components/partners/PartnerSheet.tsx --quiet` passed.
+- `pnpm exec eslint src/components/partners/center/PartnerCoursesSection.tsx --quiet` passed.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+### Blockers / follow-up QA
+
+- Manual staging QA is still required for partner workspace creation, subroom open/send, unread badge decrement, invite/onboarding flows, organization app media uploads, reports/exports, and moderation action visibility.
+- Real Supabase/private media upload proof is still required for partner app icons, partner feed/comment attachments, and partner verification evidence.
+- Partner paid-course checkout requires real education/provider payment proof; no wallet/KIS-credit flow is enabled.
+
+### Best prompt for Phase 10
+
+```text
+Please implement Phase 10 of the KIS Code-Level 100% Completion Roadmap without using git commands. Focus on Profile, Account, Settings, Family, Accessibility, and Trust completion. Complete and validate profile overview/editing, account security surfaces, family/age/accessibility preferences, verification/trust badge display, notification preferences, safe profile media uploads, privacy controls, blocked/muted/hidden user state, profile dashboards, low-bandwidth states, and clean working UI end-to-end. Visible normal-user profile/account features must be fully working, not placeholders. Preserve existing APIs/UI behavior, do not expose private data or secrets, do not enable wallet/KIS-credit-as-money flows, run focused Django/Nest/React Native validation, update docs/code-completion-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 11.
+```
+
+
+## 2026-05-22 - Code-Level 100% Completion Phase 10
+
+### Scope completed
+
+- Completed the launch-critical profile/account/settings/family/accessibility/trust cleanup slice.
+- Removed profile dashboard `Add Funds` and `Transfer` actions and converted `wallet.open` compatibility events to read-only wallet/history behavior.
+- Set profile wallet state to default to `history` while keeping legacy wallet actions blocked for old callers.
+- Removed normal-user monetization/profitability preview cards from profile health and market management modals.
+- Replaced the Education Profile Manager `Coming soon` analytics button with a working summary action and live editor guidance.
+
+### Files changed
+
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile/useProfileController.ts`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile/components/EducationProfileManager.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile-screen/HealthManagementModal.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile-screen/MarketManagementModal.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/profile-screen/WalletModal.tsx`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/accounts/serializers.py apps/accounts/views.py apps/accounts/tests.py` passed.
+- `../env/bin/python manage.py check` passed.
+- `../env/bin/python manage.py test apps.accounts.tests.FamilyAccessibilityPreferencesTests apps.accounts.tests.AccountsProfileCoreTests --keepdb` passed: 14 tests.
+- `pnpm exec eslint src/screens/tabs/ProfileScreen.tsx src/screens/tabs/profile/useProfileController.ts src/screens/tabs/profile/components/EducationProfileManager.tsx src/screens/tabs/profile-screen/HealthManagementModal.tsx src/screens/tabs/profile-screen/MarketManagementModal.tsx --quiet` passed.
+- `pnpm exec eslint src/screens/tabs/profile-screen/WalletModal.tsx --quiet` passed.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+### Blockers / follow-up QA
+
+- Manual real-device QA is still needed for profile edit/save, media uploads, privacy/family/accessibility preference persistence, notifications, verification evidence, and profile management entry points.
+- Real Supabase/private media proof is still needed for profile and verification uploads.
+- Final legal/product copy review remains required for promotional-credit wording.
+
+### Best prompt for Phase 11
+
+```text
+Please implement Phase 11 of the KIS Code-Level 100% Completion Roadmap without using git commands. Focus on Search, Discovery, Recommendations, and Low-Bandwidth completion. Complete and validate global search, messaging search with jump/highlight, profile/contact discovery, channel/feed discovery, education/health/market/partner discovery, privacy-safe recommendation placeholders that become useful working rows where data exists, blocked/muted/hidden exclusions, child/youth-safe ranking defaults, pagination/cursor behavior, offline/low-bandwidth fallbacks, and clean empty/error states. Visible normal-user search/discovery features must be fully working, not placeholders. Preserve existing APIs/UI behavior, do not expose private relationships, health/payment/verification data, private media paths, or secrets, run focused Django/Nest/React Native validation, update docs/code-completion-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 12.
+```
+
+
+## 2026-05-22 - Code-Level 100% Completion Phase 11
+
+### Scope completed
+
+- Expanded unified search to include safe market, education, and partner discovery providers in addition to existing contacts, conversations, channels, channel content, Bible, health, notifications, and verification.
+- Added blocked-owner exclusions to new market/education/partner search paths and to health search.
+- Replaced health/partner recommendation placeholders with working public recommendation rows where data exists.
+- Made Channel discovery recommendation rows actionable and wired Global Search result navigation for market, education, partner, health, channel, content, Bible, notification, contact, and conversation results.
+- Improved SearchScreen grouping, icons, short-query copy, no-result state, and safe discovery wording.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/core/views.py`
+- `/Users/nigel/dev/backend/kis/apps/core/social_recommendations.py`
+- `/Users/nigel/dev/backend/kis/apps/core/tests.py`
+- `/Users/nigel/dev/KIS/src/screens/SearchScreen.tsx`
+- `/Users/nigel/dev/KIS/src/screens/GlobalSearchScreen.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/channels/ChannelsDiscoverPage.tsx`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/views.py apps/core/social_recommendations.py apps/core/tests.py` passed.
+- `../env/bin/python manage.py check` passed.
+- `pnpm exec eslint src/screens/SearchScreen.tsx src/screens/GlobalSearchScreen.tsx src/screens/broadcast/channels/ChannelsDiscoverPage.tsx --quiet` passed.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/KIS` after rerunning without unsupported forwarded args.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs` after rerunning without unsupported forwarded args.
+- Focused Django search/recommendation test run was blocked by a local hang during `UnifiedSearchApiTests`; the first two social recommendation tests passed before the run stopped returning output.
+
+### Blockers / follow-up QA
+
+- Resolve or isolate the `UnifiedSearchApiTests` local PostgreSQL test hang before launch sign-off.
+- Perform manual QA for global search navigation, channel discovery recommendation navigation, message search jump/highlight, and low-bandwidth/offline transitions.
+- Staging QA must verify blocked/muted/hidden exclusions in real discovery data.
+
+### Best prompt for Phase 12
+
+```text
+Please implement Phase 12 of the KIS Code-Level 100% Completion Roadmap without using git commands. Focus on Public Web, Embeds, SEO, Sharing, and External Growth completion. Complete and validate public channel/content landing pages, oEmbed/embed endpoints, signed private/unlisted embed tokens, public trust badges, safe share-card metadata, robots/sitemap policy, referral/invite flows, abuse reporting, child-sensitive/public visibility protections, monetization-safe public copy, and rollback-safe launch evidence. Visible normal-user public/share/embed features must be fully working, not placeholders. Preserve existing APIs/UI behavior, do not expose private/unlisted content, child-sensitive content, private media paths, secrets, payment data, health data, or verification documents, run focused Django/Nest/React Native validation, update docs/code-completion-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 13.
+```
+
+## 2026-05-22 - Code-Level 100% Completion Phase 12
+
+### Scope completed
+
+- Hardened public channel/content landing and embed/oEmbed payloads against private/raw media URL leakage.
+- Escaped and URL-encoded embed token query values before generating iframe HTML.
+- Fixed React Native public growth routes, public channel/content share URLs, and embed-token POST handoff.
+- Added focused regression coverage for public profile media sanitization, public content private asset sanitization, embed thumbnail sanitization, and unsafe token query escaping.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/broadcasts/views.py`
+- `/Users/nigel/dev/backend/kis/apps/broadcasts/tests.py`
+- `/Users/nigel/dev/KIS/src/services/publicGrowthService.ts`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/channels/ChannelContentDetailPage.tsx`
+- `/Users/nigel/dev/KIS/src/screens/broadcast/channels/ChannelHomePage.tsx`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/broadcasts/views.py apps/broadcasts/tests.py` passed.
+- `../env/bin/python manage.py check` passed.
+- Focused Django public web/embed tests passed: 9 tests.
+- `pnpm exec eslint src/services/publicGrowthService.ts src/screens/broadcast/channels/ChannelContentDetailPage.tsx src/screens/broadcast/channels/ChannelHomePage.tsx --quiet` passed.
+- `pnpm exec tsc --noEmit --pretty false` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+### Blockers / follow-up QA
+
+- Manual deployed-domain QA is still required for public pages, share cards, embeds/oEmbed, signed private/unlisted embed tokens, abuse reports, robots, and sitemap policy.
+- Public indexing must stay disabled until launch approval.
+- Referral/invite growth loops need separate production evidence before being considered complete.
+
+### Best prompt for Phase 13
+
+```text
+Please implement Phase 13 of the KIS Code-Level 100% Completion Roadmap without using git commands. Focus on Admin/Ops, Observability, Launch Evidence, and Production Readiness completion. Complete and validate staff-only admin command centers, safety/moderation queues, payment/media/search/messaging health summaries, launch go/no-go evidence, rollback runbooks, production feature-flag checks, audit-log visibility, and clean staff-only error states. Visible staff/admin features must be working and access-controlled, not placeholders. Preserve existing APIs/UI behavior, do not expose secrets, private media paths, private health/payment/verification data, or raw documents, run focused Django/Nest/React Native validation, update docs/code-completion-roadmap/status.md and docs/BUILD_STATE.md, and give the best prompt for Phase 14.
+```
+
+## 2026-05-22 - Code-Level 100% Completion Phase 13
+
+### Scope completed
+
+- Added `apps/core/launch_ops.py` with a staff-only launch operations readiness summary composing safety command center and security launch gate data.
+- Added `/api/v1/core/admin/launch-ops-readiness/` with staff-only access, redacted operational checks, provider evidence checks, production flag checks, safe counts, blockers, warnings, and readiness percentage.
+- Added focused Django tests proving staff access, non-staff rejection, and redaction expectations.
+- Added React Native route/service/card integration for a compact staff-only Launch operations card in the existing Profile staff/admin area.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/core/launch_ops.py`
+- `/Users/nigel/dev/backend/kis/apps/core/views.py`
+- `/Users/nigel/dev/backend/kis/apps/core/urls.py`
+- `/Users/nigel/dev/backend/kis/apps/core/tests.py`
+- `/Users/nigel/dev/KIS/src/network/routes/miscRoutes.ts`
+- `/Users/nigel/dev/KIS/src/services/launchOpsReadinessService.ts`
+- `/Users/nigel/dev/KIS/src/components/dashboard/LaunchOpsReadinessCard.tsx`
+- `/Users/nigel/dev/KIS/src/screens/tabs/ProfileScreen.tsx`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/launch_ops.py apps/core/views.py apps/core/urls.py apps/core/tests.py` passed.
+- `../env/bin/python manage.py check` passed.
+- `../env/bin/python manage.py test apps.core.tests.StaffSafetyCommandCenterTests apps.core.tests.SecurityPrivacyLaunchGateTests apps.core.tests.LaunchOperationsReadinessTests --keepdb` passed: 6 tests.
+- `pnpm exec eslint src/services/launchOpsReadinessService.ts src/components/dashboard/LaunchOpsReadinessCard.tsx src/screens/tabs/ProfileScreen.tsx src/network/routes/miscRoutes.ts --quiet` passed.
+- `pnpm exec tsc --noEmit --pretty false` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+### Blockers / follow-up QA
+
+- Staff launch operations must be smoke-tested in staging with deployed auth and staff/non-staff accounts.
+- Production remains no-go until provider callback evidence, backup/restore proof, rollback drill proof, and private-media tabletop proof are attached.
+- Do not enable live charges, live provider calls, public indexing, entitlement enforcement, or legacy wallet-as-money features without approved launch evidence.
+
+### Best prompt for Phase 14
+
+```text
+Please implement Phase 14 of the KIS Code-Level 100% Completion Roadmap without using git commands. Focus on Final Launch Smoke QA, Runtime Evidence, and Release Cutover completion. Use the completed code-level systems and staff launch operations endpoint to run or prepare the final launch smoke checks across Django, NestJS, React Native Android/iOS, Render/Supabase storage, Flutterwave sandbox/direct-payment callbacks, notifications, messaging, media safety, public web/embeds, and staff-only admin surfaces. Fix only confirmed launch-blocking code issues, keep normal-user UI clean, keep live charges/provider calls/legacy wallet-as-money/public indexing gated unless evidence is approved, update docs/code-completion-roadmap/status.md and docs/BUILD_STATE.md with final smoke results, blockers, rollback notes, and a concise production go/no-go handoff.
+```
+
+## 2026-05-22 - Code-Level 100% Completion Phase 14 Final Close-Out
+
+### Scope completed
+
+- Added `apps/core/management/commands/final_launch_smoke.py` for final redacted launch smoke handoff.
+- Added `docs/operations/KIS_FINAL_LAUNCH_SMOKE_QA.md` with staging runtime evidence, release cutover, rollback, and production go/no-go rules.
+- Added focused test coverage for final launch smoke checklist-mode output.
+- Preserved normal-user UI and existing APIs; no live charges/provider calls/public indexing/entitlement enforcement/legacy wallet-as-money behavior was enabled.
+
+### Files changed
+
+- `/Users/nigel/dev/backend/kis/apps/core/management/commands/final_launch_smoke.py`
+- `/Users/nigel/dev/backend/kis/apps/core/tests.py`
+- `/Users/nigel/dev/backend/kis/docs/operations/KIS_FINAL_LAUNCH_SMOKE_QA.md`
+- `/Users/nigel/dev/backend/kis/docs/code-completion-roadmap/status.md`
+- `/Users/nigel/dev/backend/kis/docs/BUILD_STATE.md`
+
+### Validation
+
+- `python3 -m py_compile apps/core/management/commands/final_launch_smoke.py apps/core/launch_ops.py apps/core/tests.py` passed.
+- `../env/bin/python manage.py check` passed.
+- `../env/bin/python manage.py final_launch_smoke --skip-module-checks` passed and reported expected local `no_go`.
+- `../env/bin/python manage.py final_launch_smoke --json --skip-module-checks` passed and reported readiness 60% with explicit missing evidence blockers.
+- `../env/bin/python manage.py test apps.core.tests.FinalLaunchSmokeCommandTests apps.core.tests.LaunchOperationsReadinessTests --keepdb` passed: 3 tests.
+- `pnpm exec tsc --noEmit --pretty false` passed in `/Users/nigel/dev/KIS`.
+- `pnpm run typecheck` passed in `/Users/nigel/dev/backend/Nestjs`.
+
+### Blockers / go-no-go
+
+- Production status: `NO-GO` until staging runtime evidence is attached.
+- The full aggregate `../env/bin/python manage.py final_launch_smoke` run was interrupted after running too long locally. Use checklist mode plus individual module verifiers in staging.
+- Missing evidence: Render Django, Render NestJS, Supabase storage/private media, Flutterwave sandbox/direct callbacks, Android/iOS runtime QA, notifications, staff-only access, backup/restore, rollback drill, and private-media tabletop.
+
+### Final maintenance prompt
+
+```text
+Please perform a targeted KIS launch-blocker maintenance pass without using git commands. Use `../env/bin/python manage.py final_launch_smoke --json --skip-module-checks`, the staff launch operations endpoint, and docs/operations/KIS_FINAL_LAUNCH_SMOKE_QA.md to verify the current launch blockers. Fix only confirmed staging/runtime blockers from Django, NestJS, React Native, Supabase storage, Flutterwave callbacks, notifications, messaging, media safety, public web/embeds, or staff-only admin access. Do not add new roadmap phases, do not enable live charges/provider calls/public indexing/legacy wallet-as-money flows unless approved evidence exists, run focused validation, and update docs/BUILD_STATE.md with the blocker, fix, validation, and go/no-go status.
+```
+

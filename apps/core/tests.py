@@ -18,7 +18,12 @@ from apps.broadcasts.models import (
     BroadcastHealthInstitution,
     BroadcastHealthInstitutionMember,
     ChannelContent,
+    EducationAcademicRecordStatus,
+    EducationInstitution,
+    EducationInstitutionCourse,
 )
+from apps.commerce.models import Product, Shop
+from apps.partners.models import Partner, PartnerJoinConfig
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
 from apps.moderation.models import UserBlock
 from apps.core.money import (
@@ -292,6 +297,60 @@ class SecurityPrivacyLaunchGateTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
+class FinalLaunchSmokeCommandTests(TestCase):
+    def test_final_launch_smoke_skip_module_checks_outputs_safe_handoff(self):
+        output = StringIO()
+
+        call_command("final_launch_smoke", "--skip-module-checks", stdout=output)
+
+        rendered = output.getvalue().lower()
+        self.assertIn("kis final launch smoke status:", rendered)
+        self.assertIn("manual evidence still required:", rendered)
+        self.assertIn("legacy wallet/kis-credit-as-money flags disabled", rendered)
+        self.assertNotIn("password", rendered)
+        self.assertNotIn("card_number", rendered)
+        self.assertNotIn("private/raw", rendered)
+
+
+class LaunchOperationsReadinessTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            phone="+237670036001",
+            password="TestPass123!",
+            country="CM",
+            is_staff=True,
+        )
+        self.user = User.objects.create_user(phone="+237670036002", password="TestPass123!", country="CM")
+
+    def test_launch_ops_readiness_is_staff_only_and_redacted(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(reverse("core:core-admin-launch-ops-readiness"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.data
+        serialized = str(payload).lower()
+
+        self.assertEqual(payload["version"], "phase_13_code_completion_launch_ops")
+        self.assertIn(payload["go_no_go"], {"go", "conditional_go", "no_go"})
+        self.assertGreaterEqual(payload["summary"]["checks_total"], 10)
+        self.assertTrue(payload["privacy"]["staff_only"])
+        self.assertTrue(payload["privacy"]["no_secret_values"])
+        self.assertIn("operational", payload["sections"])
+        self.assertIn("provider_evidence", payload["sections"])
+        self.assertIn("production_flags", payload["sections"])
+        self.assertNotIn("password", serialized)
+        self.assertNotIn("card_number", serialized)
+        self.assertNotIn("raw_callback", serialized)
+        self.assertNotIn("private/raw", serialized)
+        self.assertNotIn("/media/", serialized)
+
+    def test_launch_ops_readiness_rejects_non_staff(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get(reverse("core:core-admin-launch-ops-readiness"))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
 class MonetizationSafetySummaryTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(phone="+237670035001", password="TestPass123!", country="CM")
@@ -535,6 +594,45 @@ class UnifiedSearchApiTests(APITestCase):
             published_at=timezone.now(),
             created_by=self.blocked,
         )
+        self.shop = Shop.objects.create(
+            owner=self.user,
+            name="Faith Market Shop",
+            slug="faith-market-shop",
+            description="Faith supplies with USD checkout.",
+            is_verified=True,
+        )
+        self.product = Product.objects.create(
+            shop=self.shop,
+            sku="FAITH-PRODUCT-001",
+            name="Faith Journal",
+            slug="faith-journal",
+            description="A practical journal for daily faith notes.",
+            price="12.00",
+            currency="USD",
+            is_active=True,
+            is_featured=True,
+        )
+        self.education_institution = EducationInstitution.objects.create(
+            owner=self.user,
+            name="Faith Academy",
+            description="Formation courses for kingdom growth.",
+            institution_type="academy",
+            is_active=True,
+        )
+        self.education_course = EducationInstitutionCourse.objects.create(
+            institution=self.education_institution,
+            title="Faith Foundations",
+            code="FAITH-101",
+            summary="Foundational faith learning path.",
+            status=EducationAcademicRecordStatus.PUBLISHED,
+        )
+        self.partner = Partner.objects.create(
+            owner=self.user,
+            name="Faith Partners Network",
+            slug="faith-partners-network",
+            description="A public partner workspace for kingdom collaboration.",
+        )
+        PartnerJoinConfig.objects.create(partner=self.partner, allow_public_listing=True)
 
     def test_unified_search_returns_grouped_permission_safe_results(self):
         response = self.client.get("/api/v1/core/search/unified/", {"q": "Faith", "groups": "contacts,conversations,channels,channel_content"})
@@ -570,6 +668,26 @@ class UnifiedSearchApiTests(APITestCase):
         serialized = str(response.data)
         self.assertIn("Faith Channel", serialized)
         self.assertNotIn("Faith Blocked", serialized)
+
+    def test_unified_search_includes_market_education_and_partner_discovery(self):
+        response = self.client.get(
+            "/api/v1/core/search/unified/",
+            {"q": "Faith", "groups": "market,education,partners", "limit": 8},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        groups = response.data["groups"]
+        self.assertIn("market", groups)
+        self.assertIn("education", groups)
+        self.assertIn("partners", groups)
+        kinds = {row["kind"] for row in response.data["results"]}
+        self.assertIn("market_shop", kinds)
+        self.assertIn("market_product", kinds)
+        self.assertIn("education_institution", kinds)
+        self.assertIn("partner", kinds)
+        serialized = str(response.data).lower()
+        self.assertNotIn("payment_data", serialized)
+        self.assertNotIn("verification_document", serialized)
 
 
 class PatientCanonicalHealthProfileTests(TestCase):

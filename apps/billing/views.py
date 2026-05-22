@@ -1429,7 +1429,7 @@ class FlutterwaveWebhookView(APIView):
     def post(self, request, *args, **kwargs):
         secret = getattr(settings, "FLW_WEBHOOK_SECRET", "")
         signature = request.headers.get("verif-hash")
-        if secret and signature != secret:
+        if not secret or signature != secret:
             return Response({"detail": "invalid signature"}, status=status.HTTP_403_FORBIDDEN)
 
         payload = request.data if isinstance(request.data, dict) else {}
@@ -1521,7 +1521,18 @@ class DirectPaymentIntentView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
         except Exception as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response({"intent": DirectPaymentIntentSerializer(intent).data}, status=status.HTTP_201_CREATED)
+        data = DirectPaymentIntentSerializer(intent).data
+        return Response(
+            {
+                "intent": data,
+                "direct_payment_intent_id": data.get("direct_payment_intent_id") or data.get("id"),
+                "payment_reference": data.get("payment_reference") or data.get("tx_ref"),
+                "payment_url": data.get("payment_url") or "",
+                "payment_status": data.get("payment_status") or data.get("status"),
+                "payment_provider": data.get("payment_provider") or data.get("provider"),
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 @method_decorator(csrf_exempt, name="dispatch")

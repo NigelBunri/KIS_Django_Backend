@@ -4,49 +4,210 @@ import json
 import os
 import time
 
+from django.utils import timezone
 from typing import Dict, Any, Iterator, Callable
 from .models import AIJob, TranslationRequest, AIModel
 
 
+def _get_claude_client():
+    try:
+        import anthropic  # type: ignore
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            return None
+        return anthropic.Anthropic(api_key=api_key)
+    except ImportError:
+        return None
+
+
+def _claude_complete(
+    client,
+    system_prompt: str,
+    user_prompt: str,
+    model: str | None = None,
+    max_tokens: int = 1024,
+) -> str:
+    model = model or os.environ.get("ANTHROPIC_DEFAULT_MODEL", "claude-haiku-4-5-20251001")
+    message = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    return message.content[0].text
+
+
 def dispatch_job_to_model(job: AIJob) -> Dict[str, Any]:
-    """
-    Decide which model / adapter to call based on job metadata and local availability.
-    For a free tier, this uses a local lightweight model adapter (stub) or external free APIs.
-    Returns dict with keys: result_ref, payload.
-    """
-    # Basic router by job_type
     if job.job_type == 'TRANSLATION':
         return handle_translation(job)
-    if job.job_type == 'CUSTOM' and job.input_ref_type == 'QNA':
-        return handle_qna(job)
-    # other handlers...
+    if job.job_type == 'SUMMARIZATION':
+        return handle_summarization(job)
+    if job.job_type == 'MODERATION':
+        return handle_moderation(job)
+    if job.job_type == 'CUSTOM':
+        if job.input_ref_type == 'QNA':
+            return handle_qna(job)
+        return handle_custom(job)
     return {'result_ref': '', 'payload': {}}
 
 
 def handle_translation(job: AIJob) -> Dict[str, Any]:
-    # Fetch translation request
     tr = getattr(job, 'translation_request', None)
     if not tr:
         return {'result_ref': '', 'payload': {}}
-    # Here you would call a real translation provider. For free tier implement a simple rule-based stub.
-    # Example stub: reverse text as "translation" (replace with real model in paid tier)
-    translated = tr.result_text or '<<translated_text_placeholder>>'
-    # Save back
+
+    text = job.metadata.get('text', '') or ''
+    if not text:
+        return {'result_ref': f'translation:{tr.id}', 'payload': {'translated': ''}}
+
+    client = _get_claude_client()
+    if client:
+        try:
+            system = (
+                f"You are a professional translation engine. Translate the following text from "
+                f"{tr.source_lang} to {tr.target_lang}. Output ONLY the translated text — no "
+                "explanation, no preamble, no quotes."
+            )
+            translated = _claude_complete(
+                client, system, text,
+                max_tokens=min(4096, max(256, len(text) * 4)),
+            )
+            quality_score = 0.92
+        except Exception as exc:
+            translated = ''
+            quality_score = 0.0
+            job.metadata = {**job.metadata, 'translation_error': str(exc)}
+            job.save(update_fields=['metadata'])
+    else:
+        translated = ''
+        quality_score = 0.0
+
     tr.result_text = translated
-    tr.quality_score = 0.0
-    tr.save()
-    return {'result_ref': f'translation:{tr.id}', 'payload': {'translated': translated}}
+    tr.quality_score = quality_score
+    tr.save(update_fields=['result_text', 'quality_score'])
+    return {'result_ref': f'translation:{tr.id}', 'payload': {'translated': translated, 'quality_score': quality_score}}
 
 
 def handle_qna(job: AIJob) -> Dict[str, Any]:
-    # Simple QnA stub: echo + context
+    from .models import QnASession
+
     message = job.metadata.get('message', '')
-    response = f"Echo (free stub): {message}"
-    # Ideally append to session conversation
-    # Save result_ref
-    job.result_ref = 'qna:stub'
-    job.save()
-    return {'result_ref': job.result_ref, 'payload': {'answer': response}}
+    session_id = job.input_ref_id
+
+    session = QnASession.objects.filter(id=session_id).first() if session_id else None
+    history = list(session.conversation_history or []) if session else []
+    context = (session.context or '') if session else ''
+
+    client = _get_claude_client()
+    if client:
+        try:
+            messages: list = []
+            for turn in history[-20:]:
+                role = turn.get('role', 'user')
+                content = turn.get('content', '')
+                if role in ('user', 'assistant') and content:
+                    messages.append({'role': role, 'content': content})
+            messages.append({'role': 'user', 'content': message})
+
+            system_prompt = "You are a helpful, concise assistant for the KIS platform."
+            if context:
+                system_prompt += f"\n\nSession context: {context}"
+
+            api_model = os.environ.get('ANTHROPIC_QNA_MODEL', 'claude-haiku-4-5-20251001')
+            import anthropic as _anthropic  # type: ignore
+            api_response = client.messages.create(
+                model=api_model,
+                max_tokens=512,
+                system=system_prompt,
+                messages=messages,
+            )
+            answer = api_response.content[0].text
+        except Exception as exc:
+            answer = "I'm unable to process your request right now. Please try again shortly."
+            job.metadata = {**job.metadata, 'qna_error': str(exc)}
+            job.save(update_fields=['metadata'])
+    else:
+        answer = "AI assistant is not configured. Please contact support."
+
+    if session:
+        history.append({'role': 'user', 'content': message})
+        history.append({'role': 'assistant', 'content': answer})
+        session.conversation_history = history[-40:]
+        session.last_interaction_at = timezone.now()
+        session.save(update_fields=['conversation_history', 'last_interaction_at'])
+
+    job.result_ref = 'qna:answered'
+    job.save(update_fields=['result_ref'])
+    return {'result_ref': job.result_ref, 'payload': {'answer': answer}}
+
+
+def handle_summarization(job: AIJob) -> Dict[str, Any]:
+    text = job.metadata.get('text', '')
+    if not text:
+        return {'result_ref': 'summarization:empty', 'payload': {'summary': ''}}
+
+    client = _get_claude_client()
+    if client:
+        try:
+            system = (
+                "You are a summarization engine. Produce a concise summary in 2-4 sentences. "
+                "Output ONLY the summary text."
+            )
+            summary = _claude_complete(client, system, text, max_tokens=300)
+        except Exception:
+            summary = ''
+    else:
+        summary = ''
+
+    job.metadata = {**job.metadata, 'summary': summary}
+    job.save(update_fields=['metadata'])
+    return {'result_ref': 'summarization:done', 'payload': {'summary': summary}}
+
+
+def handle_moderation(job: AIJob) -> Dict[str, Any]:
+    text = job.metadata.get('text', '')
+
+    client = _get_claude_client()
+    if client:
+        try:
+            system = (
+                "You are a content moderation system for a social platform. "
+                "Analyze the content and respond with valid JSON only:\n"
+                '{"flagged": true/false, "categories": ["hate_speech"|"violence"|"spam"|"adult"|"self_harm"|"harassment"|"misinformation"], "confidence": 0.0-1.0, "reason": "short explanation"}'
+            )
+            raw = _claude_complete(client, system, f"Content:\n{text}", max_tokens=200)
+            result = json.loads(raw)
+        except Exception:
+            result = {'flagged': False, 'categories': [], 'confidence': 0.5, 'reason': 'moderation_unavailable'}
+    else:
+        result = {'flagged': False, 'categories': [], 'confidence': 0.0, 'reason': 'ai_not_configured'}
+
+    job.metadata = {**job.metadata, 'moderation_result': result}
+    job.save(update_fields=['metadata'])
+    return {'result_ref': 'moderation:done', 'payload': result}
+
+
+def handle_custom(job: AIJob) -> Dict[str, Any]:
+    prompt = job.metadata.get('prompt', '') or job.metadata.get('message', '')
+    if not prompt:
+        return {'result_ref': 'custom:empty', 'payload': {}}
+
+    client = _get_claude_client()
+    if client:
+        try:
+            mode = job.metadata.get('mode', 'general')
+            system = f"You are an AI assistant for the KIS platform. Mode: {mode}. Be helpful and concise."
+            response = _claude_complete(client, system, prompt, max_tokens=1024)
+        except Exception as exc:
+            response = ''
+            job.metadata = {**job.metadata, 'custom_error': str(exc)}
+            job.save(update_fields=['metadata'])
+    else:
+        response = ''
+
+    job.metadata = {**job.metadata, 'response': response}
+    job.save(update_fields=['metadata'])
+    return {'result_ref': 'custom:done', 'payload': {'response': response}}
 
 
 def run_pipeline_steps(pipeline: AIModel):

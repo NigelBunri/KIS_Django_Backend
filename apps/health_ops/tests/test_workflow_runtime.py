@@ -140,6 +140,81 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
         self.assertIn("PASS: KIS_HEALTH_DEFAULT_PAYMENT_PROVIDER - flutterwave", rendered)
         self.assertIn("PASS: MEDIA_SAFETY_ENABLED", rendered)
 
+    def test_workflow_start_defaults_to_provider_pending_without_wallet_debit(self):
+        HealthInstitutionMembership.objects.create(
+            institution=self.institution,
+            user=self.user,
+            role=MembershipRole.MEMBER,
+            is_active=True,
+        )
+        engine = _seed_engine("health_launch_provider_default", "Provider Default", ["review"] )
+        ServiceEngineMap.objects.create(
+            service=self.service,
+            engine=engine,
+            execution_order=1,
+            config={},
+            cost_micro=200000,
+            is_required=True,
+            access_window_days=2,
+            completion_mode=EngineCompletionMode.STEP_PROGRESS,
+        )
+        wallet = get_wallet_account(self.user)
+        wallet.balance_cents = 50000
+        wallet.save(update_fields=["balance_cents", "updated_at"])
+
+        response = self.client.post(
+            reverse("health-ops-session-start"),
+            {"institution_id": str(self.institution.id), "service_id": str(self.service.id)},
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        workflow = ServiceWorkflowSession.objects.get(id=response.data["session"]["id"])
+        self.assertTrue(workflow.is_locked_by_payment)
+        self.assertEqual(workflow.metadata.get("payment_mode"), "deferred")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance_cents, 50000)
+        self.assertFalse(
+            WalletLedgerEntry.objects.filter(user=self.user, reference=f"workflow:{workflow.id}").exists()
+        )
+
+    def test_workflow_start_coerces_legacy_auto_debit_off_when_flag_disabled(self):
+        HealthInstitutionMembership.objects.create(
+            institution=self.institution,
+            user=self.user,
+            role=MembershipRole.MEMBER,
+            is_active=True,
+        )
+        engine = _seed_engine("health_launch_legacy_disabled", "Legacy Disabled", ["review"] )
+        ServiceEngineMap.objects.create(
+            service=self.service,
+            engine=engine,
+            execution_order=1,
+            config={},
+            cost_micro=200000,
+            is_required=True,
+            access_window_days=2,
+            completion_mode=EngineCompletionMode.STEP_PROGRESS,
+        )
+        wallet = get_wallet_account(self.user)
+        wallet.balance_cents = 50000
+        wallet.save(update_fields=["balance_cents", "updated_at"])
+
+        response = self.client.post(
+            reverse("health-ops-session-start"),
+            {"institution_id": str(self.institution.id), "service_id": str(self.service.id), "auto_debit": True},
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        workflow = ServiceWorkflowSession.objects.get(id=response.data["session"]["id"])
+        self.assertTrue(workflow.is_locked_by_payment)
+        self.assertTrue(workflow.metadata.get("legacy_health_wallet_checkout_disabled"))
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance_cents, 50000)
+
     def test_care_summary_exposes_care_plan_vitals_and_workflow_counts(self):
         workflow = ServiceWorkflowSession.objects.create(
             institution=self.institution,
@@ -468,6 +543,7 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
         wallet.refresh_from_db()
         self.assertEqual(wallet.balance_cents, 30000)
 
+    @override_settings(FLW_WEBHOOK_SECRET="test-webhook-secret")
     def test_health_billing_defaults_to_usd_provider_pending_without_wallet_debit(self):
         billing_engine = _seed_engine(
             "payment_billing",
@@ -503,6 +579,7 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
         billing_session = start_response.data["billing_session"]
         self.assertEqual(billing_session["payment_provider"], "flutterwave")
         self.assertEqual(billing_session["currency_label"], "USD")
+        self.assertEqual(billing_session["direct_payment_intent_id"], billing_session["payment_intent_id"])
         billing_session_id = str(billing_session["id"])
         step_url = reverse("health-ops-billing-session-step", kwargs={"billing_session_id": billing_session_id})
 
@@ -540,7 +617,7 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
 
         ok, result, _intent = reconcile_direct_payment_callback(
             payload={"data": {"tx_ref": intent.tx_ref, "status": "successful", "id": "flw-health-001"}},
-            signature="",
+            signature="test-webhook-secret",
         )
         self.assertTrue(ok)
         self.assertEqual(result, "paid")

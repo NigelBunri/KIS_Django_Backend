@@ -109,6 +109,27 @@ class PrivateMediaAccessTests(APITestCase):
         self.assertIn(str(self.public_asset.id), asset_ids)
 
 
+    def test_media_asset_serializer_hides_bucket_key_from_non_staff_owner(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/assets/{self.private_asset.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("bucket_key", response.data)
+        self.assertTrue(response.data["private"])
+        self.assertIn("/api/v1/assets/", response.data["display_url"])
+
+    def test_staff_media_asset_serializer_can_inspect_bucket_key(self):
+        self.owner.is_staff = True
+        self.owner.save(update_fields=["is_staff"])
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/assets/{self.private_asset.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["bucket_key"], self.private_key)
+
+
 class MediaSafetyUploadTests(APITestCase):
     def setUp(self):
         User = get_user_model()
@@ -174,6 +195,15 @@ class MediaSafetyUploadTests(APITestCase):
         scan = MediaSafetyScan.objects.get(upload_id=attachment["id"])
         self.assertEqual(scan.context, "profile")
         self.assertEqual(scan.status, "not_configured")
+
+        self.assertTrue(attachment["private"])
+        self.assertEqual(attachment["url"], attachment["displayUrl"])
+        self.assertEqual(attachment["url"], attachment["downloadUrl"])
+        self.assertIn("/api/v1/assets/", attachment["url"])
+        self.assertEqual(attachment["assetId"], attachment["mediaAssetId"])
+        self.assertEqual(attachment["mediaAssetRef"], attachment["mediaAssetId"])
+        self.assertNotIn("bucket_key", str(attachment))
+        self.assertNotIn("uploads/", str(attachment["asset"]))
 
     def test_upload_blocks_dangerous_extension_before_storage(self):
         upload = SimpleUploadedFile("payload.sh", b"echo unsafe", content_type="text/plain")
