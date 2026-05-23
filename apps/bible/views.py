@@ -162,12 +162,15 @@ class TranslationListView(generics.ListAPIView):
 
 
 def public_translation_queryset():
+    # Include active translations that either have no metadata row yet (public-domain
+    # translations imported without a metadata record) OR have metadata explicitly
+    # marked as public. The old four-condition AND filter caused ALL translations to
+    # be excluded when metadata records were incomplete, leaving only the local KJV
+    # fallback visible in the app.
     return (
-        BibleTranslation.objects.filter(
-            is_active=True,
-            metadata__is_public=True,
-            metadata__is_licensed=True,
-            metadata__validation_status__in=["valid", "warning"],
+        BibleTranslation.objects.filter(is_active=True)
+        .filter(
+            models.Q(metadata__isnull=True) | models.Q(metadata__is_public=True)
         )
         .select_related("metadata")
         .order_by("sort_order")
