@@ -145,6 +145,7 @@ from .serializers import (
 from .certificates import build_certificate_pdf, ensure_certificate_file, build_certificate_url
 from .importers import scan_bible_translation_registry
 from .reader import PassageReferenceError, parse_passage_reference
+from .local_reader import build_local_kjv_reader_payload
 from apps.partners.models import Partner, PartnerMembership, PartnerMembershipStatus, PartnerOrganizationProfile
 from apps.partners.seed import KCAN_PARTNER_NAME, KCAN_PARTNER_SLUG, LEGACY_DEFAULT_PARTNER_SLUGS
 from apps.chat.models import ConversationMember, BaseConversationRole
@@ -338,9 +339,23 @@ class ReaderView(APIView):
         book_code = request.query_params.get("book")
         chapter_number = request.query_params.get("chapter")
 
-        translation = get_public_translation(translation_code)
         start_verse = request.query_params.get("start_verse")
         end_verse = request.query_params.get("end_verse")
+
+        try:
+            translation = get_public_translation(translation_code)
+        except ValidationError:
+            fallback = build_local_kjv_reader_payload(
+                translation_identifier=translation_code,
+                book_identifier=book_code,
+                chapter_number=chapter_number,
+                reference=reference,
+                start_verse=start_verse,
+                end_verse=end_verse,
+            )
+            if fallback:
+                return Response(fallback, status=status.HTTP_200_OK)
+            raise
 
         if reference:
             try:
@@ -351,6 +366,13 @@ class ReaderView(APIView):
             if not chapter:
                 return Response({"detail": "Chapter not found."}, status=status.HTTP_404_NOT_FOUND)
             verses = _verses_for_passage(translation, chapter, parsed.start_verse, parsed.end_verse)
+            if not verses.exists():
+                fallback = build_local_kjv_reader_payload(
+                    translation_identifier=translation.code,
+                    reference=reference,
+                )
+                if fallback:
+                    return Response(fallback, status=status.HTTP_200_OK)
             return Response(_build_reader_payload(translation, chapter, verses, parsed.display_ref))
 
         book = None
@@ -376,6 +398,16 @@ class ReaderView(APIView):
         except (TypeError, ValueError):
             return Response({"detail": "Verse range must be numeric."}, status=status.HTTP_400_BAD_REQUEST)
         verses = _verses_for_passage(translation, chapter, start_verse, end_verse)
+        if not verses.exists():
+            fallback = build_local_kjv_reader_payload(
+                translation_identifier=translation.code,
+                book_identifier=book.code,
+                chapter_number=chapter.number,
+                start_verse=start_verse,
+                end_verse=end_verse,
+            )
+            if fallback:
+                return Response(fallback, status=status.HTTP_200_OK)
         if start_verse:
             reference_label = f"{book.name} {chapter.number}:{start_verse}"
             if end_verse and end_verse != start_verse:

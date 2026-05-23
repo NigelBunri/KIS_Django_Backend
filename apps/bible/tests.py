@@ -209,6 +209,43 @@ class BibleTranslationRegistryTests(TestCase):
         self.assertEqual([item["number"] for item in response.data["verses"]], [16, 17])
         self.assertIn("navigation", response.data)
 
+    def test_reader_uses_bundled_kjv_when_database_import_is_missing(self):
+        BibleVerse.objects.all().delete()
+        BibleChapter.objects.all().delete()
+        BibleBook.objects.all().delete()
+        BibleTranslationMetadata.objects.all().delete()
+        BibleTranslation.objects.all().delete()
+
+        response = self.client.get(
+            "/api/v1/bible/reader/",
+            {"translation": "EN_KING_JAMES_BIBLE", "book": "GENESIS", "chapter": "1"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["translation"]["code"], "EN_KING_JAMES_BIBLE")
+        self.assertEqual(response.data["book"]["code"], "GENESIS")
+        self.assertEqual(response.data["chapter"]["number"], 1)
+        self.assertEqual(len(response.data["verses"]), 31)
+        self.assertEqual(response.data["verses"][0]["text"], "In the beginning God created the heaven and the earth.")
+        self.assertEqual(response.data["source"], "bundled_kjv_fallback")
+
+    def test_reader_uses_bundled_kjv_for_reference_when_database_import_is_missing(self):
+        BibleVerse.objects.all().delete()
+        BibleChapter.objects.all().delete()
+        BibleBook.objects.all().delete()
+        BibleTranslationMetadata.objects.all().delete()
+        BibleTranslation.objects.all().delete()
+
+        response = self.client.get(
+            "/api/v1/bible/reader/",
+            {"translation": "EN_KING_JAMES_BIBLE", "reference": "John 3:16-17"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["reference"], "John 3:16-17")
+        self.assertEqual([item["number"] for item in response.data["verses"]], [16, 17])
+        self.assertTrue(response.data["verses"][0]["text"].startswith("For God so loved"))
+
     def test_reader_rejects_restricted_translation_direct_access(self):
         self._create_public_reader_fixture()
         restricted = BibleTranslation.objects.create(code="EN_NIV", name="New International Version", language="en", is_active=True)
