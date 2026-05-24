@@ -53,11 +53,13 @@ class SuspiciousActivityDetector:
             reason = "Slow admin request (>2s)"
         else:
             window_start = timezone.now() - timedelta(minutes=self.ERROR_WINDOW_MINUTES)
-            errors = AdminAuditEntry.objects.filter(
-                actor_id=actor,
+            qs = AdminAuditEntry.objects.filter(
                 created_at__gte=window_start,
                 severity__in=[AdminAuditEntry.Severity.WARNING, AdminAuditEntry.Severity.CRITICAL],
             )
+            if actor:
+                qs = qs.filter(actor_id=actor)
+            errors = qs
             if errors.count() >= self.ERROR_THRESHOLD:
                 reason = "Repeated warning events"
         if not reason:

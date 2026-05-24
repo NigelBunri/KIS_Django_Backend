@@ -681,15 +681,15 @@ class ShopViewSet(viewsets.ModelViewSet):
         return obj
 
     def perform_create(self, serializer):
-        tier = get_user_tier(self.request.user)
-        tier_name = (tier.name if tier else getattr(self.request.user, "tier", "") or "").lower()
-        is_business = "business" in tier_name or "partner" in tier_name
-        if not is_business:
-            raise PermissionDenied("Marketplace stores are available to Business+ tiers only.")
         shop_limit = _normalize_limit(get_feature_limit(self.request.user, "shops_limit", 0))
+        if shop_limit is not None and shop_limit == 0:
+            raise PermissionDenied(
+                "Marketplace stores are available on Business plans and above. "
+                "Upgrade to Business or higher to create a shop."
+            )
         existing = Shop.objects.filter(owner=self.request.user, is_deleted=False).count()
         if shop_limit is not None and existing >= shop_limit:
-            raise ValidationError({"detail": f"Your tier allows up to {shop_limit} shops."})
+            raise ValidationError({"detail": f"Your current plan allows up to {shop_limit} shop{'s' if shop_limit != 1 else ''}. Upgrade to create more."})
         image_file = serializer.validated_data.get("image_file")
         if not image_file:
             raise ValidationError({"image_file": "Shop image is required."})
@@ -1451,6 +1451,16 @@ class ShopTeamMemberViewSet(viewsets.ModelViewSet):
         shop = serializer.validated_data.get("shop")
         if not shop or (shop.owner_id != self.request.user.id and not self.request.user.is_staff):
             raise PermissionDenied("Only shop owners or staff can add members.")
+        if not self.request.user.is_staff:
+            seat_limit = normalize_limit_value(get_feature_limit(self.request.user, "team_seats", None), default=0)
+            if seat_limit is not None and seat_limit <= 0:
+                raise PermissionDenied("Team collaboration is available on Business Pro plans and above. Upgrade to add team members.")
+            if seat_limit is not None:
+                used = ShopTeamMember.objects.filter(shop__owner=self.request.user, is_active=True).count()
+                if used >= seat_limit:
+                    raise PermissionDenied(
+                        f"Your plan allows up to {seat_limit} team seat{'s' if seat_limit != 1 else ''}. Upgrade to add more members."
+                    )
         serializer.save()
 
     def list(self, request, *args, **kwargs):

@@ -23,6 +23,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAdminUser
 
+from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
 from apps.broadcasts.models import BroadcastHealthProfile
 from apps.billing.direct_payments import create_direct_payment_intent
 from apps.billing.services import debit_wallet_balance, get_wallet_account
@@ -1427,6 +1428,16 @@ class HealthInstitutionListCreateView(APIView):
 
     @transaction.atomic
     def post(self, request):
+        features = get_user_tier_features(request.user)
+        health_limit = normalize_limit_value(features.get("health_profiles"), default=0)
+        if health_limit is not None and health_limit <= 0:
+            raise PermissionDenied("Health institution profiles require Business Pro tier or higher.")
+        if health_limit is not None:
+            existing_count = HealthInstitution.objects.filter(owner=request.user).count()
+            if existing_count >= health_limit:
+                raise PermissionDenied(
+                    f"Your current plan allows up to {health_limit} health institution profile{'s' if health_limit != 1 else ''}. Upgrade to create more."
+                )
         serializer = HealthInstitutionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         institution = serializer.save(owner=request.user, slug=_slugify_name(serializer.validated_data["name"]))

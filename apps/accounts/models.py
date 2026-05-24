@@ -211,7 +211,7 @@ class User(AbstractBaseUser, PermissionsMixin, BaseEntity):
     phone = models.CharField(unique=True, max_length=50, blank=True, null=True)
     phone_country_code = models.CharField(max_length=12, blank=True, null=True, db_index=True)
     phone_number = models.CharField(max_length=32, blank=True, null=True, db_index=True)
-    tier = models.CharField(max_length=50, default="Basic", db_index=True)
+    tier = models.CharField(max_length=50, default="Free", db_index=True)
     status = models.CharField(max_length=50, default="active")
     locale = models.CharField(max_length=20, default="en")
     timezone = models.CharField(max_length=50, default="UTC")

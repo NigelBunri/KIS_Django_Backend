@@ -6,6 +6,8 @@ from rest_framework.permissions import IsAuthenticatedOrReadOnly
 from django.db import transaction
 from django.utils import timezone
 
+from apps.accounts.feature_gate import require_feature
+
 # Swagger / OpenAPI helpers (drf-yasg)
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
@@ -56,6 +58,14 @@ class EventViewSet(viewsets.ModelViewSet):
     serializer_class = srl.EventSerializer
     permission_classes = [IsAuthenticatedOrReadOnly, perms.IsEventOwnerOrReadOnly]
     lookup_field = "id"
+
+    def perform_create(self, serializer):
+        require_feature(
+            self.request.user,
+            "events",
+            "Events are available on Partner plans and above. Upgrade to unlock.",
+        )
+        serializer.save()
 
     @swagger_auto_schema(
         operation_id="publishEvent",

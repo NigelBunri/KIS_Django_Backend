@@ -49,6 +49,7 @@ from apps.communities.models import (
     CommunityRole,
 )
 from apps.accounts.models import Profile, User
+from apps.accounts.feature_gate import require_feature
 from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
 from apps.commerce.constants import KIS_COIN_CODE
 from apps.commerce.models import Product, ShopService, ShopTeamMember, ServiceBooking
@@ -8798,6 +8799,19 @@ class EducationInstitutionListView(APIView):
 
     @transaction.atomic
     def post(self, request):
+        edu_limit = _resolve_profile_limit(
+            request.user,
+            "education_profiles",
+            legacy_required_tier="business pro",
+            permission_message="Education institution profiles require Business Pro tier or higher.",
+        )
+        if edu_limit is not None:
+            existing_count = EducationInstitution.objects.filter(owner=request.user).count()
+            if existing_count >= edu_limit:
+                raise ValidationError(
+                    {"detail": f"Your current plan allows up to {edu_limit} education institution profile{'s' if edu_limit != 1 else ''}. Upgrade to create more."}
+                )
+
         name = str(request.data.get("name") or "").strip()
         if not name:
             raise ValidationError({"name": "Institution name is required."})
@@ -14114,6 +14128,11 @@ class ChannelLiveStreamListCreateView(APIView):
     def post(self, request, channel_id):
         from .live_stream_providers import LiveStreamProviderError, get_live_stream_provider
 
+        require_feature(
+            request.user,
+            "live_streaming",
+            "Live streaming is available on Partner plans and above. Upgrade to unlock.",
+        )
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
         if not _user_can_edit_content(request.user, ChannelContent(channel=channel)):
             raise PermissionDenied("You cannot schedule live streams for this channel.")
@@ -14185,6 +14204,40 @@ class ChannelLiveStreamDetailView(APIView):
         return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
 
 
+class ChannelLiveStreamStreamKeyView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, stream_id):
+        live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
+            raise PermissionDenied("You cannot view ingest details for this live stream.")
+        stream_key = ""
+        ingest_url = str(live.ingest_url or "").strip()
+        if "/app/" in ingest_url:
+            stream_key = ingest_url.rsplit("/", 1)[-1]
+        elif ingest_url.startswith(("rtmp://", "rtmps://")) and live.provider == "disabled":
+            stream_key = str(live.provider_stream_id or live.id)
+        if not stream_key:
+            raise ValidationError({"stream_key": "Stream key is not available for this provider yet."})
+        _channel_audit(
+            request,
+            action="channel_live.stream_key.view",
+            target_type="channel",
+            target_id=live.channel_id,
+            metadata={"stream_id": str(live.id), "provider": live.provider},
+        )
+        return Response(
+            {
+                "stream_id": str(live.id),
+                "provider": live.provider,
+                "ingest_url": ingest_url,
+                "stream_key": stream_key,
+                "stream_key_available": True,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class ChannelLiveStreamStartView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -14192,8 +14245,10 @@ class ChannelLiveStreamStartView(APIView):
         live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
         if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
             raise PermissionDenied("You cannot start this live stream.")
-        if _live_stream_provider() != "disabled" and not _live_provider_sandbox_enabled():
-            raise ValidationError({"provider": "Live provider calls are disabled until staging/provider approval."})
+        # In provider-backed mode the external provider/webhook is the source of truth,
+        # but this action is still allowed so Studio can move into the live state once
+        # the creator intentionally starts the session. Provider webhooks may update it
+        # again when encoder ingest actually connects.
         live.status = ChannelLiveStream.Status.LIVE
         live.started_at = live.started_at or timezone.now()
         live.save(update_fields=["status", "started_at", "updated_at"])

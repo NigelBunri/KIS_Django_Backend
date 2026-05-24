@@ -15,6 +15,27 @@ from .roles import (
     AdminRoleAssignmentView,
     AdminRoleView,
 )
+from .user_management import (
+    AdminUserListView,
+    AdminUserDetailView,
+    AdminUserBanView,
+    AdminUserUnbanView,
+    AdminUserTierChangeView,
+    AdminPlatformStatsView,
+)
+from .content_moderation import (
+    AdminContentQueueView,
+    AdminContentQueueSummaryView,
+    AdminContentActionView,
+    AdminContentTrendView,
+)
+from .partner_oversight import (
+    AdminPartnerListView,
+    AdminPartnerDetailView,
+    AdminPartnerStatsView,
+    AdminRevenueStatsView,
+    AdminEngagementStatsView,
+)
 
 __all__ = [
     "DashboardOverviewView",
@@ -33,4 +54,22 @@ __all__ = [
     "AccessOverviewView",
     "MonitoringAlertView",
     "PerformanceInsightsView",
+    # User management
+    "AdminUserListView",
+    "AdminUserDetailView",
+    "AdminUserBanView",
+    "AdminUserUnbanView",
+    "AdminUserTierChangeView",
+    "AdminPlatformStatsView",
+    # Content moderation
+    "AdminContentQueueView",
+    "AdminContentQueueSummaryView",
+    "AdminContentActionView",
+    "AdminContentTrendView",
+    # Partner oversight
+    "AdminPartnerListView",
+    "AdminPartnerDetailView",
+    "AdminPartnerStatsView",
+    "AdminRevenueStatsView",
+    "AdminEngagementStatsView",
 ]

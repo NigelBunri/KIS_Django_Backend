@@ -87,6 +87,7 @@ urlpatterns = [
     path("api/v1/", include("apps.otp.urls")),
     path("api/v1/", include("apps.chat.urls", namespace="chat-root")),
     path("api/v1/partners/", include("apps.partners.urls", namespace="partners")),
+    path("api/v1/partners/", include("apps.location.urls", namespace="location")),
     path("api/v1/", include("apps.communities.urls", namespace="communities")),
     path("api/v1/", include("apps.groups.urls", namespace="groups")),
     path("api/v1/partner-channels/", include("apps.channels.urls", namespace="channels")),

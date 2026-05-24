@@ -2127,7 +2127,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
         except PartnerOrganizationApp.DoesNotExist:
             raise ValidationError({"app_id": "Invalid organization app ID."})
 
-        if request.method == "get":
+        if request.method == "GET":
             logs = app.access_logs.select_related("user").order_by("-created_at")[:25]
             serializer = PartnerOrganizationAppAccessLogSerializer(logs, many=True)
             return Response({"logs": serializer.data}, status=status.HTTP_200_OK)
@@ -2165,7 +2165,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
         if request.method == "POST":
             if not self._user_can_manage_organization_apps(partner, request.user):
                 raise PermissionDenied("Not allowed to manage organization app tabs.")
-            serializer = PartnerOrganizationAppTabSerializer(data={**request.data, "app": app.id}, context={"request": request})
+            serializer = PartnerOrganizationAppTabSerializer(data=request.data, context={"request": request})
             serializer.is_valid(raise_exception=True)
             tab = serializer.save(app=app)
             return Response({"tab": PartnerOrganizationAppTabSerializer(tab, context={"request": request}).data}, status=status.HTTP_201_CREATED)
@@ -2194,7 +2194,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
             if not self._user_can_manage_organization_apps(partner, request.user):
                 raise PermissionDenied("Not allowed to manage organization app content.")
             serializer = PartnerOrganizationAppContentBlockSerializer(
-                data={**request.data, "tab": tab.id},
+                data=request.data,
                 context={"request": request},
             )
             serializer.is_valid(raise_exception=True)
@@ -2247,7 +2247,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
         except PartnerOrganizationApp.DoesNotExist:
             raise ValidationError({"app_id": "Invalid organization app ID."})
 
-        if request.method == "delete":
+        if request.method == "DELETE":
             app.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -2261,6 +2261,55 @@ class PartnerViewSet(viewsets.ModelViewSet):
             instance.published_at = timezone.now()
             instance.save(update_fields=["published_at", "updated_at"])
         return Response({"app": serializer.data}, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path="organization-apps/(?P<app_id>[^/.]+)/tabs/(?P<tab_id>[^/.]+)",
+    )
+    def organization_app_tab_detail(self, request, pk=None, app_id=None, tab_id=None):
+        partner = self.get_object()
+        if not self._user_can_manage_organization_apps(partner, request.user):
+            raise PermissionDenied("Not allowed to manage organization app tabs.")
+        tab = PartnerOrganizationAppTab.objects.filter(id=tab_id, app_id=app_id, app__partner=partner).first()
+        if not tab:
+            raise ValidationError({"tab_id": "Invalid organization app tab ID."})
+
+        if request.method == "DELETE":
+            tab.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = PartnerOrganizationAppTabSerializer(tab, data=request.data, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response({"tab": serializer.data}, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path="organization-apps/(?P<app_id>[^/.]+)/tabs/(?P<tab_id>[^/.]+)/blocks/(?P<block_id>[^/.]+)",
+    )
+    def organization_app_block_detail(self, request, pk=None, app_id=None, tab_id=None, block_id=None):
+        partner = self.get_object()
+        if not self._user_can_manage_organization_apps(partner, request.user):
+            raise PermissionDenied("Not allowed to manage organization app content.")
+        block = PartnerOrganizationAppContentBlock.objects.filter(
+            id=block_id, tab_id=tab_id, tab__app_id=app_id, tab__app__partner=partner
+        ).first()
+        if not block:
+            raise ValidationError({"block_id": "Invalid content block ID."})
+
+        if request.method == "DELETE":
+            block.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = PartnerOrganizationAppContentBlockSerializer(block, data=request.data, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        if instance.status == PartnerOrganizationAppStatus.PUBLISHED and not getattr(instance, "published_at", None):
+            instance.published_at = timezone.now()
+            instance.save(update_fields=["published_at", "updated_at"])
+        return Response({"block": serializer.data}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["patch"], url_path="settings")
     def update_settings(self, request, pk=None):

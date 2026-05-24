@@ -11,15 +11,21 @@ from apps.accounts.models import AccountTier, Subscription, UsageQuota
 from .tier_presets import TIER_PRESETS
 
 
+# Canonical tier hierarchy — matches TIER_PRESETS order exactly.
+# 'basic' was renamed to 'free' during tier system rollout; handled via alias below.
 TIER_HIERARCHY = [
     "free",
-    "basic",
     "pro",
     "business",
     "business pro",
     "partner",
     "partner pro",
 ]
+
+# Legacy or alternative tier names that map to a canonical name above.
+TIER_NAME_ALIASES: dict[str, str] = {
+    "basic": "free",  # renamed during tier system rollout
+}
 
 UNLIMITED_TOKENS = {"unlimited", "infinite", "none", "no-limit", "no_limit", "∞"}
 
@@ -29,12 +35,16 @@ def get_user_tier(user) -> AccountTier | None:
     if sub and sub.tier:
         return sub.tier
     if hasattr(user, "tier"):
-        return AccountTier.objects.filter(name__iexact=user.tier).first()
+        # Resolve aliases (e.g. 'basic' → 'free') before querying the DB.
+        canonical = _normalize_tier_name(user.tier)
+        if canonical:
+            return AccountTier.objects.filter(name__iexact=canonical).first()
     return None
 
 
 def _normalize_tier_name(name: str | None) -> str:
-    return (name or "").strip().lower()
+    normalized = (name or "").strip().lower()
+    return TIER_NAME_ALIASES.get(normalized, normalized)
 
 
 def _tier_weight(name: str | None) -> int:

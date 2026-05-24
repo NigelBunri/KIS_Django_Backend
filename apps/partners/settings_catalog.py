@@ -22,6 +22,17 @@ PARTNER_SETTINGS_SECTIONS: List[Dict] = [
         "features": [
             {"key": "org_apps_catalog", "title": "App catalog", "description": "List and manage organization apps.", "access": ["owner", "admin", "manager"]},
             {"key": "org_apps_bible", "title": "Bible app", "description": "Configure the bible experience that KCAN maintains.", "access": ["owner", "admin", "manager"]},
+            {"key": "org_apps_builder", "title": "App Builder", "description": "Build custom tab apps with layouts, pages, and content blocks.", "access": ["owner", "admin", "manager"]},
+        ],
+    },
+    {
+        "key": "location_attendance",
+        "title": "Location & Attendance",
+        "description": "Manage geofenced attendance events for meetings, services, classes, and field assignments.",
+        "features": [
+            {"key": "location_events", "title": "Location Events", "description": "Create and manage geofenced attendance events.", "access": ["owner", "admin", "manager"]},
+            {"key": "location_attendance_report", "title": "Attendance Reports", "description": "View check-in lists, arrival order, and export attendance.", "access": ["owner", "admin", "manager", "analyst"]},
+            {"key": "location_consent_settings", "title": "Consent Settings", "description": "View member consent status for location attendance.", "access": ["owner", "admin"]},
         ],
     },
     {

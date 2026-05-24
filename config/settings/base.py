@@ -258,6 +258,7 @@ INSTALLED_APPS = [
     "apps.health_dashboard.apps.HealthDashboardConfig",
     "apps.feed_personalization.apps.FeedPersonalizationConfig",
     "apps.bible.apps.BibleConfig",
+    "apps.location.apps.LocationConfig",
     "admin_control.apps.AdminControlConfig",
 ]
 

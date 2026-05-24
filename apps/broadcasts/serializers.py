@@ -438,6 +438,7 @@ class ChannelAnalyticsDailyRollupSerializer(serializers.ModelSerializer):
 class ChannelLiveStreamSerializer(serializers.ModelSerializer):
     channel = BroadcastChannelSummarySerializer(read_only=True)
     content_id = serializers.UUIDField(source="content.id", read_only=True)
+    ingest_url = serializers.SerializerMethodField()
     stream_key_available = serializers.SerializerMethodField()
 
     class Meta:
@@ -467,8 +468,28 @@ class ChannelLiveStreamSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    def _can_view_ingest_details(self, obj: ChannelLiveStream) -> bool:
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not getattr(user, "is_authenticated", False):
+            return False
+        if obj.channel.owner_user_id and obj.channel.owner_user_id == user.id:
+            return True
+        return BroadcastChannelRole.objects.filter(
+            channel=obj.channel,
+            user=user,
+            role__in=[
+                BroadcastChannelRole.Role.OWNER,
+                BroadcastChannelRole.Role.MANAGER,
+                BroadcastChannelRole.Role.EDITOR,
+            ],
+        ).exists()
+
+    def get_ingest_url(self, obj: ChannelLiveStream) -> str:
+        return obj.ingest_url if self._can_view_ingest_details(obj) else ""
+
     def get_stream_key_available(self, obj: ChannelLiveStream) -> bool:
-        return bool(obj.stream_key_hash)
+        return bool(obj.stream_key_hash and self._can_view_ingest_details(obj))
 
 
 def _education_humanize(value) -> str:

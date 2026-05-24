@@ -1191,7 +1191,7 @@ class PartnerOrganizationAppContentBlockSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_by", "published_at", "created_at", "updated_at"]
+        read_only_fields = ["id", "tab", "created_by", "published_at", "created_at", "updated_at"]
 
 
 class PartnerOrganizationAppTabSerializer(serializers.ModelSerializer):
@@ -1219,7 +1219,7 @@ class PartnerOrganizationAppTabSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "content_blocks", "created_at", "updated_at"]
+        read_only_fields = ["id", "app", "content_blocks", "created_at", "updated_at"]
 
     def get_content_blocks(self, obj):
         request = self.context.get("request")

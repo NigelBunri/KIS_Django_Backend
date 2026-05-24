@@ -47,6 +47,59 @@ Set realistic targets with the business owner before launch:
 - [Secret Rotation](SECRET_ROTATION_RUNBOOK.md)
 - [Security Incident Response](SECURITY_INCIDENT_RESPONSE_RUNBOOK.md)
 
+## First-Deployment Steps (one-time, order matters)
+
+Run these in sequence on every fresh production deployment before opening traffic.
+
+### 1. Apply migrations
+
+```bash
+python3 manage.py migrate --noinput
+```
+
+### 2. Run Django system checks
+
+```bash
+python3 manage.py check --deploy
+```
+
+Fix every warning before proceeding.
+
+### 3. Collect static files
+
+```bash
+python3 manage.py collectstatic --noinput
+```
+
+### 4. Create the KCAN super-admin (Nigel — GO)
+
+This is idempotent — safe to re-run on subsequent deployments.
+
+**Set the password in your secret manager / hosting provider environment variables
+before running this command. Never pass the password as a shell argument in CI logs.**
+
+```bash
+# Recommended: read from environment variable (set in Render / secret manager)
+KCAN_SUPERADMIN_PASSWORD=<from-secret-manager> python3 manage.py setup_kcan_superadmin
+
+# Alternative: pass directly (avoid in CI; value appears in process list)
+python3 manage.py setup_kcan_superadmin --password <secret>
+```
+
+**What it does:**
+- Creates the `nigelbunribah@gmail.com` / `nigel` user as `is_superuser=True`, tier `Partner Pro`
+- Creates or confirms ownership of the `kcan` Partner organisation
+- Assigns the `super_admin` role with full admin_control access
+- Idempotent: if user/partner/role already exist, it updates only what has changed — password is **not** changed on subsequent runs
+
+**Required env var:** `KCAN_SUPERADMIN_PASSWORD` — no default; command aborts if missing and the account does not yet exist.
+
+### 5. Verify the admin hub is accessible
+
+Log in as `nigelbunribah@gmail.com`, open the Partners tab, navigate to the KCAN partner, and confirm the **Admin Hub** button is visible and the KCAN Admin Dashboard opens.
+
+---
+
 ## Release Readiness Rule
 
 Do not deploy to production unless:

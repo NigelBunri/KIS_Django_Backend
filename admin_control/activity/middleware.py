@@ -26,7 +26,7 @@ class AdminControlActivityMiddleware(MiddlewareMixin):
             duration_ms = (time.time() - getattr(request, "_admin_control_start", time.time())) * 1000.0
             try:
                 record = _activity_logger.log_request(
-                    user_id=str(request.user.pk) if request.user and request.user.is_authenticated else "anonymous",
+                    user_id=str(request.user.pk) if request.user and request.user.is_authenticated else None,
                     path=path,
                     method=request.method,
                     ip=request.META.get("REMOTE_ADDR", "0.0.0.0"),

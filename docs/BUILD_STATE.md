@@ -1,4 +1,263 @@
 
+## 2026-05-24 - Partners System Final Blockers
+
+### Scope
+
+Three remaining blockers identified after completion audit.
+
+#### 1. KCAN superadmin default password removed
+
+`apps/partners/management/commands/setup_kcan_superadmin.py`
+
+- Removed `default="admin1234!"` from `--password` argument
+- Command now reads password from `KCAN_SUPERADMIN_PASSWORD` env var or `--password` flag
+- If neither is provided and the account does not yet exist → `CommandError` (hard fail, production-safe)
+- If neither is provided and the account already exists → prints a warning and continues without changing the password (idempotent update path)
+- New accounts can never be created without a password
+
+**Production usage:**
+```
+KCAN_SUPERADMIN_PASSWORD=<secret> python manage.py setup_kcan_superadmin
+```
+
+#### 2. Geolocation target scope enforcement
+
+`apps/location/views.py`
+
+Added `_user_in_target_scope(event, user, partner)` helper and called it in `LocationCheckinView.post()` immediately after consent verification.
+
+| `target_type` | Enforcement |
+|---|---|
+| `all` | Always passes |
+| `roles` | Checks `PartnerMembership.role in event.target_roles` |
+| `users` | Checks `str(user.id) in event.target_user_ids` |
+| `community` | Checks `CommunityMembership` (left_at=None, is_banned=False) |
+| `group` | Checks `core.Membership` via generic FK + STATUS_ACTIVE |
+| `channel` | Checks `BroadcastChannelSubscription` |
+
+Returns HTTP 403 `"You are not in the target audience for this event."` if the user is out of scope.
+
+5 new tests added covering: `all` scope allows any member, `roles` scope allows matching / blocks non-matching, `users` scope allows listed / blocks unlisted.
+
+#### 3. App Builder template list completed
+
+`src/components/partners/AppBuilderPanel.tsx`
+
+Added `'partner_geolocation_attendance'` to the `TEMPLATES` const. The template now appears in the tab template picker when building apps, consistent with the runtime support in `OrganizationAppScreen.tsx`.
+
+### Tests
+
+**78 tests pass** (was 73 — 5 new target scope tests added). Zero regressions.
+`manage.py check` clean. Zero new TypeScript errors.
+
+---
+
+## 2026-05-24 - KIS Partners System Completion Sprint
+
+### Scope completed
+
+Full completion pass on the KIS Partners / KCAN system. Bug fixes, 5 new admin sub-panels, and geolocation UX improvements.
+
+#### Bug Fixes
+
+**1. `organization_app_access_log` GET handler silently broken**
+- `apps/partners/views.py` line 2130: `request.method == "get"` → `"GET"` (HTTP methods are always uppercase in Django)
+- Without this fix, GET requests to the access log endpoint would fall through to the POST branch and always fail with 400
+
+**2. Anonymous UUID crash in `SuspiciousActivityDetector`**
+- `admin_control/activity/middleware.py`: changed `user_id="anonymous"` → `None` for unauthenticated requests
+- `admin_control/audit/logging.py`: guarded `actor_id=actor` ORM filter — only applies when `actor` is truthy, otherwise queries without the actor constraint
+- Without this fix, any unauthenticated request through the admin control middleware caused `ValidationError: "anonymous" is not a valid UUID` logged as an error
+
+#### KCAN Admin Dashboard — 5 new sub-panels
+
+Five nav cards that previously had `onPress={() => {}}` are now fully functional:
+
+| Card | Panel | Data source |
+|------|-------|-------------|
+| Analytics & Insights | `AdminAnalyticsPanel` | `/analytics/revenue/` + `/analytics/engagement/` |
+| Partner Organisations | `AdminPartnersPanel` | `/partners/` + `/partners/stats/` |
+| Verification Queue | `AdminVerificationPanel` | `/content/queue/` + `/content/summary/` |
+| System Health | `AdminSystemHealthPanel` | `/live/metrics/` + `/monitoring/alerts/` + `/monitoring/performance/` |
+| Audit Trail | `AdminAuditTrailPanel` | `/audit/entries/` with severity filter |
+
+Revenue KPI tile and Partners KPI tile on the main dashboard are also now wired to their respective panels.
+Verification Queue nav card shows a pending-count badge when items exist.
+
+**Architecture:**
+- Each panel follows the same hook + component pattern as `AdminUsersPanel` / `AdminContentPanel`
+- All hooks: `useMemo` panel width, `Animated.Value` translate, `open/close` animation, `load` on open
+- `AdminDashboardPanel` props updated with 5 new `onOpen*` callbacks
+- `PartnersScreen.tsx` instantiates 5 new hooks, passes `onOpen*` to dashboard, renders 5 new panels
+
+#### Geolocation UX Improvements
+
+`GeolocationPanel.tsx` create-event form:
+- **Date/time fields**: replaced raw ISO 8601 `TextInput` with `_DateTimeField` component using `@react-native-community/datetimepicker`
+  - iOS: spinner mode for date, separate time edit button
+  - Android: calendar → clock two-step (native Android date/time modal)
+  - Displays human-readable date+time, stores ISO string
+- **Location picker**: replaced bare lat/lng TextInputs with a primary "📍 Use My Current Location" button using `navigator.geolocation.getCurrentPosition` (one-shot, no background)
+  - Shows captured coordinates in a gold-bordered display with a clear button
+  - Falls back to manual coordinate inputs below "— or enter manually —" separator
+  - On failure, shows an Alert with instructions to enter coordinates manually
+
+### Tests
+
+All 53 tests pass (26 location + 27 admin_control) — no regressions.
+TypeScript: 0 new errors (only 2 pre-existing errors in SocketProvider.tsx and CameraCaptureModal.tsx unrelated to this work).
+`python3 manage.py check`: 0 issues.
+
+### Files changed
+
+**Backend (modified)**
+- `apps/partners/views.py` — `"get"` → `"GET"` fix in `organization_app_access_log`
+- `admin_control/activity/middleware.py` — `user_id=None` for unauthenticated requests
+- `admin_control/audit/logging.py` — guard `actor_id=actor` filter against None/anonymous
+
+**Frontend (new)**
+- `src/screens/tabs/partners/useAdminAnalyticsPanel.ts`
+- `src/screens/tabs/partners/useAdminPartnersPanel.ts`
+- `src/screens/tabs/partners/useAdminVerificationPanel.ts`
+- `src/screens/tabs/partners/useAdminSystemHealthPanel.ts`
+- `src/screens/tabs/partners/useAdminAuditTrailPanel.ts`
+- `src/components/partners/AdminAnalyticsPanel.tsx`
+- `src/components/partners/AdminPartnersPanel.tsx`
+- `src/components/partners/AdminVerificationPanel.tsx`
+- `src/components/partners/AdminSystemHealthPanel.tsx`
+- `src/components/partners/AdminAuditTrailPanel.tsx`
+
+**Frontend (modified)**
+- `src/components/partners/AdminDashboardPanel.tsx` — 5 new `onOpen*` props + wired all 5 nav cards
+- `src/screens/tabs/PartnersScreen.tsx` — 5 new hooks + 5 new panel renders + 5 new `onOpen*` passed to dashboard
+- `src/components/partners/GeolocationPanel.tsx` — native date/time picker + location capture button
+
+---
+
+## 2026-05-24 - Partner Pro Geolocation & Attendance
+
+### Scope completed
+
+Full geolocation-based attendance management system for churches, ministries, schools, and organizations.
+
+**Backend — new `apps/location` Django app**
+
+- 5 models: `PartnerLocationEvent`, `PartnerLocationZone`, `PartnerLocationAttendance`, `PartnerLocationConsent`, `PartnerLocationAuditLog`
+- Full migration (0001_initial.py) with proper FK dependencies on partners + accounts
+- Registered in `INSTALLED_APPS` and wired to `/api/v1/partners/<id>/location/…`
+
+**API endpoints (all under `/api/v1/partners/<partner_id>/location/`)**
+
+| Method | Path | Who |
+|--------|------|-----|
+| GET/POST | `events/` | member list / admin create |
+| GET/PATCH/DELETE | `events/<id>/` | member get / admin update/delete |
+| POST | `events/<id>/checkin/` | member (consent required, geofence enforced) |
+| GET | `events/<id>/my-status/` | member |
+| GET | `events/<id>/attendance/` | admin |
+| POST | `events/<id>/attendance/manual-checkin/` | admin |
+| GET | `events/<id>/attendance/export/` | admin (CSV) |
+| GET/POST | `events/<id>/zones/` | extra geofence zones |
+| GET/POST | `consent/` | member grant/revoke |
+| GET | `audit/` | admin audit log |
+| GET | `events/<id>/audit/` | per-event audit log |
+
+**Safety design**
+- No silent tracking: member must explicitly tap "Check In"
+- No background location: `enableHighAccuracy` one-shot only
+- Precise lat/lng discarded immediately; only rounded distance (to nearest 10 m) stored
+- Consent required and revocable; tracked per user per partner
+- Rate limit: 60-second gap between check-in attempts
+- Arrival numbers assigned atomically with `SELECT FOR UPDATE` + `MAX() + 1`
+- `unique_together = [("event", "user")]` prevents duplicate attendance records
+- Admins see member names + arrival order; members see only their own number (unless admin enables public list)
+- Export CSV omits coordinates
+
+**Audit trail**
+- `event_created/updated/deleted`, `zone_changed`, `checkin_recorded`, `checkin_manual`, `attendance_adjusted`, `report_exported`, `consent_granted/revoked`
+
+**Settings catalog**
+- Backend: `location_attendance` section added with 3 features
+- Frontend: same section added to `partnerSettingsData.ts`
+- Backend: `org_apps_builder` added to `organization_apps` section (was referenced but missing)
+- Frontend: `org_apps_builder` added to `partnerSettingsData.ts`
+
+**Frontend**
+
+- `useGeolocationPanel.ts` — slide-in panel hook (same pattern as AppBuilder)
+- `useGeolocationData.ts` — full CRUD + check-in + consent data hook
+- `GeolocationPanel.tsx` — admin panel: create events, view attendance, manage status; member panel: consent + check-in + arrival number display
+- `LocationAttendanceTemplate.tsx` — full-screen template for use inside any Partner App tab when `config.template = "partner_geolocation_attendance"`
+- `OrganizationAppScreen.tsx` — added `partner_geolocation_attendance` to `TabConfig` type, `TEMPLATE_LABELS`, and `renderTabContent`
+- `PartnersScreen.tsx` — added `useGeolocationPanel`, `GeolocationPanel`, `handleOpenGeolocation`, and routing in `handleOpenFeature`
+- `broadcastRoutes.ts` — 10 new location route functions added
+
+**App Builder integration**
+- Partners can add a tab with `template = "partner_geolocation_attendance"` in any bottom/top/side layout
+- Template inherits app brand colours and theme
+- Uses same KIS backend permissions, consent, audit, and safety rules
+
+### Tests
+
+26 backend tests covering:
+- Admin/member/stranger permission checks
+- Draft event not visible to members, visible to admins
+- Consent grant and revoke with audit log
+- Check-in inside geofence (201) and outside geofence (400)
+- Duplicate check-in returns 200 + `already_checked_in: true`
+- Closed event check-in returns 404
+- Missing lat/lng returns 400
+- Sequential arrival numbers for 5 concurrent members
+- No duplicate arrival numbers
+- Admin attendance list (200) vs member (403)
+- Member `my-status` with and without arrival list
+- Admin manual check-in
+- Audit log on event creation and admin log view
+
+All 53 tests pass (26 location + 27 admin_control).
+
+### Risks
+
+- No background-tracking guard on iOS/Android above native layer — must not be added without explicit consent + privacy review
+- Child/youth accounts: stricter policy documented in model (`is_minor`), enforcement is at admin/guardian level (not yet auto-enforced in API)
+- `navigator.geolocation` availability: falls back to error state if not available (e.g., emulator without mock location)
+
+### Blockers
+
+None. All endpoints, models, and frontend components are production-ready.
+
+### Files changed
+
+**Backend (new)**
+- `apps/location/__init__.py`
+- `apps/location/apps.py`
+- `apps/location/models.py`
+- `apps/location/serializers.py`
+- `apps/location/views.py`
+- `apps/location/urls.py`
+- `apps/location/migrations/__init__.py`
+- `apps/location/migrations/0001_initial.py`
+- `apps/location/tests.py`
+
+**Backend (modified)**
+- `config/settings/base.py` — added `apps.location.apps.LocationConfig`
+- `config/urls.py` — added location URL include
+- `apps/partners/settings_catalog.py` — added `org_apps_builder` + `location_attendance` sections
+
+**Frontend (new)**
+- `src/screens/tabs/partners/useGeolocationPanel.ts`
+- `src/screens/tabs/partners/hooks/useGeolocationData.ts`
+- `src/components/partners/GeolocationPanel.tsx`
+- `src/components/partners/LocationAttendanceTemplate.tsx`
+
+**Frontend (modified)**
+- `src/network/routes/broadcastRoutes.ts` — 10 new location routes
+- `src/screens/tabs/PartnersScreen.tsx` — geolocation panel + handleOpenFeature routing
+- `src/screens/partners/OrganizationAppScreen.tsx` — `partner_geolocation_attendance` template
+- `src/components/partners/settings/partnerSettingsData.ts` — new sections
+
+---
+
 ## 2026-05-18 - Device Compatibility Roadmap Phase 01
 
 ### Scope completed
