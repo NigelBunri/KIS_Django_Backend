@@ -1,4 +1,55 @@
 
+## 2026-05-24 - App Completion Sprint
+
+### Scope
+
+Full code-level completion pass: TypeScript errors, Coming Soon stubs, debug log elimination, backend circular import fix, new Payment & Billing engine UI.
+
+#### TypeScript errors fixed (0 remaining)
+
+- **`SocketProvider.tsx` lines 947-952**: 6 undefined names (`onChannelLiveStarted`, etc.) — handlers were defined inside `connect()` inner function, inaccessible to the cleanup closure. Removed the 6 redundant `.off()` calls (already covered by `removeAllListeners()` called immediately after).
+- **`CameraCaptureModal.tsx` line 62+165**: Added `useRef` to the React import.
+- **`src/languages/index.tsx`**: `react-native-localize` has no default export — changed `import RNLocalize from 'react-native-localize'` to named import `{ getLocales }`.
+
+#### 13 "Coming Soon" stubs replaced with real implementations
+
+| File | Feature | Implementation |
+|------|---------|---------------|
+| `BroadcastFeedSection.tsx` | Storefront browsing | `setMainSection('market')` navigation |
+| `BroadcastFeedSection.tsx` | Create lesson | Navigate to market + emit `market.studio.tab → lessons` |
+| `BroadcastFeedSection.tsx` | Follow broadcaster | POST `ROUTES.commerce.follows` with source id/type |
+| `BroadcastFeedSection.tsx` | Schedule reminder | Alert with live/all-content options → POST `channelNotificationPreference` |
+| `BroadcastFeedSection.tsx` | View insights | GET `channelAnalytics(channelId)` → display stats in Alert |
+| `MarketStudioSection.tsx` | Go Live Drop | `handleGoLiveDrop`: confirmation → POST live drop start |
+| `MarketStudioSection.tsx` | Schedule Drop (drops tab) | `handleScheduleDrop`: 4 time options → POST schedule |
+| `MarketStudioSection.tsx` | Schedule (per-product) | `handleScheduleDrop(product.id)` |
+| `MarketStudioSection.tsx` | Create Lesson | POST `ROUTES.broadcasts.lessons` → draft lesson |
+| `MarketStudioSection.tsx` | Attach Kit | Navigate to products tab + guidance alert |
+| `MarketProductsPage.tsx` | Drop scheduling | `handleScheduleProductDrop(product.id)` with time options |
+| `MarketProductsPage.tsx` | Product pinning | Local `AsyncStorage` pin state with toggle |
+| `MarketDropsPage.tsx` | Start Live Drop CTA | `handleStartLiveDrop()` confirmation + API call |
+
+#### Debug log elimination
+
+- All bare `console.log(...)` calls gated with `if (__DEV__)` across 24 source files
+- `babel-plugin-transform-remove-console` installed and configured in `babel.config.js` — strips all `console.log` in production builds, retains `warn` and `error`
+
+#### Backend: admin_control circular import fixed
+
+`admin_control/services/__init__.py`: removed `from .dashboard_service import DashboardService` auto-import (caused circular: `insights → micro → services/__init__ → dashboard_service → insights`). All callers already import `DashboardService` directly from `services.dashboard_service`.
+
+#### Frontend: Payment & Billing Engine panel added
+
+- Created `HealthEnginesDashboads/PaymentBillingManager.tsx` — full billing session management UI with start/list/refresh, status color coding, Flutterwave integration via `ROUTES.health.billingSessionStart`
+- Added `case "Payment & Billing Engine":` to `EngineModal.tsx` switch — previously fell through to "Management panel not implemented" default
+
+### Tests
+
+**58 tests pass** (31 location + 27 admin_control). Zero regressions.
+TypeScript: 0 errors. No remaining "Coming soon" stubs.
+
+---
+
 ## 2026-05-24 - Partners System Final Blockers
 
 ### Scope
