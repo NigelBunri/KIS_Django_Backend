@@ -156,6 +156,8 @@ class ChannelCreateSerializer(ChannelImageUrlSerializerMixin, serializers.ModelS
     (announcement / broadcast style), but you can tweak it.
     """
 
+    conversation_id = serializers.UUIDField(source="conversation.id", read_only=True)
+
     class Meta:
         model = Channel
         fields = [
@@ -170,6 +172,7 @@ class ChannelCreateSerializer(ChannelImageUrlSerializerMixin, serializers.ModelS
             "partner",
             "community",
             "category",
+            "conversation_id",
         ]
 
     def validate(self, attrs):

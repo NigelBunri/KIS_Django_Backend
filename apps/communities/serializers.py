@@ -154,6 +154,15 @@ class CommunityCreateSerializer(CommunityImageUrlSerializerMixin, serializers.Mo
         write_only=True,
         help_text="If true, create a posts conversation (feed) for this community.",
     )
+    main_conversation_id = serializers.UUIDField(
+        source="main_conversation.id",
+        read_only=True,
+    )
+    posts_conversation_id = serializers.UUIDField(
+        source="posts_conversation.id",
+        read_only=True,
+        required=False,
+    )
 
     class Meta:
         model = Community
@@ -166,6 +175,8 @@ class CommunityCreateSerializer(CommunityImageUrlSerializerMixin, serializers.Mo
             "avatar_url",
             "create_main_conversation",
             "create_posts_conversation",
+            "main_conversation_id",
+            "posts_conversation_id",
         ]
 
     def validate(self, attrs):
