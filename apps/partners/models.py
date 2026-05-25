@@ -1409,3 +1409,42 @@ class PartnerProfileLink(models.Model):
 
     def __str__(self):
         return f"{self.partner.name} - {self.profile_key}"
+
+
+class UserAppShortcut(models.Model):
+    """Tracks device home-screen shortcuts created by users for partner org apps."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="app_shortcuts",
+    )
+    app = models.ForeignKey(
+        "PartnerOrganizationApp",
+        on_delete=models.CASCADE,
+        related_name="shortcuts",
+        null=True,
+        blank=True,
+    )
+    partner = models.ForeignKey(
+        Partner,
+        on_delete=models.CASCADE,
+        related_name="shortcuts",
+    )
+    device_id = models.CharField(max_length=255, blank=True)
+    shortcut_name = models.CharField(max_length=128)
+    icon = models.URLField(blank=True)
+    deep_link = models.CharField(max_length=512)
+    pinned = models.BooleanField(default=False)
+    created_at = models.DateTimeField(default=timezone.now)
+    last_opened_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "user_app_shortcut"
+        indexes = [
+            models.Index(fields=["user", "partner"]),
+            models.Index(fields=["user", "device_id"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} → {self.shortcut_name}"

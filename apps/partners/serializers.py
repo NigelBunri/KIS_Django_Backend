@@ -132,7 +132,7 @@ class PartnerListSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSer
         user = getattr(request, "user", None)
         if not user or user.is_anonymous:
             return None
-        if obj.owner_id == user.id:
+        if obj.owner_id == user.id or user.is_superuser or user.is_staff:
             return BaseConversationRole.OWNER
         if not obj.main_conversation_id:
             return None
@@ -289,7 +289,7 @@ class PartnerDetailSerializer(PartnerImageUrlSerializerMixin, serializers.ModelS
         user = getattr(request, "user", None)
         if not user or user.is_anonymous:
             return None
-        if obj.owner_id == user.id:
+        if obj.owner_id == user.id or user.is_superuser or user.is_staff:
             return BaseConversationRole.OWNER
         if not obj.main_conversation_id:
             return None

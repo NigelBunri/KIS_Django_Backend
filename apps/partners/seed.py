@@ -14,10 +14,58 @@ KCAN_SYSTEM_USERNAME = "kcan"
 KCAN_SYSTEM_DISPLAY_NAME = "KCAN"
 LEGACY_DEFAULT_PARTNER_SLUGS = ["kcan", "cc", "kis", "christian-community-cc"]
 
+# Immutable platform General Overseer (GO) identity.
+GO_EMAIL = "nigelbunribah@gmail.com"
+GO_PHONE = "654008266"
+GO_COUNTRY = "CM"
+GO_USERNAME = "nigel"
+
+
+def ensure_go_identity() -> None:
+    """Enforce that the GO user always has superuser access and owns KCAN."""
+    try:
+        _ensure_go_identity()
+    except (OperationalError, ProgrammingError):
+        return
+    except Exception as exc:
+        logger.warning("[partners.seed] Unable to enforce GO identity: %s", exc)
+
+
+def _ensure_go_identity() -> None:
+    from apps.accounts.models import User
+    from apps.partners.models import Partner
+
+    user = (
+        User.objects.filter(email__iexact=GO_EMAIL).first()
+        or User.objects.filter(phone=GO_PHONE).first()
+    )
+    if not user:
+        logger.info("[partners.seed] GO user not found — will be enforced on first login.")
+        return
+
+    changed = []
+    if not user.is_superuser:
+        user.is_superuser = True
+        changed.append("is_superuser")
+    if not user.is_staff:
+        user.is_staff = True
+        changed.append("is_staff")
+    if changed:
+        user.save(update_fields=changed)
+        logger.info("[partners.seed] GO identity enforced on %s: %s", user.email, changed)
+
+    # Ensure GO is the owner of KCAN
+    kcan = Partner.objects.filter(slug=KCAN_PARTNER_SLUG).first()
+    if kcan and kcan.owner_id != user.id:
+        kcan.owner = user
+        kcan.save(update_fields=["owner"])
+        logger.info("[partners.seed] KCAN ownership transferred to GO (%s)", user.email)
+
 
 def ensure_kis_partner() -> None:
     try:
         _ensure_kis_partner()
+        ensure_go_identity()
     except (OperationalError, ProgrammingError):
         # Database not ready (e.g. during migrations/startup).
         return

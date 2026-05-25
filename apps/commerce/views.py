@@ -1119,6 +1119,130 @@ class SubscriptionViewSet(viewsets.ModelViewSet):
         serializer.save(user=self.request.user)
 
 
+POINT_EARNING_RULES = [
+    {
+        'key': 'profile_complete',
+        'title': 'Complete your profile',
+        'description': 'Fill in all profile fields and add a profile photo',
+        'points': 50,
+        'category': 'profile',
+        'icon': 'person',
+        'repeatable': False,
+    },
+    {
+        'key': 'email_verified',
+        'title': 'Verify your email',
+        'description': 'Confirm your email address to secure your account',
+        'points': 25,
+        'category': 'profile',
+        'icon': 'mail',
+        'repeatable': False,
+    },
+    {
+        'key': 'daily_login',
+        'title': 'Daily app engagement',
+        'description': 'Open and actively use the app each day',
+        'points': 5,
+        'category': 'engagement',
+        'icon': 'calendar',
+        'repeatable': True,
+    },
+    {
+        'key': 'first_purchase',
+        'title': 'First marketplace purchase',
+        'description': 'Complete your first order in the KIS marketplace',
+        'points': 100,
+        'category': 'market',
+        'icon': 'cart',
+        'repeatable': False,
+    },
+    {
+        'key': 'first_booking',
+        'title': 'Book a service or artist',
+        'description': 'Book a service or artist through KIS for the first time',
+        'points': 75,
+        'category': 'market',
+        'icon': 'bookmark',
+        'repeatable': False,
+    },
+    {
+        'key': 'leave_review',
+        'title': 'Leave a review',
+        'description': 'Write a genuine review for a product or service you purchased',
+        'points': 30,
+        'category': 'community',
+        'icon': 'star',
+        'repeatable': True,
+    },
+    {
+        'key': 'invite_friend',
+        'title': 'Invite a friend',
+        'description': 'Refer a friend who creates an account and uses KIS',
+        'points': 200,
+        'category': 'community',
+        'icon': 'people',
+        'repeatable': True,
+    },
+    {
+        'key': 'education_course',
+        'title': 'Complete an education course',
+        'description': 'Finish any education course, lesson, or certification program',
+        'points': 150,
+        'category': 'education',
+        'icon': 'school',
+        'repeatable': True,
+    },
+    {
+        'key': 'broadcast_post',
+        'title': 'Share quality content',
+        'description': 'Post meaningful content to your broadcast feed that your community engages with',
+        'points': 20,
+        'category': 'broadcast',
+        'icon': 'megaphone',
+        'repeatable': True,
+    },
+    {
+        'key': 'partner_active',
+        'title': 'Active partner organisation',
+        'description': 'Keep your partner organisation active, verified, and in good standing',
+        'points': 100,
+        'category': 'partner',
+        'icon': 'business',
+        'repeatable': True,
+    },
+    {
+        'key': 'health_activity',
+        'title': 'Log a health activity',
+        'description': 'Record a health check, appointment, or wellness activity',
+        'points': 15,
+        'category': 'health',
+        'icon': 'heart',
+        'repeatable': True,
+    },
+]
+
+POINT_REDEMPTION_OPTIONS = [
+    {
+        'key': 'tier_upgrade',
+        'title': 'Upgrade your account tier',
+        'description': 'Use points to reduce the cost of upgrading to a higher KIS account tier. Every 100 points = 1% off, up to 50% discount.',
+        'points_per_unit': 100,
+        'discount_value': '1% off tier upgrade price',
+        'max_discount_percent': 50,
+        'icon': 'arrow-up-circle',
+    },
+    {
+        'key': 'artist_discount',
+        'title': 'Artist & creator discount',
+        'description': 'Redeem points to reduce the cost of booking artists, musicians, or creators through the KIS marketplace. Every 50 points = 1% off, up to 30% discount.',
+        'points_per_unit': 50,
+        'discount_value': '1% off artist booking price',
+        'max_discount_percent': 30,
+        'icon': 'musical-notes',
+    },
+]
+
+
 @class_doc_decorator('Loyalty')
 class LoyaltyPointViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = LoyaltyPointSerializer
@@ -1129,6 +1253,39 @@ class LoyaltyPointViewSet(viewsets.ReadOnlyModelViewSet):
         if self.request.user.is_staff:
             return qs
         return qs.filter(user=self.request.user)
+
+    @action(detail=False, methods=['get'])
+    def balance(self, request):
+        from django.db.models import Sum
+        total = LoyaltyPoint.objects.filter(user=request.user).aggregate(
+            total=Sum('points')
+        )['total'] or 0
+        tier_name = None
+        try:
+            tier_obj = getattr(request.user, 'account', None)
+            if tier_obj:
+                tier_name = getattr(getattr(tier_obj, 'tier', None), 'name', None)
+        except Exception:
+            pass
+        recent = list(
+            LoyaltyPoint.objects.filter(user=request.user)
+            .order_by('-created_at')
+            .values('id', 'points', 'reason', 'earned_at', 'expires_at')[:10]
+        )
+        return Response({
+            'points': int(total),
+            'tier': tier_name,
+            'earning_rules': POINT_EARNING_RULES,
+            'redemption_options': POINT_REDEMPTION_OPTIONS,
+            'recent_history': recent,
+        })
+
+    @action(detail=False, methods=['get'])
+    def rules(self, request):
+        return Response({
+            'earning_rules': POINT_EARNING_RULES,
+            'redemption_options': POINT_REDEMPTION_OPTIONS,
+        })
 
 
 @class_doc_decorator('Follows')

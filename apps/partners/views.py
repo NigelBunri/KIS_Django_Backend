@@ -114,6 +114,7 @@ from apps.partners.serializers import (
     PartnerMemberDirectoryEntrySerializer,
 )
 from apps.partners.seed import KCAN_PARTNER_SLUG, LEGACY_DEFAULT_PARTNER_SLUGS
+from apps.partners.permissions import is_kcan_admin, IsKCANAdmin, PartnerScopedPermission
 from apps.moderation.models import UserBlock
 from apps.accounts.feature_gate import require_feature
 from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
@@ -3661,3 +3662,128 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
         except Exception:
             pass
         return Response({"detail": "Post broadcasted."}, status=status.HTTP_200_OK)
+
+
+class UserAppShortcutViewSet(viewsets.ViewSet):
+    """
+    Home-screen shortcut management for partner org apps.
+    Tracks real device shortcuts created via native Android/iOS APIs.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _get_partner(self, partner_id):
+        from apps.partners.models import Partner
+        try:
+            return Partner.objects.get(id=partner_id)
+        except Partner.DoesNotExist:
+            return None
+
+    def list(self, request):
+        from apps.partners.models import UserAppShortcut
+        qs = UserAppShortcut.objects.filter(user=request.user).select_related("partner", "app")
+        device_id = request.query_params.get("device_id")
+        if device_id:
+            qs = qs.filter(device_id=device_id)
+        data = [
+            {
+                "id": str(s.id),
+                "partner_id": str(s.partner_id),
+                "partner_name": s.partner.name,
+                "app_id": str(s.app_id) if s.app_id else None,
+                "app_name": s.app.name if s.app else None,
+                "device_id": s.device_id,
+                "shortcut_name": s.shortcut_name,
+                "icon": s.icon,
+                "deep_link": s.deep_link,
+                "pinned": s.pinned,
+                "created_at": s.created_at.isoformat(),
+                "last_opened_at": s.last_opened_at.isoformat() if s.last_opened_at else None,
+            }
+            for s in qs
+        ]
+        return Response(data)
+
+    def create(self, request):
+        from apps.partners.models import UserAppShortcut, PartnerOrganizationApp
+        d = request.data
+        partner_id = d.get("partner_id")
+        if not partner_id:
+            return Response({"detail": "partner_id required."}, status=status.HTTP_400_BAD_REQUEST)
+        partner = self._get_partner(partner_id)
+        if not partner:
+            return Response({"detail": "Partner not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        app = None
+        app_id = d.get("app_id")
+        if app_id:
+            try:
+                app = PartnerOrganizationApp.objects.get(id=app_id, partner=partner)
+            except PartnerOrganizationApp.DoesNotExist:
+                pass
+
+        device_id = d.get("device_id", "")
+        deep_link = d.get("deep_link") or f"kis://org-app/{app_id or partner_id}"
+        shortcut_name = d.get("shortcut_name") or (app.name if app else partner.name)
+        icon = d.get("icon", "")
+        pinned = bool(d.get("pinned", False))
+
+        # Prevent duplicate shortcuts per device
+        existing = UserAppShortcut.objects.filter(
+            user=request.user,
+            partner=partner,
+            device_id=device_id,
+            deep_link=deep_link,
+        ).first()
+        if existing:
+            return Response(
+                {"detail": "already_pinned", "id": str(existing.id)},
+                status=status.HTTP_200_OK,
+            )
+
+        shortcut = UserAppShortcut.objects.create(
+            user=request.user,
+            app=app,
+            partner=partner,
+            device_id=device_id,
+            shortcut_name=shortcut_name,
+            icon=icon,
+            deep_link=deep_link,
+            pinned=pinned,
+        )
+        log_partner_audit(partner, request.user, "shortcut.created", {"shortcut_id": str(shortcut.id), "device_id": device_id})
+        return Response({"detail": "created", "id": str(shortcut.id)}, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, pk=None):
+        from apps.partners.models import UserAppShortcut
+        try:
+            shortcut = UserAppShortcut.objects.get(id=pk, user=request.user)
+        except UserAppShortcut.DoesNotExist:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        partner = shortcut.partner
+        log_partner_audit(partner, request.user, "shortcut.removed", {"shortcut_id": pk})
+        shortcut.delete()
+        return Response({"detail": "removed."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="opened")
+    def update_last_opened(self, request, pk=None):
+        from apps.partners.models import UserAppShortcut
+        try:
+            shortcut = UserAppShortcut.objects.get(id=pk, user=request.user)
+        except UserAppShortcut.DoesNotExist:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        shortcut.last_opened_at = timezone.now()
+        shortcut.save(update_fields=["last_opened_at"])
+        return Response({"detail": "updated."})
+
+    @action(detail=False, methods=["get"], url_path="analytics")
+    def analytics(self, request):
+        """KCAN/admin analytics for shortcut usage across the platform."""
+        if not (request.user.is_staff or request.user.is_superuser):
+            raise PermissionDenied("Admin access required.")
+        from apps.partners.models import UserAppShortcut
+        from django.db.models import Count
+        qs = UserAppShortcut.objects.values("partner__name", "partner__slug").annotate(
+            total=Count("id"),
+            pinned_count=Count("id", filter=models.Q(pinned=True)),
+        ).order_by("-total")[:50]
+        return Response({"results": list(qs)})

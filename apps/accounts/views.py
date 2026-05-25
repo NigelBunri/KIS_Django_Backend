@@ -492,6 +492,7 @@ def _build_profile_payload(profile: Profile, viewer: Optional[User], request=Non
             "subscription": SubscriptionSerializer(subscription).data if subscription else None,
         }
 
+    is_self = bool(viewer and str(viewer.id) == owner_id_str)
     return {
         "user": {
             "id": owner.id,
@@ -505,6 +506,8 @@ def _build_profile_payload(profile: Profile, viewer: Optional[User], request=Non
             "phone_country_code": maybe(owner.phone_country_code, "contact_phone"),
             "phone_number": maybe(owner.phone_number, "contact_phone"),
             "email": maybe(owner.email, "contact_email"),
+            # Only expose privilege flags to the authenticated user viewing their own profile
+            **({"is_superuser": owner.is_superuser, "is_staff": owner.is_staff} if is_self else {}),
         },
         "profile": {
             "id": profile.id,
