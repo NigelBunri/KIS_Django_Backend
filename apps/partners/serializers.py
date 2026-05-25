@@ -1,5 +1,6 @@
 # apps/partners/serializers.py
 from django.db import models
+from django.utils.text import slugify
 from rest_framework import serializers
 from apps.media.safety import validate_attachment_metadata_for_safe_messaging
 
@@ -1196,6 +1197,7 @@ class PartnerOrganizationAppContentBlockSerializer(serializers.ModelSerializer):
 
 class PartnerOrganizationAppTabSerializer(serializers.ModelSerializer):
     content_blocks = serializers.SerializerMethodField()
+    slug = serializers.SlugField(max_length=120, required=False, allow_blank=True)
     visible_to = serializers.ListField(
         child=serializers.ChoiceField(choices=[(role, role.capitalize()) for role in PARTNER_ORG_APP_VISIBILITY_ROLES]),
         required=False,
@@ -1220,6 +1222,27 @@ class PartnerOrganizationAppTabSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "app", "content_blocks", "created_at", "updated_at"]
+
+    def _unique_slug(self, app, base_slug):
+        slug = base_slug[:120]
+        counter = 1
+        while PartnerOrganizationAppTab.objects.filter(app=app, slug=slug).exists():
+            suffix = f"-{counter}"
+            slug = base_slug[: 120 - len(suffix)] + suffix
+            counter += 1
+        return slug
+
+    def create(self, validated_data):
+        if not validated_data.get("slug"):
+            app = validated_data.get("app")
+            base = slugify(validated_data.get("title", "tab")) or "tab"
+            validated_data["slug"] = self._unique_slug(app, base)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if not validated_data.get("slug"):
+            validated_data.pop("slug", None)
+        return super().update(instance, validated_data)
 
     def get_content_blocks(self, obj):
         request = self.context.get("request")
