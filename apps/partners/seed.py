@@ -230,41 +230,12 @@ def _ensure_kis_partner() -> None:
         from apps.partners.models import PartnerOrganizationApp, PartnerOrganizationAppType
         ensure_partner_policy(partner)
         ensure_default_partner_roles(partner)
-        bible_app, _ = PartnerOrganizationApp.objects.get_or_create(
-            partner=partner,
-            type=PartnerOrganizationAppType.BIBLE,
-            defaults={
-                "name": "KCAN Bible",
-                "slug": "bible",
-                "description": "Official KCAN Bible experience.",
-                "link": "/bible",
-                "module": "partner.bible",
-                "metadata": {"internal": True, "immutable": True, "owner": "kcan"},
-                "status": "published",
-                "is_promoted_global": True,
-                "promoted_order": 20,
-                "order": 0,
-            },
-        )
-        bible_updates = {
-            "name": "KCAN Bible",
-            "slug": "bible",
-            "description": "Official KCAN Bible experience.",
-            "link": "/bible",
-            "module": "partner.bible",
-            "metadata": {"internal": True, "immutable": True, "owner": "kcan"},
-            "status": "published",
-            "is_promoted_global": True,
-            "promoted_order": 20,
-            "is_active": True,
-        }
-        changed = []
-        for field, value in bible_updates.items():
-            if getattr(bible_app, field) != value:
-                setattr(bible_app, field, value)
-                changed.append(field)
-        if changed:
-            bible_app.save(update_fields=[*changed, "updated_at"])
+        # The "KCAN Bible" org-app (type=BIBLE) is retired from auto-creation:
+        # it duplicated the main Bible tab and showed the same BibleScreen.
+        # Bible access for KCAN members is provided by the Bible tab in the
+        # main navigation. The Bible admin panel in PartnersCenterPane covers
+        # all content management. Existing records are preserved; new KCAN
+        # setups no longer auto-create this redundant floating app.
 
         if partner.main_conversation_id:
             _ensure_kis_members(partner.main_conversation)

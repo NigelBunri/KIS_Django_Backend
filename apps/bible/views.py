@@ -714,6 +714,38 @@ class PrayerRequestViewSet(viewsets.ModelViewSet):
         qs = PrayerRequest.objects.filter(is_public=True).order_by("-created_at")[:50]
         return Response(PrayerRequestSerializer(qs, many=True).data, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=["get"], url_path="admin-list")
+    def admin_list(self, request):
+        from apps.partners.permissions import is_kcan_admin
+        if not is_kcan_admin(request.user):
+            return Response({"detail": "Forbidden."}, status=status.HTTP_403_FORBIDDEN)
+        qs = (
+            PrayerRequest.objects.filter(is_public=True)
+            .select_related("user")
+            .order_by("-created_at")[:200]
+        )
+        data = []
+        for pr in qs:
+            d = PrayerRequestSerializer(pr).data
+            d["user_display"] = pr.user.get_full_name() or pr.user.username
+            data.append(d)
+        return Response(data)
+
+    @action(detail=True, methods=["post"], url_path="mark-prayed")
+    def mark_prayed(self, request, pk=None):
+        from apps.partners.permissions import is_kcan_admin
+        if not is_kcan_admin(request.user):
+            return Response({"detail": "Forbidden."}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            prayer = PrayerRequest.objects.get(pk=pk, is_public=True)
+        except PrayerRequest.DoesNotExist:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        prayer.answered = not prayer.answered
+        prayer.save(update_fields=["answered"])
+        d = PrayerRequestSerializer(prayer).data
+        d["user_display"] = prayer.user.get_full_name() or prayer.user.username
+        return Response(d)
+
 
 class ReadingPlanViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
