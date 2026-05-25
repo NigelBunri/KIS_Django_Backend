@@ -75,6 +75,7 @@ class Command(BaseCommand):
             user = self._ensure_user(password)
             partner = self._ensure_kcan_partner(user)
             self._ensure_admin_role(user)
+            self._ensure_kcan_verified(partner, user)
         self.stdout.write(self.style.SUCCESS(
             f"[setup_kcan_superadmin] Done — user: {user.email} | partner: {partner.slug} | role: {SUPER_ROLE_NAME}"
         ))
@@ -164,6 +165,11 @@ class Command(BaseCommand):
             defaults={"status": "member", "role": "admin"},
         )
         return partner
+
+    def _ensure_kcan_verified(self, partner, owner):
+        from apps.partners.seed import ensure_kcan_verified
+        ensure_kcan_verified()
+        self.stdout.write(f"  [verification] KCAN badges ensured")
 
     def _ensure_admin_role(self, user):
         from admin_control.roles import AdminRole, AdminRolePermission, AdminRoleAssignment

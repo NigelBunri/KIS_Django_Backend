@@ -31,6 +31,72 @@ def ensure_go_identity() -> None:
         logger.warning("[partners.seed] Unable to enforce GO identity: %s", exc)
 
 
+def ensure_kcan_verified() -> None:
+    """Ensure KCAN always has active verified_partner and official_partner badges."""
+    try:
+        _ensure_kcan_verified()
+    except (OperationalError, ProgrammingError):
+        return
+    except Exception as exc:
+        logger.warning("[partners.seed] Unable to verify KCAN: %s", exc)
+
+
+def _ensure_kcan_verified() -> None:
+    from apps.partners.models import Partner
+    from apps.verification.constants import (
+        VerificationBadgeCode,
+        VerificationBadgeStatus,
+        VerificationCaseStatus,
+        VerificationSubjectType,
+    )
+    from apps.verification.models import VerificationBadge, VerificationSubject
+
+    partner = Partner.objects.filter(slug=KCAN_PARTNER_SLUG).first()
+    if not partner:
+        return
+
+    subject, _ = VerificationSubject.objects.get_or_create(
+        subject_type=VerificationSubjectType.PARTNER,
+        subject_id=partner.id,
+        defaults={
+            "owner": partner.owner,
+            "display_name": partner.name,
+            "country": "CM",
+            "current_status": VerificationCaseStatus.APPROVED,
+            "current_level": "platform",
+        },
+    )
+
+    # Always keep status and level correct even if it already existed
+    changed = []
+    if subject.current_status != VerificationCaseStatus.APPROVED:
+        subject.current_status = VerificationCaseStatus.APPROVED
+        changed.append("current_status")
+    if subject.current_level != "platform":
+        subject.current_level = "platform"
+        changed.append("current_level")
+    if changed:
+        subject.save(update_fields=[*changed, "updated_at"])
+
+    # Issue the two platform badges
+    for code in (VerificationBadgeCode.VERIFIED_PARTNER, VerificationBadgeCode.OFFICIAL_PARTNER):
+        badge, created = VerificationBadge.objects.get_or_create(
+            subject=subject,
+            code=code,
+            defaults={
+                "status": VerificationBadgeStatus.ACTIVE,
+                "public": True,
+                "metadata": {"source": "platform", "immutable": True},
+            },
+        )
+        if not created and badge.status != VerificationBadgeStatus.ACTIVE:
+            badge.status = VerificationBadgeStatus.ACTIVE
+            badge.revoked_at = None
+            badge.revoke_reason = ""
+            badge.save(update_fields=["status", "revoked_at", "revoke_reason", "updated_at"])
+            logger.info("[partners.seed] Re-activated KCAN badge: %s", code)
+
+
 def _ensure_go_identity() -> None:
     from apps.accounts.models import User
     from apps.partners.models import Partner
@@ -66,6 +132,7 @@ def ensure_kis_partner() -> None:
     try:
         _ensure_kis_partner()
         ensure_go_identity()
+        ensure_kcan_verified()
     except (OperationalError, ProgrammingError):
         # Database not ready (e.g. during migrations/startup).
         return
