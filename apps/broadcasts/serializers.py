@@ -25,6 +25,20 @@ from .models import (
     ChannelContent,
     ChannelContentAsset,
     ChannelContentComment,
+    ChannelCommentReaction,
+    ChannelContentClip,
+    ChannelContentChapter,
+    ChannelContentSubtitle,
+    ChannelContentEndScreen,
+    ChannelContentCard,
+    ChannelActivityEvent,
+    ChannelLivePoll,
+    ChannelLivePollVote,
+    ChannelLiveQA,
+    ChannelLiveQAQuestion,
+    ChannelLiveQAQuestionUpvote,
+    CommentCreatorHeart,
+    ChannelWatchHistorySettings,
     ChannelModerationRecord,
     BroadcastLesson,
     LessonEnrollment,
@@ -312,6 +326,9 @@ class ChannelContentDetailSerializer(ChannelContentListSerializer):
 
 class ChannelContentCommentSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
+    like_count = serializers.SerializerMethodField()
+    is_liked = serializers.SerializerMethodField()
+    reply_count = serializers.SerializerMethodField()
 
     class Meta:
         model = ChannelContentComment
@@ -322,10 +339,14 @@ class ChannelContentCommentSerializer(serializers.ModelSerializer):
             "user_display",
             "body",
             "parent",
+            "is_pinned",
+            "like_count",
+            "is_liked",
+            "reply_count",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "content", "user", "user_display", "created_at", "updated_at"]
+        read_only_fields = ["id", "content", "user", "user_display", "is_pinned", "like_count", "is_liked", "reply_count", "created_at", "updated_at"]
 
     def get_user_display(self, obj: ChannelContentComment) -> str:
         user = obj.user
@@ -335,6 +356,25 @@ class ChannelContentCommentSerializer(serializers.ModelSerializer):
             or getattr(user, "phone", "")
             or "KIS user"
         )
+
+    def get_like_count(self, obj: ChannelContentComment) -> int:
+        return obj.reactions.count()
+
+    def get_is_liked(self, obj: ChannelContentComment) -> bool:
+        request = self.context.get("request")
+        if not request or not getattr(request.user, "is_authenticated", False):
+            return False
+        return obj.reactions.filter(user=request.user).exists()
+
+    def get_reply_count(self, obj: ChannelContentComment) -> int:
+        return obj.replies.filter(is_deleted=False).count()
+
+
+class ChannelContentChapterSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentChapter
+        fields = ["id", "content", "title", "start_seconds", "sort_order", "created_at", "updated_at"]
+        read_only_fields = ["id", "content", "created_at", "updated_at"]
 
 
 class BroadcastPlaylistItemSerializer(serializers.ModelSerializer):
@@ -2133,3 +2173,118 @@ class EducationProfileSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+
+class ChannelContentSubtitleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentSubtitle
+        fields = [
+            "id",
+            "content",
+            "language",
+            "label",
+            "vtt_url",
+            "segments",
+            "is_auto_generated",
+            "created_at",
+        ]
+        read_only_fields = ["id", "content", "created_at"]
+
+
+class ChannelContentEndScreenSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentEndScreen
+        fields = ["id", "content", "config", "is_enabled", "created_at", "updated_at"]
+        read_only_fields = ["id", "content", "created_at", "updated_at"]
+
+
+class ChannelContentCardSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentCard
+        fields = [
+            "id",
+            "content",
+            "card_type",
+            "title",
+            "start_seconds",
+            "end_seconds",
+            "target_id",
+            "url",
+            "sort_order",
+        ]
+        read_only_fields = ["id", "content"]
+
+
+class ChannelActivityEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelActivityEvent
+        fields = [
+            "id",
+            "channel",
+            "event_type",
+            "actor_display",
+            "target_type",
+            "target_id",
+            "metadata",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class ChannelLivePollSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelLivePoll
+        fields = [
+            "id",
+            "stream",
+            "question",
+            "options",
+            "status",
+            "created_at",
+            "ended_at",
+        ]
+        read_only_fields = ["id", "stream", "created_at"]
+
+
+class ChannelLiveQASerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelLiveQA
+        fields = ["id", "stream", "status", "created_at", "ended_at"]
+        read_only_fields = ["id", "stream", "created_at"]
+
+
+class ChannelLiveQAQuestionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelLiveQAQuestion
+        fields = [
+            "id",
+            "session",
+            "user",
+            "user_display",
+            "question_text",
+            "upvote_count",
+            "is_answered",
+            "is_pinned",
+            "is_hidden",
+            "created_at",
+        ]
+        read_only_fields = ["id", "session", "user", "upvote_count", "created_at"]
+
+
+class BroadcastChannelSubscriptionDetailSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField()
+    user_id = serializers.UUIDField(source="user.id", read_only=True)
+
+    class Meta:
+        model = BroadcastChannelSubscription
+        fields = ["id", "user_id", "user_display", "notifications", "created_at", "updated_at"]
+        read_only_fields = fields
+
+    def get_user_display(self, obj: BroadcastChannelSubscription) -> str:
+        user = obj.user
+        return (
+            getattr(user, "full_name", "")
+            or getattr(user, "username", "")
+            or getattr(user, "phone", "")
+            or "KIS user"
+        )
