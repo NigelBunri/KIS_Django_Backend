@@ -748,6 +748,13 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
             raise DRFValidationError({"detail": "Duplicate or invalid data."})
 
         upsert_device(user, device_id, device_platform or None, device_name or None, request)
+        # Send welcome email (non-blocking)
+        try:
+            if getattr(user, "email", None):
+                from apps.notifications.email_service import send_welcome_email
+                send_welcome_email(to_email=user.email)
+        except Exception:
+            pass
         user_payload = UserSerializer(user, context={"request": request}).data
         tokens = issue_tokens_for_user(user, device_id=device_id)
         resp = {**user_payload, **tokens}

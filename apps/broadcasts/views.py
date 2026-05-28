@@ -18236,16 +18236,104 @@ class ChannelMembershipView(APIView):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
         tier_id = str(request.data.get("tier_id") or "").strip()
         tier = get_object_or_404(ChannelMembershipTier, id=tier_id, channel=channel, is_active=True)
-        membership, created = ChannelMembership.objects.update_or_create(
-            user=request.user,
-            tier=tier,
-            defaults={
-                "status": ChannelMembership.Status.ACTIVE,
-                "payment_reference": str(request.data.get("payment_reference") or ""),
-                "expires_at": None,
-            },
-        )
-        return Response({"joined": True, "tier_id": str(tier.id), "created": created}, status=201 if created else 200)
+
+        if tier.price_cents > 0:
+            # Paid tier — create pending membership and initiate payment
+            membership, created = ChannelMembership.objects.update_or_create(
+                user=request.user,
+                tier=tier,
+                defaults={
+                    "status": "pending_payment",
+                    "payment_reference": "",
+                    "expires_at": None,
+                },
+            )
+            payment_provider = str(request.data.get("payment_provider") or "flutterwave").lower().strip()
+            redirect_url = str(request.data.get("redirect_url") or "").strip()
+
+            if payment_provider == "stripe":
+                from apps.billing.stripe_payments import is_configured as stripe_configured, create_checkout_session
+                if not stripe_configured():
+                    return Response({"error": "Stripe is not configured."}, status=503)
+                from django.conf import settings as _s
+                base_url = getattr(_s, "KIS_PUBLIC_WEB_BASE_URL", "https://kis.app")
+                result = create_checkout_session(
+                    amount_cents=tier.price_cents,
+                    currency=tier.currency,
+                    product_name=f"{tier.title} — {channel.name}",
+                    success_url=redirect_url or f"{base_url}/membership/success",
+                    cancel_url=redirect_url or f"{base_url}/membership/cancel",
+                    target_type="channel_membership",
+                    target_id=str(membership.id),
+                    user_id=str(request.user.id),
+                )
+                return Response({
+                    "payment_required": True,
+                    "payment_provider": "stripe",
+                    "checkout_url": result["checkout_url"],
+                    "membership_id": str(membership.id),
+                    "tier_id": str(tier.id),
+                }, status=202)
+            else:
+                # Flutterwave
+                from apps.billing.views import _flutterwave_payment_link, _flutterwave_headers
+                from django.conf import settings as _s
+                base_url = getattr(_s, "KIS_PUBLIC_WEB_BASE_URL", "https://kis.app")
+                flw_payload = {
+                    "tx_ref": f"KIS-MEM-{membership.id}",
+                    "amount": str(tier.price_cents / 100),
+                    "currency": tier.currency,
+                    "redirect_url": redirect_url or f"{base_url}/membership/success",
+                    "customer": {
+                        "email": getattr(request.user, "email", "") or "",
+                        "name": request.user.get_full_name() or str(request.user.username or ""),
+                    },
+                    "customizations": {
+                        "title": f"{tier.title} — {channel.name}",
+                        "description": tier.description or f"Membership tier for {channel.name}",
+                    },
+                    "meta": {
+                        "target_type": "channel_membership",
+                        "target_id": str(membership.id),
+                        "user_id": str(request.user.id),
+                    },
+                }
+                try:
+                    result = _flutterwave_payment_link(flw_payload)
+                    payment_url = (result or {}).get("data", {}).get("link") or ""
+                except Exception as exc:
+                    logger.warning("[Membership] Flutterwave link failed: %s", exc)
+                    payment_url = ""
+                return Response({
+                    "payment_required": True,
+                    "payment_provider": "flutterwave",
+                    "payment_url": payment_url,
+                    "membership_id": str(membership.id),
+                    "tier_id": str(tier.id),
+                }, status=202)
+        else:
+            # Free tier — activate immediately
+            membership, created = ChannelMembership.objects.update_or_create(
+                user=request.user,
+                tier=tier,
+                defaults={
+                    "status": ChannelMembership.Status.ACTIVE,
+                    "payment_reference": "",
+                    "expires_at": None,
+                },
+            )
+            # Send welcome email for free tiers too
+            try:
+                if getattr(request.user, "email", None):
+                    from apps.notifications.email_service import send_membership_email
+                    send_membership_email(
+                        to_email=request.user.email,
+                        tier_title=tier.title,
+                        channel_name=channel.name,
+                    )
+            except Exception:
+                pass
+            return Response({"joined": True, "tier_id": str(tier.id), "created": created}, status=201 if created else 200)
 
     def delete(self, request, channel_id):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)

@@ -16,7 +16,7 @@ from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.filters import OrderingFilter
-from rest_framework.permissions import BasePermission, IsAuthenticated, IsAdminUser
+from rest_framework.permissions import AllowAny, BasePermission, IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -89,6 +89,8 @@ from .services import (
     credits_to_cents,
     adjust_points,
 )
+
+logger = logging.getLogger(__name__)
 
 FLW_BASE_URL = "https://api.flutterwave.com/v3"
 def _flutterwave_headers() -> dict:
@@ -1479,6 +1481,37 @@ class FlutterwaveWebhookView(APIView):
                     reference=transaction_obj.tx_ref,
                     meta={"provider": "flutterwave"},
                 )
+            # Activate channel membership if payment metadata indicates it
+            _meta = transaction_obj.meta or {}
+            if _meta.get("target_type") == "channel_membership":
+                _mem_id = _meta.get("target_id")
+                _user_id = _meta.get("user_id")
+                if _mem_id and _user_id:
+                    try:
+                        from apps.broadcasts.models import ChannelMembership
+                        ChannelMembership.objects.filter(
+                            id=_mem_id, user_id=_user_id, status="pending_payment"
+                        ).update(status=ChannelMembership.Status.ACTIVE, payment_reference=str(tx_ref or ""))
+                    except Exception as _exc:
+                        logger.warning("[FLW webhook] membership activation failed: %s", _exc)
+            # Send payment receipt email
+            try:
+                user_id = getattr(transaction_obj.user, "id", None) if transaction_obj.user else None
+                amount = transaction_obj.amount_cents
+                currency = str(data.get("currency") or "USD")
+                from django.contrib.auth import get_user_model as _get_user_model
+                _User = _get_user_model()
+                _user_obj = _User.objects.filter(id=str(user_id or "")).first() if user_id else None
+                if _user_obj and getattr(_user_obj, "email", None):
+                    from apps.notifications.email_service import send_payment_receipt_email
+                    send_payment_receipt_email(
+                        to_email=_user_obj.email,
+                        amount=str(amount or ""),
+                        currency=str(currency or "USD"),
+                        tx_ref=str(tx_ref or ""),
+                    )
+            except Exception:
+                pass
         elif status_flag in ("failed", "cancelled"):
             transaction_obj.status = "failed" if status_flag == "failed" else "cancelled"
             meta = transaction_obj.meta or {}
@@ -1600,3 +1633,83 @@ class PromoCodeViewSet(viewsets.ModelViewSet):
     def public(self, request):
         active = PromoCode.objects.filter(is_active=True).order_by("-created_at")[:50]
         return Response({"results": PromoCodeSerializer(active, many=True).data}, status=status.HTTP_200_OK)
+
+
+class StripeWebhookView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, *args, **kwargs):
+        from apps.billing.stripe_payments import verify_webhook
+        sig_header = request.META.get("HTTP_STRIPE_SIGNATURE", "")
+        event = verify_webhook(request.body, sig_header)
+        if event is None:
+            return Response({"error": "Invalid signature"}, status=400)
+
+        event_type = event.get("type", "")
+        data_obj = (event.get("data") or {}).get("object") or {}
+
+        if event_type == "payment_intent.succeeded":
+            intent_id = data_obj.get("id") or ""
+            metadata = data_obj.get("metadata") or {}
+            target_type = metadata.get("target_type", "")
+            target_id = metadata.get("target_id", "")
+            user_id = metadata.get("user_id", "")
+            amount = int(data_obj.get("amount") or 0)
+            currency = str(data_obj.get("currency") or "usd").upper()
+            logger.info(
+                "[Stripe] payment_intent.succeeded intent=%s target=%s/%s user=%s amount=%s %s",
+                intent_id, target_type, target_id, user_id, amount, currency,
+            )
+            # Activate channel membership if this was a membership payment
+            if target_type == "channel_membership" and target_id and user_id:
+                try:
+                    from apps.broadcasts.models import ChannelMembership
+                    ChannelMembership.objects.filter(
+                        id=target_id,
+                        user_id=user_id,
+                        status="pending_payment",
+                    ).update(
+                        status=ChannelMembership.Status.ACTIVE,
+                        payment_reference=intent_id,
+                    )
+                    # Send confirmation email
+                    from django.contrib.auth import get_user_model
+                    _User = get_user_model()
+                    user_obj = _User.objects.filter(id=user_id).first()
+                    if user_obj and getattr(user_obj, "email", None):
+                        try:
+                            membership = ChannelMembership.objects.select_related("tier__channel").filter(id=target_id).first()
+                            if membership:
+                                from apps.notifications.email_service import send_membership_email
+                                send_membership_email(
+                                    to_email=user_obj.email,
+                                    tier_title=membership.tier.title,
+                                    channel_name=membership.tier.channel.name,
+                                )
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    logger.warning("[Stripe] membership activation failed: %s", exc)
+            # Send payment receipt email
+            try:
+                from django.contrib.auth import get_user_model
+                _User = get_user_model()
+                user_obj = _User.objects.filter(id=user_id).first()
+                if user_obj and getattr(user_obj, "email", None):
+                    from apps.notifications.email_service import send_payment_receipt_email
+                    send_payment_receipt_email(
+                        to_email=user_obj.email,
+                        amount=f"{amount / 100:.2f}",
+                        currency=currency,
+                        tx_ref=intent_id,
+                    )
+            except Exception:
+                pass
+
+        elif event_type == "checkout.session.completed":
+            session_id = data_obj.get("id") or ""
+            metadata = data_obj.get("metadata") or {}
+            logger.info("[Stripe] checkout.session.completed session=%s meta=%s", session_id, metadata)
+
+        return Response({"received": True})

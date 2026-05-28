@@ -6,6 +6,7 @@ from .views import (
     InsuranceClaimViewSet,
     PaymentDisputeViewSet,
     PricingInsightsView,
+    StripeWebhookView,
     WalletViewSet,
     WalletAdminViewSet,
     PromoCodeViewSet,
@@ -42,6 +43,7 @@ urlpatterns = [
     path("direct-payments/intents/", DirectPaymentIntentView.as_view(), name="direct-payment-intents"),
     path("direct-payments/webhook/flutterwave/", DirectPaymentFlutterwaveWebhookView.as_view(), name="direct-payment-flw-webhook"),
     path("wallet/webhook/flutterwave/", FlutterwaveWebhookView.as_view(), name="wallet-flw-webhook"),
+    path("billing/stripe/webhook/", StripeWebhookView.as_view(), name="stripe-webhook"),
 ]
 
 urlpatterns += [

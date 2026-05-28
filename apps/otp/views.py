@@ -50,10 +50,41 @@ def make_code_hash(phone: str, purpose: str, code: str) -> str:
     return hmac.new(key, msg, sha256).hexdigest()
 
 def send_sms_via_provider(phone: str, body: str) -> None:
+    """Send SMS via Infobip. Silently skips if not configured (dev mode)."""
+    import urllib.request as _req
+    import json as _json
+    api_key = getattr(settings, "INFOBIP_API_KEY", "") or ""
+    base = getattr(settings, "INFOBIP_BASE", "") or ""
+    if not api_key or not base:
+        logger.info("SMS not sent (Infobip not configured): %s", _masked_phone(phone))
+        return
+    url = f"{base.rstrip('/')}/sms/2/text/advanced"
+    payload = _json.dumps({
+        "messages": [{
+            "from": "KIS",
+            "destinations": [{"to": phone}],
+            "text": body,
+        }]
+    }).encode("utf-8")
+    request = _req.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"App {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
     try:
-        logger.info("SMS OTP queued to %s", _masked_phone(phone))
-    except Exception as e:
-        logger.warning("SMS send failed (dev non-fatal): %s", e)
+        with _req.urlopen(request, timeout=10) as resp:
+            status = resp.status
+            if status not in (200, 201):
+                logger.warning("Infobip SMS returned status %s for %s", status, _masked_phone(phone))
+            else:
+                logger.info("SMS sent via Infobip to %s", _masked_phone(phone))
+    except Exception as exc:
+        logger.warning("Infobip SMS failed for %s: %s", _masked_phone(phone), exc)
 
 def normalize_phone_input(phone: str, country: str = "CM") -> str:
     phone = (phone or "").strip()

@@ -37,6 +37,107 @@ def _claude_complete(
     return message.content[0].text
 
 
+def _get_openai_client():
+    try:
+        import openai
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        return openai.OpenAI(api_key=api_key)
+    except ImportError:
+        return None
+
+
+def _openai_complete(
+    client,
+    system_prompt: str,
+    user_prompt: str,
+    model: str | None = None,
+    max_tokens: int = 1024,
+) -> str:
+    model = model or os.environ.get("OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
+    response = client.chat.completions.create(
+        model=model,
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+
+def _get_gemini_client():
+    try:
+        import google.generativeai as genai
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return None
+        genai.configure(api_key=api_key)
+        model_name = os.environ.get("GEMINI_DEFAULT_MODEL", "gemini-1.5-flash")
+        return genai.GenerativeModel(model_name)
+    except ImportError:
+        return None
+
+
+def _gemini_complete(
+    client,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 1024,
+) -> str:
+    full_prompt = f"{system_prompt}\n\n{user_prompt}"
+    response = client.generate_content(
+        full_prompt,
+        generation_config={"max_output_tokens": max_tokens},
+    )
+    return response.text or ""
+
+
+def _ai_complete(system_prompt: str, user_prompt: str, max_tokens: int = 1024) -> str:
+    """
+    Dispatch to the configured AI provider.
+    KIS_AI_PROVIDER: anthropic | openai | gemini | groq
+    Falls back through the chain until one succeeds.
+    """
+    from django.conf import settings as _s
+    provider = str(getattr(_s, "KIS_AI_PROVIDER", "") or os.environ.get("KIS_AI_PROVIDER", "anthropic")).lower().strip()
+
+    providers_tried = []
+
+    # Try configured provider first, then fall back
+    order = [provider] + [p for p in ["anthropic", "openai", "gemini"] if p != provider]
+
+    for p in order:
+        providers_tried.append(p)
+        if p == "anthropic":
+            client = _get_claude_client()
+            if client:
+                try:
+                    return _claude_complete(client, system_prompt, user_prompt, max_tokens=max_tokens)
+                except Exception as exc:
+                    import logging as _log
+                    _log.getLogger(__name__).warning("Claude failed: %s", exc)
+        elif p == "openai":
+            client = _get_openai_client()
+            if client:
+                try:
+                    return _openai_complete(client, system_prompt, user_prompt, max_tokens=max_tokens)
+                except Exception as exc:
+                    import logging as _log
+                    _log.getLogger(__name__).warning("OpenAI failed: %s", exc)
+        elif p == "gemini":
+            client = _get_gemini_client()
+            if client:
+                try:
+                    return _gemini_complete(client, system_prompt, user_prompt, max_tokens=max_tokens)
+                except Exception as exc:
+                    import logging as _log
+                    _log.getLogger(__name__).warning("Gemini failed: %s", exc)
+
+    raise RuntimeError(f"No AI provider available. Tried: {providers_tried}. Check API keys.")
+
+
 def dispatch_job_to_model(job: AIJob) -> Dict[str, Any]:
     if job.job_type == 'TRANSLATION':
         return handle_translation(job)
@@ -60,27 +161,22 @@ def handle_translation(job: AIJob) -> Dict[str, Any]:
     if not text:
         return {'result_ref': f'translation:{tr.id}', 'payload': {'translated': ''}}
 
-    client = _get_claude_client()
-    if client:
-        try:
-            system = (
-                f"You are a professional translation engine. Translate the following text from "
-                f"{tr.source_lang} to {tr.target_lang}. Output ONLY the translated text — no "
-                "explanation, no preamble, no quotes."
-            )
-            translated = _claude_complete(
-                client, system, text,
-                max_tokens=min(4096, max(256, len(text) * 4)),
-            )
-            quality_score = 0.92
-        except Exception as exc:
-            translated = ''
-            quality_score = 0.0
-            job.metadata = {**job.metadata, 'translation_error': str(exc)}
-            job.save(update_fields=['metadata'])
-    else:
+    try:
+        system = (
+            f"You are a professional translation engine. Translate the following text from "
+            f"{tr.source_lang} to {tr.target_lang}. Output ONLY the translated text — no "
+            "explanation, no preamble, no quotes."
+        )
+        translated = _ai_complete(
+            system, text,
+            max_tokens=min(4096, max(256, len(text) * 4)),
+        )
+        quality_score = 0.92
+    except Exception as exc:
         translated = ''
         quality_score = 0.0
+        job.metadata = {**job.metadata, 'translation_error': str(exc)}
+        job.save(update_fields=['metadata'])
 
     tr.result_text = translated
     tr.quality_score = quality_score
@@ -146,17 +242,13 @@ def handle_summarization(job: AIJob) -> Dict[str, Any]:
     if not text:
         return {'result_ref': 'summarization:empty', 'payload': {'summary': ''}}
 
-    client = _get_claude_client()
-    if client:
-        try:
-            system = (
-                "You are a summarization engine. Produce a concise summary in 2-4 sentences. "
-                "Output ONLY the summary text."
-            )
-            summary = _claude_complete(client, system, text, max_tokens=300)
-        except Exception:
-            summary = ''
-    else:
+    try:
+        system = (
+            "You are a summarization engine. Produce a concise summary in 2-4 sentences. "
+            "Output ONLY the summary text."
+        )
+        summary = _ai_complete(system, text, max_tokens=300)
+    except Exception:
         summary = ''
 
     job.metadata = {**job.metadata, 'summary': summary}
@@ -167,20 +259,16 @@ def handle_summarization(job: AIJob) -> Dict[str, Any]:
 def handle_moderation(job: AIJob) -> Dict[str, Any]:
     text = job.metadata.get('text', '')
 
-    client = _get_claude_client()
-    if client:
-        try:
-            system = (
-                "You are a content moderation system for a social platform. "
-                "Analyze the content and respond with valid JSON only:\n"
-                '{"flagged": true/false, "categories": ["hate_speech"|"violence"|"spam"|"adult"|"self_harm"|"harassment"|"misinformation"], "confidence": 0.0-1.0, "reason": "short explanation"}'
-            )
-            raw = _claude_complete(client, system, f"Content:\n{text}", max_tokens=200)
-            result = json.loads(raw)
-        except Exception:
-            result = {'flagged': False, 'categories': [], 'confidence': 0.5, 'reason': 'moderation_unavailable'}
-    else:
-        result = {'flagged': False, 'categories': [], 'confidence': 0.0, 'reason': 'ai_not_configured'}
+    try:
+        system = (
+            "You are a content moderation system for a social platform. "
+            "Analyze the content and respond with valid JSON only:\n"
+            '{"flagged": true/false, "categories": ["hate_speech"|"violence"|"spam"|"adult"|"self_harm"|"harassment"|"misinformation"], "confidence": 0.0-1.0, "reason": "short explanation"}'
+        )
+        raw = _ai_complete(system, f"Content:\n{text}", max_tokens=200)
+        result = json.loads(raw)
+    except Exception:
+        result = {'flagged': False, 'categories': [], 'confidence': 0.5, 'reason': 'moderation_unavailable'}
 
     job.metadata = {**job.metadata, 'moderation_result': result}
     job.save(update_fields=['metadata'])
@@ -192,18 +280,14 @@ def handle_custom(job: AIJob) -> Dict[str, Any]:
     if not prompt:
         return {'result_ref': 'custom:empty', 'payload': {}}
 
-    client = _get_claude_client()
-    if client:
-        try:
-            mode = job.metadata.get('mode', 'general')
-            system = f"You are an AI assistant for the KIS platform. Mode: {mode}. Be helpful and concise."
-            response = _claude_complete(client, system, prompt, max_tokens=1024)
-        except Exception as exc:
-            response = ''
-            job.metadata = {**job.metadata, 'custom_error': str(exc)}
-            job.save(update_fields=['metadata'])
-    else:
+    try:
+        mode = job.metadata.get('mode', 'general')
+        system = f"You are an AI assistant for the KIS platform. Mode: {mode}. Be helpful and concise."
+        response = _ai_complete(system, prompt, max_tokens=1024)
+    except Exception as exc:
         response = ''
+        job.metadata = {**job.metadata, 'custom_error': str(exc)}
+        job.save(update_fields=['metadata'])
 
     job.metadata = {**job.metadata, 'response': response}
     job.save(update_fields=['metadata'])
