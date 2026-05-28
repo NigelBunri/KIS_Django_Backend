@@ -24,7 +24,7 @@ from django.utils.translation import gettext_lazy as _
 import pyotp
 import phonenumbers as _phonenumbers
 
-from rest_framework import viewsets, mixins, filters, status, serializers, permissions
+from rest_framework import viewsets, mixins, filters, status, serializers, permissions, generics
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
@@ -32,6 +32,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from django_filters.rest_framework import DjangoFilterBackend
+from django.contrib.auth import get_user_model
 
 from drf_spectacular.utils import (
     extend_schema, extend_schema_view, OpenApiResponse
@@ -70,6 +71,7 @@ from .models import (
     ProfileShowcase,
     UserContact,
     ApiToken,
+    UserConnection,
 )
 from .security_events import log_security_event, record_failed_auth, request_meta
 
@@ -98,8 +100,8 @@ from .serializers import (
 from .feature_gate import require_feature
 from .family_accessibility import serialize_family_accessibility_preferences, update_family_accessibility_preferences
 from .tiers import ensure_default_account_tiers, get_user_tier_features, public_account_tiers_qs
-from apps.partners.models import Partner
-from apps.partners.serializers import PartnerListSerializer
+from apps.partners.models import Partner, PartnerApplication, PartnerJobPost
+from apps.partners.serializers import PartnerListSerializer, PartnerApplicationDetailSerializer, PartnerJobPostSerializer
 from apps.commerce.models import LoyaltyPoint
 from apps.billing.models import WalletAccount, CreditAccount
 from apps.billing.services import credits_to_cents
@@ -1512,6 +1514,14 @@ class ProfileViewSet(viewsets.ModelViewSet):
         ).data
         payload["tiers"] = AccountTierSerializer(public_account_tiers_qs(), many=True).data
         payload.update(_partner_profile_summary(request.user, request))
+
+        # --- connection stats (own profile: count only, degree is always None) ---
+        connection_count = UserConnection.objects.filter(
+            Q(from_user=request.user) | Q(to_user=request.user),
+            status=UserConnection.STATUS_ACCEPTED,
+        ).count()
+        payload["connection_count"] = connection_count
+        payload["connection_degree"] = None
         return Response(payload)
 
     @action(detail=True, methods=["get"], permission_classes=[permissions.AllowAny], authentication_classes=JWT_AUTH)
@@ -1519,7 +1529,110 @@ class ProfileViewSet(viewsets.ModelViewSet):
         profile = self.get_object()
         viewer = request.user if getattr(request.user, "is_authenticated", False) else None
         payload = _build_profile_payload(profile, viewer, request=request)
+
+        # --- connection stats ---
+        connection_count = UserConnection.objects.filter(
+            Q(from_user=profile.user) | Q(to_user=profile.user),
+            status=UserConnection.STATUS_ACCEPTED,
+        ).count()
+
+        degree = None
+        me = request.user
+        if me.is_authenticated and me != profile.user:
+            is_first = UserConnection.objects.filter(
+                Q(from_user=me, to_user=profile.user) | Q(from_user=profile.user, to_user=me),
+                status=UserConnection.STATUS_ACCEPTED,
+            ).exists()
+            if is_first:
+                degree = 1
+            else:
+                my_ids = set(
+                    UserConnection.objects.filter(
+                        Q(from_user=me) | Q(to_user=me),
+                        status=UserConnection.STATUS_ACCEPTED,
+                    ).values_list("from_user_id", flat=True)
+                ) | set(
+                    UserConnection.objects.filter(
+                        Q(from_user=me) | Q(to_user=me),
+                        status=UserConnection.STATUS_ACCEPTED,
+                    ).values_list("to_user_id", flat=True)
+                )
+                my_ids.discard(me.id)
+                their_ids = set(
+                    UserConnection.objects.filter(
+                        Q(from_user=profile.user) | Q(to_user=profile.user),
+                        status=UserConnection.STATUS_ACCEPTED,
+                    ).values_list("from_user_id", flat=True)
+                ) | set(
+                    UserConnection.objects.filter(
+                        Q(from_user=profile.user) | Q(to_user=profile.user),
+                        status=UserConnection.STATUS_ACCEPTED,
+                    ).values_list("to_user_id", flat=True)
+                )
+                their_ids.discard(profile.user.id)
+                degree = 2 if (my_ids & their_ids) else 3
+
+        payload["connection_count"] = connection_count
+        payload["connection_degree"] = degree
         return Response(payload)
+
+    @action(detail=True, methods=["post"], url_path="endorse-skill", permission_classes=[IsAuthenticated], authentication_classes=JWT_AUTH)
+    def endorse_skill(self, request, pk=None):
+        profile_obj = self.get_object()
+        if profile_obj.user == request.user:
+            return Response({"detail": "Cannot endorse your own skill."}, status=400)
+        skill_id = request.data.get("skill_id")
+        if not skill_id:
+            return Response({"detail": "skill_id required."}, status=400)
+        skill = UserSkill.objects.filter(user=profile_obj.user, id=skill_id).first()
+        if not skill:
+            return Response({"detail": "Skill not found."}, status=404)
+        skill.endorsements = (skill.endorsements or 0) + 1
+        skill.save(update_fields=["endorsements"])
+        return Response({"endorsements": skill.endorsements})
+
+    @action(detail=False, methods=["post"], url_path="open-to-work", permission_classes=[IsAuthenticated], authentication_classes=JWT_AUTH)
+    def set_open_to_work(self, request):
+        profile_obj = Profile.objects.get(user=request.user)
+        profile_obj.open_to_work = bool(request.data.get("open_to_work", False))
+        profile_obj.save(update_fields=["open_to_work"])
+        return Response({"open_to_work": profile_obj.open_to_work})
+
+    @action(detail=False, methods=["get"], url_path="discover", permission_classes=[IsAuthenticated], authentication_classes=JWT_AUTH)
+    def discover(self, request):
+        qs = Profile.objects.select_related("user").filter(visibility="public")
+        open_to_work = request.query_params.get("open_to_work", "").strip()
+        industry = request.query_params.get("industry", "").strip()
+        skills = request.query_params.get("skills", "").strip()
+        search = request.query_params.get("search", "").strip()
+        if open_to_work in ("true", "1"):
+            qs = qs.filter(open_to_work=True)
+        if industry:
+            qs = qs.filter(industry__icontains=industry)
+        if search:
+            qs = qs.filter(
+                Q(headline__icontains=search) |
+                Q(bio__icontains=search) |
+                Q(user__display_name__icontains=search)
+            )
+        if skills:
+            for skill_name in [s.strip() for s in skills.split(",") if s.strip()]:
+                qs = qs.filter(user__user_skills__description__icontains=skill_name)
+        qs = qs[:50]
+        data = []
+        for p in qs:
+            data.append({
+                "id": str(p.user_id),
+                "profile_id": str(p.id),
+                "display_name": p.user.display_name or p.user.username,
+                "headline": p.headline or "",
+                "bio": (p.bio or "")[:200],
+                "industry": p.industry or "",
+                "avatar_url": p.avatar_url or "",
+                "open_to_work": p.open_to_work,
+                "completion_score": p.completion_score,
+            })
+        return Response(data)
 
 
 @extend_schema_view(
@@ -2164,3 +2277,167 @@ class CheckContact(APIView):
             results[phone] = {"registered": user_id is not None, "user_id": user_id}
 
         return Response({"results": results})
+
+
+# ---------------------------------------------------------------------------
+# ConnectionSerializer
+# ---------------------------------------------------------------------------
+class ConnectionSerializer(serializers.ModelSerializer):
+    from_user_id = serializers.UUIDField(source="from_user.id", read_only=True)
+    from_user_name = serializers.CharField(source="from_user.display_name", read_only=True)
+    from_user_avatar = serializers.SerializerMethodField()
+    to_user_id = serializers.UUIDField(source="to_user.id", read_only=True)
+    to_user_name = serializers.CharField(source="to_user.display_name", read_only=True)
+    to_user_avatar = serializers.SerializerMethodField()
+
+    class Meta:
+        model = UserConnection
+        fields = [
+            "id", "from_user_id", "from_user_name", "from_user_avatar",
+            "to_user_id", "to_user_name", "to_user_avatar",
+            "status", "note", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+    def get_from_user_avatar(self, obj):
+        p = getattr(obj.from_user, "profile", None)
+        return getattr(p, "avatar_url", "") or ""
+
+    def get_to_user_avatar(self, obj):
+        p = getattr(obj.to_user, "profile", None)
+        return getattr(p, "avatar_url", "") or ""
+
+
+# ---------------------------------------------------------------------------
+# ConnectionViewSet
+# ---------------------------------------------------------------------------
+class ConnectionViewSet(viewsets.ModelViewSet):
+    """Send, accept/reject, list, delete connections."""
+    permission_classes = [IsAuthenticated]
+    authentication_classes = JWT_AUTH
+    http_method_names = ["get", "post", "patch", "delete"]
+
+    def get_queryset(self):
+        user = self.request.user
+        return UserConnection.objects.filter(
+            Q(from_user=user) | Q(to_user=user)
+        ).select_related("from_user", "to_user").order_by("-created_at")
+
+    def get_serializer_class(self):
+        return ConnectionSerializer
+
+    def create(self, request, *args, **kwargs):
+        target_id = request.data.get("user_id")
+        if not target_id:
+            return Response({"detail": "user_id required."}, status=400)
+        UserModel = get_user_model()
+        try:
+            target = UserModel.objects.get(id=target_id)
+        except (UserModel.DoesNotExist, ValueError):
+            return Response({"detail": "User not found."}, status=404)
+        if target == request.user:
+            return Response({"detail": "Cannot connect to yourself."}, status=400)
+        existing = UserConnection.objects.filter(
+            Q(from_user=request.user, to_user=target) |
+            Q(from_user=target, to_user=request.user)
+        ).first()
+        if existing:
+            return Response(ConnectionSerializer(existing).data, status=200)
+        conn = UserConnection.objects.create(
+            from_user=request.user, to_user=target,
+            note=request.data.get("note", ""),
+        )
+        return Response(ConnectionSerializer(conn).data, status=201)
+
+    def partial_update(self, request, pk=None, **kwargs):
+        conn = get_object_or_404(UserConnection, pk=pk, to_user=request.user)
+        new_status = request.data.get("status")
+        if new_status not in (UserConnection.STATUS_ACCEPTED, UserConnection.STATUS_REJECTED, UserConnection.STATUS_BLOCKED):
+            return Response({"detail": "Invalid status."}, status=400)
+        conn.status = new_status
+        conn.save(update_fields=["status", "updated_at"])
+        return Response(ConnectionSerializer(conn).data)
+
+    @action(detail=False, methods=["get"], url_path="people-you-may-know")
+    def people_you_may_know(self, request):
+        """Suggest users with the same industry or mutual connections."""
+        user = request.user
+        profile = getattr(user, "profile", None)
+        industry = getattr(profile, "industry", "") or ""
+        connected_ids = set(
+            UserConnection.objects.filter(
+                Q(from_user=user) | Q(to_user=user),
+                status=UserConnection.STATUS_ACCEPTED,
+            ).values_list("from_user_id", flat=True)
+        ) | set(
+            UserConnection.objects.filter(
+                Q(from_user=user) | Q(to_user=user),
+                status=UserConnection.STATUS_ACCEPTED,
+            ).values_list("to_user_id", flat=True)
+        )
+        connected_ids.add(user.id)
+        UserModel = get_user_model()
+        if industry:
+            suggestions = UserModel.objects.exclude(id__in=connected_ids).filter(
+                profile__industry=industry
+            ).select_related("profile")[:20]
+        else:
+            suggestions = UserModel.objects.exclude(id__in=connected_ids).select_related("profile")[:20]
+        data = []
+        for u in suggestions:
+            p = getattr(u, "profile", None)
+            data.append({
+                "id": str(u.id),
+                "display_name": u.display_name or u.username,
+                "headline": getattr(p, "headline", ""),
+                "avatar_url": getattr(p, "avatar_url", ""),
+                "industry": getattr(p, "industry", ""),
+            })
+        return Response(data)
+
+
+# ---------------------------------------------------------------------------
+# MyApplicationsView
+# ---------------------------------------------------------------------------
+class MyApplicationsView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated]
+    authentication_classes = JWT_AUTH
+    serializer_class = PartnerApplicationDetailSerializer
+
+    def get_queryset(self):
+        return PartnerApplication.objects.filter(
+            user=self.request.user
+        ).select_related("partner", "job_post").order_by("-created_at")
+
+
+# ---------------------------------------------------------------------------
+# GlobalJobBoardView
+# ---------------------------------------------------------------------------
+class GlobalJobBoardView(generics.ListAPIView):
+    permission_classes = IS_AUTH_OR_RO
+    authentication_classes = JWT_AUTH
+    serializer_class = PartnerJobPostSerializer
+
+    def get_queryset(self):
+        qs = PartnerJobPost.objects.filter(is_active=True).select_related("partner").order_by("-created_at")
+        search = self.request.query_params.get("search", "").strip()
+        job_type = self.request.query_params.get("job_type", "").strip()
+        is_remote = self.request.query_params.get("is_remote", "").strip()
+        partner_id = self.request.query_params.get("partner_id", "").strip()
+        skills = self.request.query_params.get("skills", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(title__icontains=search) |
+                Q(description__icontains=search) |
+                Q(location__icontains=search)
+            )
+        if job_type:
+            qs = qs.filter(job_type=job_type)
+        if is_remote in ("true", "1"):
+            qs = qs.filter(is_remote=True)
+        if partner_id:
+            qs = qs.filter(partner_id=partner_id)
+        if skills:
+            for s in [x.strip() for x in skills.split(",") if x.strip()]:
+                qs = qs.filter(tags__icontains=s)
+        return qs

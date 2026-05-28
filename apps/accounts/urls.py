@@ -34,6 +34,9 @@ from .views import (
     SubscriptionViewSet,
     SessionViewSet,
     ApiTokenViewSet,
+    ConnectionViewSet,
+    GlobalJobBoardView,
+    MyApplicationsView,
 )
 
 # Optional: SimpleJWT endpoints (convenience here too)
@@ -65,6 +68,7 @@ router.register(r"educations", EducationViewSet, basename="educations")
 router.register(r"skills", UserSkillViewSet, basename="skills")
 router.register(r"projects", ProjectViewSet, basename="projects")
 router.register(r"recommendations", RecommendationViewSet, basename="recommendations")
+router.register(r"connections", ConnectionViewSet, basename="connections")
 
 urlpatterns = [
     # JWT login/logout you defined in views.py
@@ -88,6 +92,8 @@ urlpatterns = [
     path("auth/jwt/verify/",  TokenVerifyView.as_view(),    name="jwt-verify"),
     path("contacts/check", CheckContact.as_view(), name="check_contact"),
     path("users/check-contacts/", CheckContact.as_view(), name="check_contact_legacy"),
+    path("jobs/", GlobalJobBoardView.as_view(), name="global-job-board"),
+    path("my-applications/", MyApplicationsView.as_view(), name="my-applications"),
 
     path("", include(router.urls)),
 ]

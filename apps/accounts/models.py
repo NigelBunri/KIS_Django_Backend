@@ -372,6 +372,7 @@ class Profile(BaseEntity):
     completion_score = models.IntegerField(default=0, validators=[MinValueValidator(0)])
     visibility = models.CharField(max_length=50, default="public")
     branding_prefs = models.JSONField(default=dict, blank=True)
+    open_to_work = models.BooleanField(default=False)
 
     class Meta:
         verbose_name = "Profile"
@@ -907,6 +908,32 @@ class ProfileLanguage(BaseEntity):
     class Meta:
         indexes = [models.Index(fields=["user", "name"])]
         unique_together = ("user", "name")
+
+
+class UserConnection(models.Model):
+    STATUS_PENDING = "pending"
+    STATUS_ACCEPTED = "accepted"
+    STATUS_REJECTED = "rejected"
+    STATUS_BLOCKED = "blocked"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_ACCEPTED, "Accepted"),
+        (STATUS_REJECTED, "Rejected"),
+        (STATUS_BLOCKED, "Blocked"),
+    ]
+    from_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="sent_connections")
+    to_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="received_connections")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    note = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("from_user", "to_user")
+        indexes = [
+            models.Index(fields=["to_user", "status"]),
+            models.Index(fields=["from_user", "status"]),
+        ]
 
 
 class ProfileShowcase(BaseEntity):

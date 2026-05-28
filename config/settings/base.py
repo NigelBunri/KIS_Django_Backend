@@ -269,6 +269,7 @@ INSTALLED_APPS = [
     "apps.bible.apps.BibleConfig",
     "apps.location.apps.LocationConfig",
     "admin_control.apps.AdminControlConfig",
+    "apps.testimony.apps.TestimonyConfig",
 ]
 
 MIDDLEWARE = [

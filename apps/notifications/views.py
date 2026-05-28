@@ -459,6 +459,57 @@ class NotificationViewSet(viewsets.ModelViewSet):
 # -------------------------
 # Notification Template management
 # -------------------------
+class MentionNotificationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        mentioned_ids = request.data.get("mentioned_user_ids", [])
+        context = request.data.get("context", {})
+        sender_name = str(context.get("sender_name", "Someone"))
+        preview = str(context.get("preview", ""))[:200]
+        conversation_id = str(context.get("conversation_id", ""))
+        message_id = str(context.get("message_id", ""))
+
+        if not mentioned_ids or not isinstance(mentioned_ids, list):
+            return Response({"detail": "mentioned_user_ids required."}, status=400)
+
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        created = 0
+        for uid in mentioned_ids[:20]:
+            try:
+                user = User.objects.get(id=uid)
+            except (User.DoesNotExist, Exception):
+                continue
+            if str(user.id) == str(request.user.id):
+                continue  # don't notify yourself
+
+            notif = models.Notification.objects.create(
+                user_id=user.id,
+                type="mention",
+                title=f"{sender_name} mentioned you",
+                body=preview or f"{sender_name} mentioned you in a conversation.",
+                context_data={
+                    "conversation_id": conversation_id,
+                    "message_id": message_id,
+                    "sender_id": str(request.user.id),
+                    "sender_name": sender_name,
+                },
+            )
+            # trigger async delivery
+            try:
+                from .tasks import process_notification_delivery
+                process_notification_delivery.delay(str(notif.id))
+            except Exception:
+                pass
+            created += 1
+
+        return Response({"created": created})
+
+
+# -------------------------
+# Notification Template management
+# -------------------------
 class NotificationTemplateViewSet(viewsets.ModelViewSet):
     """
     CRUD for notification templates used to render titles & bodies.

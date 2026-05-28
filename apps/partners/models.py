@@ -184,6 +184,17 @@ class PartnerJobPost(models.Model):
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
     requirements = models.TextField(blank=True)
+    location = models.CharField(max_length=200, blank=True, default="")
+    is_remote = models.BooleanField(default=False)
+    job_type = models.CharField(
+        max_length=30,
+        choices=[("full_time", "Full Time"), ("part_time", "Part Time"), ("contract", "Contract"), ("freelance", "Freelance"), ("internship", "Internship")],
+        default="full_time",
+    )
+    salary_min_cents = models.PositiveIntegerField(null=True, blank=True)
+    salary_max_cents = models.PositiveIntegerField(null=True, blank=True)
+    salary_currency = models.CharField(max_length=10, blank=True, default="USD")
+    tags = models.JSONField(default=list, blank=True)
     steps = models.JSONField(default=list, blank=True)
     auto_assign = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(default=True)

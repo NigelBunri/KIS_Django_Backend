@@ -747,14 +747,26 @@ class PartnerMemberDirectoryEntrySerializer(serializers.Serializer):
 
 
 class PartnerJobPostSerializer(serializers.ModelSerializer):
+    partner_name = serializers.CharField(source="partner.name", read_only=True)
+    partner_id = serializers.UUIDField(source="partner.id", read_only=True)
+
     class Meta:
         model = PartnerJobPost
         fields = [
             "id",
             "partner",
+            "partner_id",
+            "partner_name",
             "title",
             "description",
             "requirements",
+            "location",
+            "is_remote",
+            "job_type",
+            "salary_min_cents",
+            "salary_max_cents",
+            "salary_currency",
+            "tags",
             "steps",
             "auto_assign",
             "is_active",

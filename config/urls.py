@@ -100,6 +100,7 @@ urlpatterns = [
     path("api/v1/", include("apps.statuses.urls", namespace="statuses")),
     path("api/v1/", include("apps.billing.urls")),
     path("api/v1/verification/", include("apps.verification.urls", namespace="verification")),
+    path("api/v1/", include("apps.testimony.urls")),
 
     # --- JWT auth endpoints (SimpleJWT) ---
     # Obtain access/refresh with username/password
