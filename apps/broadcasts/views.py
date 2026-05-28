@@ -9601,7 +9601,6 @@ class EducationInstitutionProgramDetailView(APIView):
     def get(self, request, institution_id: str, program_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
         program = _get_institution_program_or_404(institution, program_id)
-        print( _build_program_detail_payload(institution, program, request))
         return Response(
             _build_program_detail_payload(institution, program, request),
             status=status.HTTP_200_OK,
@@ -18343,3 +18342,74 @@ class ChannelMembershipView(APIView):
             qs = qs.filter(tier_id=tier_id)
         qs.update(status=ChannelMembership.Status.CANCELLED)
         return Response({"cancelled": True})
+
+
+class TipCreatorView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id):
+        from apps.billing.direct_payments import create_flutterwave_payment_link
+        from apps.billing.stripe_payments import create_checkout_session, is_configured as stripe_ok
+
+        try:
+            content = BroadcastItem.objects.get(id=content_id)
+        except BroadcastItem.DoesNotExist:
+            return Response({"detail": "Content not found."}, status=404)
+
+        amount_cents = int(request.data.get("amount_cents", 0))
+        currency = str(request.data.get("currency", "USD")).upper()
+        provider = str(request.data.get("payment_provider", "flutterwave")).lower()
+        message = str(request.data.get("message", ""))[:200]
+
+        if amount_cents < 50:
+            return Response({"detail": "Minimum tip is 0.50."}, status=400)
+
+        content_title = str((content.metadata or {}).get("title") or content.source_type)
+        recipient_id = str(getattr(content.broadcasted_by, "id", "") or "")
+
+        meta = {
+            "type": "tip",
+            "content_id": str(content_id),
+            "recipient_user_id": recipient_id,
+            "tipper_user_id": str(request.user.id),
+            "message": message,
+        }
+
+        if provider == "stripe" and stripe_ok():
+            try:
+                session = create_checkout_session(
+                    amount_cents=amount_cents,
+                    currency=currency.lower(),
+                    product_name=f"Tip for {content_title}",
+                    metadata=meta,
+                    success_url="kis://payment/success",
+                    cancel_url="kis://payment/cancel",
+                )
+                if session:
+                    return Response({
+                        "payment_required": True,
+                        "checkout_url": session.get("checkout_url") or session.get("url"),
+                        "provider": "stripe",
+                    })
+            except Exception:
+                pass
+            return Response({"detail": "Stripe checkout failed."}, status=502)
+
+        # Flutterwave default
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        payer = User.objects.filter(id=request.user.id).first()
+        email = getattr(payer, "email", "") or ""
+        name = getattr(payer, "display_name", "") or getattr(payer, "username", "") or "KIS User"
+
+        link = create_flutterwave_payment_link(
+            amount=amount_cents / 100,
+            currency=currency,
+            email=email,
+            name=name,
+            title=f"Tip: {content_title[:60]}",
+            meta=meta,
+        )
+        if link:
+            return Response({"payment_required": True, "payment_url": link, "provider": "flutterwave"})
+        return Response({"detail": "Payment link creation failed."}, status=502)

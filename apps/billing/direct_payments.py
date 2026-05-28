@@ -129,6 +129,51 @@ def _create_flutterwave_payment_link(intent: DirectPaymentIntent) -> tuple[str, 
     return link, redact_payment_payload(data)
 
 
+def create_flutterwave_payment_link(
+    *,
+    amount: float,
+    currency: str = "USD",
+    email: str,
+    name: str,
+    title: str,
+    meta: dict | None = None,
+) -> str | None:
+    """
+    Create a Flutterwave payment link without requiring a DirectPaymentIntent model.
+    Returns the payment URL string, or None on failure.
+    """
+    flw_key = getattr(settings, "FLW_SECRET_KEY", "") or ""
+    redirect_url = getattr(settings, "FLW_REDIRECT_URL", "") or ""
+    if not flw_key:
+        logger.warning("create_flutterwave_payment_link: FLW_SECRET_KEY not configured.")
+        return None
+    tx_ref = f"kis_tip_{uuid.uuid4().hex}"
+    payload = {
+        "tx_ref": tx_ref,
+        "amount": str(round(float(amount), 2)),
+        "currency": currency.upper(),
+        "redirect_url": redirect_url,
+        "customer": {"email": email or f"anon_{tx_ref}@kis.local", "name": name or "KIS User"},
+        "customizations": {"title": title[:100]},
+        "meta": meta or {},
+    }
+    try:
+        response = requests.post(
+            f"{FLW_BASE_URL}/payments",
+            json=payload,
+            headers={"Authorization": f"Bearer {flw_key}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        data = response.json() if response.content else {}
+        if response.status_code >= 300:
+            logger.warning("create_flutterwave_payment_link failed: %s", data.get("message"))
+            return None
+        return str((data.get("data") or {}).get("link") or "") or None
+    except Exception as exc:
+        logger.warning("create_flutterwave_payment_link exception: %s", exc)
+        return None
+
+
 def _ensure_provider_payment_link(intent: DirectPaymentIntent, *, actor=None) -> DirectPaymentIntent:
     if intent.payment_url or not _provider_links_enabled(intent.provider):
         return intent

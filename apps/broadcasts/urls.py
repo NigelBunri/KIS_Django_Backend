@@ -181,6 +181,7 @@ from .views import (
     ChannelContentDownloadView,
     ChannelMembershipTierListView,
     ChannelMembershipView,
+    TipCreatorView,
 )
 
 app_name = "broadcasts"
@@ -715,4 +716,5 @@ urlpatterns = [
     # Task 5: channel membership tiers and membership
     path("broadcasts/channels/<uuid:channel_id>/membership-tiers/", ChannelMembershipTierListView.as_view(), name="broadcast-channel-membership-tiers"),
     path("broadcasts/channels/<uuid:channel_id>/membership/", ChannelMembershipView.as_view(), name="broadcast-channel-membership"),
+    path("broadcast-items/<str:content_id>/tip/", TipCreatorView.as_view(), name="tip-creator"),
 ]

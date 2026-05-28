@@ -364,7 +364,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
     # ------------------------------------------------------------------
     @action(detail=False, methods=['post'], url_path='direct')
     def direct(self, request):
-        print("see request.data: ", request.data)
         """
         POST /api/v1/conversations/direct/
 
@@ -551,7 +550,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.locked_by = request.user
         conversation.save(update_fields=['is_locked', 'locked_by'])
         response = ConversationDetailSerializer(conversation).data
-        print("see Response: ", response)
         return Response(response, status=200)
 
     @action(detail=True, methods=['post'], url_path='archive')
