@@ -442,6 +442,19 @@ class Device(BaseEntity):
     revoked_at = models.DateTimeField(null=True, blank=True, db_index=True)
     revoke_reason = models.CharField(max_length=120, blank=True, default="")
 
+    # Multi-device QR login fields
+    is_parent = models.BooleanField(default=False)
+    linked_via_qr = models.BooleanField(default=False)
+    parent_device = models.ForeignKey(
+        'self',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='secondary_devices',
+    )
+    nickname = models.CharField(max_length=100, blank=True)
+    trusted_until = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         indexes = [
             models.Index(fields=["user", "last_seen_at"]),
@@ -478,6 +491,112 @@ class E2EPreKey(BaseEntity):
             models.Index(fields=["user", "device", "prekey_id"]),
             models.Index(fields=["user", "device", "consumed_at"]),
         ]
+
+class DeviceQRToken(models.Model):
+    """
+    One-time QR token used to link a secondary device to a user account.
+
+    Flow:
+      1. Parent device calls GET /auth/devices/qr/ → server creates a new token,
+         returns token_plain (never stored) + nonce.
+      2. Parent device encodes token_plain into a QR image (client-side).
+      3. Secondary device scans QR → POSTs token_plain to /auth/devices/qr-login/.
+      4. Server hashes token_plain → looks up DeviceQRToken by token_hash → validates
+         expiry and single-use → creates Device record for the secondary device.
+    """
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='qr_tokens',
+    )
+    parent_device = models.ForeignKey(
+        Device,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='generated_qr_tokens',
+    )
+    # HMAC-SHA256 hex of the plain token (never stored plain).
+    token_hash = models.CharField(max_length=64)
+    nonce = models.CharField(max_length=64)
+    issued_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    # One-time use: set when consumed.
+    used_at = models.DateTimeField(null=True, blank=True)
+    used_by_device = models.ForeignKey(
+        Device,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='qr_login_used',
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['user', 'expires_at'], name='accounts_de_user_id_456775_idx'),
+            models.Index(fields=['token_hash'], name='accounts_de_token_h_09f6e8_idx'),
+        ]
+
+    @classmethod
+    def generate_for_device(cls, user, device) -> tuple:
+        """
+        Always create a fresh QR token for this (user, device) pair.
+        Deletes any previously unused tokens for the same device first.
+        Returns (DeviceQRToken instance, token_plain).
+        token_plain is returned ONCE here; it is never stored. Encode it into the QR.
+        """
+        # Invalidate previous unused tokens for this device to keep things tidy.
+        cls.objects.filter(
+            user=user,
+            parent_device=device,
+            used_at__isnull=True,
+        ).delete()
+
+        token_plain = secrets.token_urlsafe(48)
+        token_hash = hmac.new(
+            settings.SECRET_KEY.encode('utf-8'),
+            token_plain.encode('utf-8'),
+            hashlib.sha256,
+        ).hexdigest()
+        nonce = secrets.token_hex(16)
+        now = timezone.now()
+        expires_at = now + datetime.timedelta(hours=3)
+        obj = cls.objects.create(
+            user=user,
+            parent_device=device,
+            token_hash=token_hash,
+            nonce=nonce,
+            expires_at=expires_at,
+        )
+        return obj, token_plain
+
+    @classmethod
+    def consume(cls, token_plain: str):
+        """
+        Validate and consume a plain token posted by a secondary device.
+        Returns the DeviceQRToken instance on success, or None if invalid/expired/used.
+        Sets used_at on success (caller should set used_by_device and save).
+        """
+        if not token_plain:
+            return None
+        token_hash = hmac.new(
+            settings.SECRET_KEY.encode('utf-8'),
+            token_plain.encode('utf-8'),
+            hashlib.sha256,
+        ).hexdigest()
+        now = timezone.now()
+        try:
+            qr_token = cls.objects.select_related('user', 'parent_device').get(
+                token_hash=token_hash,
+                used_at__isnull=True,
+                expires_at__gt=now,
+            )
+        except cls.DoesNotExist:
+            return None
+        qr_token.used_at = now
+        qr_token.save(update_fields=['used_at'])
+        return qr_token
+
 
 class ApiToken(BaseEntity):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="api_tokens")

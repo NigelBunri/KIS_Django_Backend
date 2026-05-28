@@ -8,6 +8,7 @@ Changes:
 """
 
 from typing import Optional, Iterable
+import datetime
 import os
 import re
 from django.utils import timezone
@@ -52,6 +53,7 @@ from .models import (
     Subscription,
     Session,
     Device,
+    DeviceQRToken,
     TwoFactor,
     E2EDeviceKey,
     E2EPreKey,
@@ -643,19 +645,31 @@ def upsert_device(
 ) -> Device:
     existing = Device.objects.filter(user=user, device_id=str(device_id)).first()
     token_version = (existing.token_version + 1) if existing and existing.revoked_at else (existing.token_version if existing else 1)
+
+    # Determine whether this device should become the parent device.
+    # A device is the parent if it's the very first active (non-revoked) device for this user.
+    has_active_parent = Device.objects.filter(
+        user=user, is_parent=True, revoked_at__isnull=True
+    ).exclude(device_id=str(device_id)).exists()
+
+    defaults = {
+        "platform": platform or "unknown",
+        "name": name or None,
+        "last_seen_at": timezone.now(),
+        "last_ip": request.META.get("REMOTE_ADDR") if request else None,
+        "user_agent": request.META.get("HTTP_USER_AGENT") if request else None,
+        "token_version": token_version,
+        "revoked_at": None,
+        "revoke_reason": "",
+    }
+    if not has_active_parent:
+        # No existing parent — promote this device.
+        defaults["is_parent"] = True
+
     device, _ = Device.objects.update_or_create(
         user=user,
         device_id=str(device_id),
-        defaults={
-            "platform": platform or "unknown",
-            "name": name or None,
-            "last_seen_at": timezone.now(),
-            "last_ip": request.META.get("REMOTE_ADDR") if request else None,
-            "user_agent": request.META.get("HTTP_USER_AGENT") if request else None,
-            "token_version": token_version,
-            "revoked_at": None,
-            "revoke_reason": "",
-        },
+        defaults=defaults,
     )
     return device
 
@@ -2441,3 +2455,524 @@ class GlobalJobBoardView(generics.ListAPIView):
             for s in [x.strip() for x in skills.split(",") if x.strip()]:
                 qs = qs.filter(tags__icontains=s)
         return qs
+
+
+# ===========================================================================
+# Multi-device QR Login Views
+# ===========================================================================
+
+IS_AUTH = (IsAuthenticated,)
+_QR_JWT_AUTH = (DeviceBoundJWTAuthentication,)
+
+
+def _send_push_to_device(user: User, device: Device, title: str, body: str) -> None:
+    """Best-effort push notification to a specific device. Swallows all errors."""
+    try:
+        from apps.notifications.models import NotificationDeviceToken, Notification
+        from apps.notifications.firebase import send_push
+        token_obj = NotificationDeviceToken.objects.filter(
+            user=user, device_id=str(device.device_id)
+        ).first()
+        if token_obj and token_obj.token:
+            notif = Notification(
+                user=user,
+                title=title,
+                body=body,
+                notification_type="device.linked",
+                channel="PUSH",
+            )
+            send_push(token_obj.token, notif)
+    except Exception:
+        pass
+
+
+def _send_recovery_email(user: User, recovery_code: str) -> None:
+    """Best-effort recovery email. Swallows all errors."""
+    try:
+        from apps.notifications.email_service import send_templated_email
+        email = getattr(user, "email", None)
+        if email:
+            send_templated_email(
+                to_email=email,
+                subject="KIS Account Recovery — your parent device recovery code",
+                template_name="device_recovery",
+                context={"recovery_code": recovery_code, "expires_minutes": 15},
+            )
+    except Exception:
+        pass
+
+
+@extend_schema(
+    summary="Generate a QR login token for the parent device",
+    tags=["Auth", "Devices"],
+)
+class DeviceQRGenerateView(APIView):
+    """
+    GET auth/devices/qr/
+    Authenticated by the PARENT device. Returns a short-lived token encoded
+    into a QR code client-side. The secondary device scans this QR and posts
+    the token to /auth/devices/qr-login/.
+    """
+    authentication_classes = _QR_JWT_AUTH
+    permission_classes = IS_AUTH
+
+    def get(self, request):
+        device_id = request_device_id(request)
+        if not device_id:
+            return Response({"detail": "X-Device-Id header is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        device = Device.objects.filter(
+            user=request.user,
+            device_id=str(device_id),
+            is_parent=True,
+            revoked_at__isnull=True,
+        ).first()
+        if not device:
+            return Response(
+                {"detail": "Only the parent device may generate a QR login token."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        qr_token, token_plain = DeviceQRToken.generate_for_device(request.user, device)
+        AuditLog.log(
+            actor=request.user,
+            action="device.qr_generated",
+            meta={"parent_device_id": device_id},
+        )
+        return Response(
+            {
+                "qr_payload": token_plain,
+                "expires_at": qr_token.expires_at.isoformat(),
+                "nonce": qr_token.nonce,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class _QRLoginSerializer(serializers.Serializer):
+    token = serializers.CharField()
+    device_id = serializers.CharField()
+    device_name = serializers.CharField(required=False, allow_blank=True, default="")
+    platform = serializers.CharField(required=False, allow_blank=True, default="unknown")
+
+
+@extend_schema(
+    summary="Login via QR code scan (secondary device)",
+    tags=["Auth", "Devices"],
+)
+class DeviceQRLoginView(APIView):
+    """
+    POST auth/devices/qr-login/
+    No auth required. The secondary device posts the token_plain it read
+    from the QR code. On success, returns JWT tokens for the associated user.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        ser = _QRLoginSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        token_plain = data["token"]
+        device_id = data["device_id"].strip()
+        device_name = (data.get("device_name") or "").strip() or None
+        platform = (data.get("platform") or "unknown").strip()
+
+        qr_token = DeviceQRToken.consume(token_plain)
+        if not qr_token:
+            return Response({"detail": "Invalid or expired QR token."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        user = qr_token.user
+        now = timezone.now()
+
+        with transaction.atomic():
+            existing = Device.objects.filter(user=user, device_id=str(device_id)).first()
+            token_version = (
+                (existing.token_version + 1) if existing and existing.revoked_at
+                else (existing.token_version if existing else 1)
+            )
+            device, _ = Device.objects.update_or_create(
+                user=user,
+                device_id=str(device_id),
+                defaults={
+                    "platform": platform,
+                    "name": device_name,
+                    "last_seen_at": now,
+                    "last_ip": request.META.get("REMOTE_ADDR"),
+                    "user_agent": request.META.get("HTTP_USER_AGENT"),
+                    "token_version": token_version,
+                    "revoked_at": None,
+                    "revoke_reason": "",
+                    "is_parent": False,
+                    "linked_via_qr": True,
+                    "trusted_until": now + datetime.timedelta(days=30),
+                    "parent_device": qr_token.parent_device,
+                },
+            )
+            # Record which device consumed this QR token.
+            qr_token.used_by_device = device
+            qr_token.save(update_fields=["used_by_device"])
+
+        tokens = issue_tokens_for_user(user, device_id=device_id)
+
+        AuditLog.log(
+            actor=user,
+            action="device.qr_login",
+            meta={
+                "linked_device_id": device_id,
+                "parent_device_id": str(qr_token.parent_device.device_id) if qr_token.parent_device else None,
+            },
+        )
+
+        # Notify the parent device.
+        if qr_token.parent_device:
+            _send_push_to_device(
+                user,
+                qr_token.parent_device,
+                title="New device linked",
+                body=f"New device linked: {device_name or device_id}",
+            )
+
+        return Response(
+            {
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
+                "token_type": "Bearer",
+                "user": {
+                    "id": user.id,
+                    "phone": getattr(user, "phone", None),
+                    "status": getattr(user, "status", "active"),
+                    "is_active": user.is_active,
+                    "device_id": device_id,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class _TransferParentSerializer(serializers.Serializer):
+    target_device_id = serializers.CharField()
+
+
+@extend_schema(
+    summary="Transfer parent device role to another device",
+    tags=["Auth", "Devices"],
+)
+class TransferParentDeviceView(APIView):
+    """
+    POST auth/devices/transfer-parent/
+    The currently authenticated PARENT device can transfer the parent role
+    to another active device owned by the same user.
+    """
+    authentication_classes = _QR_JWT_AUTH
+    permission_classes = IS_AUTH
+
+    def post(self, request):
+        requesting_device_id = request_device_id(request)
+        if not requesting_device_id:
+            return Response({"detail": "X-Device-Id header is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        current_parent = Device.objects.filter(
+            user=request.user,
+            device_id=str(requesting_device_id),
+            is_parent=True,
+            revoked_at__isnull=True,
+        ).first()
+        if not current_parent:
+            return Response(
+                {"detail": "Only the current parent device may initiate a parent transfer."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        ser = _TransferParentSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        target_device_id = ser.validated_data["target_device_id"].strip()
+
+        if str(target_device_id) == str(requesting_device_id):
+            return Response({"detail": "Target device is already the parent."}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_device = Device.objects.filter(
+            user=request.user,
+            device_id=str(target_device_id),
+            revoked_at__isnull=True,
+        ).first()
+        if not target_device:
+            return Response(
+                {"detail": "Target device not found or has been revoked."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        with transaction.atomic():
+            current_parent.is_parent = False
+            current_parent.save(update_fields=["is_parent", "updated_at"])
+
+            target_device.is_parent = True
+            target_device.save(update_fields=["is_parent", "updated_at"])
+
+        AuditLog.log(
+            actor=request.user,
+            action="device.parent_transfer",
+            meta={
+                "from_device_id": str(requesting_device_id),
+                "to_device_id": str(target_device_id),
+            },
+        )
+        return Response(
+            {"detail": "Parent device transferred successfully.", "new_parent_device_id": target_device_id},
+            status=status.HTTP_200_OK,
+        )
+
+
+@extend_schema(
+    summary="Revoke all secondary (non-parent) devices",
+    tags=["Auth", "Devices"],
+)
+class RevokeAllSecondaryView(APIView):
+    """
+    DELETE auth/devices/revoke-all-secondary/
+    The authenticated PARENT device revokes all other active devices for the user.
+    """
+    authentication_classes = _QR_JWT_AUTH
+    permission_classes = IS_AUTH
+
+    def delete(self, request):
+        requesting_device_id = request_device_id(request)
+        if not requesting_device_id:
+            return Response({"detail": "X-Device-Id header is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        is_parent = Device.objects.filter(
+            user=request.user,
+            device_id=str(requesting_device_id),
+            is_parent=True,
+            revoked_at__isnull=True,
+        ).exists()
+        if not is_parent:
+            return Response(
+                {"detail": "Only the parent device may revoke all secondary devices."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        now = timezone.now()
+        updated = Device.objects.filter(
+            user=request.user,
+            is_parent=False,
+            revoked_at__isnull=True,
+        ).update(
+            revoked_at=now,
+            revoke_reason="parent_revoked_all",
+        )
+
+        AuditLog.log(
+            actor=request.user,
+            action="device.revoke_all_secondary",
+            meta={"parent_device_id": requesting_device_id, "revoked_count": updated},
+        )
+        return Response({"revoked_count": updated}, status=status.HTTP_200_OK)
+
+
+class _DeviceRenameSerializer(serializers.Serializer):
+    nickname = serializers.CharField(max_length=100, allow_blank=True)
+
+
+@extend_schema(
+    summary="Rename a device (set nickname)",
+    tags=["Auth", "Devices"],
+)
+class DeviceRenameView(APIView):
+    """
+    PATCH auth/devices/<device_id>/rename/
+    Any authenticated user may rename any of their own devices.
+    """
+    authentication_classes = _QR_JWT_AUTH
+    permission_classes = IS_AUTH
+
+    def patch(self, request, device_id: str):
+        ser = _DeviceRenameSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        device = get_object_or_404(
+            Device,
+            user=request.user,
+            device_id=str(device_id),
+            revoked_at__isnull=True,
+        )
+        device.nickname = ser.validated_data["nickname"]
+        device.save(update_fields=["nickname", "updated_at"])
+
+        AuditLog.log(
+            actor=request.user,
+            action="device.renamed",
+            meta={"device_id": device_id, "nickname": device.nickname},
+        )
+        return Response({"device_id": device_id, "nickname": device.nickname}, status=status.HTTP_200_OK)
+
+
+# ---- Parent Device Recovery ------------------------------------------------
+
+_RECOVERY_CACHE_PREFIX = "device_recovery:"
+_RECOVERY_TTL_SECONDS = 15 * 60  # 15 minutes
+
+
+class _ParentRecoveryInitSerializer(serializers.Serializer):
+    phone = serializers.CharField(required=False, allow_blank=True)
+    email = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if not attrs.get("phone") and not attrs.get("email"):
+            raise serializers.ValidationError("Provide either phone or email.")
+        return attrs
+
+
+@extend_schema(
+    summary="Initiate parent device recovery (step 1)",
+    tags=["Auth", "Devices"],
+)
+class ParentRecoveryInitView(APIView):
+    """
+    POST auth/recovery/initiate/
+    No auth required. Sends a recovery code email if the account exists.
+    Does NOT reveal whether the account exists to prevent enumeration.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        ser = _ParentRecoveryInitSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        phone = (ser.validated_data.get("phone") or "").strip()
+        email = (ser.validated_data.get("email") or "").strip()
+
+        user = None
+        if email:
+            user = User.objects.filter(email__iexact=email, is_active=True).first()
+        if not user and phone:
+            from apps.accounts.views import _phone_variants
+            candidates = _phone_variants(phone)
+            digit_candidates = [_digits_only(v) for v in candidates if _digits_only(v)]
+            user = User.objects.filter(
+                Q(phone__in=candidates) | Q(phone_number__in=digit_candidates),
+                is_active=True,
+            ).first()
+
+        # Always return the same message regardless of whether user exists.
+        if user:
+            import secrets as _secrets
+            recovery_code = _secrets.token_urlsafe(24)
+            cache_key = f"{_RECOVERY_CACHE_PREFIX}{recovery_code}"
+            cache.set(cache_key, str(user.id), timeout=_RECOVERY_TTL_SECONDS)
+            _send_recovery_email(user, recovery_code)
+            AuditLog.log(
+                actor=user,
+                action="device.parent_recovery_initiated",
+                meta={"identifier": email or phone},
+            )
+
+        return Response(
+            {"message": "Recovery email sent if account exists."},
+            status=status.HTTP_200_OK,
+        )
+
+
+class _ParentRecoveryConfirmSerializer(serializers.Serializer):
+    recovery_token = serializers.CharField()
+    device_id = serializers.CharField()
+    device_name = serializers.CharField(required=False, allow_blank=True, default="")
+    platform = serializers.CharField(required=False, allow_blank=True, default="unknown")
+
+
+@extend_schema(
+    summary="Confirm parent device recovery (step 2)",
+    tags=["Auth", "Devices"],
+)
+class ParentRecoveryConfirmView(APIView):
+    """
+    POST auth/recovery/confirm/
+    No auth required. Validates the recovery token, revokes the old parent,
+    and registers the new device as the parent.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        ser = _ParentRecoveryConfirmSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        recovery_token = data["recovery_token"].strip()
+        device_id = data["device_id"].strip()
+        device_name = (data.get("device_name") or "").strip() or None
+        platform = (data.get("platform") or "unknown").strip()
+
+        cache_key = f"{_RECOVERY_CACHE_PREFIX}{recovery_token}"
+        user_id = cache.get(cache_key)
+        if not user_id:
+            return Response({"detail": "Invalid or expired recovery token."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        try:
+            user = User.objects.get(id=user_id, is_active=True)
+        except User.DoesNotExist:
+            return Response({"detail": "Invalid or expired recovery token."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Consume the token so it cannot be reused.
+        cache.delete(cache_key)
+
+        now = timezone.now()
+        with transaction.atomic():
+            # Revoke the old parent(s).
+            Device.objects.filter(
+                user=user, is_parent=True, revoked_at__isnull=True
+            ).update(
+                revoked_at=now,
+                revoke_reason="parent_recovery",
+                is_parent=False,
+            )
+
+            existing = Device.objects.filter(user=user, device_id=str(device_id)).first()
+            token_version = (
+                (existing.token_version + 1) if existing and existing.revoked_at
+                else (existing.token_version if existing else 1)
+            )
+            device, _ = Device.objects.update_or_create(
+                user=user,
+                device_id=str(device_id),
+                defaults={
+                    "platform": platform,
+                    "name": device_name,
+                    "last_seen_at": now,
+                    "last_ip": request.META.get("REMOTE_ADDR"),
+                    "user_agent": request.META.get("HTTP_USER_AGENT"),
+                    "token_version": token_version,
+                    "revoked_at": None,
+                    "revoke_reason": "",
+                    "is_parent": True,
+                    "linked_via_qr": False,
+                    "trusted_until": now + datetime.timedelta(days=30),
+                    "parent_device": None,
+                },
+            )
+
+        tokens = issue_tokens_for_user(user, device_id=device_id)
+
+        AuditLog.log(
+            actor=user,
+            action="device.parent_recovery",
+            meta={"new_parent_device_id": device_id},
+        )
+
+        return Response(
+            {
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
+                "token_type": "Bearer",
+                "user": {
+                    "id": user.id,
+                    "phone": getattr(user, "phone", None),
+                    "status": getattr(user, "status", "active"),
+                    "is_active": user.is_active,
+                    "device_id": device_id,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )

@@ -37,6 +37,14 @@ from .views import (
     ConnectionViewSet,
     GlobalJobBoardView,
     MyApplicationsView,
+    # Multi-device QR login
+    DeviceQRGenerateView,
+    DeviceQRLoginView,
+    TransferParentDeviceView,
+    RevokeAllSecondaryView,
+    DeviceRenameView,
+    ParentRecoveryInitView,
+    ParentRecoveryConfirmView,
 )
 
 # Optional: SimpleJWT endpoints (convenience here too)
@@ -94,6 +102,15 @@ urlpatterns = [
     path("users/check-contacts/", CheckContact.as_view(), name="check_contact_legacy"),
     path("jobs/", GlobalJobBoardView.as_view(), name="global-job-board"),
     path("my-applications/", MyApplicationsView.as_view(), name="my-applications"),
+
+    # Multi-device QR login
+    path("auth/devices/qr/", DeviceQRGenerateView.as_view(), name="device-qr-generate"),
+    path("auth/devices/qr-login/", DeviceQRLoginView.as_view(), name="device-qr-login"),
+    path("auth/devices/transfer-parent/", TransferParentDeviceView.as_view(), name="device-transfer-parent"),
+    path("auth/devices/revoke-all-secondary/", RevokeAllSecondaryView.as_view(), name="device-revoke-all-secondary"),
+    path("auth/devices/<str:device_id>/rename/", DeviceRenameView.as_view(), name="device-rename"),
+    path("auth/recovery/initiate/", ParentRecoveryInitView.as_view(), name="parent-recovery-init"),
+    path("auth/recovery/confirm/", ParentRecoveryConfirmView.as_view(), name="parent-recovery-confirm"),
 
     path("", include(router.urls)),
 ]

@@ -882,6 +882,7 @@ class SessionSerializer(serializers.ModelSerializer):
 class DeviceSessionSerializer(serializers.ModelSerializer):
     has_e2ee_keys = serializers.SerializerMethodField()
     current = serializers.SerializerMethodField()
+    parent_device_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Device
@@ -890,11 +891,16 @@ class DeviceSessionSerializer(serializers.ModelSerializer):
             "device_id",
             "platform",
             "name",
+            "nickname",
             "user_agent",
             "last_ip",
             "last_seen_at",
             "revoked_at",
             "revoke_reason",
+            "is_parent",
+            "linked_via_qr",
+            "trusted_until",
+            "parent_device_name",
             "has_e2ee_keys",
             "current",
             "created_at",
@@ -915,6 +921,14 @@ class DeviceSessionSerializer(serializers.ModelSerializer):
             or request.headers.get("X-DeviceId")
         )
         return bool(header_device_id and str(header_device_id) == str(obj.device_id))
+
+    def get_parent_device_name(self, obj):
+        if not obj.parent_device_id:
+            return None
+        parent = obj.parent_device
+        if not parent:
+            return None
+        return parent.nickname or parent.name or str(parent.device_id)
 
 
 class E2EEDeviceBundleSerializer(serializers.Serializer):
