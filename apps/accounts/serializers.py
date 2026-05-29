@@ -537,7 +537,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
     phone = serializers.CharField(required=False, allow_blank=True)
     phone_country_code = serializers.CharField(required=False, allow_blank=True)
     phone_number = serializers.CharField(required=False, allow_blank=True)
-    country = serializers.CharField(required=True, allow_blank=False)
+    country = serializers.CharField(required=False, allow_blank=True)
 
     class Meta:
         model = User
@@ -556,10 +556,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
         if attrs.get("password") != attrs.get("password2"):
             raise serializers.ValidationError({"password": "Password fields didn't match."})
 
-        # Country required (keep free-form unless you enforce ISO codes)
         country = attrs.get("country", "").strip()
-        if not country:
-            raise serializers.ValidationError({"country": "Country is required."})
 
         phone_raw = str(attrs.get("phone") or "").strip()
         normalized_code = _normalize_country_code(attrs.get("phone_country_code"))
@@ -568,7 +565,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
         if phone_raw:
             if not (phone_raw.startswith("+") or phone_raw[0].isdigit()):
                 raise serializers.ValidationError({"phone": "Invalid phone format. Use digits, optional leading '+'."})
-            parsed_code, parsed_number = _split_phone_parts(phone_raw, default_region=country.upper())
+            parsed_code, parsed_number = _split_phone_parts(phone_raw, default_region=country.upper() if country else "CM")
             if parsed_number and not normalized_number:
                 normalized_number = parsed_number
             if parsed_code and not normalized_code:
@@ -589,6 +586,17 @@ class UserCreateSerializer(serializers.ModelSerializer):
         attrs["phone_country_code"] = normalized_code or None
         attrs["phone_number"] = normalized_number
         attrs["phone"] = composed_phone
+
+        # Derive country from phone if not provided
+        if not country and normalized_code:
+            try:
+                dial_int = int(_normalize_country_code(normalized_code).lstrip("+"))
+                region = phonenumbers.region_code_for_country_code(dial_int)
+                if region and region != "001":
+                    country = region
+            except Exception:
+                pass
+        attrs["country"] = country or "CM"
 
         existing = User.objects.filter(phone_number=normalized_number)
         if existing.exists():
