@@ -1158,6 +1158,17 @@ class LoginSerializer(serializers.Serializer):
                 "error_code": "account_disabled",
             })
 
+        # Block login if phone has never been verified (account bypassed verification).
+        phone_verified = bool(
+            (getattr(user, "verification", None) or {}).get("phone", {}).get("verified")
+        )
+        if not phone_verified:
+            raise serializers.ValidationError({
+                "detail": _("Please verify your phone number before logging in."),
+                "error_code": "phone_not_verified",
+                "phone": str(getattr(user, "phone", "") or ""),
+            })
+
         if not phone_e164:
             try:
                 base_phone = user.phone or _compose_phone(user.phone_country_code, user.phone_number) or phone_raw

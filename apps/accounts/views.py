@@ -771,10 +771,27 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
                 send_welcome_email(to_email=user.email)
         except Exception:
             pass
-        user_payload = UserSerializer(user, context={"request": request}).data
-        tokens = issue_tokens_for_user(user, device_id=device_id)
-        resp = {**user_payload, **tokens}
-        return Response(resp, status=status.HTTP_201_CREATED)
+
+        # Do NOT issue tokens yet — the account must be phone-verified first.
+        # Tokens are issued by OtpVerifyView after successful code verification.
+        phone_verified = bool(
+            (user.verification or {}).get("phone", {}).get("verified")
+        )
+        return Response(
+            {
+                "success": True,
+                "pending_verification": not phone_verified,
+                "phone_verified": phone_verified,
+                "user": {
+                    "id": user.id,
+                    "phone": getattr(user, "phone", None),
+                    "status": getattr(user, "status", "pending"),
+                    "is_active": user.is_active,
+                    "phone_verified": phone_verified,
+                },
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 @extend_schema(

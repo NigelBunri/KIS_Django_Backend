@@ -27,7 +27,7 @@ RESEND_COOLDOWN_SECONDS = 60
 MAX_ATTEMPTS = 5
 
 ALLOWED_PURPOSES = {"register", "login", "reset"}
-ALLOWED_CHANNELS = {"sms"}
+ALLOWED_CHANNELS = {"sms", "email", "whatsapp"}
 
 
 def _masked_phone(phone: str) -> str:
@@ -41,13 +41,24 @@ def _debug_otp_logging_enabled() -> bool:
     return bool(settings.DEBUG and getattr(settings, "OTP_DEBUG_LOG_CODES", False))
 
 def generate_otp(length: int = OTP_LENGTH) -> str:
-    import string, secrets
     return ''.join(secrets.choice(string.digits) for _ in range(length))
 
 def make_code_hash(phone: str, purpose: str, code: str) -> str:
     msg = f"{phone}|{purpose}|{code}".encode("utf-8")
     key = settings.SECRET_KEY.encode("utf-8")
     return hmac.new(key, msg, sha256).hexdigest()
+
+def sms_configured() -> bool:
+    return bool(
+        getattr(settings, "INFOBIP_API_KEY", "") and
+        getattr(settings, "INFOBIP_BASE", "")
+    )
+
+def email_configured() -> bool:
+    return bool(
+        getattr(settings, "SENDGRID_API_KEY", "") or
+        (getattr(settings, "EMAIL_HOST", "") and getattr(settings, "EMAIL_HOST_USER", ""))
+    )
 
 def send_sms_via_provider(phone: str, body: str) -> None:
     """Send SMS via Infobip. Silently skips if not configured (dev mode)."""
@@ -78,13 +89,62 @@ def send_sms_via_provider(phone: str, body: str) -> None:
     )
     try:
         with _req.urlopen(request, timeout=10) as resp:
-            status = resp.status
-            if status not in (200, 201):
-                logger.warning("Infobip SMS returned status %s for %s", status, _masked_phone(phone))
+            resp_status = resp.status
+            if resp_status not in (200, 201):
+                logger.warning("Infobip SMS returned status %s for %s", resp_status, _masked_phone(phone))
             else:
                 logger.info("SMS sent via Infobip to %s", _masked_phone(phone))
     except Exception as exc:
         logger.warning("Infobip SMS failed for %s: %s", _masked_phone(phone), exc)
+
+def send_email_otp(to_email: str, code: str, purpose: str) -> bool:
+    """Send OTP via email. Returns True if sent, False if not configured or failed."""
+    subject = "KIS verification code"
+    body = f"Your KIS verification code is: {code}\n\nThis code expires in 5 minutes. Do not share it with anyone."
+    sendgrid_key = getattr(settings, "SENDGRID_API_KEY", "") or ""
+    if sendgrid_key:
+        try:
+            import urllib.request as _req
+            import json as _json
+            payload = _json.dumps({
+                "personalizations": [{"to": [{"email": to_email}]}],
+                "from": {"email": getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@kis.app")},
+                "subject": subject,
+                "content": [{"type": "text/plain", "value": body}],
+            }).encode("utf-8")
+            req = _req.Request(
+                "https://api.sendgrid.com/v3/mail/send",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {sendgrid_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with _req.urlopen(req, timeout=10) as resp:
+                if resp.status in (200, 202):
+                    logger.info("Email OTP sent via SendGrid to %s", to_email)
+                    return True
+        except Exception as exc:
+            logger.warning("SendGrid email failed for %s: %s", to_email, exc)
+    # Fallback: Django email backend
+    email_host = getattr(settings, "EMAIL_HOST", "") or ""
+    email_user = getattr(settings, "EMAIL_HOST_USER", "") or ""
+    if email_host and email_user:
+        try:
+            from django.core.mail import send_mail
+            send_mail(
+                subject=subject,
+                message=body,
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", email_user),
+                recipient_list=[to_email],
+                fail_silently=False,
+            )
+            logger.info("Email OTP sent via Django backend to %s", to_email)
+            return True
+        except Exception as exc:
+            logger.warning("Django email OTP failed for %s: %s", to_email, exc)
+    return False
 
 def normalize_phone_input(phone: str, country: str = "CM") -> str:
     phone = (phone or "").strip()
@@ -95,6 +155,21 @@ def normalize_phone_input(phone: str, country: str = "CM") -> str:
     except Exception:
         digits_only = ''.join(ch for ch in phone if ch.isdigit())
         return digits_only or phone
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class ChannelsView(APIView):
+    """GET /api/v1/auth/otp/channels/ — returns which delivery channels are available."""
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        return Response({
+            "sms": sms_configured(),
+            "email": email_configured(),
+            "whatsapp": True,  # always available — uses deep link, no API key required
+        })
+
 
 @method_decorator(csrf_exempt, name="dispatch")
 class OtpInitiateView(APIView):
@@ -114,6 +189,17 @@ class OtpInitiateView(APIView):
             return Response({"success": False, "message": "invalid purpose"}, status=400)
         if channel not in ALLOWED_CHANNELS:
             return Response({"success": False, "message": "invalid channel"}, status=400)
+
+        # Validate channel availability
+        if channel == "sms" and not sms_configured():
+            return Response({"success": False, "message": "SMS is not available"}, status=400)
+        if channel == "email":
+            if not email_configured():
+                return Response({"success": False, "message": "Email is not available"}, status=400)
+            # Require user email for email channel
+            user = User.objects.filter(phone=phone).first()
+            if not user or not user.email:
+                return Response({"success": False, "message": "No email address on this account"}, status=400)
 
         now = timezone.now()
         last = (PhoneOTP.objects
@@ -136,20 +222,47 @@ class OtpInitiateView(APIView):
         if _debug_otp_logging_enabled():
             logger.warning("[DEV ONLY] OTP generated for %s (%s): %s", _masked_phone(phone), purpose, code)
         else:
-            logger.info("OTP generated for %s (%s)", _masked_phone(phone), purpose)
+            logger.info("OTP generated for %s (%s) via %s", _masked_phone(phone), purpose, channel)
 
-        try:
-            send_sms_via_provider(phone, f"Your verification code is {code}. It expires in 5 minutes.")
-        except Exception as e:
-            logger.exception("Provider send failed: %s", e)
+        response_data = {
+            "success": True,
+            "expires_in": OTP_TTL_SECONDS,
+            "cooldown": RESEND_COOLDOWN_SECONDS,
+            "channel": channel,
+        }
 
-        return Response({"success": True, "expires_in": OTP_TTL_SECONDS, "cooldown": RESEND_COOLDOWN_SECONDS}, status=200)
+        if channel == "sms":
+            try:
+                send_sms_via_provider(phone, f"Your KIS verification code is {code}. It expires in 5 minutes.")
+            except Exception as e:
+                logger.exception("SMS provider send failed: %s", e)
+
+        elif channel == "email":
+            user = User.objects.filter(phone=phone).first()
+            if user and user.email:
+                sent = send_email_otp(user.email, code, purpose)
+                if not sent:
+                    logger.warning("Email OTP delivery failed for %s", _masked_phone(phone))
+
+        elif channel == "whatsapp":
+            # WhatsApp: return the code and a deep link for the user to send via WhatsApp.
+            # The actual verification is still code-based — WhatsApp message is an audit trail.
+            support_number = getattr(settings, "WHATSAPP_SUPPORT_NUMBER", "").strip()
+            response_data["whatsapp_code"] = code
+            if support_number:
+                import urllib.parse
+                msg = urllib.parse.quote(f"KIS verification code: {code}")
+                response_data["whatsapp_link"] = f"https://wa.me/{support_number.lstrip('+')}?text={msg}"
+
+        return Response(response_data, status=200)
+
 
 @method_decorator(csrf_exempt, name="dispatch")
 class OtpVerifyView(APIView):
     """
     POST /api/v1/auth/otp/verify/
-    body: { phone, purpose='register', code }
+    body: { phone, purpose='register', code, device_id? }
+    On success for 'register' purpose: marks phone verified, issues auth tokens.
     """
     authentication_classes = []
     permission_classes = [AllowAny]
@@ -161,6 +274,7 @@ class OtpVerifyView(APIView):
         phone = normalize_phone_input(phone_raw, country)
         purpose = (request.data.get("purpose") or "register").strip()
         code = (request.data.get("code") or "").strip()
+        device_id = (request.data.get("device_id") or "").strip() or "unknown-device"
 
         if not phone or not code:
             return Response({"success": False, "message": "phone and code required"}, status=400)
@@ -182,10 +296,9 @@ class OtpVerifyView(APIView):
             otp.save(update_fields=["attempts"])
             return Response({"success": False, "message": "invalid code"}, status=400)
 
-        # ✅ Success: consume OTP
+        # ✅ Code verified — consume OTP
         otp.delete()
 
-        # For reset purpose, only confirm the code was valid (do not activate user).
         if purpose == "reset":
             return Response({"success": True, "verified": True}, status=200)
 
@@ -193,7 +306,7 @@ class OtpVerifyView(APIView):
         if not user:
             return Response({"success": False, "message": "user not found"}, status=404)
 
-        # mark verification/activation
+        # Mark phone as verified and activate account
         v = dict(user.verification or {})
         v["phone"] = {"verified": True, "verified_at": timezone.now().isoformat()}
         user.verification = v
@@ -201,14 +314,22 @@ class OtpVerifyView(APIView):
         user.is_active = True
         user.save(update_fields=["verification", "status", "is_active", "updated_at"])
 
+        # Issue auth tokens now that the account is verified
+        from apps.accounts.views import issue_tokens_for_user, upsert_device
+        upsert_device(user, device_id, None, None, request)
+        tokens = issue_tokens_for_user(user, device_id=device_id)
+
         return Response(
             {
                 "success": True,
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
                 "user": {
                     "id": user.id,
                     "phone": user.phone,
                     "status": user.status,
                     "is_active": user.is_active,
+                    "phone_verified": True,
                     "verification": user.verification,
                 },
             },
@@ -257,12 +378,26 @@ class PasswordResetInitiateView(APIView):
         else:
             logger.info("OTP generated for %s (%s)", _masked_phone(phone), purpose)
 
-        try:
-            send_sms_via_provider(phone, f"Your password reset code is {code}. It expires in 5 minutes.")
-        except Exception as e:
-            logger.exception("Provider send failed: %s", e)
+        response_data = {"success": True, "expires_in": OTP_TTL_SECONDS, "cooldown": RESEND_COOLDOWN_SECONDS, "channel": channel}
 
-        return Response({"success": True, "expires_in": OTP_TTL_SECONDS, "cooldown": RESEND_COOLDOWN_SECONDS}, status=200)
+        if channel == "sms":
+            try:
+                send_sms_via_provider(phone, f"Your KIS password reset code is {code}. It expires in 5 minutes.")
+            except Exception as e:
+                logger.exception("Provider send failed: %s", e)
+        elif channel == "email":
+            user = User.objects.filter(phone=phone).first()
+            if user and user.email:
+                send_email_otp(user.email, code, purpose)
+        elif channel == "whatsapp":
+            support_number = getattr(settings, "WHATSAPP_SUPPORT_NUMBER", "").strip()
+            response_data["whatsapp_code"] = code
+            if support_number:
+                import urllib.parse
+                msg = urllib.parse.quote(f"KIS password reset code: {code}")
+                response_data["whatsapp_link"] = f"https://wa.me/{support_number.lstrip('+')}?text={msg}"
+
+        return Response(response_data, status=200)
 
 
 @method_decorator(csrf_exempt, name="dispatch")
@@ -306,7 +441,6 @@ class PasswordResetView(APIView):
             if digits_only:
                 user = User.objects.filter(phone=digits_only).first()
         if not user:
-            # Avoid leaking whether phone exists
             otp.delete()
             return Response({"success": True}, status=200)
 
