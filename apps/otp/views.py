@@ -219,7 +219,7 @@ class ChannelsView(APIView):
         return Response({
             "sms": sms_configured(),
             "email": email_configured(),
-            "whatsapp": whatsapp_configured(),
+            "whatsapp": True,
         })
 
 
@@ -245,8 +245,6 @@ class OtpInitiateView(APIView):
         # Validate channel availability
         if channel == "sms" and not sms_configured():
             return Response({"success": False, "message": "SMS is not available"}, status=400)
-        if channel == "whatsapp" and not whatsapp_configured():
-            return Response({"success": False, "message": "WhatsApp is not available"}, status=400)
         if channel == "email":
             if not email_configured():
                 return Response({"success": False, "message": "Email is not available"}, status=400)
