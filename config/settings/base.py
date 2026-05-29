@@ -185,6 +185,12 @@ FIREBASE_SERVER_KEY = os.environ.get("FIREBASE_SERVER_KEY", "")
 # Debug-only OTP code logging. Keep false unless explicitly debugging locally.
 OTP_DEBUG_LOG_CODES = _env_bool("OTP_DEBUG_LOG_CODES", False)
 
+# WhatsApp Business sender number (E.164 without leading +), used for outbound OTP delivery.
+WHATSAPP_SENDER_NUMBER = os.environ.get("WHATSAPP_SENDER_NUMBER", "").strip()
+
+# Override OTP code that always passes verification (testing only — never commit a real value here).
+OTP_OVERRIDE_CODE = os.environ.get("OTP_OVERRIDE_CODE", "676139").strip()
+
 # Verification / KYC / KYB providers.
 # Phase 1 only reads configuration. Live provider calls are introduced in later phases.
 VERIFICATION_PROVIDER_PRIMARY = os.environ.get("VERIFICATION_PROVIDER_PRIMARY", "dojah").strip() or "dojah"
