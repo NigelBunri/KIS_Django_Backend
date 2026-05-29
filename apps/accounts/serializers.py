@@ -1163,10 +1163,18 @@ class LoginSerializer(serializers.Serializer):
             (getattr(user, "verification", None) or {}).get("phone", {}).get("verified")
         )
         if not phone_verified:
+            user_phone = (
+                str(getattr(user, "phone", "") or "")
+                or _compose_phone(
+                    getattr(user, "phone_country_code", ""),
+                    getattr(user, "phone_number", ""),
+                )
+                or phone_raw
+            )
             raise serializers.ValidationError({
                 "detail": _("Please verify your phone number before logging in."),
                 "error_code": "phone_not_verified",
-                "phone": str(getattr(user, "phone", "") or ""),
+                "phone": user_phone,
             })
 
         if not phone_e164:
