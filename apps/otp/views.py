@@ -250,6 +250,13 @@ class OtpInitiateView(APIView):
                 return Response({"success": False, "message": "Email is not available"}, status=400)
             # Require user email for email channel
             user = User.objects.filter(phone=phone).first()
+            if not user:
+                local_digits = ''.join(ch for ch in phone if ch.isdigit())
+                if local_digits:
+                    user = (
+                        User.objects.filter(phone_number=local_digits).first()
+                        or User.objects.filter(phone=local_digits).first()
+                    )
             if not user or not user.email:
                 return Response({"success": False, "message": "No email address on this account"}, status=400)
 
@@ -291,6 +298,13 @@ class OtpInitiateView(APIView):
 
         elif channel == "email":
             user = User.objects.filter(phone=phone).first()
+            if not user:
+                local_digits = ''.join(ch for ch in phone if ch.isdigit())
+                if local_digits:
+                    user = (
+                        User.objects.filter(phone_number=local_digits).first()
+                        or User.objects.filter(phone=local_digits).first()
+                    )
             if user and user.email:
                 sent = send_email_otp(user.email, code, purpose)
                 if not sent:
@@ -359,6 +373,15 @@ class OtpVerifyView(APIView):
 
         user = User.objects.filter(phone=phone).first()
         if not user:
+            # Fallback: look up by local digits in case the user was stored without country code
+            local_digits = ''.join(ch for ch in phone if ch.isdigit())
+            if local_digits:
+                user = (
+                    User.objects.filter(phone_number=local_digits).first()
+                    or User.objects.filter(phone=local_digits).first()
+                )
+        if not user:
+            logger.warning("OTP verify: user not found for phone %s", _masked_phone(phone))
             return Response({"success": False, "message": "user not found"}, status=404)
 
         # Mark phone as verified and activate account
@@ -489,9 +512,12 @@ class PasswordResetView(APIView):
 
         user = User.objects.filter(phone=phone).first()
         if not user:
-            digits_only = ''.join(ch for ch in phone_raw if ch.isdigit())
-            if digits_only:
-                user = User.objects.filter(phone=digits_only).first()
+            local_digits = ''.join(ch for ch in phone if ch.isdigit())
+            if local_digits:
+                user = (
+                    User.objects.filter(phone_number=local_digits).first()
+                    or User.objects.filter(phone=local_digits).first()
+                )
         if not user:
             otp.delete()
             return Response({"success": True}, status=200)
