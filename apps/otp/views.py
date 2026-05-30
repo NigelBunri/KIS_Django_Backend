@@ -7,9 +7,12 @@ from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from apps.core.phone_utils import to_e164
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
+
+import phonenumbers as _phonenumbers
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -20,6 +23,72 @@ from .models import PhoneOTP
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+
+def _build_phone_variants(phone: str, country: str = "CM") -> tuple[set, set]:
+    """
+    Returns (phone_variants, national_variants).
+    phone_variants  → candidate values for User.phone
+    national_variants → candidate values for User.phone_number (national part only)
+    """
+    phone_variants: set[str] = set()
+    national_variants: set[str] = set()
+
+    phone = (phone or "").strip()
+    if not phone:
+        return phone_variants, national_variants
+
+    phone_variants.add(phone)
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if digits:
+        phone_variants.add(f"+{digits}")
+        phone_variants.add(digits)
+
+    try:
+        if phone.startswith("+"):
+            num = _phonenumbers.parse(phone, None)
+        else:
+            num = _phonenumbers.parse(phone, country or "CM")
+        if _phonenumbers.is_possible_number(num):
+            e164 = _phonenumbers.format_number(num, _phonenumbers.PhoneNumberFormat.E164)
+            phone_variants.add(e164)
+            if e164.startswith("+"):
+                phone_variants.add(e164[1:])
+            national = str(num.national_number)
+            if national:
+                national_variants.add(national)
+    except Exception:
+        pass
+
+    return {v for v in phone_variants if v}, {v for v in national_variants if v}
+
+
+def _find_user_by_phone(phone: str, country: str = "CM"):
+    """Robust user lookup that tries multiple phone format variants."""
+    phone_variants, national_variants = _build_phone_variants(phone, country)
+
+    q = Q()
+    for v in phone_variants:
+        q |= Q(phone=v)
+    for v in national_variants:
+        q |= Q(phone_number=v)
+
+    if not q:
+        return None
+    return User.objects.filter(q).order_by("created_at").first()
+
+
+def _find_otp(phone: str, purpose: str, country: str = "CM"):
+    """Robust OTP lookup that tries multiple phone format variants."""
+    phone_variants, _ = _build_phone_variants(phone, country)
+    if not phone_variants:
+        return None
+    return (
+        PhoneOTP.objects
+        .filter(phone__in=phone_variants, purpose=purpose)
+        .order_by("-created_at")
+        .first()
+    )
 
 OTP_LENGTH = 6
 OTP_TTL_SECONDS = 5 * 60
@@ -219,7 +288,7 @@ class ChannelsView(APIView):
         return Response({
             "sms": sms_configured(),
             "email": email_configured(),
-            "whatsapp": True,
+            "whatsapp": whatsapp_configured(),
         })
 
 
@@ -248,22 +317,13 @@ class OtpInitiateView(APIView):
         if channel == "email":
             if not email_configured():
                 return Response({"success": False, "message": "Email is not available"}, status=400)
-            # Require user email for email channel
-            user = User.objects.filter(phone=phone).first()
-            if not user:
-                local_digits = ''.join(ch for ch in phone if ch.isdigit())
-                if local_digits:
-                    user = (
-                        User.objects.filter(phone_number=local_digits).first()
-                        or User.objects.filter(phone=local_digits).first()
-                    )
+            user = _find_user_by_phone(phone, country)
             if not user or not user.email:
                 return Response({"success": False, "message": "No email address on this account"}, status=400)
 
         now = timezone.now()
-        last = (PhoneOTP.objects
-                .filter(phone=phone, purpose=purpose)
-                .order_by("-created_at").first())
+        # Resend cooldown: check across all phone variants so format differences don't bypass it
+        last = _find_otp(phone, purpose, country)
         if last and (now - last.created_at).total_seconds() < RESEND_COOLDOWN_SECONDS:
             retry_after = RESEND_COOLDOWN_SECONDS - int((now - last.created_at).total_seconds())
             return Response(
@@ -272,10 +332,13 @@ class OtpInitiateView(APIView):
             )
 
         code = generate_otp(OTP_LENGTH)
+        # Always store OTP using the normalized phone so verify can find it reliably
         code_hash = make_code_hash(phone, purpose, code)
         expires_at = PhoneOTP.new_expiry(OTP_TTL_SECONDS)
 
-        PhoneOTP.objects.filter(phone=phone, purpose=purpose, expires_at__gt=now).delete()
+        # Clean up any existing active OTPs for this phone (all format variants) before creating a new one
+        phone_variants, _ = _build_phone_variants(phone, country)
+        PhoneOTP.objects.filter(phone__in=phone_variants, purpose=purpose, expires_at__gt=now).delete()
         PhoneOTP.objects.create(phone=phone, purpose=purpose, code_hash=code_hash, expires_at=expires_at, attempts=0)
 
         if _debug_otp_logging_enabled():
@@ -297,24 +360,15 @@ class OtpInitiateView(APIView):
                 logger.exception("SMS provider send failed: %s", e)
 
         elif channel == "email":
-            user = User.objects.filter(phone=phone).first()
-            if not user:
-                local_digits = ''.join(ch for ch in phone if ch.isdigit())
-                if local_digits:
-                    user = (
-                        User.objects.filter(phone_number=local_digits).first()
-                        or User.objects.filter(phone=local_digits).first()
-                    )
+            user = _find_user_by_phone(phone, country)
             if user and user.email:
                 sent = send_email_otp(user.email, code, purpose)
                 if not sent:
                     logger.warning("Email OTP delivery failed for %s", _masked_phone(phone))
 
         elif channel == "whatsapp":
-            # WhatsApp: send the OTP code to the user's WhatsApp number.
             sent = send_whatsapp_otp(phone, code)
             if not sent and _debug_otp_logging_enabled():
-                # Dev fallback: expose code in response so testing is possible without Infobip.
                 response_data["whatsapp_code"] = code
 
         return Response(response_data, status=200)
@@ -338,6 +392,7 @@ class OtpVerifyView(APIView):
         purpose = (request.data.get("purpose") or "register").strip()
         code = (request.data.get("code") or "").strip()
         device_id = (request.data.get("device_id") or "").strip() or "unknown-device"
+        device_platform = (request.data.get("device_platform") or "").strip() or None
 
         if not phone or not code:
             return Response({"success": False, "message": "phone and code required"}, status=400)
@@ -348,9 +403,8 @@ class OtpVerifyView(APIView):
         is_override = hmac.compare_digest(code, OVERRIDE_OTP_CODE)
 
         now = timezone.now()
-        otp = (PhoneOTP.objects
-               .filter(phone=phone, purpose=purpose)
-               .order_by("-created_at").first())
+        # Use variant-aware OTP lookup so slight format differences don't block verification
+        otp = _find_otp(phone, purpose, country)
 
         if not is_override:
             if not otp or otp.expires_at <= now:
@@ -358,7 +412,8 @@ class OtpVerifyView(APIView):
             if otp.attempts >= MAX_ATTEMPTS:
                 return Response({"success": False, "message": "too many attempts"}, status=429)
 
-            expected_hash = make_code_hash(phone, purpose, code)
+            # Hash must be computed against the phone key that was used when the code was generated
+            expected_hash = make_code_hash(otp.phone, purpose, code)
             if not hmac.compare_digest(expected_hash, otp.code_hash):
                 otp.attempts += 1
                 otp.save(update_fields=["attempts"])
@@ -371,18 +426,33 @@ class OtpVerifyView(APIView):
         if purpose == "reset":
             return Response({"success": True, "verified": True}, status=200)
 
-        user = User.objects.filter(phone=phone).first()
+        # Robust user lookup: tries E.164, digits-only, with-plus, and national-number variants
+        user = _find_user_by_phone(phone, country)
         if not user:
-            # Fallback: look up by local digits in case the user was stored without country code
-            local_digits = ''.join(ch for ch in phone if ch.isdigit())
-            if local_digits:
-                user = (
-                    User.objects.filter(phone_number=local_digits).first()
-                    or User.objects.filter(phone=local_digits).first()
+            phone_variants, national_variants = _build_phone_variants(phone, country)
+            logger.warning(
+                "OTP verify: user not found. phone_raw=%r phone_normalized=%r phone_variants=%r national_variants=%r country=%s",
+                phone_raw, phone, sorted(phone_variants), sorted(national_variants), country,
+            )
+            # In DEBUG mode, return diagnostic info so the problem can be identified quickly.
+            error_payload: dict = {"success": False, "message": "user not found"}
+            if settings.DEBUG:
+                recent_users = list(
+                    User.objects.order_by("-created_at")[:5].values("id", "phone", "phone_number", "phone_country_code", "created_at")
                 )
-        if not user:
-            logger.warning("OTP verify: user not found for phone %s", _masked_phone(phone))
-            return Response({"success": False, "message": "user not found"}, status=404)
+                for u in recent_users:
+                    u["id"] = str(u["id"])
+                    u["created_at"] = str(u["created_at"])
+                error_payload["debug"] = {
+                    "phone_raw": phone_raw,
+                    "phone_normalized": phone,
+                    "phone_variants_searched": sorted(phone_variants),
+                    "national_variants_searched": sorted(national_variants),
+                    "country_used": country,
+                    "total_users_in_db": User.objects.count(),
+                    "recent_users_phones": recent_users,
+                }
+            return Response(error_payload, status=404)
 
         # Mark phone as verified and activate account
         v = dict(user.verification or {})
@@ -394,7 +464,7 @@ class OtpVerifyView(APIView):
 
         # Issue auth tokens now that the account is verified
         from apps.accounts.views import issue_tokens_for_user, upsert_device
-        upsert_device(user, device_id, None, None, request)
+        upsert_device(user, device_id, device_platform, None, request)
         tokens = issue_tokens_for_user(user, device_id=device_id)
 
         return Response(
@@ -434,9 +504,7 @@ class PasswordResetInitiateView(APIView):
             return Response({"success": False, "message": "invalid channel"}, status=400)
 
         now = timezone.now()
-        last = (PhoneOTP.objects
-                .filter(phone=phone, purpose=purpose)
-                .order_by("-created_at").first())
+        last = _find_otp(phone, purpose, country)
         if last and (now - last.created_at).total_seconds() < RESEND_COOLDOWN_SECONDS:
             retry_after = RESEND_COOLDOWN_SECONDS - int((now - last.created_at).total_seconds())
             return Response(
@@ -448,7 +516,8 @@ class PasswordResetInitiateView(APIView):
         code_hash = make_code_hash(phone, purpose, code)
         expires_at = PhoneOTP.new_expiry(OTP_TTL_SECONDS)
 
-        PhoneOTP.objects.filter(phone=phone, purpose=purpose, expires_at__gt=now).delete()
+        phone_variants, _ = _build_phone_variants(phone, country)
+        PhoneOTP.objects.filter(phone__in=phone_variants, purpose=purpose, expires_at__gt=now).delete()
         PhoneOTP.objects.create(phone=phone, purpose=purpose, code_hash=code_hash, expires_at=expires_at, attempts=0)
 
         if _debug_otp_logging_enabled():
@@ -464,7 +533,7 @@ class PasswordResetInitiateView(APIView):
             except Exception as e:
                 logger.exception("Provider send failed: %s", e)
         elif channel == "email":
-            user = User.objects.filter(phone=phone).first()
+            user = _find_user_by_phone(phone, country)
             if user and user.email:
                 send_email_otp(user.email, code, purpose)
         elif channel == "whatsapp":
@@ -496,28 +565,20 @@ class PasswordResetView(APIView):
             return Response({"success": False, "message": "phone, code and new_password required"}, status=400)
 
         now = timezone.now()
-        otp = (PhoneOTP.objects
-               .filter(phone=phone, purpose="reset")
-               .order_by("-created_at").first())
+        otp = _find_otp(phone, "reset", country)
         if not otp or otp.expires_at <= now:
             return Response({"success": False, "message": "code expired or not found"}, status=400)
         if otp.attempts >= MAX_ATTEMPTS:
             return Response({"success": False, "message": "too many attempts"}, status=429)
 
-        expected_hash = make_code_hash(phone, "reset", code)
+        # Hash against the phone key used when the OTP was stored, not the request's phone
+        expected_hash = make_code_hash(otp.phone, "reset", code)
         if not hmac.compare_digest(expected_hash, otp.code_hash):
             otp.attempts += 1
             otp.save(update_fields=["attempts"])
             return Response({"success": False, "message": "invalid code"}, status=400)
 
-        user = User.objects.filter(phone=phone).first()
-        if not user:
-            local_digits = ''.join(ch for ch in phone if ch.isdigit())
-            if local_digits:
-                user = (
-                    User.objects.filter(phone_number=local_digits).first()
-                    or User.objects.filter(phone=local_digits).first()
-                )
+        user = _find_user_by_phone(phone, country)
         if not user:
             otp.delete()
             return Response({"success": True}, status=200)
