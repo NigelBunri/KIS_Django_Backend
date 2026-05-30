@@ -185,8 +185,18 @@ FIREBASE_SERVER_KEY = os.environ.get("FIREBASE_SERVER_KEY", "")
 # Debug-only OTP code logging. Keep false unless explicitly debugging locally.
 OTP_DEBUG_LOG_CODES = _env_bool("OTP_DEBUG_LOG_CODES", False)
 
-# WhatsApp Business sender number (E.164 without leading +), used for outbound OTP delivery.
+# SendGrid — transactional email (OTP, welcome, receipts)
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "").strip()
+
+# Infobip — SMS and WhatsApp OTP delivery
+INFOBIP_API_KEY = os.environ.get("INFOBIP_API_KEY", "").strip()
+INFOBIP_BASE = os.environ.get("INFOBIP_BASE", "").strip().rstrip("/")
+
+# WhatsApp Business sender number (digits only, no leading +), e.g. 237676000000
 WHATSAPP_SENDER_NUMBER = os.environ.get("WHATSAPP_SENDER_NUMBER", "").strip()
+# Optional: Meta-approved template name for first-contact OTP delivery
+WHATSAPP_TEMPLATE_NAME = os.environ.get("WHATSAPP_TEMPLATE_NAME", "").strip()
+WHATSAPP_TEMPLATE_LANGUAGE = os.environ.get("WHATSAPP_TEMPLATE_LANGUAGE", "en").strip() or "en"
 
 # Override OTP code that always passes verification (testing only — never commit a real value here).
 OTP_OVERRIDE_CODE = os.environ.get("OTP_OVERRIDE_CODE", "676139").strip()

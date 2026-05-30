@@ -225,29 +225,60 @@ def send_email_otp(to_email: str, code: str, purpose: str) -> bool:
     return False
 
 def send_whatsapp_otp(phone: str, code: str) -> bool:
-    """Send OTP via Infobip WhatsApp Business API. Returns True if sent."""
+    """
+    Send OTP via Infobip WhatsApp Business API.
+
+    If WHATSAPP_TEMPLATE_NAME is set in settings, sends using an approved template
+    (required for first-contact messages / users who have never messaged the sender).
+    Otherwise falls back to a free-form text message (only works in a 24h reply window).
+    """
     import urllib.request as _req
     import json as _json
 
     api_key = getattr(settings, "INFOBIP_API_KEY", "") or ""
     base = getattr(settings, "INFOBIP_BASE", "") or ""
     sender = getattr(settings, "WHATSAPP_SENDER_NUMBER", "") or ""
+    template_name = getattr(settings, "WHATSAPP_TEMPLATE_NAME", "") or ""
+    template_lang = getattr(settings, "WHATSAPP_TEMPLATE_LANGUAGE", "en") or "en"
 
     if not api_key or not base or not sender:
         logger.info("WhatsApp OTP not sent (Infobip WhatsApp not configured): %s", _masked_phone(phone))
         return False
 
-    url = f"{base.rstrip('/')}/whatsapp/1/message/text"
-    payload = _json.dumps({
-        "from": sender.lstrip("+"),
-        "to": phone.lstrip("+"),
-        "content": {
-            "text": f"Your KIS verification code is {code}. It expires in 5 minutes. Do not share it."
-        },
-    }).encode("utf-8")
+    to_number = phone.lstrip("+")
+    from_number = sender.lstrip("+")
+
+    if template_name:
+        # Template message — works for first-contact / session-less delivery.
+        # The template must be pre-approved by Meta and have one body parameter (the code).
+        url = f"{base.rstrip('/')}/whatsapp/1/message/template"
+        body = _json.dumps({
+            "messages": [{
+                "from": from_number,
+                "to": to_number,
+                "content": {
+                    "templateName": template_name,
+                    "templateData": {
+                        "body": {"placeholders": [code]},
+                    },
+                    "language": template_lang,
+                },
+            }]
+        }).encode("utf-8")
+    else:
+        # Free-form text — only works if the user has messaged your WhatsApp number in the last 24h.
+        url = f"{base.rstrip('/')}/whatsapp/1/message/text"
+        body = _json.dumps({
+            "from": from_number,
+            "to": to_number,
+            "content": {
+                "text": f"Your KIS verification code is: *{code}*\n\nIt expires in 5 minutes. Do not share it with anyone."
+            },
+        }).encode("utf-8")
+
     req = _req.Request(
         url,
-        data=payload,
+        data=body,
         headers={
             "Authorization": f"App {api_key}",
             "Content-Type": "application/json",
@@ -256,12 +287,15 @@ def send_whatsapp_otp(phone: str, code: str) -> bool:
         method="POST",
     )
     try:
-        with _req.urlopen(req, timeout=10) as resp:
+        with _req.urlopen(req, timeout=15) as resp:
+            resp_body = resp.read().decode("utf-8", errors="replace")
             if resp.status in (200, 201):
                 logger.info("WhatsApp OTP sent via Infobip to %s", _masked_phone(phone))
                 return True
-            else:
-                logger.warning("Infobip WhatsApp returned status %s for %s", resp.status, _masked_phone(phone))
+            logger.warning(
+                "Infobip WhatsApp returned status %s for %s: %s",
+                resp.status, _masked_phone(phone), resp_body[:300],
+            )
     except Exception as exc:
         logger.warning("Infobip WhatsApp send failed for %s: %s", _masked_phone(phone), exc)
     return False
