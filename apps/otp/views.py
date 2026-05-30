@@ -333,11 +333,22 @@ class OtpInitiateView(APIView):
     throttle_scope = "otp"
 
     def post(self, request):
+        try:
+            return self._handle(request)
+        except Exception as exc:
+            logger.exception("OtpInitiateView unhandled error: %s", exc)
+            return Response(
+                {"success": False, "message": "Server error — please try again.", "detail": str(exc) if settings.DEBUG else ""},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def _handle(self, request):
         country = (request.data.get("country") or "CM").strip().upper()
         phone_raw = (request.data.get("phone") or "").strip()
         phone = normalize_phone_input(phone_raw, country)
         purpose = (request.data.get("purpose") or "register").strip()
         channel = (request.data.get("channel") or "sms").strip()
+
         if not phone:
             return Response({"success": False, "message": "phone required"}, status=400)
         if purpose not in ALLOWED_PURPOSES:
@@ -345,7 +356,7 @@ class OtpInitiateView(APIView):
         if channel not in ALLOWED_CHANNELS:
             return Response({"success": False, "message": "invalid channel"}, status=400)
 
-        # Validate channel availability
+        # Channel availability checks
         if channel == "sms" and not sms_configured():
             return Response({"success": False, "message": "SMS is not available"}, status=400)
         if channel == "email":
@@ -356,54 +367,61 @@ class OtpInitiateView(APIView):
                 return Response({"success": False, "message": "No email address on this account"}, status=400)
 
         now = timezone.now()
-        # Resend cooldown: check across all phone variants so format differences don't bypass it
-        last = _find_otp(phone, purpose, country)
-        if last and (now - last.created_at).total_seconds() < RESEND_COOLDOWN_SECONDS:
-            retry_after = RESEND_COOLDOWN_SECONDS - int((now - last.created_at).total_seconds())
-            return Response(
-                {"success": False, "message": "Please wait before requesting another code.", "retry_after": max(retry_after, 1)},
-                status=status.HTTP_429_TOO_MANY_REQUESTS,
-            )
 
+        # Cooldown check
+        try:
+            last = _find_otp(phone, purpose, country)
+            if last and (now - last.created_at).total_seconds() < RESEND_COOLDOWN_SECONDS:
+                retry_after = RESEND_COOLDOWN_SECONDS - int((now - last.created_at).total_seconds())
+                return Response(
+                    {"success": False, "message": "Please wait before requesting another code.", "retry_after": max(retry_after, 1)},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+        except Exception as exc:
+            logger.warning("OTP cooldown check failed (non-fatal): %s", exc)
+
+        # Generate and store OTP
         code = generate_otp(OTP_LENGTH)
-        # Always store OTP using the normalized phone so verify can find it reliably
         code_hash = make_code_hash(phone, purpose, code)
         expires_at = PhoneOTP.new_expiry(OTP_TTL_SECONDS)
 
-        # Clean up any existing active OTPs for this phone (all format variants) before creating a new one
-        phone_variants, _ = _build_phone_variants(phone, country)
-        PhoneOTP.objects.filter(phone__in=phone_variants, purpose=purpose, expires_at__gt=now).delete()
-        PhoneOTP.objects.create(phone=phone, purpose=purpose, code_hash=code_hash, expires_at=expires_at, attempts=0)
+        try:
+            phone_variants, _ = _build_phone_variants(phone, country)
+            PhoneOTP.objects.filter(phone__in=phone_variants, purpose=purpose, expires_at__gt=now).delete()
+            PhoneOTP.objects.create(phone=phone, purpose=purpose, code_hash=code_hash, expires_at=expires_at, attempts=0)
+        except Exception as exc:
+            logger.exception("OTP DB write failed: %s", exc)
+            return Response(
+                {"success": False, "message": "Could not create verification code — database error.", "detail": str(exc) if settings.DEBUG else ""},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         if _debug_otp_logging_enabled():
-            logger.warning("[DEV ONLY] OTP generated for %s (%s): %s", _masked_phone(phone), purpose, code)
+            logger.warning("[DEV ONLY] OTP for %s (%s): %s", _masked_phone(phone), purpose, code)
         else:
             logger.info("OTP generated for %s (%s) via %s", _masked_phone(phone), purpose, channel)
 
-        response_data = {
+        response_data: dict = {
             "success": True,
             "expires_in": OTP_TTL_SECONDS,
             "cooldown": RESEND_COOLDOWN_SECONDS,
             "channel": channel,
         }
 
-        if channel == "sms":
-            try:
+        # Delivery — never let a delivery failure block the success response
+        try:
+            if channel == "sms":
                 send_sms_via_provider(phone, f"Your KIS verification code is {code}. It expires in 5 minutes.")
-            except Exception as e:
-                logger.exception("SMS provider send failed: %s", e)
-
-        elif channel == "email":
-            user = _find_user_by_phone(phone, country)
-            if user and user.email:
-                sent = send_email_otp(user.email, code, purpose)
-                if not sent:
-                    logger.warning("Email OTP delivery failed for %s", _masked_phone(phone))
-
-        elif channel == "whatsapp":
-            sent = send_whatsapp_otp(phone, code)
-            if not sent and _debug_otp_logging_enabled():
-                response_data["whatsapp_code"] = code
+            elif channel == "email":
+                user = _find_user_by_phone(phone, country)
+                if user and user.email:
+                    if not send_email_otp(user.email, code, purpose):
+                        logger.warning("Email OTP delivery failed for %s", _masked_phone(phone))
+            elif channel == "whatsapp":
+                if not send_whatsapp_otp(phone, code) and _debug_otp_logging_enabled():
+                    response_data["whatsapp_code"] = code
+        except Exception as exc:
+            logger.warning("OTP delivery error (non-fatal): %s", exc)
 
         return Response(response_data, status=200)
 
