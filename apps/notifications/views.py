@@ -461,11 +461,15 @@ class NotificationViewSet(viewsets.ModelViewSet):
 # Notification Template management
 # -------------------------
 class MentionNotificationView(APIView):
+    from apps.accounts.jwt_auth import DeviceBoundJWTAuthentication
+    authentication_classes = [DeviceBoundJWTAuthentication]
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         mentioned_ids = request.data.get("mentioned_user_ids", [])
         context = request.data.get("context", {})
+        if isinstance(context, str):
+            context = {}
         sender_name = str(context.get("sender_name", "Someone"))
         preview = str(context.get("preview", ""))[:200]
         conversation_id = str(context.get("conversation_id", ""))

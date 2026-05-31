@@ -16,6 +16,7 @@ from django.shortcuts import get_object_or_404
 from django.db import transaction, IntegrityError
 from django.db.models import Sum, Q
 from django.contrib.auth import authenticate
+from django.core.cache import cache
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 
@@ -809,7 +810,7 @@ class LoginView(APIView):
         serializer = LoginSerializer(data=request.data, context={"request": request})
         try:
             serializer.is_valid(raise_exception=True)
-        except DRFValidationError:
+        except DRFValidationError as exc:
             login_identifier = None
             if hasattr(request, "data"):
                 login_identifier = (
@@ -817,11 +818,19 @@ class LoginView(APIView):
                     or request.data.get("phone_number")
                     or request.data.get("email")
                 )
-            record_failed_auth(
-                request,
-                identifier=login_identifier,
-            )
-            raise
+            record_failed_auth(request, identifier=login_identifier)
+            # DRF wraps each dict value in a list — flatten single-item lists so
+            # mobile clients can do `error_code === "phone_not_verified"` directly.
+            raw = exc.detail if isinstance(exc.detail, dict) else {"detail": exc.detail}
+            flat: dict = {}
+            for k, v in raw.items():
+                if isinstance(v, list) and len(v) == 1:
+                    flat[k] = str(v[0])
+                elif isinstance(v, list):
+                    flat[k] = [str(i) for i in v]
+                else:
+                    flat[k] = str(v) if v is not None else v
+            return Response(flat, status=exc.status_code)
         user = serializer.validated_data["user"]
         otp_code = (serializer.validated_data.get("otp_code") or "").strip()
         if TwoFactor.objects.filter(user=user, type="totp", enabled=True).exists():

@@ -8,7 +8,4 @@ router.register(r"tickets", TicketViewSet, basename="tickets")
 router.register(r"attendances", AttendanceViewSet, basename="attendances")
 
 
-urlpatterns = [
-    # Primary API routes for the events app
-    path("api/", include((router.urls, "events"), namespace="events")),
-]
+urlpatterns = router.urls
