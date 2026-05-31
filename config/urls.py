@@ -65,6 +65,7 @@ DocsSwaggerView = SpectacularSwaggerView if settings.DEBUG else StaffOnlySpectac
 DocsRedocView = SpectacularRedocView if settings.DEBUG else StaffOnlySpectacularRedocView
 
 urlpatterns = [
+    path("", health_check, name="root"),
     path("health/", health_check, name="health-check"),
     path("admin/", admin.site.urls),
     path("control/admin/", include("admin_control.urls")),
