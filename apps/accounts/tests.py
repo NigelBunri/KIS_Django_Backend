@@ -250,6 +250,50 @@ class AccountsDeviceLoginPolicyTests(APITestCase):
         self.assertTrue(secondary.linked_via_qr)
         self.assertEqual(secondary.parent_device_id, self.parent_device.id)
 
+    def test_parent_request_revokes_existing_unapproved_second_device(self):
+        rogue = Device.objects.create(
+            user=self.user,
+            device_id="dev_rogue",
+            platform="android",
+            is_parent=False,
+            linked_via_qr=False,
+            last_seen_at=timezone.now(),
+        )
+        tokens = issue_tokens_for_user(self.user, device_id="dev_parent")
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {tokens['access']}",
+            HTTP_X_DEVICE_ID="dev_parent",
+        )
+
+        response = self.client.get(reverse("auth-devices"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        rogue.refresh_from_db()
+        self.assertIsNotNone(rogue.revoked_at)
+        self.assertEqual(rogue.revoke_reason, "unapproved_secondary_device")
+
+    def test_unapproved_second_device_token_is_rejected_and_revoked(self):
+        rogue = Device.objects.create(
+            user=self.user,
+            device_id="dev_rogue",
+            platform="android",
+            is_parent=False,
+            linked_via_qr=False,
+            last_seen_at=timezone.now(),
+        )
+        tokens = issue_tokens_for_user(self.user, device_id="dev_rogue")
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {tokens['access']}",
+            HTTP_X_DEVICE_ID="dev_rogue",
+        )
+
+        response = self.client.get(reverse("auth-devices"))
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        rogue.refresh_from_db()
+        self.assertIsNotNone(rogue.revoked_at)
+        self.assertEqual(rogue.revoke_reason, "unapproved_secondary_device")
+
 
 class AccountsE2EEBundleTests(APITestCase):
     def setUp(self):

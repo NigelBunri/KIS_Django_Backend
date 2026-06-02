@@ -42,7 +42,11 @@ from drf_spectacular.utils import (
 
 # SimpleJWT
 from rest_framework_simplejwt.authentication import JWTAuthentication
-from .jwt_auth import DeviceBoundJWTAuthentication, DeviceBoundJWTAuthenticationAllowPhoneLookup
+from .jwt_auth import (
+    DeviceBoundJWTAuthentication,
+    DeviceBoundJWTAuthenticationAllowPhoneLookup,
+    revoke_unapproved_secondary_devices,
+)
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.settings import api_settings as jwt_api_settings
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -876,6 +880,7 @@ class LoginView(APIView):
         device_id = serializer.validated_data.get("device_id")
         device_platform = serializer.validated_data.get("device_platform") or None
         device_name = serializer.validated_data.get("device_name") or None
+        revoke_unapproved_secondary_devices(user)
         if password_login_requires_qr(user, device_id):
             log_security_event(
                 user,

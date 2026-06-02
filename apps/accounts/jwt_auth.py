@@ -2,7 +2,30 @@ from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.utils import timezone
 
-from .models import Device
+from .models import Device, E2EDeviceKey, E2EPreKey
+
+
+def revoke_unapproved_secondary_devices(user) -> int:
+    if not Device.objects.filter(user=user, is_parent=True, revoked_at__isnull=True).exists():
+        return 0
+
+    devices = list(
+        Device.objects.filter(
+            user=user,
+            is_parent=False,
+            linked_via_qr=False,
+            revoked_at__isnull=True,
+        )
+    )
+    now = timezone.now()
+    for device in devices:
+        device.token_version = int(device.token_version or 1) + 1
+        device.revoked_at = now
+        device.revoke_reason = "unapproved_secondary_device"
+        device.save(update_fields=["token_version", "revoked_at", "revoke_reason", "updated_at"])
+        E2EDeviceKey.objects.filter(user=user, device=device).delete()
+        E2EPreKey.objects.filter(user=user, device=device).delete()
+    return len(devices)
 
 
 class DeviceBoundJWTAuthentication(JWTAuthentication):
@@ -39,6 +62,9 @@ class DeviceBoundJWTAuthentication(JWTAuthentication):
         device = Device.objects.filter(user=user, device_id=str(token_device_id)).first()
         if not device:
             raise AuthenticationFailed("Device session revoked")
+
+        revoke_unapproved_secondary_devices(user)
+        device.refresh_from_db()
         if device.revoked_at:
             raise AuthenticationFailed("Device session revoked")
 
