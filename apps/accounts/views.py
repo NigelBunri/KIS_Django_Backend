@@ -637,6 +637,23 @@ def request_device_id(request) -> str:
         or ""
     )
 
+def password_login_requires_qr(user: User, device_id: str) -> bool:
+    """
+    Password credentials may only resume an already-active device session.
+    Any new device for an account with an active device must be linked by QR
+    from the parent device under Profile -> Manage Devices.
+    """
+    normalized_device_id = str(device_id or "").strip()
+    if not normalized_device_id:
+        return True
+
+    active_devices = Device.objects.filter(user=user, revoked_at__isnull=True)
+    if not active_devices.exists():
+        return False
+
+    return not active_devices.filter(device_id=normalized_device_id).exists()
+
+
 def upsert_device(
     user: User,
     device_id: str,
@@ -859,6 +876,24 @@ class LoginView(APIView):
         device_id = serializer.validated_data.get("device_id")
         device_platform = serializer.validated_data.get("device_platform") or None
         device_name = serializer.validated_data.get("device_name") or None
+        if password_login_requires_qr(user, device_id):
+            log_security_event(
+                user,
+                "security.auth.secondary_device_qr_required",
+                request=request,
+                severity="warning",
+                device_id=device_id,
+                device_platform=device_platform,
+            )
+            return Response(
+                {
+                    "detail": "This account is already active on another device. Use the primary device to link this device by QR code.",
+                    "error_code": "secondary_device_qr_required",
+                    "secondary_device_required": True,
+                    "qr_login_required": True,
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         upsert_device(user, device_id, device_platform, device_name, request)
         tokens = issue_tokens_for_user(user, device_id=device_id)  # should return {access, refresh} or similar
 
@@ -2610,6 +2645,11 @@ class DeviceQRLoginView(APIView):
             return Response({"detail": "Invalid or expired QR token."}, status=status.HTTP_401_UNAUTHORIZED)
 
         user = qr_token.user
+        if qr_token.parent_device and str(device_id) == str(qr_token.parent_device.device_id):
+            return Response(
+                {"detail": "The primary device cannot consume its own secondary-device QR code."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         now = timezone.now()
 
         with transaction.atomic():

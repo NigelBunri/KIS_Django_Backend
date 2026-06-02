@@ -9,6 +9,7 @@ from rest_framework.test import APITestCase
 
 from .models import (
     Device,
+    DeviceQRToken,
     E2EDeviceKey,
     E2EPreKey,
     ProfileArticle,
@@ -153,6 +154,101 @@ class AccountsDeviceSessionTests(APITestCase):
 
         self.assertEqual(refresh_response.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertEqual(refresh_response.data["detail"], "Device session revoked.")
+
+
+
+class AccountsDeviceLoginPolicyTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            phone="+237670000021",
+            password="TestPass123!",
+            country="CM",
+        )
+        self.user.verification = {"phone": {"verified": True, "verified_at": timezone.now().isoformat()}}
+        self.user.status = "active"
+        self.user.is_active = True
+        self.user.save(update_fields=["verification", "status", "is_active"])
+        self.parent_device = Device.objects.create(
+            user=self.user,
+            device_id="dev_parent",
+            platform="ios",
+            name="Parent iPhone",
+            is_parent=True,
+            last_seen_at=timezone.now(),
+        )
+
+    def test_password_login_allows_existing_active_device(self):
+        response = self.client.post(
+            reverse("auth-login"),
+            {
+                "phone": "+237670000021",
+                "password": "TestPass123!",
+                "device_id": "dev_parent",
+                "device_platform": "ios",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.data)
+
+    def test_password_login_blocks_new_device_when_account_has_active_device(self):
+        response = self.client.post(
+            reverse("auth-login"),
+            {
+                "phone": "+237670000021",
+                "password": "TestPass123!",
+                "device_id": "dev_new_android",
+                "device_platform": "android",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data["error_code"], "secondary_device_qr_required")
+        self.assertTrue(response.data["qr_login_required"])
+        self.assertFalse(Device.objects.filter(user=self.user, device_id="dev_new_android").exists())
+
+    def test_qr_login_rejects_parent_device_consuming_own_qr(self):
+        qr_token, token_plain = DeviceQRToken.generate_for_device(self.user, self.parent_device)
+
+        response = self.client.post(
+            reverse("device-qr-login"),
+            {
+                "token": token_plain,
+                "device_id": "dev_parent",
+                "device_name": "Parent iPhone",
+                "platform": "ios",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("primary device", response.data["detail"])
+        qr_token.refresh_from_db()
+        self.assertIsNotNone(qr_token.used_at)
+        self.assertIsNone(qr_token.used_by_device)
+
+    def test_qr_login_creates_secondary_device(self):
+        _qr_token, token_plain = DeviceQRToken.generate_for_device(self.user, self.parent_device)
+
+        response = self.client.post(
+            reverse("device-qr-login"),
+            {
+                "token": token_plain,
+                "device_id": "dev_secondary",
+                "device_name": "Secondary Android",
+                "platform": "android",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.data)
+        secondary = Device.objects.get(user=self.user, device_id="dev_secondary")
+        self.assertFalse(secondary.is_parent)
+        self.assertTrue(secondary.linked_via_qr)
+        self.assertEqual(secondary.parent_device_id, self.parent_device.id)
 
 
 class AccountsE2EEBundleTests(APITestCase):
