@@ -365,7 +365,7 @@ class UploadFileView(APIView):
 
         identifier = uuid.uuid4().hex
         filename = get_valid_filename(upload.name or "upload") or "upload"
-        checksum = hash_upload(upload)
+        checksum = hash_upload(upload) if getattr(settings, "MEDIA_UPLOAD_CHECKSUM_ENABLED", False) else ""
         mime_type = upload.content_type or ""
         decision = scan_upload_for_explicit_content(filename=filename, mime_type=mime_type, context=context)
         relative_path = f"uploads/{identifier}/{filename}"
