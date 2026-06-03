@@ -59,7 +59,7 @@ class SupabaseStorage(Storage):
         self.bucket = _env("SUPABASE_STORAGE_BUCKET", "kis-media")
         self.service_key = _env("SUPABASE_SERVICE_ROLE_KEY")
         self.public_bucket = _env("SUPABASE_STORAGE_PUBLIC_BUCKET", "false").lower() in {"1", "true", "yes", "on"}
-        self.timeout = float(_env("SUPABASE_STORAGE_TIMEOUT_SECONDS", "30") or "30")
+        self.timeout = float(_env("SUPABASE_STORAGE_TIMEOUT_SECONDS", "180") or "180")
         if not self.base_url or not self.bucket or not self.service_key:
             raise ImproperlyConfigured(
                 "Supabase storage requires SUPABASE_URL or SUPABASE_STORAGE_API_URL, "
