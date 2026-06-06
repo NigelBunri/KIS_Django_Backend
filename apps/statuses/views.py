@@ -95,23 +95,33 @@ class StatusViewSet(viewsets.ModelViewSet):
             for value in StatusMute.objects.filter(user=self.request.user).values_list("muted_user_id", flat=True)
         }
 
+    def _get_author_contact_ids(self, author_ids: set[str]) -> dict[str, set[str]]:
+        if not author_ids:
+            return {}
+        rows = UserContact.objects.filter(
+            user_id__in=author_ids,
+            contact_user__isnull=False,
+        ).values_list("user_id", "contact_user_id")
+        mapping: dict[str, set[str]] = defaultdict(set)
+        for author_id, contact_user_id in rows:
+            mapping[str(author_id)].add(str(contact_user_id))
+        return mapping
+
     def _can_view_status(
         self,
         status_item: StatusItem,
         *,
         viewer_id: str,
-        mutual_contact_ids: set[str],
         blocked_user_ids: set[str],
+        author_contact_ids: dict[str, set[str]] | None = None,
+        mutual_contact_ids: set[str] | None = None,
     ) -> bool:
         author_id = str(status_item.user_id)
         if author_id == viewer_id:
             return True
         if author_id in blocked_user_ids or viewer_id in blocked_user_ids:
             return False
-        if author_id not in mutual_contact_ids:
-            return False
-        if status_item.visibility == StatusVisibility.CONTACTS:
-            return True
+
         target_ids = {
             str(target.target_user_id)
             for target in getattr(status_item, "_prefetched_objects_cache", {}).get("audience_targets", [])
@@ -121,8 +131,21 @@ class StatusViewSet(viewsets.ModelViewSet):
                 str(value)
                 for value in status_item.audience_targets.values_list("target_user_id", flat=True)
             }
+
+        contacts_for_author = (author_contact_ids or {}).get(author_id)
+        if contacts_for_author is None:
+            contacts_for_author = set(
+                str(value)
+                for value in UserContact.objects.filter(
+                    user_id=author_id,
+                    contact_user__isnull=False,
+                ).values_list("contact_user_id", flat=True)
+            )
+
+        if status_item.visibility == StatusVisibility.CONTACTS:
+            return viewer_id in contacts_for_author
         if status_item.visibility == StatusVisibility.CONTACTS_EXCEPT:
-            return viewer_id not in target_ids
+            return viewer_id in contacts_for_author and viewer_id not in target_ids
         if status_item.visibility == StatusVisibility.ONLY_SHARE_WITH:
             return viewer_id in target_ids
         return False
@@ -189,6 +212,8 @@ class StatusViewSet(viewsets.ModelViewSet):
             .exclude(user_id__in=muted_user_ids)
             .order_by("-created_at")
         )
+        base_items = list(base_items)
+        author_contact_ids = self._get_author_contact_ids({str(item.user_id) for item in base_items})
         items = [
             item
             for item in base_items
@@ -196,8 +221,9 @@ class StatusViewSet(viewsets.ModelViewSet):
             and self._can_view_status(
                 item,
                 viewer_id=viewer_id,
-                mutual_contact_ids=mutual_contact_ids,
                 blocked_user_ids=blocked_user_ids,
+                author_contact_ids=author_contact_ids,
+                mutual_contact_ids=mutual_contact_ids,
             )
         ]
         viewed_ids = set(
@@ -306,8 +332,9 @@ class StatusViewSet(viewsets.ModelViewSet):
         if not self._can_view_status(
             status_item,
             viewer_id=str(request.user.id),
-            mutual_contact_ids=mutual_contact_ids,
             blocked_user_ids=blocked_user_ids,
+            author_contact_ids=self._get_author_contact_ids({str(status_item.user_id)}),
+            mutual_contact_ids=mutual_contact_ids,
         ):
             return Response({"detail": "You cannot view this status."}, status=status.HTTP_403_FORBIDDEN)
 
@@ -345,8 +372,9 @@ class StatusViewSet(viewsets.ModelViewSet):
             if self._can_view_status(
                 item,
                 viewer_id=viewer_id,
-                mutual_contact_ids=mutual_contact_ids,
                 blocked_user_ids=blocked_user_ids,
+                author_contact_ids=self._get_author_contact_ids({str(item.user_id)}),
+                mutual_contact_ids=mutual_contact_ids,
             )
         ]
         viewed_ids = set(
@@ -483,7 +511,7 @@ class StatusViewSet(viewsets.ModelViewSet):
         except StatusItem.DoesNotExist:
             return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        if status_item.reply_permission == "NOBODY":
+        if status_item.reply_permission == "nobody":
             return Response({"detail": "Replies disabled for this status."}, status=status.HTTP_403_FORBIDDEN)
 
         text = (request.data.get("text") or "").strip()

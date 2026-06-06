@@ -10,6 +10,7 @@ from apps.moderation.models import AuditLog, Flag, UserBlock
 from apps.statuses.models import (
     StatusAudienceTarget,
     StatusItem,
+    StatusItemView,
     StatusMute,
     StatusReplyPermission,
     StatusType,
@@ -87,7 +88,7 @@ class StatusPrivacyContractTests(APITestCase):
         self._create_status(author=self.stranger)
 
         self.client.force_authenticate(self.viewer)
-        res = self.client.get(reverse("status-list"))
+        res = self.client.get(reverse("statuses:status-list"))
 
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         results = res.json()["results"]
@@ -106,52 +107,124 @@ class StatusPrivacyContractTests(APITestCase):
         )
         self.client.force_authenticate(self.excluded)
 
-        res = self.client.get(reverse("status-list"))
+        res = self.client.get(reverse("statuses:status-list"))
 
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         author_entries = [
             entry for entry in res.json()["results"] if entry["user"]["id"] == str(self.author.id)
         ]
         self.assertEqual(author_entries, [])
-        mark_view = self.client.post(reverse("status-view", kwargs={"pk": status_item.id}))
+        mark_view = self.client.post(f"/api/v1/statuses/{status_item.id}/view/")
         self.assertEqual(mark_view.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_only_share_with_requires_target_membership(self):
+    def test_only_share_with_requires_selected_target(self):
         self._create_status(
             author=self.author,
             visibility=StatusVisibility.ONLY_SHARE_WITH,
             targets=[self.viewer],
         )
         self.client.force_authenticate(self.viewer)
-        allowed = self.client.get(reverse("status-list"))
+        allowed = self.client.get(reverse("statuses:status-list"))
         self.assertEqual(allowed.status_code, status.HTTP_200_OK)
         self.assertEqual(len(allowed.json()["results"]), 1)
 
         self.client.force_authenticate(self.excluded)
-        denied = self.client.get(reverse("status-list"))
+        denied = self.client.get(reverse("statuses:status-list"))
         author_entries = [
             entry for entry in denied.json()["results"] if entry["user"]["id"] == str(self.author.id)
         ]
         self.assertEqual(author_entries, [])
 
+    def test_author_contacts_can_view_without_saving_author_back(self):
+        author_only_contact = User.objects.create_user(
+            phone="+2348000000105",
+            password="password123",
+            country="NG",
+            display_name="Author Contact",
+        )
+        UserContact.objects.create(
+            user=self.author,
+            contact_user=author_only_contact,
+            contact_phone=author_only_contact.phone,
+            contact_phone_number=author_only_contact.phone,
+            contact_display_name=author_only_contact.display_name or "",
+        )
+        self._create_status(author=self.author)
+
+        self.client.force_authenticate(author_only_contact)
+        res = self.client.get(reverse("statuses:status-list"))
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        user_ids = [entry["user"]["id"] for entry in res.json()["results"]]
+        self.assertIn(str(self.author.id), user_ids)
+
+    def test_only_share_with_selected_contact_can_view_without_reverse_contact(self):
+        author_only_contact = User.objects.create_user(
+            phone="+2348000000106",
+            password="password123",
+            country="NG",
+            display_name="Selected Contact",
+        )
+        UserContact.objects.create(
+            user=self.author,
+            contact_user=author_only_contact,
+            contact_phone=author_only_contact.phone,
+            contact_phone_number=author_only_contact.phone,
+            contact_display_name=author_only_contact.display_name or "",
+        )
+        self._create_status(
+            author=self.author,
+            visibility=StatusVisibility.ONLY_SHARE_WITH,
+            targets=[author_only_contact],
+        )
+
+        self.client.force_authenticate(author_only_contact)
+        res = self.client.get(reverse("statuses:status-list"))
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        user_ids = [entry["user"]["id"] for entry in res.json()["results"]]
+        self.assertIn(str(self.author.id), user_ids)
+
+    def test_create_accepts_explicit_audience_aliases(self):
+        self.client.force_authenticate(self.author)
+        res = self.client.post(
+            "/api/v1/statuses/",
+            {
+                "type": StatusType.TEXT,
+                "text": "Alias audience",
+                "visibility": StatusVisibility.ONLY_SHARE_WITH,
+                "allowed_user_ids": [str(self.viewer.id)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        created = StatusItem.objects.get(text="Alias audience")
+        self.assertTrue(
+            StatusAudienceTarget.objects.filter(
+                status=created,
+                target_user=self.viewer,
+            ).exists()
+        )
+
     def test_mute_and_block_remove_author_from_status_feed(self):
         self._create_status(author=self.author)
         self.client.force_authenticate(self.viewer)
 
-        mute_res = self.client.post(reverse("status-mute"), {"user_id": str(self.author.id)}, format="json")
+        mute_res = self.client.post(reverse("statuses:status-mute"), {"user_id": str(self.author.id)}, format="json")
         self.assertEqual(mute_res.status_code, status.HTTP_200_OK)
         self.assertTrue(
             StatusMute.objects.filter(user=self.viewer, muted_user=self.author).exists()
         )
-        muted_list = self.client.get(reverse("status-list"))
+        muted_list = self.client.get(reverse("statuses:status-list"))
         author_entries = [
             entry for entry in muted_list.json()["results"] if entry["user"]["id"] == str(self.author.id)
         ]
         self.assertEqual(author_entries, [])
 
-        self.client.post(reverse("status-unmute"), {"user_id": str(self.author.id)}, format="json")
+        self.client.post(reverse("statuses:status-unmute"), {"user_id": str(self.author.id)}, format="json")
         UserBlock.objects.create(blocker=self.viewer, blocked=self.author, reason="status_block")
-        blocked_list = self.client.get(reverse("status-list"))
+        blocked_list = self.client.get(reverse("statuses:status-list"))
         author_entries = [
             entry for entry in blocked_list.json()["results"] if entry["user"]["id"] == str(self.author.id)
         ]
@@ -162,7 +235,7 @@ class StatusPrivacyContractTests(APITestCase):
         self.client.force_authenticate(self.viewer)
 
         res = self.client.post(
-            reverse("status-report", kwargs={"pk": status_item.id}),
+            reverse("statuses:status-report", kwargs={"pk": status_item.id}),
             {"reason": "spam"},
             format="json",
         )
@@ -185,7 +258,7 @@ class StatusPrivacyContractTests(APITestCase):
         self.client.force_authenticate(self.viewer)
         StatusItemView.objects.create(status=matching, user=self.viewer)
 
-        res = self.client.get(reverse("status-search"), {"q": "Launch checklist"})
+        res = self.client.get(reverse("statuses:status-search"), {"q": "Launch checklist"})
 
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         rows = res.json()["results"]
@@ -198,13 +271,13 @@ class StatusPrivacyContractTests(APITestCase):
         StatusItemView.objects.create(status=status_item, user=self.viewer)
 
         self.client.force_authenticate(self.author)
-        owner_res = self.client.get(reverse("status-viewers", kwargs={"pk": status_item.id}))
+        owner_res = self.client.get(reverse("statuses:status-viewers", kwargs={"pk": status_item.id}))
         self.assertEqual(owner_res.status_code, status.HTTP_200_OK)
         self.assertEqual(owner_res.json()["view_count"], 1)
         self.assertEqual(owner_res.json()["results"][0]["id"], str(self.viewer.id))
 
         self.client.force_authenticate(self.viewer)
-        viewer_res = self.client.get(reverse("status-viewers", kwargs={"pk": status_item.id}))
+        viewer_res = self.client.get(reverse("statuses:status-viewers", kwargs={"pk": status_item.id}))
         self.assertEqual(viewer_res.status_code, status.HTTP_404_NOT_FOUND)
 
     @override_settings(MEDIA_EXPLICIT_SCAN_REQUIRED=True, MEDIA_SAFETY_ENABLED=True)

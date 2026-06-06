@@ -69,7 +69,7 @@ class StatusItemSerializer(serializers.ModelSerializer):
         if obj.reply_permission == StatusReplyPermission.NOBODY:
             return False
         mutual_contact_ids = self.context.get("mutual_contact_ids") or set()
-        return obj.user_id in mutual_contact_ids
+        return str(obj.user_id) in {str(value) for value in mutual_contact_ids}
 
     def get_audience_user_ids(self, obj: StatusItem) -> list[str]:
         request = self.context.get("request")
@@ -102,6 +102,18 @@ class StatusCreateSerializer(serializers.ModelSerializer):
         allow_empty=True,
         write_only=True,
     )
+    allowed_user_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        write_only=True,
+    )
+    excluded_user_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        write_only=True,
+    )
 
     class Meta:
         model = StatusItem
@@ -115,6 +127,8 @@ class StatusCreateSerializer(serializers.ModelSerializer):
             "visibility",
             "reply_permission",
             "target_user_ids",
+            "allowed_user_ids",
+            "excluded_user_ids",
             "created_at",
             "expires_at",
         ]
@@ -138,17 +152,44 @@ class StatusCreateSerializer(serializers.ModelSerializer):
             except Exception:
                 raise serializers.ValidationError({"style": "Invalid style payload."})
 
-        raw_targets = self.initial_data.get("target_user_ids")
-        if isinstance(raw_targets, str):
-            try:
-                parsed = json.loads(raw_targets)
-                if isinstance(parsed, list):
-                    attrs["target_user_ids"] = parsed
-                    target_user_ids = parsed
-            except Exception:
-                tokens = [token.strip() for token in raw_targets.split(",") if token.strip()]
-                attrs["target_user_ids"] = tokens
-                target_user_ids = tokens
+        def parse_id_list(raw_value):
+            if raw_value is None:
+                return []
+            if isinstance(raw_value, (list, tuple)):
+                return list(raw_value)
+            if isinstance(raw_value, str):
+                try:
+                    parsed = json.loads(raw_value)
+                    if isinstance(parsed, list):
+                        return parsed
+                except Exception:
+                    pass
+                return [token.strip() for token in raw_value.split(",") if token.strip()]
+            return []
+
+        raw_target_aliases = [
+            self.initial_data.get("target_user_ids"),
+            self.initial_data.get("audience_user_ids"),
+        ]
+        if visibility == StatusVisibility.ONLY_SHARE_WITH:
+            raw_target_aliases.extend([
+                self.initial_data.get("allowed_user_ids"),
+                self.initial_data.get("only_user_ids"),
+                self.initial_data.get("only_share_with_user_ids"),
+            ])
+        elif visibility == StatusVisibility.CONTACTS_EXCEPT:
+            raw_target_aliases.extend([
+                self.initial_data.get("excluded_user_ids"),
+                self.initial_data.get("except_user_ids"),
+                self.initial_data.get("contacts_except_user_ids"),
+            ])
+
+        merged_targets = []
+        for raw_targets in raw_target_aliases:
+            merged_targets.extend(parse_id_list(raw_targets))
+        if merged_targets:
+            attrs["target_user_ids"] = merged_targets
+            target_user_ids = merged_targets
 
         if status_type == StatusType.TEXT and not text:
             raise serializers.ValidationError({"text": "Text status requires text."})
@@ -215,6 +256,8 @@ class StatusCreateSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         target_user_ids = validated_data.pop("target_user_ids", [])
+        validated_data.pop("allowed_user_ids", None)
+        validated_data.pop("excluded_user_ids", None)
         item = super().create(validated_data)
         if target_user_ids:
             StatusAudienceTarget.objects.bulk_create(
