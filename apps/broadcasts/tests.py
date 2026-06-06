@@ -37,6 +37,7 @@ from apps.broadcasts.models import (
     BroadcastMarketProfile,
     BroadcastSourceType,
     BroadcastVideo,
+    UserContentPlaylist,
     EducationInstitution,
     EducationInstitutionBroadcast,
     EducationInstitutionCourse,
@@ -1139,6 +1140,38 @@ class ChannelEngagementTests(APITestCase):
         self.assertIn('summary', response.data)
         self.assertGreaterEqual(response.data['summary']['views'], 1)
         self.assertTrue(ChannelAnalyticsDailyRollup.objects.filter(channel=self.channel, date=timezone.localdate()).exists())
+
+
+class UserContentPlaylistApiTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            phone='5557600001',
+            username='playlist_user',
+            password='secret',
+            country='NG',
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_user_playlist_list_and_create_do_not_crash(self):
+        list_response = self.client.get('/api/v1/broadcasts/user-playlists/')
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK, list_response.data)
+        self.assertEqual(list_response.data['results'], [])
+
+        create_response = self.client.post(
+            '/api/v1/broadcasts/user-playlists/',
+            {'title': 'Watch later', 'visibility': 'private'},
+            format='json',
+        )
+
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        self.assertEqual(create_response.data['title'], 'Watch later')
+        self.assertTrue(
+            UserContentPlaylist.objects.filter(
+                user=self.user,
+                title='Watch later',
+            ).exists()
+        )
 
 
 @override_settings(
