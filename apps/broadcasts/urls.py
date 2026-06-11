@@ -182,6 +182,52 @@ from .views import (
     ChannelMembershipTierListView,
     ChannelMembershipView,
     TipCreatorView,
+    ChannelContentTipView,
+    ChannelLiveStreamTipView,
+    ChannelLiveStreamTipListView,
+    ChannelContentWatchEventView,
+    ChannelContentWatchSegmentView,
+    ChannelContentAudioTracksView,
+    ChannelContentGeoRestrictionView,
+    ChannelContentPremiereView,
+    ChannelContentTranscriptView,
+    ChannelContentTranscriptWebhookView,
+    ChannelMonetizationSettingsView,
+    ChannelPayoutRequestView,
+    ChannelLiveStreamGuestsView,
+    ChannelLiveStreamGuestActionView,
+    ChannelContentRecommendationsView,
+    ChannelRevenueAnalyticsView,
+    ChannelContentAutoChaptersView,
+    ChannelContentProductsView,
+    ChannelContentProductDetailView,
+    ChannelLiveStreamTargetsView,
+    ChannelLiveStreamTargetDetailView,
+    ChannelMembershipGiftView,
+    ChannelMembershipGiftRedeemView,
+    ChannelContentCopyrightClaimsView,
+    ChannelContentCopyrightDisputeView,
+    ChannelAudienceDemographicsView,
+    ChannelAdCampaignView,
+    ChannelAdSlotView,
+    ChannelAdImpressionView,
+    ChannelContentQueueView,
+    ChannelContentQueueReorderView,
+    BroadcastChannelVerifyView,
+    BroadcastSearchView,
+    ChannelCommentPinByContentView,
+    ChannelTrailerFeaturedView,
+    ChannelAnalyticsImpressionsCTRView,
+    ChannelAnalyticsTrafficSourcesView,
+    ChannelKeywordFiltersView,
+    ChannelKeywordFilterDetailView,
+    ChannelHomepageShelvesView,
+    ChannelHomepageShelfDetailView,
+    ChannelHomepageShelfItemsView,
+    ChannelCategoryListView,
+    ChannelCategoryBrowseView,
+    ChannelContentFingerprintView,
+    ChannelLiveStreamSettingsView,
 )
 
 app_name = "broadcasts"
@@ -717,4 +763,79 @@ urlpatterns = [
     path("broadcasts/channels/<uuid:channel_id>/membership-tiers/", ChannelMembershipTierListView.as_view(), name="broadcast-channel-membership-tiers"),
     path("broadcasts/channels/<uuid:channel_id>/membership/", ChannelMembershipView.as_view(), name="broadcast-channel-membership"),
     path("broadcast-items/<str:content_id>/tip/", TipCreatorView.as_view(), name="tip-creator"),
+    # Super Thanks / Super Chat tips
+    path("broadcasts/channel-contents/<uuid:content_id>/tips/", ChannelContentTipView.as_view(), name="broadcast-channel-content-tips"),
+    path("broadcasts/live-streams/<uuid:stream_id>/tips/", ChannelLiveStreamTipListView.as_view(), name="broadcast-live-stream-tips"),
+    path("broadcasts/live-streams/<uuid:stream_id>/tip/", ChannelLiveStreamTipView.as_view(), name="broadcast-live-stream-tip"),
+    # Watch heatmap + recommendation signals
+    path("broadcasts/channel-contents/<uuid:content_id>/watch-segments/", ChannelContentWatchSegmentView.as_view(), name="broadcast-channel-content-watch-segments"),
+    path("broadcasts/channel-contents/<uuid:content_id>/watch-event/", ChannelContentWatchEventView.as_view(), name="broadcast-channel-content-watch-event"),
+    # Audio tracks
+    path("broadcasts/channel-contents/<uuid:content_id>/audio-tracks/", ChannelContentAudioTracksView.as_view(), name="broadcast-channel-content-audio-tracks"),
+    # Geo-restriction
+    path("broadcasts/channel-contents/<uuid:content_id>/geo-restriction/", ChannelContentGeoRestrictionView.as_view(), name="broadcast-channel-content-geo-restriction"),
+    # Premiere
+    path("broadcasts/channel-contents/<uuid:content_id>/premiere/", ChannelContentPremiereView.as_view(), name="broadcast-channel-content-premiere"),
+    # Transcript / auto-captions
+    path("broadcasts/channel-contents/<uuid:content_id>/transcript/", ChannelContentTranscriptView.as_view(), name="broadcast-channel-content-transcript"),
+    path("broadcasts/transcripts/webhook/", ChannelContentTranscriptWebhookView.as_view(), name="broadcast-transcript-webhook"),
+    # Monetization + payouts
+    path("broadcasts/channels/<uuid:channel_id>/monetization/", ChannelMonetizationSettingsView.as_view(), name="broadcast-channel-monetization"),
+    path("broadcasts/channels/<uuid:channel_id>/payout-requests/", ChannelPayoutRequestView.as_view(), name="broadcast-channel-payout-requests"),
+    # Co-streaming guests
+    path("broadcasts/live-streams/<uuid:stream_id>/guests/", ChannelLiveStreamGuestsView.as_view(), name="broadcast-live-stream-guests"),
+    path("broadcasts/live-streams/<uuid:stream_id>/guests/<uuid:guest_id>/", ChannelLiveStreamGuestActionView.as_view(), name="broadcast-live-stream-guest-action"),
+    # Recommendations
+    path("broadcasts/recommendations/", ChannelContentRecommendationsView.as_view(), name="broadcast-recommendations"),
+    # Revenue analytics
+    path("broadcasts/channels/<uuid:channel_id>/revenue/", ChannelRevenueAnalyticsView.as_view(), name="broadcast-channel-revenue"),
+    # Auto-chapters
+    path("broadcasts/channel-contents/<uuid:content_id>/auto-chapters/", ChannelContentAutoChaptersView.as_view(), name="broadcast-channel-content-auto-chapters"),
+    # Product tagging
+    path("broadcasts/channel-contents/<uuid:content_id>/products/", ChannelContentProductsView.as_view(), name="broadcast-channel-content-products"),
+    path("broadcasts/channel-contents/<uuid:content_id>/products/<uuid:tag_id>/", ChannelContentProductDetailView.as_view(), name="broadcast-channel-content-product-detail"),
+    # SimulCast
+    path("broadcasts/live-streams/<uuid:stream_id>/simulcast/", ChannelLiveStreamTargetsView.as_view(), name="broadcast-live-stream-simulcast"),
+    path("broadcasts/live-streams/<uuid:stream_id>/simulcast/<uuid:target_id>/", ChannelLiveStreamTargetDetailView.as_view(), name="broadcast-live-stream-simulcast-detail"),
+    # Gift memberships
+    path("broadcasts/memberships/gift/", ChannelMembershipGiftView.as_view(), name="broadcast-membership-gift"),
+    path("broadcasts/memberships/gift/<str:token>/redeem/", ChannelMembershipGiftRedeemView.as_view(), name="broadcast-membership-gift-redeem"),
+    # Copyright claims
+    path("broadcasts/channels/<uuid:channel_id>/copyright-claims/", ChannelContentCopyrightClaimsView.as_view(), name="broadcast-channel-copyright-claims"),
+    path("broadcasts/copyright-claims/<uuid:claim_id>/dispute/", ChannelContentCopyrightDisputeView.as_view(), name="broadcast-copyright-claim-dispute"),
+    # Audience demographics
+    path("broadcasts/channels/<uuid:channel_id>/demographics/", ChannelAudienceDemographicsView.as_view(), name="broadcast-channel-demographics"),
+    # Ad campaigns + slots + impressions
+    path("broadcasts/channels/<uuid:channel_id>/ad-campaigns/", ChannelAdCampaignView.as_view(), name="broadcast-channel-ad-campaigns"),
+    path("broadcasts/channel-contents/<uuid:content_id>/ad-slots/", ChannelAdSlotView.as_view(), name="broadcast-channel-content-ad-slots"),
+    path("broadcasts/ad-slots/<uuid:slot_id>/impression/", ChannelAdImpressionView.as_view(), name="broadcast-ad-slot-impression"),
+    # Watch queue
+    path("broadcasts/queue/", ChannelContentQueueView.as_view(), name="broadcast-queue"),
+    path("broadcasts/queue/reorder/", ChannelContentQueueReorderView.as_view(), name="broadcast-queue-reorder"),
+    # Verified channel (admin)
+    path("broadcasts/channels/<uuid:channel_id>/verify/", BroadcastChannelVerifyView.as_view(), name="broadcast-channel-verify"),
+    # Search
+    path("broadcasts/search/", BroadcastSearchView.as_view(), name="broadcast-search"),
+    # Comment pin (content-scoped)
+    path("broadcasts/channel-contents/<uuid:content_id>/comments/<uuid:comment_id>/pin/", ChannelCommentPinByContentView.as_view(), name="broadcast-comment-pin"),
+    # Channel trailer / featured
+    path("broadcasts/channels/<uuid:channel_id>/trailer-featured/", ChannelTrailerFeaturedView.as_view(), name="broadcast-channel-trailer-featured"),
+    # Analytics: impressions + CTR
+    path("broadcasts/channels/<uuid:channel_id>/analytics/impressions/", ChannelAnalyticsImpressionsCTRView.as_view(), name="broadcast-channel-analytics-impressions"),
+    # Analytics: traffic sources
+    path("broadcasts/channels/<uuid:channel_id>/analytics/traffic-sources/", ChannelAnalyticsTrafficSourcesView.as_view(), name="broadcast-channel-analytics-traffic-sources"),
+    # Keyword filters
+    path("broadcasts/channels/<uuid:channel_id>/keyword-filters/", ChannelKeywordFiltersView.as_view(), name="broadcast-channel-keyword-filters"),
+    path("broadcasts/keyword-filters/<uuid:filter_id>/", ChannelKeywordFilterDetailView.as_view(), name="broadcast-keyword-filter-detail"),
+    # Homepage shelves
+    path("broadcasts/channels/<uuid:channel_id>/shelves/", ChannelHomepageShelvesView.as_view(), name="broadcast-channel-shelves"),
+    path("broadcasts/shelves/<uuid:shelf_id>/", ChannelHomepageShelfDetailView.as_view(), name="broadcast-shelf-detail"),
+    path("broadcasts/shelves/<uuid:shelf_id>/items/", ChannelHomepageShelfItemsView.as_view(), name="broadcast-shelf-items"),
+    # Categories
+    path("broadcasts/categories/", ChannelCategoryListView.as_view(), name="broadcast-categories"),
+    path("broadcasts/categories/<slug:slug>/browse/", ChannelCategoryBrowseView.as_view(), name="broadcast-category-browse"),
+    # Content fingerprint
+    path("broadcasts/channel-contents/<uuid:content_id>/fingerprint/", ChannelContentFingerprintView.as_view(), name="broadcast-content-fingerprint"),
+    # Live stream settings (latency/DVR)
+    path("broadcasts/live-streams/<uuid:stream_id>/settings/", ChannelLiveStreamSettingsView.as_view(), name="broadcast-live-stream-settings"),
 ]

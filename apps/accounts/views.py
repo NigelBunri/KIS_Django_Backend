@@ -1181,44 +1181,69 @@ class E2EERegisterKeysView(APIView):
         if header_device_id and str(header_device_id) != str(device_id):
             return Response({"detail": "Device mismatch"}, status=status.HTTP_400_BAD_REQUEST)
 
-        device, _ = Device.objects.get_or_create(
-            user=request.user,
-            device_id=str(device_id),
-            defaults={
-                "platform": "unknown",
-                "last_seen_at": timezone.now(),
-            },
-        )
-
         signed = data.validated_data["signed_prekey"]
         registration_id = data.validated_data.get("registration_id")
-
-        E2EDeviceKey.objects.update_or_create(
-            user=request.user,
-            device=device,
-            defaults={
-                "identity_key": data.validated_data["identity_key"],
-                "signed_prekey_id": signed["id"],
-                "signed_prekey": signed["key"],
-                "signed_prekey_signature": signed["signature"],
-                "registration_id": registration_id,
-            },
-        )
-
         prekeys = data.validated_data.get("prekeys") or []
-        if prekeys:
-            E2EPreKey.objects.filter(user=request.user, device=device).delete()
-            E2EPreKey.objects.bulk_create(
-                [
-                    E2EPreKey(
-                        user=request.user,
-                        device=device,
-                        prekey_id=item["id"],
-                        prekey=item["key"],
-                    )
-                    for item in prekeys
-                ]
+
+        with transaction.atomic():
+            device, _ = Device.objects.get_or_create(
+                user=request.user,
+                device_id=str(device_id),
+                defaults={
+                    "platform": "unknown",
+                    "last_seen_at": timezone.now(),
+                },
             )
+            # Serialize all key replacement work for this device. This prevents
+            # concurrent app startup calls from creating duplicate bundles.
+            device = Device.objects.select_for_update().get(pk=device.pk)
+
+            device_keys = E2EDeviceKey.objects.filter(
+                user=request.user,
+                device=device,
+            ).order_by("-updated_at", "-created_at", "-id")
+            key_record = device_keys.first()
+            if key_record:
+                device_keys.exclude(pk=key_record.pk).delete()
+                key_record.identity_key = data.validated_data["identity_key"]
+                key_record.signed_prekey_id = signed["id"]
+                key_record.signed_prekey = signed["key"]
+                key_record.signed_prekey_signature = signed["signature"]
+                key_record.registration_id = registration_id
+                key_record.save(
+                    update_fields=[
+                        "identity_key",
+                        "signed_prekey_id",
+                        "signed_prekey",
+                        "signed_prekey_signature",
+                        "registration_id",
+                        "updated_at",
+                    ]
+                )
+            else:
+                E2EDeviceKey.objects.create(
+                    user=request.user,
+                    device=device,
+                    identity_key=data.validated_data["identity_key"],
+                    signed_prekey_id=signed["id"],
+                    signed_prekey=signed["key"],
+                    signed_prekey_signature=signed["signature"],
+                    registration_id=registration_id,
+                )
+
+            if prekeys:
+                E2EPreKey.objects.filter(user=request.user, device=device).delete()
+                E2EPreKey.objects.bulk_create(
+                    [
+                        E2EPreKey(
+                            user=request.user,
+                            device=device,
+                            prekey_id=item["id"],
+                            prekey=item["key"],
+                        )
+                        for item in prekeys
+                    ]
+                )
 
         AuditLog.log(actor=request.user, action="e2ee.keys.register", meta={"device_id": device_id})
         return Response({"ok": True}, status=status.HTTP_200_OK)

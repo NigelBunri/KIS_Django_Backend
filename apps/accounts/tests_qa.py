@@ -15,6 +15,7 @@ from rest_framework import status
 from .models import (
     User, Device, TwoFactor, ProfileFieldVisibility,
     Experience, Education, UserSkill, UserConnection,
+    E2EDeviceKey, E2EPreKey,
 )
 from .views import issue_tokens_for_user
 
@@ -215,6 +216,43 @@ class SecurityTests(TestCase):
         }, format="json")
         self.assertEqual(res.status_code, 200)
         self.assertTrue(res.data["ok"])
+
+    def test_e2ee_key_registration_is_idempotent(self):
+        """Repeated startup registration replaces one device bundle without duplicates."""
+        first_payload = {
+            "device_id": DEVICE_ID,
+            "identity_key": "identity_first",
+            "signed_prekey": {"id": 1, "key": "signed_first", "signature": "sig_first"},
+            "prekeys": [{"id": 10, "key": "prekey_first"}],
+            "registration_id": 12345,
+        }
+        second_payload = {
+            "device_id": DEVICE_ID,
+            "identity_key": "identity_second",
+            "signed_prekey": {"id": 2, "key": "signed_second", "signature": "sig_second"},
+            "prekeys": [{"id": 20, "key": "prekey_second"}],
+            "registration_id": 54321,
+        }
+
+        self.assertEqual(
+            self.client.post("/api/v1/auth/e2ee/keys/", first_payload, format="json").status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post("/api/v1/auth/e2ee/keys/", second_payload, format="json").status_code,
+            200,
+        )
+
+        device_keys = E2EDeviceKey.objects.filter(user=self.user, device=self.device)
+        self.assertEqual(device_keys.count(), 1)
+        self.assertEqual(device_keys.get().identity_key, "identity_second")
+        self.assertEqual(
+            list(
+                E2EPreKey.objects.filter(user=self.user, device=self.device)
+                .values_list("prekey_id", flat=True)
+            ),
+            [20],
+        )
 
     def test_e2ee_bundle_fetch(self):
         """E2EE bundle can be fetched for a user after key registration."""

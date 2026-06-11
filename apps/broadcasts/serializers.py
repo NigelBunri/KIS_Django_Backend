@@ -72,6 +72,34 @@ from .models import (
     Medium,
     Service,
     ServiceMediumMap,
+    ChannelContentTip,
+    ChannelLiveStreamTip,
+    ChannelMonetizationSettings,
+    ChannelPayoutRequest,
+    ChannelContentWatchEvent,
+    ChannelContentWatchSegment,
+    ChannelContentAudioTrack,
+    ChannelContentGeoRestriction,
+    ChannelContentPremiere,
+    ChannelLiveStreamGuest,
+    ChannelContentTranscript,
+    ChannelContentProduct,
+    ChannelLiveStreamTarget,
+    ChannelMembershipGift,
+    ChannelContentCopyrightClaim,
+    ChannelContentDemographicSnapshot,
+    ChannelAdCampaign,
+    ChannelAdSlot,
+    ChannelAdImpression,
+    ChannelContentQueue,
+    ChannelContentAutoChapterSuggestion,
+    ChannelContentTrafficSource,
+    ChannelKeywordFilter,
+    ChannelHomepageShelf,
+    ChannelHomepageShelfItem,
+    ChannelCategory,
+    ChannelContentFingerprint,
+    ChannelFingerprintMatch,
 )
 from apps.partners.models import Partner
 from apps.communities.models import Community
@@ -2288,3 +2316,310 @@ class BroadcastChannelSubscriptionDetailSerializer(serializers.ModelSerializer):
             or getattr(user, "phone", "")
             or "KIS user"
         )
+
+
+class ChannelContentTipSerializer(serializers.ModelSerializer):
+    user_display_name = serializers.SerializerMethodField()
+    amount_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelContentTip
+        fields = ["id", "content", "user", "user_display_name", "amount_cents", "currency",
+                  "message", "status", "amount_display", "created_at"]
+        read_only_fields = ["id", "user", "status", "created_at"]
+
+    def get_user_display_name(self, obj):
+        return (getattr(getattr(obj.user, "profile", None), "display_name", None)
+                or getattr(obj.user, "display_name", str(obj.user_id)))
+
+    def get_amount_display(self, obj):
+        return f"{obj.currency} {obj.amount_cents / 100:.2f}"
+
+
+class ChannelLiveStreamTipSerializer(serializers.ModelSerializer):
+    user_display_name = serializers.SerializerMethodField()
+    amount_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelLiveStreamTip
+        fields = ["id", "live_stream", "user", "user_display_name", "amount_cents", "currency",
+                  "message", "status", "is_pinned", "pinned_until", "amount_display", "created_at"]
+        read_only_fields = ["id", "user", "status", "is_pinned", "pinned_until", "created_at"]
+
+    def get_user_display_name(self, obj):
+        return (getattr(getattr(obj.user, "profile", None), "display_name", None)
+                or getattr(obj.user, "display_name", str(obj.user_id)))
+
+    def get_amount_display(self, obj):
+        return f"{obj.currency} {obj.amount_cents / 100:.2f}"
+
+
+class ChannelMonetizationSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelMonetizationSettings
+        fields = ["tips_enabled", "membership_enabled", "ad_revenue_enabled",
+                  "revenue_share_pct", "payout_threshold_cents", "payout_schedule", "updated_at"]
+
+
+class ChannelPayoutRequestSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelPayoutRequest
+        fields = ["id", "channel", "requested_by", "amount_cents", "currency", "status",
+                  "period_start", "period_end", "payment_method_ref", "notes", "processed_at", "created_at"]
+        read_only_fields = ["id", "requested_by", "status", "processed_at", "created_at"]
+
+
+class ChannelContentWatchEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentWatchEvent
+        fields = ["id", "content", "session_id", "watch_percent",
+                  "duration_watched_seconds", "source", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class ChannelContentWatchSegmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentWatchSegment
+        fields = ["segment_start_seconds", "segment_end_seconds", "view_count"]
+
+
+class ChannelContentAudioTrackSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentAudioTrack
+        fields = ["id", "content", "language_code", "label", "url", "is_default", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class ChannelContentGeoRestrictionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentGeoRestriction
+        fields = ["content", "restriction_type", "countries"]
+
+
+class ChannelContentPremiereSerializer(serializers.ModelSerializer):
+    seconds_until_premiere = serializers.SerializerMethodField()
+    is_live_now = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelContentPremiere
+        fields = ["content", "trailer_url", "pre_chat_opens_at", "lobby_conversation",
+                  "viewer_count", "metadata", "seconds_until_premiere", "is_live_now",
+                  "created_at", "updated_at"]
+        read_only_fields = ["viewer_count", "lobby_conversation", "created_at", "updated_at"]
+
+    def get_seconds_until_premiere(self, obj):
+        from django.utils import timezone as _tz
+        scheduled_at = getattr(obj.content, "scheduled_at", None) or getattr(obj.content, "published_at", None)
+        if not scheduled_at:
+            return None
+        delta = (scheduled_at - _tz.now()).total_seconds()
+        return max(0, int(delta))
+
+    def get_is_live_now(self, obj):
+        from django.utils import timezone as _tz
+        scheduled_at = getattr(obj.content, "scheduled_at", None) or getattr(obj.content, "published_at", None)
+        if not scheduled_at:
+            return False
+        return scheduled_at <= _tz.now()
+
+
+class ChannelLiveStreamGuestSerializer(serializers.ModelSerializer):
+    user_display_name = serializers.SerializerMethodField()
+    invite_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelLiveStreamGuest
+        fields = ["id", "live_stream", "user", "user_display_name", "email", "role",
+                  "status", "invite_url", "accepted_at", "created_at"]
+        read_only_fields = ["id", "invite_token", "accepted_at", "created_at"]
+
+    def get_user_display_name(self, obj):
+        if not obj.user:
+            return obj.email or "Guest"
+        return (getattr(getattr(obj.user, "profile", None), "display_name", None)
+                or getattr(obj.user, "display_name", str(obj.user_id)))
+
+    def get_invite_url(self, obj):
+        request = self.context.get("request")
+        if not request:
+            return None
+        return request.build_absolute_uri(f"/broadcasts/live/join/{obj.invite_token}/")
+
+
+class ChannelContentTranscriptSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentTranscript
+        fields = ["id", "content", "language_code", "source", "status",
+                  "text_plain", "vtt_url", "provider", "created_at", "updated_at"]
+        read_only_fields = ["id", "status", "vtt_url", "provider", "provider_job_id",
+                            "created_at", "updated_at"]
+
+
+class ChannelContentProductSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentProduct
+        fields = ["id", "content", "product_id", "product_url", "product_title",
+                  "thumbnail_url", "price_display", "timestamp_seconds", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class ChannelLiveStreamTargetSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelLiveStreamTarget
+        fields = ["id", "live_stream", "platform", "label", "rtmp_url", "status", "created_at"]
+        read_only_fields = ["id", "status", "created_at"]
+        extra_kwargs = {"stream_key": {"write_only": True}}
+
+
+class ChannelMembershipGiftSerializer(serializers.ModelSerializer):
+    tier_title = serializers.SerializerMethodField()
+    gifter_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelMembershipGift
+        fields = ["id", "tier", "tier_title", "gifter", "gifter_display", "recipient",
+                  "recipient_email", "message", "status", "expires_at", "redeemed_at", "created_at"]
+        read_only_fields = ["id", "gifter", "status", "redeemed_at", "redeem_token", "created_at"]
+
+    def get_tier_title(self, obj):
+        return getattr(obj.tier, "title", "")
+
+    def get_gifter_display(self, obj):
+        return (getattr(getattr(obj.gifter, "profile", None), "display_name", None)
+                or getattr(obj.gifter, "display_name", str(obj.gifter_id)))
+
+
+class ChannelContentCopyrightClaimSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentCopyrightClaim
+        fields = ["id", "content", "claimant_channel", "claimant_name", "claim_type",
+                  "status", "dispute_reason", "resolution_notes", "resolved_at", "created_at"]
+        read_only_fields = ["id", "status", "resolution_notes", "resolved_at", "created_at"]
+
+
+class ChannelContentDemographicSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentDemographicSnapshot
+        fields = ["id", "snapshot_date", "age_bucket", "country_code", "view_count", "watch_time_seconds"]
+        read_only_fields = ["id"]
+
+
+class ChannelAdCampaignSerializer(serializers.ModelSerializer):
+    remaining_budget_cents = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelAdCampaign
+        fields = ["id", "advertiser_channel", "title", "budget_cents", "spent_cents", "currency",
+                  "start_date", "end_date", "target_content_types", "target_countries",
+                  "target_age_buckets", "status", "remaining_budget_cents", "created_at"]
+        read_only_fields = ["id", "spent_cents", "created_at"]
+
+    def get_remaining_budget_cents(self, obj):
+        return max(0, (obj.budget_cents or 0) - (obj.spent_cents or 0))
+
+
+class ChannelAdSlotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelAdSlot
+        fields = ["id", "content", "campaign", "placement", "timestamp_seconds",
+                  "is_skippable", "skip_after_seconds", "ad_media_url", "click_url",
+                  "impression_count", "skip_count", "created_at"]
+        read_only_fields = ["id", "impression_count", "skip_count", "created_at"]
+
+
+class ChannelAdImpressionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelAdImpression
+        fields = ["id", "slot", "watched_seconds", "skipped", "clicked", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class ChannelContentQueueSerializer(serializers.ModelSerializer):
+    content_title = serializers.SerializerMethodField()
+    content_thumbnail = serializers.SerializerMethodField()
+    channel_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelContentQueue
+        fields = ["id", "content", "content_title", "content_thumbnail", "channel_name", "position", "added_at"]
+        read_only_fields = ["id", "added_at"]
+
+    def get_content_title(self, obj):
+        return getattr(obj.content, "title", "")
+
+    def get_content_thumbnail(self, obj):
+        return getattr(obj.content, "thumbnail_url", "")
+
+    def get_channel_name(self, obj):
+        return getattr(getattr(obj.content, "channel", None), "name", "")
+
+
+class ChannelContentAutoChapterSuggestionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentAutoChapterSuggestion
+        fields = ["id", "content", "status", "suggestions", "created_at", "updated_at"]
+        read_only_fields = ["id", "status", "created_at", "updated_at"]
+
+
+# ─── Round-3 YouTube-parity serializers ──────────────────────────────────────
+
+class ChannelLiveStreamLatencySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelLiveStream
+        fields = ['id', 'latency_mode', 'dvr_enabled', 'dvr_window_seconds', 'updated_at']
+        read_only_fields = ['id', 'updated_at']
+
+
+class ChannelContentTrafficSourceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentTrafficSource
+        fields = ['id', 'content', 'date', 'source_type', 'view_count', 'watch_time_seconds', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class ChannelKeywordFilterSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelKeywordFilter
+        fields = ['id', 'channel', 'keyword', 'filter_type', 'is_active', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'channel', 'created_at', 'updated_at']
+
+
+class ChannelHomepageShelfSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelHomepageShelf
+        fields = ['id', 'channel', 'title', 'shelf_type', 'sort_order', 'is_active', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'channel', 'created_at', 'updated_at']
+
+
+class ChannelHomepageShelfItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelHomepageShelfItem
+        fields = ['id', 'shelf', 'content', 'playlist', 'sort_order', 'created_at']
+        read_only_fields = ['id', 'shelf', 'created_at']
+
+
+class ChannelCategorySerializer(serializers.ModelSerializer):
+    subcategories = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChannelCategory
+        fields = ['id', 'name', 'slug', 'description', 'icon_name', 'parent', 'sort_order', 'is_active', 'created_at', 'subcategories']
+        read_only_fields = ['id', 'created_at']
+
+    def get_subcategories(self, obj):
+        children = obj.subcategories.filter(is_active=True)
+        return ChannelCategorySerializer(children, many=True).data
+
+
+class ChannelContentFingerprintSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelContentFingerprint
+        fields = ['id', 'content', 'algorithm', 'fingerprint_hash', 'status', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'content', 'status', 'created_at', 'updated_at']
+
+
+class ChannelFingerprintMatchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChannelFingerprintMatch
+        fields = ['id', 'source_fingerprint', 'matched_fingerprint', 'similarity_score', 'claim', 'created_at']
+        read_only_fields = ['id', 'created_at']

@@ -94,6 +94,12 @@ class Community(models.Model):
         default=True,
         help_text="If false, join links are disabled; joins must go through approval.",
     )
+    invite_token = models.CharField(
+        max_length=64,
+        blank=True,
+        db_index=True,
+        help_text="Short random token used to build a shareable invite link.",
+    )
     require_join_survey = models.BooleanField(
         default=False,
         help_text="When true, new joiners must complete a survey/workflow before being approved.",

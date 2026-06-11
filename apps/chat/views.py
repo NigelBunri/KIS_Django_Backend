@@ -27,6 +27,7 @@ from .models import (
     BaseConversationRole,
     ConversationNotificationLevel,
     ConversationSendPolicy,
+    ConversationJoinPolicy,
     ConversationRequestState,
 )
 from .serializers import (
@@ -47,9 +48,9 @@ from apps.accounts.models import User
 from apps.partners.models import Partner
 from apps.partners.services import ensure_partner_policy, evaluate_partner_dlp, log_partner_audit
 from apps.partners.services import dispatch_partner_webhooks
-from apps.groups.models import Group
+from apps.groups.models import Group, GroupMembership, GroupRole
 from apps.channels.models import Channel
-from apps.communities.models import Community
+from apps.communities.models import Community, CommunityMembership, CommunityRole
 
 
 def _extract_phone_participants(raw_data) -> list[str]:
@@ -253,6 +254,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         )
         if self.action == "list":
             qs = qs.exclude(type=ConversationType.POST)
+            qs = qs.exclude(type=ConversationType.THREAD)
             qs = qs.exclude(
                 Q(group__partner__isnull=False)
                 | Q(group__community__partner__isnull=False)
@@ -864,7 +866,99 @@ class ConversationViewSet(viewsets.ModelViewSet):
         ).first()
 
         if not member:
-            return Response({"isMember": False, "isBlocked": False, "role": "member", "scopes": []})
+            # Log for any active conversation type to diagnose missing membership
+            all_members = ConversationMember.objects.filter(
+                conversation=conversation,
+                user_id=user_id,
+            ).values_list('left_at', flat=True)
+            logger.warning(
+                "chat.ws_perms no active member conversation=%s user=%s type=%s "
+                "member_rows_with_any_left_at=%s",
+                pk, user_id, conversation.type, list(all_members),
+            )
+
+            # --- Fallback: check Group / Community membership and auto-repair ---
+            repaired_role = None
+
+            if conversation.type == ConversationType.GROUP:
+                try:
+                    group = Group.objects.get(conversation=conversation)
+                except Group.DoesNotExist:
+                    group = None
+                if group:
+                    if str(group.owner_id) == str(user_id):
+                        repaired_role = BaseConversationRole.OWNER
+                    else:
+                        gm = GroupMembership.objects.filter(
+                            group=group, user_id=user_id,
+                            left_at__isnull=True, is_banned=False,
+                        ).first()
+                        if gm:
+                            repaired_role = (
+                                BaseConversationRole.ADMIN
+                                if gm.role in (GroupRole.OWNER, GroupRole.ADMIN, GroupRole.MOD)
+                                else BaseConversationRole.MEMBER
+                            )
+                # Fallback: conversation.created_by is always the owner
+                if repaired_role is None and str(getattr(conversation, 'created_by_id', None) or '') == str(user_id):
+                    repaired_role = BaseConversationRole.OWNER
+
+            elif conversation.type in (ConversationType.CHANNEL, ConversationType.DIRECT):
+                # For channels: created_by is an owner; allow them in
+                if str(getattr(conversation, 'created_by_id', None) or '') == str(user_id):
+                    repaired_role = BaseConversationRole.OWNER
+
+            elif conversation.type in (ConversationType.POST, ConversationType.THREAD):
+                # Feed comment rooms and thread rooms use OPEN join policy — auto-admit anyone
+                settings_obj = ConversationSettings.objects.filter(conversation=conversation).first()
+                if settings_obj and settings_obj.join_policy == ConversationJoinPolicy.OPEN:
+                    repaired_role = BaseConversationRole.MEMBER
+                elif str(getattr(conversation, 'created_by_id', None) or '') == str(user_id):
+                    repaired_role = BaseConversationRole.OWNER
+                else:
+                    # POST rooms are public — auto-admit even without explicit settings
+                    repaired_role = BaseConversationRole.MEMBER
+
+            # Community main/posts conversations: check CommunityMembership
+            if repaired_role is None:
+                cm = CommunityMembership.objects.filter(
+                    user_id=user_id,
+                    left_at__isnull=True,
+                    is_banned=False,
+                    community__in=Community.objects.filter(
+                        Q(main_conversation=conversation) | Q(posts_conversation=conversation)
+                    ),
+                ).first()
+                if cm:
+                    repaired_role = (
+                        BaseConversationRole.ADMIN
+                        if cm.role in (CommunityRole.OWNER, CommunityRole.ADMIN, CommunityRole.MOD)
+                        else BaseConversationRole.MEMBER
+                    )
+
+            if repaired_role is None:
+                logger.warning(
+                    "chat.ws_perms access denied conversation=%s user=%s type=%s created_by=%s",
+                    pk, user_id, conversation.type,
+                    getattr(conversation, 'created_by_id', None),
+                )
+                return Response({"isMember": False, "isBlocked": False, "role": "member", "scopes": []})
+
+            # Auto-repair: recreate the missing ConversationMember row
+            member, _ = ConversationMember.objects.get_or_create(
+                conversation=conversation,
+                user_id=user_id,
+                defaults={"base_role": repaired_role},
+            )
+            if member.left_at is not None:
+                member.left_at = None
+                member.base_role = repaired_role
+                member.save(update_fields=["left_at", "base_role"])
+            logger.warning(
+                "chat.ws_perms auto-repaired missing ConversationMember "
+                "conversation=%s user=%s role=%s",
+                conversation.id, user_id, repaired_role,
+            )
 
         if member.is_blocked:
             return Response({"isMember": True, "isBlocked": True, "role": member.base_role, "scopes": []})

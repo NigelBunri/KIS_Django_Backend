@@ -467,7 +467,7 @@ SPECTACULAR_SETTINGS = {
 # Simple JWT — read signing/validation config from environment
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=int(os.environ.get("JWT_ACCESS_MINUTES", 60))),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=int(os.environ.get("JWT_REFRESH_DAYS", 7))),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=int(os.environ.get("JWT_REFRESH_DAYS", 90))),
     "ALGORITHM": "HS256",
 
     # Use your JWT secret from the environment (fallback to SECRET_KEY for dev)

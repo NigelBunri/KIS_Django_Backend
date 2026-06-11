@@ -194,6 +194,27 @@ from apps.broadcasts.models import (
     LiveChatMessage,
     ChannelMembershipTier,
     ChannelMembership,
+    ChannelContentTip,
+    ChannelLiveStreamTip,
+    ChannelMonetizationSettings,
+    ChannelPayoutRequest,
+    ChannelContentWatchEvent,
+    ChannelContentWatchSegment,
+    ChannelContentAudioTrack,
+    ChannelContentGeoRestriction,
+    ChannelContentPremiere,
+    ChannelLiveStreamGuest,
+    ChannelContentTranscript,
+    ChannelContentProduct,
+    ChannelLiveStreamTarget,
+    ChannelMembershipGift,
+    ChannelContentCopyrightClaim,
+    ChannelContentDemographicSnapshot,
+    ChannelAdCampaign,
+    ChannelAdSlot,
+    ChannelAdImpression,
+    ChannelContentQueue,
+    ChannelContentAutoChapterSuggestion,
 )
 from apps.broadcasts.services import cleanup_expired_broadcast_items
 from apps.broadcasts.health_engine_policy import (
@@ -253,6 +274,27 @@ from apps.broadcasts.serializers import (
     EducationProfileSerializer,
     MediumSerializer,
     ServiceSerializer,
+    ChannelContentTipSerializer,
+    ChannelLiveStreamTipSerializer,
+    ChannelMonetizationSettingsSerializer,
+    ChannelPayoutRequestSerializer,
+    ChannelContentWatchEventSerializer,
+    ChannelContentWatchSegmentSerializer,
+    ChannelContentAudioTrackSerializer,
+    ChannelContentGeoRestrictionSerializer,
+    ChannelContentPremiereSerializer,
+    ChannelLiveStreamGuestSerializer,
+    ChannelContentTranscriptSerializer,
+    ChannelContentProductSerializer,
+    ChannelLiveStreamTargetSerializer,
+    ChannelMembershipGiftSerializer,
+    ChannelContentCopyrightClaimSerializer,
+    ChannelContentDemographicSnapshotSerializer,
+    ChannelAdCampaignSerializer,
+    ChannelAdSlotSerializer,
+    ChannelAdImpressionSerializer,
+    ChannelContentQueueSerializer,
+    ChannelContentAutoChapterSuggestionSerializer,
 )
 from apps.verification.constants import VerificationSubjectType
 from apps.verification.models import VerificationCase
@@ -6928,13 +6970,26 @@ def _apply_broadcast_engagement_counts(
     items: list[dict[str, Any]],
     counts: dict[str, dict[str, int]],
 ) -> None:
+    # Collect comment conversation IDs to bulk-fetch message counts
+    conv_ids = [
+        str(item["comment_conversation_id"])
+        for item in items
+        if item.get("comment_conversation_id")
+    ]
+    conv_seq_map: dict[str, int] = {}
+    if conv_ids:
+        from apps.chat.models import Conversation as _Conv
+        for row in _Conv.objects.filter(id__in=conv_ids).values("id", "last_message_seq"):
+            conv_seq_map[str(row["id"])] = int(row["last_message_seq"] or 0)
+
     for item in items:
         broadcast_id = str(item.get("id") or "")
         item_counts = counts.get(broadcast_id, {})
         item["share_count"] = int(item_counts.get("share_count") or item.get("share_count") or 0)
         item["view_count"] = int(item_counts.get("view_count") or item.get("view_count") or 0)
         item["impression_count"] = int(item_counts.get("impression_count") or item.get("impression_count") or 0)
-        item["comment_count"] = int(item.get("comment_count") or 0)
+        conv_id = str(item.get("comment_conversation_id") or "")
+        item["comment_count"] = conv_seq_map.get(conv_id) or int(item.get("comment_count") or 0)
 
 
 class BroadcastFeedView(APIView):
@@ -18416,3 +18471,1436 @@ class TipCreatorView(APIView):
         if link:
             return Response({"payment_required": True, "payment_url": link, "provider": "flutterwave"})
         return Response({"detail": "Payment link creation failed."}, status=502)
+
+
+# ─── Super Thanks: tip on a video ────────────────────────────────────────────
+class ChannelContentTipView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        tips = ChannelContentTip.objects.filter(
+            content=content, status=ChannelContentTip.Status.COMPLETED
+        ).order_by("-created_at")[:50]
+        return Response(ChannelContentTipSerializer(tips, many=True, context={"request": request}).data)
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        amount_cents = int(request.data.get("amount_cents") or 0)
+        if amount_cents < 100:
+            raise ValidationError({"amount_cents": "Minimum tip is 1.00."})
+        tip = ChannelContentTip.objects.create(
+            content=content,
+            user=request.user,
+            amount_cents=amount_cents,
+            currency=str(request.data.get("currency") or "USD").upper()[:3],
+            message=str(request.data.get("message") or "")[:150],
+            status=ChannelContentTip.Status.COMPLETED,
+        )
+        return Response(
+            ChannelContentTipSerializer(tip, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+# ─── Super Chat: tips during a live stream ────────────────────────────────────
+class ChannelLiveStreamTipView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, stream_id):
+        live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        amount_cents = int(request.data.get("amount_cents") or 0)
+        if amount_cents < 100:
+            raise ValidationError({"amount_cents": "Minimum tip is 1.00."})
+        tip = ChannelLiveStreamTip.objects.create(
+            live_stream=live_stream,
+            user=request.user,
+            amount_cents=amount_cents,
+            currency=str(request.data.get("currency") or "USD").upper()[:3],
+            message=str(request.data.get("message") or "")[:150],
+            status=ChannelLiveStreamTip.Status.COMPLETED,
+        )
+        if amount_cents >= 1000:
+            tip.is_pinned = True
+            tip.pinned_until = timezone.now() + timedelta(minutes=2)
+            tip.save(update_fields=["is_pinned", "pinned_until"])
+        return Response(
+            ChannelLiveStreamTipSerializer(tip, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class ChannelLiveStreamTipListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, stream_id):
+        live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        tips = ChannelLiveStreamTip.objects.filter(
+            live_stream=live_stream, status=ChannelLiveStreamTip.Status.COMPLETED
+        ).order_by("-created_at")[:100]
+        return Response(
+            ChannelLiveStreamTipSerializer(tips, many=True, context={"request": request}).data
+        )
+
+
+# ─── Channel Monetization Settings ────────────────────────────────────────────
+class ChannelMonetizationSettingsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _get_channel_owner_or_403(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _user_channel_role(request.user, channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied("Only channel owners can manage monetization settings.")
+        return channel
+
+    def get(self, request, channel_id):
+        channel = self._get_channel_owner_or_403(request, channel_id)
+        settings_obj, _ = ChannelMonetizationSettings.objects.get_or_create(channel=channel)
+        return Response(ChannelMonetizationSettingsSerializer(settings_obj).data)
+
+    def patch(self, request, channel_id):
+        channel = self._get_channel_owner_or_403(request, channel_id)
+        settings_obj, _ = ChannelMonetizationSettings.objects.get_or_create(channel=channel)
+        ser = ChannelMonetizationSettingsSerializer(settings_obj, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
+
+
+# ─── Payout Requests ──────────────────────────────────────────────────────────
+class ChannelPayoutRequestView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _get_channel_owner_or_403(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _user_channel_role(request.user, channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        return channel
+
+    def get(self, request, channel_id):
+        channel = self._get_channel_owner_or_403(request, channel_id)
+        reqs = ChannelPayoutRequest.objects.filter(channel=channel).order_by("-created_at")[:50]
+        return Response(ChannelPayoutRequestSerializer(reqs, many=True).data)
+
+    def post(self, request, channel_id):
+        channel = self._get_channel_owner_or_403(request, channel_id)
+        amount_cents = int(request.data.get("amount_cents") or 0)
+        if amount_cents < 100:
+            raise ValidationError({"amount_cents": "Minimum payout is 1.00."})
+        req = ChannelPayoutRequest.objects.create(
+            channel=channel,
+            requested_by=request.user,
+            amount_cents=amount_cents,
+            currency=str(request.data.get("currency") or "USD").upper()[:3],
+            period_start=request.data.get("period_start") or None,
+            period_end=request.data.get("period_end") or None,
+            payment_method_ref=str(request.data.get("payment_method_ref") or ""),
+            notes=str(request.data.get("notes") or ""),
+        )
+        return Response(ChannelPayoutRequestSerializer(req).data, status=status.HTTP_201_CREATED)
+
+
+# ─── Watch Events ─────────────────────────────────────────────────────────────
+class ChannelContentWatchEventView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        event = ChannelContentWatchEvent.objects.create(
+            content=content,
+            user=request.user,
+            session_id=str(request.data.get("session_id") or "")[:64],
+            watch_percent=min(100, max(0, float(request.data.get("watch_percent") or 0))),
+            duration_watched_seconds=max(0, int(request.data.get("duration_watched_seconds") or 0)),
+            source=str(request.data.get("source") or "direct")[:32],
+        )
+        return Response(ChannelContentWatchEventSerializer(event).data, status=status.HTTP_201_CREATED)
+
+
+# ─── Watch Segment Heatmap ────────────────────────────────────────────────────
+class ChannelContentWatchSegmentView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        segments = ChannelContentWatchSegment.objects.filter(content=content).order_by("segment_start_seconds")
+        return Response(ChannelContentWatchSegmentSerializer(segments, many=True).data)
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        segments_data = request.data.get("segments") or []
+        if not isinstance(segments_data, list):
+            raise ValidationError({"segments": "Must be a list."})
+        updated = 0
+        for seg in segments_data[:500]:
+            start = int(seg.get("start_seconds") or 0)
+            end = int(seg.get("end_seconds") or start + 5)
+            qs = ChannelContentWatchSegment.objects.filter(content=content, segment_start_seconds=start)
+            if qs.exists():
+                qs.update(view_count=models.F("view_count") + 1)
+            else:
+                ChannelContentWatchSegment.objects.get_or_create(
+                    content=content,
+                    segment_start_seconds=start,
+                    defaults={"segment_end_seconds": end, "view_count": 1},
+                )
+            updated += 1
+        return Response({"updated": updated})
+
+
+# ─── Audio Tracks ─────────────────────────────────────────────────────────────
+class ChannelContentAudioTracksView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        tracks = ChannelContentAudioTrack.objects.filter(content=content).order_by("-is_default", "language_code")
+        return Response(ChannelContentAudioTrackSerializer(tracks, many=True).data)
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _user_channel_role(request.user, content.channel)
+        if role not in ("owner", "staff", "editor"):
+            raise PermissionDenied()
+        data = dict(request.data)
+        data["content"] = str(content_id)
+        ser = ChannelContentAudioTrackSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        track = ser.save(content=content)
+        if track.is_default:
+            ChannelContentAudioTrack.objects.filter(content=content).exclude(id=track.id).update(is_default=False)
+        return Response(ChannelContentAudioTrackSerializer(track).data, status=status.HTTP_201_CREATED)
+
+
+# ─── Geo-restrictions ─────────────────────────────────────────────────────────
+class ChannelContentGeoRestrictionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        try:
+            restriction = content.geo_restriction
+        except ChannelContentGeoRestriction.DoesNotExist:
+            return Response({"restriction_type": "block", "countries": []})
+        return Response(ChannelContentGeoRestrictionSerializer(restriction).data)
+
+    def put(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _user_channel_role(request.user, content.channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        restriction, _ = ChannelContentGeoRestriction.objects.get_or_create(content=content)
+        ser = ChannelContentGeoRestrictionSerializer(restriction, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
+
+
+# ─── Premiere ─────────────────────────────────────────────────────────────────
+class ChannelContentPremiereView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        try:
+            premiere = content.premiere
+        except ChannelContentPremiere.DoesNotExist:
+            return Response({"detail": "No premiere configured."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(ChannelContentPremiereSerializer(premiere, context={"request": request}).data)
+
+    @transaction.atomic
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _user_channel_role(request.user, content.channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        premiere, created = ChannelContentPremiere.objects.get_or_create(content=content)
+        if request.data.get("trailer_url") is not None:
+            premiere.trailer_url = str(request.data["trailer_url"])
+        if request.data.get("pre_chat_opens_at") is not None:
+            from django.utils.dateparse import parse_datetime as _pd
+            premiere.pre_chat_opens_at = _pd(str(request.data["pre_chat_opens_at"]))
+        if premiere.lobby_conversation is None:
+            from apps.chat.models import ConversationSettings as _CS
+            lobby = Conversation.objects.create(
+                type=ConversationType.THREAD,
+                title=f"Premiere: {content.title or 'Upcoming'}",
+                created_by=request.user,
+            )
+            ConversationMember.objects.create(
+                conversation=lobby,
+                user=request.user,
+                base_role=BaseConversationRole.OWNER,
+            )
+            _CS.objects.create(conversation=lobby)
+            premiere.lobby_conversation = lobby
+        if request.data.get("metadata"):
+            premiere.metadata = {**premiere.metadata, **request.data["metadata"]}
+        premiere.save()
+        return Response(
+            ChannelContentPremiereSerializer(premiere, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+# ─── Co-streaming Guests ──────────────────────────────────────────────────────
+class ChannelLiveStreamGuestsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, stream_id):
+        live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        guests = (
+            ChannelLiveStreamGuest.objects
+            .filter(live_stream=live_stream)
+            .exclude(status=ChannelLiveStreamGuest.Status.REMOVED)
+            .select_related("user")
+        )
+        return Response(ChannelLiveStreamGuestSerializer(guests, many=True, context={"request": request}).data)
+
+    def post(self, request, stream_id):
+        live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        role = _user_channel_role(request.user, live_stream.channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        user_id = request.data.get("user_id")
+        email = str(request.data.get("email") or "")
+        invited_user = get_object_or_404(User, id=user_id) if user_id else None
+        guest = ChannelLiveStreamGuest.objects.create(
+            live_stream=live_stream,
+            user=invited_user,
+            email=email,
+            role=str(request.data.get("role") or ChannelLiveStreamGuest.Role.GUEST),
+            invited_by=request.user,
+        )
+        return Response(
+            ChannelLiveStreamGuestSerializer(guest, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class ChannelLiveStreamGuestActionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, stream_id, guest_id):
+        guest = get_object_or_404(ChannelLiveStreamGuest, id=guest_id, live_stream_id=stream_id)
+        action = str(request.data.get("action") or "").strip().lower()
+        now = timezone.now()
+        if action == "accept":
+            if guest.user != request.user:
+                raise PermissionDenied()
+            guest.status = ChannelLiveStreamGuest.Status.ACCEPTED
+            guest.accepted_at = now
+            guest.save(update_fields=["status", "accepted_at", "updated_at"])
+        elif action == "decline":
+            if guest.user != request.user:
+                raise PermissionDenied()
+            guest.status = ChannelLiveStreamGuest.Status.DECLINED
+            guest.save(update_fields=["status", "updated_at"])
+        elif action in ("activate", "remove"):
+            role = _user_channel_role(request.user, guest.live_stream.channel)
+            if role not in ("owner", "staff"):
+                raise PermissionDenied()
+            if action == "activate":
+                guest.status = ChannelLiveStreamGuest.Status.ACTIVE
+                guest.save(update_fields=["status", "updated_at"])
+            else:
+                guest.status = ChannelLiveStreamGuest.Status.REMOVED
+                guest.removed_at = now
+                guest.save(update_fields=["status", "removed_at", "updated_at"])
+        else:
+            raise ValidationError({"action": "Use: accept, decline, activate, remove."})
+        return Response(ChannelLiveStreamGuestSerializer(guest, context={"request": request}).data)
+
+
+# ─── Transcripts / Auto-captions ──────────────────────────────────────────────
+class ChannelContentTranscriptView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        lang = request.query_params.get("lang", "en")
+        transcript = ChannelContentTranscript.objects.filter(
+            content=content, language_code=lang, status=ChannelContentTranscript.Status.READY
+        ).first()
+        if not transcript:
+            return Response({"detail": "No transcript available."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(ChannelContentTranscriptSerializer(transcript).data)
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _user_channel_role(request.user, content.channel)
+        lang = str(request.data.get("language_code") or "en")[:10]
+        source = str(request.data.get("source") or ChannelContentTranscript.Source.AUTO)
+        if source == ChannelContentTranscript.Source.MANUAL:
+            if role not in ("owner", "staff", "editor"):
+                raise PermissionDenied()
+            transcript, _ = ChannelContentTranscript.objects.update_or_create(
+                content=content,
+                language_code=lang,
+                source=source,
+                defaults={
+                    "text_plain": str(request.data.get("text_plain") or ""),
+                    "vtt_url": str(request.data.get("vtt_url") or ""),
+                    "status": ChannelContentTranscript.Status.READY,
+                },
+            )
+        else:
+            transcript, created = ChannelContentTranscript.objects.get_or_create(
+                content=content,
+                language_code=lang,
+                source=source,
+                defaults={"status": ChannelContentTranscript.Status.PENDING, "provider": "whisper"},
+            )
+            if transcript.status in (
+                ChannelContentTranscript.Status.READY,
+                ChannelContentTranscript.Status.PROCESSING,
+            ):
+                return Response(ChannelContentTranscriptSerializer(transcript).data)
+            transcript.status = ChannelContentTranscript.Status.PENDING
+            transcript.save(update_fields=["status", "updated_at"])
+        return Response(ChannelContentTranscriptSerializer(transcript).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelContentTranscriptWebhookView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        job_id = str(request.data.get("job_id") or "")
+        if not job_id:
+            return Response({"detail": "job_id required."}, status=status.HTTP_400_BAD_REQUEST)
+        success = bool(request.data.get("success", True))
+        updated = ChannelContentTranscript.objects.filter(provider_job_id=job_id).update(
+            text_plain=str(request.data.get("text") or ""),
+            vtt_url=str(request.data.get("vtt_url") or ""),
+            status=(
+                ChannelContentTranscript.Status.READY if success
+                else ChannelContentTranscript.Status.FAILED
+            ),
+        )
+        return Response({"updated": updated})
+
+
+# ─── Algorithmic Recommendations ──────────────────────────────────────────────
+class ChannelContentRecommendationsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Avg, Count, Case, When, IntegerField, Value
+        user = request.user
+
+        watched_ids = set(
+            ChannelContentWatchEvent.objects
+            .filter(user=user, watch_percent__gte=80)
+            .values_list("content_id", flat=True)
+        )
+        subscribed_channel_ids = list(
+            BroadcastChannelSubscription.objects
+            .filter(user=user)
+            .values_list("channel_id", flat=True)
+        )
+
+        # Score = (is_subscribed * 3) + (avg_watch_pct / 33) + log(engagement + 1)
+        # Done in Python to avoid dialect-specific SQL; fetch candidates first
+        base_qs = (
+            ChannelContent.objects
+            .filter(
+                status="published",
+                visibility="public",
+                is_deleted=False,
+                published_at__isnull=False,
+                published_at__gte=timezone.now() - timedelta(days=90),
+            )
+            .exclude(id__in=watched_ids)
+            .annotate(
+                avg_watch_pct=Avg("watch_events__watch_percent"),
+                reaction_count=Count("reactions", distinct=True),
+                comment_count=Count("channel_comments", distinct=True),
+                is_subscribed=Case(
+                    When(channel_id__in=subscribed_channel_ids, then=Value(1)),
+                    default=Value(0),
+                    output_field=IntegerField(),
+                ),
+            )
+            .select_related("channel")
+        )
+
+        import math
+        candidates = list(base_qs.order_by("-published_at")[:200])
+
+        def score(item):
+            sub_bonus = 3 if item.is_subscribed else 0
+            watch_score = float(item.avg_watch_pct or 0) / 33.0
+            engagement = int(item.reaction_count or 0) + int(item.comment_count or 0)
+            engagement_score = math.log(engagement + 1, 2)
+            age_days = max(0, (timezone.now() - item.published_at).days) if item.published_at else 90
+            recency_score = max(0, 3 - age_days / 30)  # 3pts if today, 0 if 90d old
+            return sub_bonus + watch_score + engagement_score + recency_score
+
+        candidates.sort(key=score, reverse=True)
+        subscribed_contents = [c for c in candidates if c.is_subscribed][:20]
+        discovery_contents = [c for c in candidates if not c.is_subscribed][:15]
+
+        from apps.broadcasts.serializers import ChannelContentListSerializer as _Ser
+        all_items = subscribed_contents + discovery_contents
+        return Response({
+            "results": _Ser(all_items, many=True, context={"request": request}).data,
+            "source": "weighted_hybrid",
+            "subscribed_count": len(subscribed_contents),
+            "discovery_count": len(discovery_contents),
+        })
+
+
+# ─── Revenue Analytics ────────────────────────────────────────────────────────
+class ChannelRevenueAnalyticsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _viewer_channel_role(channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        from django.db.models import Sum, Count
+        period_days = int(request.query_params.get("days") or 30)
+        cutoff = timezone.now() - timedelta(days=period_days)
+
+        # Content tips (Super Thanks)
+        content_tips = ChannelContentTip.objects.filter(
+            content__channel=channel,
+            status=ChannelContentTip.Status.COMPLETED,
+            created_at__gte=cutoff,
+        ).aggregate(total=Sum("amount_cents"), count=Count("id"))
+
+        # Live stream tips (Super Chat)
+        live_tips = ChannelLiveStreamTip.objects.filter(
+            live_stream__channel=channel,
+            status=ChannelLiveStreamTip.Status.COMPLETED,
+            created_at__gte=cutoff,
+        ).aggregate(total=Sum("amount_cents"), count=Count("id"))
+
+        # Active memberships revenue (price * count approximation)
+        membership_revenue = (
+            ChannelMembership.objects
+            .filter(tier__channel=channel, status=ChannelMembership.Status.ACTIVE)
+            .aggregate(
+                count=Count("id"),
+                monthly_total=Sum("tier__price_cents"),
+            )
+        )
+
+        # Ad impressions revenue (stub — no CPM rate yet; placeholder)
+        ad_slots = ChannelAdSlot.objects.filter(content__channel=channel)
+        ad_impressions = ChannelAdImpression.objects.filter(
+            slot__in=ad_slots, created_at__gte=cutoff
+        ).count()
+
+        def _safe(val):
+            return int(val or 0)
+
+        return Response({
+            "period_days": period_days,
+            "currency": "USD",
+            "super_thanks": {
+                "total_cents": _safe(content_tips["total"]),
+                "count": _safe(content_tips["count"]),
+            },
+            "super_chat": {
+                "total_cents": _safe(live_tips["total"]),
+                "count": _safe(live_tips["count"]),
+            },
+            "memberships": {
+                "active_count": _safe(membership_revenue["count"]),
+                "estimated_monthly_cents": _safe(membership_revenue["monthly_total"]),
+            },
+            "ad_impressions": ad_impressions,
+            "total_estimated_cents": (
+                _safe(content_tips["total"])
+                + _safe(live_tips["total"])
+                + _safe(membership_revenue["monthly_total"])
+            ),
+        })
+
+
+# ─── Auto-chapter Detection ───────────────────────────────────────────────────
+class ChannelContentAutoChaptersView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        suggestion = ChannelContentAutoChapterSuggestion.objects.filter(content=content).order_by("-created_at").first()
+        if not suggestion:
+            return Response({"detail": "No suggestions generated yet."}, status=status.HTTP_404_NOT_FOUND)
+        from apps.broadcasts.serializers import ChannelContentAutoChapterSuggestionSerializer as _S
+        return Response(_S(suggestion).data)
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _viewer_channel_role(content.channel, request.user)
+        if role not in ("owner", "staff", "editor"):
+            raise PermissionDenied()
+
+        # Find best available transcript
+        transcript = ChannelContentTranscript.objects.filter(
+            content=content, status=ChannelContentTranscript.Status.READY
+        ).order_by("source").first()
+
+        suggestion = ChannelContentAutoChapterSuggestion.objects.create(
+            content=content,
+            transcript=transcript,
+            status=ChannelContentAutoChapterSuggestion.Status.PENDING,
+        )
+
+        if transcript and transcript.text_plain:
+            suggestions = _generate_chapter_suggestions(transcript.text_plain, content.duration_seconds or 600)
+            suggestion.suggestions = suggestions
+            suggestion.status = ChannelContentAutoChapterSuggestion.Status.READY
+            suggestion.save(update_fields=["suggestions", "status", "updated_at"])
+        else:
+            suggestion.status = ChannelContentAutoChapterSuggestion.Status.FAILED
+            suggestion.save(update_fields=["status", "updated_at"])
+
+        from apps.broadcasts.serializers import ChannelContentAutoChapterSuggestionSerializer as _S
+        return Response(_S(suggestion).data, status=status.HTTP_201_CREATED)
+
+
+def _generate_chapter_suggestions(text: str, duration_seconds: int) -> list:
+    """
+    Heuristic chapter generator: splits transcript into equal-ish segments,
+    uses the first sentence of each segment as the chapter title.
+    Returns [{title, start_seconds}] with at most 10 chapters.
+    """
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    if not sentences:
+        return []
+    target_chapters = min(10, max(3, len(sentences) // 5))
+    chunk_size = max(1, len(sentences) // target_chapters)
+    chapters = []
+    for i in range(0, len(sentences), chunk_size):
+        chunk_index = i // chunk_size
+        start_frac = chunk_index / target_chapters
+        start_seconds = int(start_frac * duration_seconds)
+        title = sentences[i][:60]
+        if len(sentences[i]) > 60:
+            title = title.rsplit(" ", 1)[0] + "…"
+        chapters.append({"title": title, "start_seconds": start_seconds})
+        if len(chapters) >= target_chapters:
+            break
+    return chapters
+
+
+# ─── Product Tagging ──────────────────────────────────────────────────────────
+class ChannelContentProductsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        tags = ChannelContentProduct.objects.filter(content=content).order_by("timestamp_seconds")
+        return Response(ChannelContentProductSerializer(tags, many=True).data)
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _viewer_channel_role(content.channel, request.user)
+        if role not in ("owner", "staff", "editor"):
+            raise PermissionDenied()
+        data = dict(request.data)
+        data["content"] = str(content_id)
+        ser = ChannelContentProductSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        tag = ser.save(content=content)
+        return Response(ChannelContentProductSerializer(tag).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelContentProductDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, content_id, tag_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _viewer_channel_role(content.channel, request.user)
+        if role not in ("owner", "staff", "editor"):
+            raise PermissionDenied()
+        tag = get_object_or_404(ChannelContentProduct, id=tag_id, content=content)
+        tag.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ─── SimulCast Targets ────────────────────────────────────────────────────────
+class ChannelLiveStreamTargetsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, stream_id):
+        live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        role = _viewer_channel_role(live_stream.channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        targets = ChannelLiveStreamTarget.objects.filter(live_stream=live_stream)
+        return Response(ChannelLiveStreamTargetSerializer(targets, many=True).data)
+
+    def post(self, request, stream_id):
+        live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        role = _viewer_channel_role(live_stream.channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        data = dict(request.data)
+        data["live_stream"] = str(stream_id)
+        ser = ChannelLiveStreamTargetSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        target = ser.save(live_stream=live_stream, stream_key=str(request.data.get("stream_key") or ""))
+        return Response(ChannelLiveStreamTargetSerializer(target).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelLiveStreamTargetDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, stream_id, target_id):
+        live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        role = _viewer_channel_role(live_stream.channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        target = get_object_or_404(ChannelLiveStreamTarget, id=target_id, live_stream=live_stream)
+        target.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ─── Gift Memberships ─────────────────────────────────────────────────────────
+class ChannelMembershipGiftView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        tier_id = request.data.get("tier_id")
+        tier = get_object_or_404(ChannelMembershipTier, id=tier_id, is_active=True)
+        recipient_id = request.data.get("recipient_id")
+        recipient = get_object_or_404(User, id=recipient_id) if recipient_id else None
+        gift = ChannelMembershipGift.objects.create(
+            tier=tier,
+            gifter=request.user,
+            recipient=recipient,
+            recipient_email=str(request.data.get("recipient_email") or ""),
+            message=str(request.data.get("message") or "")[:300],
+            expires_at=timezone.now() + timedelta(days=30),
+        )
+        return Response(ChannelMembershipGiftSerializer(gift).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelMembershipGiftRedeemView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, token):
+        gift = get_object_or_404(ChannelMembershipGift, redeem_token=token, status=ChannelMembershipGift.Status.PENDING)
+        if gift.expires_at and gift.expires_at < timezone.now():
+            gift.status = ChannelMembershipGift.Status.EXPIRED
+            gift.save(update_fields=["status"])
+            raise ValidationError({"detail": "This gift has expired."})
+        ChannelMembership.objects.get_or_create(
+            user=request.user,
+            tier=gift.tier,
+            defaults={"status": ChannelMembership.Status.ACTIVE, "expires_at": timezone.now() + timedelta(days=30)},
+        )
+        gift.status = ChannelMembershipGift.Status.REDEEMED
+        gift.recipient = request.user
+        gift.redeemed_at = timezone.now()
+        gift.save(update_fields=["status", "recipient", "redeemed_at"])
+        return Response(ChannelMembershipGiftSerializer(gift).data)
+
+
+# ─── Copyright Claims ─────────────────────────────────────────────────────────
+class ChannelContentCopyrightClaimsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _viewer_channel_role(channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        claims = ChannelContentCopyrightClaim.objects.filter(
+            content__channel=channel
+        ).order_by("-created_at")[:50]
+        return Response(ChannelContentCopyrightClaimSerializer(claims, many=True).data)
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        content_id = request.data.get("content_id")
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        claim = ChannelContentCopyrightClaim.objects.create(
+            content=content,
+            claimant_channel=channel,
+            claimant_name=str(request.data.get("claimant_name") or ""),
+            claim_type=str(request.data.get("claim_type") or ChannelContentCopyrightClaim.ClaimType.MANUAL),
+            asset_fingerprint=str(request.data.get("asset_fingerprint") or ""),
+        )
+        return Response(ChannelContentCopyrightClaimSerializer(claim).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelContentCopyrightDisputeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, claim_id):
+        claim = get_object_or_404(ChannelContentCopyrightClaim, id=claim_id)
+        role = _viewer_channel_role(claim.content.channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        if claim.status not in (ChannelContentCopyrightClaim.Status.PENDING, ChannelContentCopyrightClaim.Status.MATCHED):
+            raise ValidationError({"detail": "Claim cannot be disputed in its current state."})
+        claim.status = ChannelContentCopyrightClaim.Status.DISPUTED
+        claim.dispute_reason = str(request.data.get("reason") or "")
+        claim.save(update_fields=["status", "dispute_reason", "updated_at"])
+        return Response(ChannelContentCopyrightClaimSerializer(claim).data)
+
+
+# ─── Audience Demographics ────────────────────────────────────────────────────
+class ChannelAudienceDemographicsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _viewer_channel_role(channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        from django.db.models import Sum
+        period_days = int(request.query_params.get("days") or 30)
+        cutoff = timezone.now().date() - timedelta(days=period_days)
+        snapshots = (
+            ChannelContentDemographicSnapshot.objects
+            .filter(channel=channel, snapshot_date__gte=cutoff)
+            .values("age_bucket", "country_code")
+            .annotate(total_views=Sum("view_count"), total_watch_time=Sum("watch_time_seconds"))
+            .order_by("-total_views")
+        )
+        by_age = {}
+        by_country = {}
+        for row in snapshots:
+            ab = row["age_bucket"]
+            cc = row["country_code"] or "ZZ"
+            by_age[ab] = by_age.get(ab, 0) + int(row["total_views"] or 0)
+            by_country[cc] = by_country.get(cc, 0) + int(row["total_views"] or 0)
+        return Response({
+            "period_days": period_days,
+            "age_buckets": [{"age_bucket": k, "view_count": v} for k, v in sorted(by_age.items(), key=lambda x: -x[1])],
+            "countries": [{"country_code": k, "view_count": v} for k, v in sorted(by_country.items(), key=lambda x: -x[1])[:20]],
+        })
+
+    def post(self, request, channel_id):
+        """Ingest demographic snapshot data (called by analytics pipeline)."""
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _viewer_channel_role(channel, request.user)
+        if role not in ("owner", "staff") and not request.user.is_staff:
+            raise PermissionDenied()
+        rows = request.data.get("rows") or []
+        created_count = 0
+        for row in rows[:1000]:
+            ChannelContentDemographicSnapshot.objects.update_or_create(
+                channel=channel,
+                content_id=row.get("content_id") or None,
+                snapshot_date=row.get("date"),
+                age_bucket=row.get("age_bucket", "unknown"),
+                country_code=(row.get("country_code") or "")[:2],
+                defaults={
+                    "view_count": int(row.get("view_count") or 0),
+                    "watch_time_seconds": int(row.get("watch_time_seconds") or 0),
+                },
+            )
+            created_count += 1
+        return Response({"ingested": created_count})
+
+
+# ─── Ad Campaigns ─────────────────────────────────────────────────────────────
+class ChannelAdCampaignView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _viewer_channel_role(channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        campaigns = ChannelAdCampaign.objects.filter(advertiser_channel=channel).order_by("-created_at")
+        return Response(ChannelAdCampaignSerializer(campaigns, many=True).data)
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _viewer_channel_role(channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        ser = ChannelAdCampaignSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        campaign = ser.save(advertiser_channel=channel)
+        return Response(ChannelAdCampaignSerializer(campaign).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelAdSlotView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        slots = ChannelAdSlot.objects.filter(content=content).order_by("timestamp_seconds")
+        return Response(ChannelAdSlotSerializer(slots, many=True).data)
+
+    def post(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _viewer_channel_role(content.channel, request.user)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied()
+        ser = ChannelAdSlotSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        slot = ser.save(content=content)
+        return Response(ChannelAdSlotSerializer(slot).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelAdImpressionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, slot_id):
+        slot = get_object_or_404(ChannelAdSlot, id=slot_id)
+        skipped = bool(request.data.get("skipped", False))
+        clicked = bool(request.data.get("clicked", False))
+        impression = ChannelAdImpression.objects.create(
+            slot=slot,
+            user=request.user,
+            watched_seconds=max(0, int(request.data.get("watched_seconds") or 0)),
+            skipped=skipped,
+            clicked=clicked,
+        )
+        ChannelAdSlot.objects.filter(id=slot.id).update(
+            impression_count=models.F("impression_count") + 1,
+            skip_count=models.F("skip_count") + (1 if skipped else 0),
+        )
+        if slot.campaign_id:
+            cost_per_impression = 10  # 10 cents per impression (stub)
+            ChannelAdCampaign.objects.filter(id=slot.campaign_id).update(
+                spent_cents=models.F("spent_cents") + cost_per_impression
+            )
+        return Response(ChannelAdImpressionSerializer(impression).data, status=status.HTTP_201_CREATED)
+
+
+# ─── Watch Queue / Up Next ────────────────────────────────────────────────────
+class ChannelContentQueueView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queue = ChannelContentQueue.objects.filter(user=request.user).select_related("content__channel").order_by("position", "added_at")
+        return Response(ChannelContentQueueSerializer(queue, many=True).data)
+
+    def post(self, request):
+        content_id = request.data.get("content_id")
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        max_pos = ChannelContentQueue.objects.filter(user=request.user).aggregate(
+            m=models.Max("position")
+        )["m"] or 0
+        item, created = ChannelContentQueue.objects.get_or_create(
+            user=request.user,
+            content=content,
+            defaults={"position": max_pos + 1},
+        )
+        return Response(ChannelContentQueueSerializer(item).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+    def delete(self, request):
+        content_id = request.data.get("content_id")
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        ChannelContentQueue.objects.filter(user=request.user, content=content).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ChannelContentQueueReorderView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        ordered_ids = request.data.get("content_ids") or []
+        if not isinstance(ordered_ids, list):
+            raise ValidationError({"content_ids": "Must be a list."})
+        for position, content_id in enumerate(ordered_ids):
+            ChannelContentQueue.objects.filter(user=request.user, content_id=content_id).update(position=position)
+        return Response({"reordered": len(ordered_ids)})
+
+
+# ─── Verified Channel Admin ───────────────────────────────────────────────────
+class BroadcastChannelVerifyView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id)
+        verify = bool(request.data.get("verified", True))
+        BroadcastChannel.objects.filter(id=channel_id).update(is_verified=verify)
+        channel.refresh_from_db(fields=["is_verified"])
+        return Response({"channel_id": str(channel_id), "is_verified": channel.is_verified})
+
+
+# ─── Round-3 YouTube-parity views ────────────────────────────────────────────
+
+class BroadcastSearchView(APIView):
+    """Public full-text search across published channel content."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        from django.db.models import Sum, Count
+        q = request.query_params.get("q", "").strip()
+        content_type = request.query_params.get("type", "")
+        channel_id = request.query_params.get("channel_id", "")
+        date_from = request.query_params.get("date_from", "")
+        date_to = request.query_params.get("date_to", "")
+        sort = request.query_params.get("sort", "relevance")
+
+        qs = ChannelContent.objects.filter(
+            status="published",
+            visibility="public",
+            is_deleted=False,
+        ).select_related("channel")
+
+        if q:
+            qs = qs.filter(
+                Q(title__icontains=q) | Q(description__icontains=q) | Q(tags__icontains=q)
+            )
+        if content_type:
+            qs = qs.filter(content_type=content_type)
+        if channel_id:
+            qs = qs.filter(channel_id=channel_id)
+        if date_from:
+            qs = qs.filter(published_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(published_at__date__lte=date_to)
+
+        # view_count/reaction_count live inside ChannelContent.stats JSON;
+        # for non-date sorts we fall back to published_at to keep the query simple.
+        qs = qs.order_by("-published_at")
+
+        page = max(1, int(request.query_params.get("page", 1)))
+        page_size = 24
+        offset = (page - 1) * page_size
+        total = qs.count()
+        items = qs[offset:offset + page_size]
+
+        from apps.broadcasts.serializers import ChannelContentListSerializer
+        data = ChannelContentListSerializer(items, many=True, context={"request": request}).data
+        return Response({
+            "count": total,
+            "page": page,
+            "page_size": page_size,
+            "results": data,
+        })
+
+
+class ChannelCommentPinByContentView(APIView):
+    """Pin/unpin a comment via content-scoped URL — channel managers only."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, content_id, comment_id):
+        comment = get_object_or_404(
+            ChannelContentComment.objects.select_related("content__channel"),
+            id=comment_id, content_id=content_id, is_deleted=False, parent__isnull=True,
+        )
+        if not _user_can_manage_channel(request.user, comment.content.channel):
+            raise PermissionDenied("Only channel managers can pin comments.")
+        ChannelContentComment.objects.filter(
+            content=comment.content, is_pinned=True,
+        ).exclude(id=comment.id).update(is_pinned=False)
+        comment.is_pinned = True
+        comment.save(update_fields=["is_pinned", "updated_at"])
+        return Response({"pinned": True, "id": str(comment.id)})
+
+    def delete(self, request, content_id, comment_id):
+        comment = get_object_or_404(
+            ChannelContentComment.objects.select_related("content__channel"),
+            id=comment_id, content_id=content_id, is_deleted=False,
+        )
+        if not _user_can_manage_channel(request.user, comment.content.channel):
+            raise PermissionDenied("Only channel managers can unpin comments.")
+        comment.is_pinned = False
+        comment.save(update_fields=["is_pinned", "updated_at"])
+        return Response({"pinned": False, "id": str(comment.id)})
+
+
+class ChannelTrailerFeaturedView(APIView):
+    """PATCH trailer_content and/or featured_content on a channel."""
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _user_channel_role(request.user, channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied("Only channel owners can update trailer/featured content.")
+
+        trailer_id = request.data.get("trailer_content_id", ...)
+        featured_id = request.data.get("featured_content_id", ...)
+
+        update_fields = []
+        if trailer_id is not ...:
+            if trailer_id is None:
+                channel.trailer_content = None
+            else:
+                channel.trailer_content = get_object_or_404(ChannelContent, id=trailer_id, channel=channel)
+            update_fields.append("trailer_content")
+        if featured_id is not ...:
+            if featured_id is None:
+                channel.featured_content = None
+            else:
+                channel.featured_content = get_object_or_404(ChannelContent, id=featured_id, channel=channel)
+            update_fields.append("featured_content")
+
+        if update_fields:
+            channel.save(update_fields=update_fields)
+
+        from apps.broadcasts.serializers import BroadcastChannelSummarySerializer
+        return Response(BroadcastChannelSummarySerializer(channel, context={"request": request}).data)
+
+
+class ChannelAnalyticsImpressionsCTRView(APIView):
+    """Impressions + CTR analytics for a channel."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        from django.db.models import Sum, F
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _user_channel_role(request.user, channel)
+        if role not in ("owner", "staff", "manager"):
+            raise PermissionDenied()
+
+        period = request.query_params.get("period", "30d")
+        days = {"7d": 7, "30d": 30, "90d": 90}.get(period, 30)
+        cutoff = timezone.now().date() - timedelta(days=days)
+
+        rollups = ChannelAnalyticsDailyRollup.objects.filter(channel=channel, date__gte=cutoff)
+
+        totals = rollups.aggregate(
+            total_impressions=Sum("impressions"),
+            total_views=Sum("views"),
+            total_watch_time=Sum("watch_time_seconds"),
+        )
+        total_impressions = totals["total_impressions"] or 0
+        total_views = totals["total_views"] or 0
+        total_watch_time = totals["total_watch_time"] or 0
+        ctr = round(total_views / total_impressions * 100, 2) if total_impressions else 0.0
+
+        by_content_qs = (
+            rollups.filter(content__isnull=False)
+            .values("content_id", "content__title")
+            .annotate(
+                impressions=Sum("impressions"),
+                views=Sum("views"),
+                avg_watch_time=Sum("watch_time_seconds"),
+            )
+            .order_by("-impressions")[:20]
+        )
+
+        by_content = []
+        for row in by_content_qs:
+            imp = row["impressions"] or 0
+            vws = row["views"] or 0
+            by_content.append({
+                "content_id": str(row["content_id"]),
+                "title": row["content__title"] or "",
+                "impressions": imp,
+                "views": vws,
+                "ctr_percent": round(vws / imp * 100, 2) if imp else 0.0,
+                "avg_watch_time": row["avg_watch_time"] or 0,
+            })
+
+        return Response({
+            "period": period,
+            "total_impressions": total_impressions,
+            "total_views": total_views,
+            "ctr_percent": ctr,
+            "avg_watch_time_seconds": total_watch_time,
+            "by_content": by_content,
+        })
+
+
+class ChannelAnalyticsTrafficSourcesView(APIView):
+    """Traffic source breakdown for a channel."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        from django.db.models import Sum
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _user_channel_role(request.user, channel)
+        if role not in ("owner", "staff", "manager"):
+            raise PermissionDenied()
+
+        period = request.query_params.get("period", "30d")
+        days = {"7d": 7, "30d": 30, "90d": 90}.get(period, 30)
+        cutoff = timezone.now().date() - timedelta(days=days)
+
+        from apps.broadcasts.models import ChannelContentTrafficSource
+        rows = (
+            ChannelContentTrafficSource.objects.filter(
+                content__channel=channel,
+                date__gte=cutoff,
+            )
+            .values("source_type")
+            .annotate(
+                view_count=Sum("view_count"),
+                watch_time_seconds=Sum("watch_time_seconds"),
+            )
+            .order_by("-view_count")
+        )
+
+        total_views = sum(r["view_count"] or 0 for r in rows)
+        sources = []
+        for row in rows:
+            vc = row["view_count"] or 0
+            sources.append({
+                "source_type": row["source_type"],
+                "view_count": vc,
+                "watch_time_seconds": row["watch_time_seconds"] or 0,
+                "percent": round(vc / total_views * 100, 2) if total_views else 0.0,
+            })
+
+        return Response({"period": period, "sources": sources})
+
+
+class ChannelKeywordFiltersView(APIView):
+    """List and create keyword filters for a channel."""
+    permission_classes = [IsAuthenticated]
+
+    def _get_channel_editor_or_403(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _user_channel_role(request.user, channel)
+        if role not in ("owner", "staff", "manager", "editor"):
+            raise PermissionDenied("Channel editors only.")
+        return channel
+
+    def get(self, request, channel_id):
+        from apps.broadcasts.models import ChannelKeywordFilter
+        from apps.broadcasts.serializers import ChannelKeywordFilterSerializer
+        channel = self._get_channel_editor_or_403(request, channel_id)
+        filters = ChannelKeywordFilter.objects.filter(channel=channel).order_by("keyword")
+        return Response(ChannelKeywordFilterSerializer(filters, many=True).data)
+
+    def post(self, request, channel_id):
+        from apps.broadcasts.models import ChannelKeywordFilter
+        from apps.broadcasts.serializers import ChannelKeywordFilterSerializer
+        channel = self._get_channel_editor_or_403(request, channel_id)
+        ser = ChannelKeywordFilterSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        ser.save(channel=channel, created_by=request.user)
+        return Response(ser.data, status=status.HTTP_201_CREATED)
+
+
+class ChannelKeywordFilterDetailView(APIView):
+    """Update or delete a single keyword filter."""
+    permission_classes = [IsAuthenticated]
+
+    def _get_filter_editor_or_403(self, request, filter_id):
+        from apps.broadcasts.models import ChannelKeywordFilter
+        kf = get_object_or_404(ChannelKeywordFilter, id=filter_id)
+        role = _user_channel_role(request.user, kf.channel)
+        if role not in ("owner", "staff", "manager", "editor"):
+            raise PermissionDenied("Channel editors only.")
+        return kf
+
+    def patch(self, request, filter_id):
+        from apps.broadcasts.serializers import ChannelKeywordFilterSerializer
+        kf = self._get_filter_editor_or_403(request, filter_id)
+        ser = ChannelKeywordFilterSerializer(kf, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
+
+    def delete(self, request, filter_id):
+        kf = self._get_filter_editor_or_403(request, filter_id)
+        kf.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ChannelHomepageShelvesView(APIView):
+    """List (public) or create (owner) homepage shelves for a channel."""
+    permission_classes = [AllowAny]
+
+    def get(self, request, channel_id):
+        from apps.broadcasts.models import ChannelHomepageShelf
+        from apps.broadcasts.serializers import ChannelHomepageShelfSerializer
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        shelves = ChannelHomepageShelf.objects.filter(channel=channel, is_active=True)
+        return Response(ChannelHomepageShelfSerializer(shelves, many=True).data)
+
+    def post(self, request, channel_id):
+        from apps.broadcasts.models import ChannelHomepageShelf
+        from apps.broadcasts.serializers import ChannelHomepageShelfSerializer
+        if not request.user or not request.user.is_authenticated:
+            raise PermissionDenied()
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        role = _user_channel_role(request.user, channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied("Only channel owners can create shelves.")
+        ser = ChannelHomepageShelfSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        ser.save(channel=channel)
+        return Response(ser.data, status=status.HTTP_201_CREATED)
+
+
+class ChannelHomepageShelfDetailView(APIView):
+    """Get, update, or delete a single homepage shelf."""
+    permission_classes = [AllowAny]
+
+    def _get_shelf(self, shelf_id):
+        from apps.broadcasts.models import ChannelHomepageShelf
+        return get_object_or_404(ChannelHomepageShelf, id=shelf_id)
+
+    def get(self, request, shelf_id):
+        from apps.broadcasts.serializers import ChannelHomepageShelfSerializer
+        shelf = self._get_shelf(shelf_id)
+        return Response(ChannelHomepageShelfSerializer(shelf).data)
+
+    def patch(self, request, shelf_id):
+        from apps.broadcasts.serializers import ChannelHomepageShelfSerializer
+        if not request.user or not request.user.is_authenticated:
+            raise PermissionDenied()
+        shelf = self._get_shelf(shelf_id)
+        role = _user_channel_role(request.user, shelf.channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied("Only channel owners can update shelves.")
+        ser = ChannelHomepageShelfSerializer(shelf, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
+
+    def delete(self, request, shelf_id):
+        if not request.user or not request.user.is_authenticated:
+            raise PermissionDenied()
+        shelf = self._get_shelf(shelf_id)
+        role = _user_channel_role(request.user, shelf.channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied("Only channel owners can delete shelves.")
+        shelf.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ChannelHomepageShelfItemsView(APIView):
+    """List or add items to a homepage shelf."""
+    permission_classes = [AllowAny]
+
+    def _get_shelf(self, shelf_id):
+        from apps.broadcasts.models import ChannelHomepageShelf
+        return get_object_or_404(ChannelHomepageShelf, id=shelf_id)
+
+    def get(self, request, shelf_id):
+        from apps.broadcasts.models import ChannelHomepageShelfItem
+        from apps.broadcasts.serializers import ChannelHomepageShelfItemSerializer
+        shelf = self._get_shelf(shelf_id)
+        items = ChannelHomepageShelfItem.objects.filter(shelf=shelf)
+        return Response(ChannelHomepageShelfItemSerializer(items, many=True).data)
+
+    def post(self, request, shelf_id):
+        from apps.broadcasts.models import ChannelHomepageShelfItem
+        from apps.broadcasts.serializers import ChannelHomepageShelfItemSerializer
+        if not request.user or not request.user.is_authenticated:
+            raise PermissionDenied()
+        shelf = self._get_shelf(shelf_id)
+        role = _user_channel_role(request.user, shelf.channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied("Only channel owners can add shelf items.")
+        content_id = request.data.get("content_id")
+        playlist_id = request.data.get("playlist_id")
+        sort_order = request.data.get("sort_order", 0)
+        item = ChannelHomepageShelfItem(shelf=shelf, sort_order=sort_order)
+        if content_id:
+            item.content = get_object_or_404(ChannelContent, id=content_id)
+        if playlist_id:
+            item.playlist = get_object_or_404(BroadcastPlaylist, id=playlist_id)
+        item.save()
+        return Response(ChannelHomepageShelfItemSerializer(item).data, status=status.HTTP_201_CREATED)
+
+
+class ChannelCategoryListView(APIView):
+    """Public — return top-level categories with nested subcategories."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        from apps.broadcasts.models import ChannelCategory
+        from apps.broadcasts.serializers import ChannelCategorySerializer
+        top = ChannelCategory.objects.filter(is_active=True, parent__isnull=True)
+        return Response(ChannelCategorySerializer(top, many=True).data)
+
+
+class ChannelCategoryBrowseView(APIView):
+    """Public — browse published content by category slug (approximate tag match)."""
+    permission_classes = [AllowAny]
+
+    def get(self, request, slug):
+        qs = ChannelContent.objects.filter(
+            status="published",
+            visibility="public",
+            is_deleted=False,
+        ).filter(
+            Q(channel__category__icontains=slug) | Q(tags__icontains=slug)
+        ).order_by("-published_at").select_related("channel")
+
+        page = max(1, int(request.query_params.get("page", 1)))
+        page_size = 24
+        offset = (page - 1) * page_size
+        total = qs.count()
+        items = qs[offset:offset + page_size]
+
+        from apps.broadcasts.serializers import ChannelContentListSerializer
+        return Response({
+            "count": total,
+            "page": page,
+            "page_size": page_size,
+            "results": ChannelContentListSerializer(items, many=True, context={"request": request}).data,
+        })
+
+
+class ChannelContentFingerprintView(APIView):
+    """List or submit content fingerprints (owner only)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id):
+        from apps.broadcasts.models import ChannelContentFingerprint
+        from apps.broadcasts.serializers import ChannelContentFingerprintSerializer
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _user_channel_role(request.user, content.channel)
+        if role not in ("owner", "staff", "manager"):
+            raise PermissionDenied()
+        fps = ChannelContentFingerprint.objects.filter(content=content)
+        return Response(ChannelContentFingerprintSerializer(fps, many=True).data)
+
+    def post(self, request, content_id):
+        from apps.broadcasts.models import ChannelContentFingerprint, ChannelFingerprintMatch
+        from apps.broadcasts.serializers import ChannelContentFingerprintSerializer
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        role = _user_channel_role(request.user, content.channel)
+        if role not in ("owner", "staff", "manager"):
+            raise PermissionDenied()
+        algorithm = request.data.get("algorithm", ChannelContentFingerprint.Algorithm.SHA256)
+        fingerprint_hash = request.data.get("fingerprint_hash", "").strip()
+        if not fingerprint_hash:
+            raise ValidationError({"fingerprint_hash": "This field is required."})
+
+        fp, created = ChannelContentFingerprint.objects.get_or_create(
+            content=content,
+            algorithm=algorithm,
+            defaults={"fingerprint_hash": fingerprint_hash, "status": ChannelContentFingerprint.Status.INDEXED},
+        )
+        if not created:
+            fp.fingerprint_hash = fingerprint_hash
+            fp.status = ChannelContentFingerprint.Status.INDEXED
+            fp.save(update_fields=["fingerprint_hash", "status", "updated_at"])
+
+        # Scan for exact matches among other fingerprints with the same algorithm
+        matches = ChannelContentFingerprint.objects.filter(
+            algorithm=algorithm,
+            fingerprint_hash=fingerprint_hash,
+        ).exclude(id=fp.id)
+        for match in matches:
+            ChannelFingerprintMatch.objects.get_or_create(
+                source_fingerprint=fp,
+                matched_fingerprint=match,
+                defaults={"similarity_score": 1.0},
+            )
+
+        return Response(ChannelContentFingerprintSerializer(fp).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
+class ChannelLiveStreamSettingsView(APIView):
+    """PATCH latency_mode, dvr_enabled, dvr_window_seconds on a live stream."""
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, stream_id):
+        from apps.broadcasts.serializers import ChannelLiveStreamLatencySerializer
+        stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        role = _user_channel_role(request.user, stream.channel)
+        if role not in ("owner", "staff", "manager", "editor"):
+            raise PermissionDenied("Channel editors only.")
+        ser = ChannelLiveStreamLatencySerializer(stream, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)

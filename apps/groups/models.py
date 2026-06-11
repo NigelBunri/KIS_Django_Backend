@@ -92,6 +92,13 @@ class Group(models.Model):
     allow_links = models.BooleanField(default=True)
     require_post_approval = models.BooleanField(default=False)
 
+    invite_token = models.CharField(
+        max_length=64,
+        blank=True,
+        db_index=True,
+        help_text="Short random token used to build a shareable invite link.",
+    )
+
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 

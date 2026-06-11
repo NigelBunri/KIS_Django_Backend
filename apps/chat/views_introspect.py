@@ -37,9 +37,9 @@ class IntrospectView(APIView):
 
         username = getattr(user, "username", "") or ""
         email = getattr(user, "email", "") or ""
-        display_name = ""
+        display_name = (getattr(user, "display_name", "") or "").strip()
         if hasattr(user, "get_full_name"):
-            display_name = user.get_full_name() or ""
+            display_name = display_name or user.get_full_name() or ""
         if not display_name:
             display_name = username or (email.split("@")[0] if email else "")
 

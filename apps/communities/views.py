@@ -1,4 +1,6 @@
 # apps/communities/views.py
+import secrets
+from django.conf import settings
 from django.db import models, transaction
 from django.utils import timezone
 from rest_framework import viewsets, status
@@ -139,6 +141,8 @@ class CommunityViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
 
         user = self.request.user
         features = get_user_tier_features(user)
@@ -147,7 +151,12 @@ class CommunityViewSet(viewsets.ModelViewSet):
             count = Community.objects.filter(owner=user).count()
             if count >= limit:
                 raise ValidationError({"detail": "Community limit reached for your plan."})
-        serializer.save()
+        _log.info("community.create request_data=%s", self.request.data)
+        try:
+            serializer.save()
+        except Exception as exc:
+            _log.error("community.create failed exc=%r validated=%r", exc, getattr(serializer, '_validated_data', None))
+            raise
 
     def _get_membership(self, community: Community, user):
         return CommunityMembership.objects.filter(
@@ -588,6 +597,48 @@ class CommunityViewSet(viewsets.ModelViewSet):
         CommunityMembership.objects.filter(community=community, user_id=user_id).update(is_banned=False)
         return Response({"detail": "Unbanned."}, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["get", "post"], url_path="invite-link")
+    def invite_link(self, request, pk=None):
+        """GET returns current link; POST regenerates it. Admins only."""
+        community = self.get_object()
+        membership = CommunityMembership.objects.filter(
+            community=community, user=request.user, left_at__isnull=True, is_banned=False
+        ).first()
+        role = membership.role if membership else None
+        if role not in ("owner", "admin", "mod"):
+            raise PermissionDenied("Only admins can manage the invite link.")
+        if not community.allow_join_link:
+            return Response({"detail": "Invite links are disabled for this community."}, status=400)
+        if request.method == "POST" or not community.invite_token:
+            community.invite_token = secrets.token_urlsafe(24)
+            community.save(update_fields=["invite_token"])
+        base = getattr(settings, "SITE_URL", "").rstrip("/")
+        link = f"{base}/join/community/{community.invite_token}"
+        return Response({"invite_link": link, "invite_token": community.invite_token})
+
+    @action(detail=False, methods=["post"], url_path="join-by-invite")
+    def join_by_invite(self, request):
+        """POST { invite_token } — join by invite token."""
+        token = request.data.get("invite_token", "").strip()
+        if not token:
+            return Response({"detail": "invite_token is required."}, status=400)
+        community = Community.objects.filter(invite_token=token, is_active=True).first()
+        if not community:
+            return Response({"detail": "Invalid or expired invite link."}, status=404)
+        if not community.allow_join_link:
+            return Response({"detail": "Invite links are disabled for this community."}, status=403)
+        existing = CommunityMembership.objects.filter(community=community, user=request.user).first()
+        if existing and existing.left_at is None and not existing.is_banned:
+            return Response({"detail": "Already a member."})
+        if existing and existing.is_banned:
+            return Response({"detail": "You are banned from this community."}, status=403)
+        CommunityMembership.objects.update_or_create(
+            community=community,
+            user=request.user,
+            defaults={"role": CommunityRole.MEMBER, "left_at": None, "is_banned": False},
+        )
+        return Response({"detail": "Joined successfully.", "community_id": str(community.id)})
+
 
 class CommunityPostViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
@@ -755,7 +806,18 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
         if action in ("remove", "unlike") or (action == "toggle" and existing):
             if existing:
                 existing.delete()
-            return Response({"detail": "Reaction removed.", "has_reacted": False}, status=status.HTTP_200_OK)
+            reactions = list(
+                post.reactions.values("emoji").annotate(count=models.Count("id"))
+            )
+            return Response(
+                {
+                    "detail": "Reaction removed.",
+                    "has_reacted": False,
+                    "reactions": reactions,
+                    "reactions_count": sum(item["count"] for item in reactions),
+                },
+                status=status.HTTP_200_OK,
+            )
 
         reaction, created = CommunityPostReaction.objects.get_or_create(
             post=post,
@@ -766,7 +828,18 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
             reaction.emoji = emoji
             reaction.save(update_fields=["emoji"])
 
-        return Response({"detail": "Reaction saved.", "has_reacted": True}, status=status.HTTP_200_OK)
+        reactions = list(
+            post.reactions.values("emoji").annotate(count=models.Count("id"))
+        )
+        return Response(
+            {
+                "detail": "Reaction saved.",
+                "has_reacted": True,
+                "reactions": reactions,
+                "reactions_count": sum(item["count"] for item in reactions),
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["post"], url_path="delete")
     def delete_post(self, request, pk=None):

@@ -89,8 +89,21 @@ urlpatterns = [
     path("api/v1/", include("apps.chat.urls", namespace="chat-root")),
     path("api/v1/partners/", include("apps.partners.urls", namespace="partners")),
     path("api/v1/partners/", include("apps.location.urls", namespace="location")),
+    # The generic core app already owns /api/v1/communities/. Chat-backed
+    # communities need a separate route that creates their conversations.
+    path(
+        "api/v1/chat-communities/",
+        include("apps.communities.chat_urls", namespace="chat-communities"),
+    ),
+    # Keep community post routes such as /api/v1/posts/ available.
     path("api/v1/", include("apps.communities.urls", namespace="communities")),
-    path("api/v1/", include("apps.groups.urls", namespace="groups")),
+    # Chat-backed groups use a dedicated prefix. The generic core app already
+    # owns /api/v1/groups/, and routing chat creation there produces a Group ID
+    # without creating an apps.chat.Conversation.
+    path(
+        "api/v1/chat-groups/",
+        include("apps.groups.chat_urls", namespace="chat-groups"),
+    ),
     path("api/v1/partner-channels/", include("apps.channels.urls", namespace="channels")),
     path("api/v1/", include("apps.broadcasts.urls", namespace="broadcasts")),
     path("api/v1/", include("apps.health_ops.urls")),

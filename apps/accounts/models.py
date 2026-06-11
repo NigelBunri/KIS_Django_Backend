@@ -477,6 +477,12 @@ class E2EDeviceKey(BaseEntity):
             models.Index(fields=["user", "device"]),
             models.Index(fields=["user", "device", "signed_prekey_id"]),
         ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "device"],
+                name="accounts_e2e_device_key_user_device_uniq",
+            ),
+        ]
 
 
 class E2EPreKey(BaseEntity):
@@ -490,6 +496,12 @@ class E2EPreKey(BaseEntity):
         indexes = [
             models.Index(fields=["user", "device", "prekey_id"]),
             models.Index(fields=["user", "device", "consumed_at"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "device", "prekey_id"],
+                name="accounts_e2e_prekey_user_device_id_uniq",
+            ),
         ]
 
 class DeviceQRToken(models.Model):

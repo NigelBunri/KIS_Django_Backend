@@ -1,4 +1,7 @@
 # apps/groups/views.py
+import secrets
+
+from django.conf import settings
 from django.db import models
 from rest_framework import viewsets, status
 from rest_framework.permissions import IsAuthenticated
@@ -288,11 +291,14 @@ class GroupViewSet(viewsets.ModelViewSet):
             membership.is_banned = False
             membership.save(update_fields=["left_at", "is_banned"])
 
-        ConversationMember.objects.get_or_create(
+        cm, _ = ConversationMember.objects.get_or_create(
             conversation=group.conversation,
             user=user,
             defaults={"base_role": BaseConversationRole.MEMBER},
         )
+        if cm.left_at is not None:
+            cm.left_at = None
+            cm.save(update_fields=["left_at"])
 
         return Response(GroupMembershipSerializer(membership).data, status=status.HTTP_200_OK)
 
@@ -334,11 +340,14 @@ class GroupViewSet(viewsets.ModelViewSet):
                 m.left_at = None
                 m.is_banned = False
                 m.save(update_fields=["left_at", "is_banned"])
-            ConversationMember.objects.get_or_create(
+            cm, _ = ConversationMember.objects.get_or_create(
                 conversation=group.conversation,
                 user=target,
                 defaults={"base_role": BaseConversationRole.MEMBER},
             )
+            if cm.left_at is not None:
+                cm.left_at = None
+                cm.save(update_fields=["left_at"])
             if group.community_id:
                 CommunityMembership.objects.update_or_create(
                     community_id=group.community_id,
@@ -347,17 +356,23 @@ class GroupViewSet(viewsets.ModelViewSet):
                 )
                 community = group.community
                 if community and community.main_conversation_id:
-                    ConversationMember.objects.get_or_create(
+                    mcm, _ = ConversationMember.objects.get_or_create(
                         conversation=community.main_conversation,
                         user=target,
                         defaults={"base_role": BaseConversationRole.MEMBER},
                     )
+                    if mcm.left_at is not None:
+                        mcm.left_at = None
+                        mcm.save(update_fields=["left_at"])
                 if community and community.posts_conversation_id:
-                    ConversationMember.objects.get_or_create(
+                    pcm, _ = ConversationMember.objects.get_or_create(
                         conversation=community.posts_conversation,
                         user=target,
                         defaults={"base_role": BaseConversationRole.MEMBER},
                     )
+                    if pcm.left_at is not None:
+                        pcm.left_at = None
+                        pcm.save(update_fields=["left_at"])
             if created:
                 added.append(str(target.id))
 
@@ -471,3 +486,54 @@ class GroupViewSet(viewsets.ModelViewSet):
         GroupBan.objects.filter(group=group, user_id=user_id).delete()
         GroupMembership.objects.filter(group=group, user_id=user_id).update(is_banned=False)
         return Response({"detail": "Unbanned."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="invite-link")
+    def invite_link(self, request, pk=None):
+        """
+        GET  — return the current invite link (generates one if absent).
+        POST — regenerate the invite token (invalidates the old link).
+        Only admins/owners may call this.
+        """
+        group = self.get_object()
+        membership = self._get_membership(group, request.user)
+        if not self._is_admin(membership):
+            raise PermissionDenied("Only admins can manage the invite link.")
+
+        if request.method == "POST" or not group.invite_token:
+            group.invite_token = secrets.token_urlsafe(24)
+            group.save(update_fields=["invite_token"])
+
+        base = getattr(settings, "SITE_URL", "").rstrip("/")
+        invite_link = f"{base}/join/group/{group.invite_token}"
+        return Response({"invite_link": invite_link, "invite_token": group.invite_token})
+
+    @action(detail=False, methods=["post"], url_path="join-by-invite")
+    def join_by_invite(self, request):
+        """
+        POST { "invite_token": "..." } — join the group identified by the token.
+        """
+        token = request.data.get("invite_token", "").strip()
+        if not token:
+            return Response({"detail": "invite_token is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        group = Group.objects.filter(invite_token=token, is_archived=False).first()
+        if not group:
+            return Response({"detail": "Invalid or expired invite link."}, status=status.HTTP_404_NOT_FOUND)
+
+        existing = GroupMembership.objects.filter(group=group, user=request.user).first()
+        if existing and existing.left_at is None and not existing.is_banned:
+            return Response({"detail": "Already a member."}, status=status.HTTP_200_OK)
+        if existing and existing.is_banned:
+            return Response({"detail": "You are banned from this group."}, status=status.HTTP_403_FORBIDDEN)
+
+        GroupMembership.objects.update_or_create(
+            group=group,
+            user=request.user,
+            defaults={"role": GroupRole.MEMBER, "left_at": None, "is_banned": False},
+        )
+        ConversationMember.objects.get_or_create(
+            conversation=group.conversation,
+            user=request.user,
+            defaults={"base_role": BaseConversationRole.MEMBER},
+        )
+        return Response({"detail": "Joined successfully.", "group_id": str(group.id)})

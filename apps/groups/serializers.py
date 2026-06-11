@@ -1,4 +1,6 @@
 # apps/groups/serializers.py
+from django.db import transaction
+from django.utils.text import slugify
 from rest_framework import serializers
 
 from apps.groups.models import (
@@ -80,13 +82,29 @@ class GroupCreateSerializer(serializers.ModelSerializer):
             "channel",
             "conversation_id",
         ]
+        extra_kwargs = {
+            "slug": {"required": False, "allow_blank": True},
+        }
 
     conversation_id = serializers.UUIDField(source="conversation.id", read_only=True)
 
+    def _ensure_unique_slug(self, base_slug: str, community_id) -> str:
+        candidate = base_slug or "group"
+        suffix = 0
+        while Group.objects.filter(community_id=community_id, slug=candidate).exists():
+            suffix += 1
+            candidate = f"{base_slug}-{suffix}"
+        return candidate
+
     def validate(self, attrs):
-        # You can add custom validation here (e.g. require partner or community)
+        name = (attrs.get("name") or "").strip()
+        raw_slug = (attrs.get("slug") or "").strip()
+        base = slugify(raw_slug or name or "group")
+        community_id = attrs.get("community_id") or (attrs.get("community").id if attrs.get("community") else None)
+        attrs["slug"] = self._ensure_unique_slug(base or "group", community_id)
         return attrs
 
+    @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
         user = request.user

@@ -1,5 +1,5 @@
 # apps/communities/serializers.py
-from django.db import models
+from django.db import models, transaction
 from rest_framework import serializers
 
 from apps.chat.discussion import get_discussion_count
@@ -35,6 +35,41 @@ class CommunityImageUrlSerializerMixin:
         return normalize_image_payload(value)
 
 
+class CommunityMembershipStateSerializerMixin:
+    def _current_membership(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or user.is_anonymous:
+            return None
+        cache_name = "_serializer_current_membership"
+        if not hasattr(obj, cache_name):
+            setattr(
+                obj,
+                cache_name,
+                CommunityMembership.objects.filter(
+                    community=obj,
+                    user=user,
+                    left_at__isnull=True,
+                    is_banned=False,
+                ).first(),
+            )
+        return getattr(obj, cache_name)
+
+    def get_is_owner(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return bool(user and not user.is_anonymous and obj.owner_id == user.id)
+
+    def get_is_member(self, obj):
+        return self.get_is_owner(obj) or self._current_membership(obj) is not None
+
+    def get_current_user_role(self, obj):
+        if self.get_is_owner(obj):
+            return CommunityRole.OWNER
+        membership = self._current_membership(obj)
+        return membership.role if membership else None
+
+
 class CommunityUserSerializer(serializers.ModelSerializer):
     avatar_url = serializers.SerializerMethodField()
 
@@ -50,7 +85,14 @@ class CommunityUserSerializer(serializers.ModelSerializer):
         )
 
 
-class CommunityListSerializer(CommunityImageUrlSerializerMixin, serializers.ModelSerializer):
+class CommunityListSerializer(
+    CommunityMembershipStateSerializerMixin,
+    CommunityImageUrlSerializerMixin,
+    serializers.ModelSerializer,
+):
+    is_member = serializers.SerializerMethodField()
+    is_owner = serializers.SerializerMethodField()
+    current_user_role = serializers.SerializerMethodField()
     main_conversation_id = serializers.UUIDField(
         source="main_conversation.id",
         read_only=True,
@@ -67,10 +109,14 @@ class CommunityListSerializer(CommunityImageUrlSerializerMixin, serializers.Mode
             "id",
             "name",
             "slug",
+            "description",
             "avatar_url",
             "is_active",
             "allow_broadcasts",
             "partner",
+            "is_member",
+            "is_owner",
+            "current_user_role",
             "main_conversation_id",
             "posts_conversation_id",
             "created_at",
@@ -78,7 +124,14 @@ class CommunityListSerializer(CommunityImageUrlSerializerMixin, serializers.Mode
         ]
 
 
-class CommunityDetailSerializer(CommunityImageUrlSerializerMixin, serializers.ModelSerializer):
+class CommunityDetailSerializer(
+    CommunityMembershipStateSerializerMixin,
+    CommunityImageUrlSerializerMixin,
+    serializers.ModelSerializer,
+):
+    is_member = serializers.SerializerMethodField()
+    is_owner = serializers.SerializerMethodField()
+    current_user_role = serializers.SerializerMethodField()
     main_conversation_id = serializers.UUIDField(
         source="main_conversation.id",
         read_only=True,
@@ -99,6 +152,9 @@ class CommunityDetailSerializer(CommunityImageUrlSerializerMixin, serializers.Mo
             "avatar_url",
             "partner",
             "owner",
+            "is_member",
+            "is_owner",
+            "current_user_role",
             "visibility",
             "join_policy",
             "post_policy",
@@ -178,6 +234,9 @@ class CommunityCreateSerializer(CommunityImageUrlSerializerMixin, serializers.Mo
             "main_conversation_id",
             "posts_conversation_id",
         ]
+        extra_kwargs = {
+            "slug": {"required": False, "allow_blank": True},
+        }
 
     def validate(self, attrs):
         name = (attrs.get("name") or "").strip()
@@ -194,6 +253,7 @@ class CommunityCreateSerializer(CommunityImageUrlSerializerMixin, serializers.Mo
             candidate = f"{base_slug}-{suffix}"
         return candidate
 
+    @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
         user = request.user
