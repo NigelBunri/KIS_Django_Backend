@@ -749,6 +749,8 @@ class PartnerMemberDirectoryEntrySerializer(serializers.Serializer):
 class PartnerJobPostSerializer(serializers.ModelSerializer):
     partner_name = serializers.CharField(source="partner.name", read_only=True)
     partner_id = serializers.UUIDField(source="partner.id", read_only=True)
+    salary_min = serializers.SerializerMethodField()
+    salary_max = serializers.SerializerMethodField()
 
     class Meta:
         model = PartnerJobPost
@@ -765,6 +767,8 @@ class PartnerJobPostSerializer(serializers.ModelSerializer):
             "job_type",
             "salary_min_cents",
             "salary_max_cents",
+            "salary_min",
+            "salary_max",
             "salary_currency",
             "tags",
             "steps",
@@ -773,6 +777,12 @@ class PartnerJobPostSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_salary_min(self, obj):
+        return obj.salary_min_cents / 100 if obj.salary_min_cents else None
+
+    def get_salary_max(self, obj):
+        return obj.salary_max_cents / 100 if obj.salary_max_cents else None
 
 
 class PartnerPolicySerializer(serializers.ModelSerializer):

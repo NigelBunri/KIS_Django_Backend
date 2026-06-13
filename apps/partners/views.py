@@ -3364,6 +3364,65 @@ class PartnerViewSet(viewsets.ModelViewSet):
         serializer = PartnerProfileLinkSerializer(link, context={"request": request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=["get"], url_path="jobs", permission_classes=[IsAuthenticated])
+    def global_jobs(self, request):
+        """Public job board — returns active job posts across all partners with optional filtering."""
+        from django.db.models import Q
+        qs = PartnerJobPost.objects.filter(is_active=True).select_related("partner").order_by("-created_at")
+        search = request.query_params.get("search", "").strip()
+        job_type = request.query_params.get("job_type", "").strip()
+        is_remote = request.query_params.get("is_remote", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(title__icontains=search) |
+                Q(description__icontains=search) |
+                Q(partner__name__icontains=search)
+            )
+        if job_type:
+            qs = qs.filter(job_type=job_type)
+        if is_remote in ("true", "1"):
+            qs = qs.filter(is_remote=True)
+        return Response(PartnerJobPostSerializer(qs, many=True).data)
+
+    @action(detail=False, methods=["get"], url_path="my-applications", permission_classes=[IsAuthenticated])
+    def my_applications(self, request):
+        """Returns the current user's partner applications with job and partner details."""
+        qs = (
+            PartnerApplication.objects
+            .filter(user=request.user)
+            .select_related("partner", "job_post")
+            .order_by("-created_at")
+        )
+        data = [
+            {
+                "id": str(app.id),
+                "partner_name": app.partner.name if app.partner else None,
+                "partner_id": str(app.partner.id) if app.partner else None,
+                "job_title": app.job_post.title if app.job_post else None,
+                "job_post_id": str(app.job_post_id) if app.job_post_id else None,
+                "status": app.status,
+                "method": app.method,
+                "created_at": app.created_at.isoformat() if app.created_at else None,
+            }
+            for app in qs
+        ]
+        return Response(data)
+
+    @action(detail=False, methods=["post"], url_path=r"my-applications/(?P<app_id>[^/.]+)/withdraw", permission_classes=[IsAuthenticated])
+    def withdraw_application(self, request, app_id=None):
+        """Allows an applicant to withdraw their own pending application."""
+        from rest_framework.exceptions import NotFound
+        app = PartnerApplication.objects.filter(
+            id=app_id,
+            user=request.user,
+            status=PartnerApplicationStatus.PENDING,
+        ).first()
+        if not app:
+            raise NotFound("Application not found or cannot be withdrawn.")
+        app.status = PartnerApplicationStatus.WITHDRAWN
+        app.save(update_fields=["status", "updated_at"])
+        return Response({"status": app.status})
+
 
 class PartnerPostViewSet(viewsets.ModelViewSet):
     """
