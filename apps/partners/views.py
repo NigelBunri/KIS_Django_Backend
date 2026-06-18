@@ -838,7 +838,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
         )
         return Response({"detail": "Partner reactivated."}, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=["post"], url_path="delete")
+    @action(detail=True, methods=["post"], url_path="remove")
     def delete(self, request, pk=None):
         partner = self.get_object()
         if partner.owner != request.user:

@@ -1023,6 +1023,11 @@ class ProfilePreferences(BaseEntity):
     social_proof = models.JSONField(default=dict, blank=True)
     ask_tags = models.JSONField(default=list, blank=True)
     highlights = models.JSONField(default=list, blank=True)
+    notification_preferences = models.JSONField(default=dict, blank=True)
+    consent_preferences = models.JSONField(default=dict, blank=True)
+    language_preference = models.CharField(max_length=20, blank=True, default='')
+    # NOTE: Run makemigrations after this change
+    quicklock_pin_hash = models.CharField(max_length=128, blank=True, null=True)
 
     class Meta:
         indexes = [models.Index(fields=["user"])]

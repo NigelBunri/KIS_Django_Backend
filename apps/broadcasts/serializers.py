@@ -340,6 +340,7 @@ class ChannelContentListSerializer(serializers.ModelSerializer):
 
 class ChannelContentDetailSerializer(ChannelContentListSerializer):
     assets = ChannelContentAssetSerializer(many=True, read_only=True)
+    geo_restricted = serializers.SerializerMethodField()
 
     class Meta(ChannelContentListSerializer.Meta):
         fields = ChannelContentListSerializer.Meta.fields + [
@@ -348,8 +349,14 @@ class ChannelContentDetailSerializer(ChannelContentListSerializer):
             "text_doc",
             "assets",
             "metadata",
+            "tags",
             "scheduled_at",
+            "age_restriction",
+            "geo_restricted",
         ]
+
+    def get_geo_restricted(self, obj: ChannelContent) -> bool:
+        return hasattr(obj, "geo_restriction") and obj.geo_restriction is not None
 
 
 class ChannelContentCommentSerializer(serializers.ModelSerializer):
@@ -683,9 +690,6 @@ class ServiceSerializer(serializers.ModelSerializer):
         model = Service
         fields = [
             "id",
-            "owner",
-            "owner_user_id",
-            "ownerUserId",
             "name",
             "description",
             "is_default",
@@ -719,6 +723,9 @@ class BroadcastFeatureSerializer(serializers.ModelSerializer):
 
 class BroadcastFeatureStatusSerializer(BroadcastFeatureSerializer):
     enabled = serializers.BooleanField()
+
+    class Meta(BroadcastFeatureSerializer.Meta):
+        fields = BroadcastFeatureSerializer.Meta.fields + ["enabled"]
 
 
 class BroadcastVideoSerializer(serializers.ModelSerializer):

@@ -35,6 +35,7 @@ from .partner_oversight import (
     AdminPartnerStatsView,
     AdminRevenueStatsView,
     AdminEngagementStatsView,
+    AdminAnalyticsDashboardsView,
 )
 
 __all__ = [
@@ -72,4 +73,5 @@ __all__ = [
     "AdminPartnerStatsView",
     "AdminRevenueStatsView",
     "AdminEngagementStatsView",
+    "AdminAnalyticsDashboardsView",
 ]

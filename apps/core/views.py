@@ -5,6 +5,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+import uuid
 from decimal import Decimal
 from typing import Any, Dict
 
@@ -1292,13 +1293,39 @@ class PatientMasterRecordViewSet(viewsets.ModelViewSet):
     def my_health_profile(self, request):
         patient = _resolve_patient_for_user(request.user)
         if not patient:
-            return Response(
-                {
-                    "detail": "No linked patient master record found for the current user.",
-                    "code": "patient_profile_not_linked",
-                },
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            user = request.user
+            user_id = str(getattr(user, "id", "") or "").strip()
+            email = str(getattr(user, "email", "") or "").strip()
+            phone = str(getattr(user, "phone", "") or getattr(user, "phone_number", "") or "").strip()
+            first_name = str(getattr(user, "first_name", "") or "").strip() or "User"
+            last_name = str(getattr(user, "last_name", "") or "").strip() or user_id[:8] or "Unknown"
+            mrn = f"MRN-{uuid.uuid4().hex[:12].upper()}"
+            primary_contact = {}
+            if user_id:
+                primary_contact["user_id"] = user_id
+            if email:
+                primary_contact["email"] = email
+            if phone:
+                primary_contact["phone"] = phone
+            if not user_id:
+                return Response(
+                    {"detail": "Unable to resolve or create patient record.", "code": "patient_profile_not_linked"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            with transaction.atomic():
+                existing = models.PatientMasterRecord.objects.filter(
+                    primary_contact__user_id=user_id
+                ).first()
+                if existing:
+                    patient = existing
+                else:
+                    patient = models.PatientMasterRecord.objects.create(
+                        mrn=mrn,
+                        first_name=first_name,
+                        last_name=last_name,
+                        primary_contact=primary_contact,
+                        status=models.PatientMasterRecord.STATUS_ACTIVE,
+                    )
         _log_patient_access(request.user, patient, "patient.health_profile.read", "owner")
         serializer = serializers.PatientCanonicalHealthProfileSerializer(
             patient,

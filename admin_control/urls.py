@@ -36,6 +36,7 @@ from admin_control.views import (
     AdminPartnerStatsView,
     AdminRevenueStatsView,
     AdminEngagementStatsView,
+    AdminAnalyticsDashboardsView,
 )
 
 urlpatterns = [
@@ -83,4 +84,5 @@ urlpatterns = [
     # ── Platform analytics ────────────────────────────────────────────────
     path("analytics/revenue/", AdminRevenueStatsView.as_view(), name="admin-revenue-stats"),
     path("analytics/engagement/", AdminEngagementStatsView.as_view(), name="admin-engagement-stats"),
+    path("analytics/dashboards/", AdminAnalyticsDashboardsView.as_view(), name="admin-analytics-dashboards"),
 ]

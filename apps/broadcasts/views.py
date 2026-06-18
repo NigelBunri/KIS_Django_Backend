@@ -8856,6 +8856,35 @@ class LessonEnrollmentListView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
+class CreatorStudentListView(APIView):
+    """Return enrollments for lessons owned by the authenticated user's partner."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.partners.models import Partner
+        try:
+            partner = Partner.objects.get(owner=request.user)
+        except Partner.DoesNotExist:
+            return Response([], status=status.HTTP_200_OK)
+
+        enrollments = (
+            LessonEnrollment.objects.filter(lesson__partner=partner)
+            .select_related("user", "lesson")
+            .order_by("-enrolled_at")[:100]
+        )
+        data = [
+            {
+                "id": str(e.id),
+                "name": e.user.get_full_name() or e.user.username or str(e.user.id),
+                "last_lesson": e.lesson.title if e.lesson_id else "",
+                "status": e.status,
+                "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
+            }
+            for e in enrollments
+        ]
+        return Response(data, status=status.HTTP_200_OK)
+
+
 class LessonEnrollmentActionView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -14136,6 +14165,11 @@ class ChannelContentDetailView(APIView):
             if not isinstance(value, dict):
                 raise ValidationError({"metadata": "Expected an object."})
             content.metadata = value
+        if "tags" in request.data:
+            value = request.data.get("tags")
+            if not isinstance(value, list):
+                raise ValidationError({"tags": "Expected a list of strings."})
+            content.tags = [str(t).strip() for t in value if str(t).strip()]
         if "scheduled_at" in request.data:
             content.scheduled_at = _content_datetime_from_request(request.data.get("scheduled_at"))
         if "comments_disabled" in request.data:

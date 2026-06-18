@@ -853,13 +853,28 @@ def _extract_broadcast_member_user_id(member: Any) -> str:
 
 
 def _resolve_broadcast_membership_role(institution_payload: dict[str, Any], user) -> str:
-    members = institution_payload.get("members")
-    if not isinstance(members, list):
-        return ""
+    members: list[Any] = []
+    for key in ("members", "employees"):
+        rows = institution_payload.get(key)
+        if isinstance(rows, list):
+            members.extend(rows)
 
     target_user_id = _coerce_uuid_string(getattr(user, "id", "")) or _clean_service_reference(getattr(user, "id", ""))
     target_phone = _clean_service_reference(getattr(user, "phone", ""))
     target_email = _clean_service_reference(getattr(user, "email", "")).lower()
+
+    owner_contact = institution_payload.get("owner_contact")
+    if not isinstance(owner_contact, dict):
+        owner_contact = institution_payload.get("ownerContact") if isinstance(institution_payload.get("ownerContact"), dict) else {}
+    owner_contact_user_id = _extract_broadcast_member_user_id(owner_contact)
+    owner_contact_phone = _clean_service_reference(owner_contact.get("phone"))
+    owner_contact_email = _clean_service_reference(owner_contact.get("email")).lower()
+    if target_user_id and owner_contact_user_id and owner_contact_user_id == target_user_id:
+        return "owner"
+    if target_phone and owner_contact_phone and owner_contact_phone == target_phone:
+        return "owner"
+    if target_email and owner_contact_email and owner_contact_email == target_email:
+        return "owner"
 
     for member in members:
         if not isinstance(member, dict):

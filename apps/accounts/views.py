@@ -23,6 +23,7 @@ from django.views.decorators.csrf import csrf_exempt
 from apps.core.phone_utils import to_e164
 from common.media_urls import absolutize_backend_media
 from django.utils.translation import gettext_lazy as _
+from django.contrib.auth.hashers import make_password, check_password
 import pyotp
 import phonenumbers as _phonenumbers
 
@@ -1141,7 +1142,11 @@ class TwoFactorStatusView(APIView):
 
     def get(self, request):
         tf = TwoFactor.objects.filter(user=request.user, type="totp").first()
-        return Response({"enabled": bool(tf and tf.enabled)}, status=status.HTTP_200_OK)
+        return Response({
+            "enabled": bool(tf and tf.enabled),
+            "method": "totp" if (tf and tf.enabled) else None,
+            "setup_complete": bool(tf and tf.enabled and (tf.meta or {}).get("verified")),
+        }, status=status.HTTP_200_OK)
 
 
 @extend_schema(summary="Get OTP status for the authenticated user", tags=["Auth"])
@@ -1833,12 +1838,15 @@ class ProfilePreferencesViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
-    @action(detail=False, methods=["get"], permission_classes=[IsAuthenticated], authentication_classes=JWT_AUTH)
+    @action(detail=False, methods=["get", "patch"], permission_classes=[IsAuthenticated], authentication_classes=JWT_AUTH)
     def me(self, request):
-        pref = ProfilePreferences.objects.filter(user=request.user).first()
-        if not pref:
-            pref = ProfilePreferences.objects.create(user=request.user)
-        serializer = self.get_serializer(pref)
+        prefs, _ = ProfilePreferences.objects.get_or_create(user=request.user)
+        if request.method == "PATCH":
+            serializer = self.get_serializer(prefs, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data)
+        serializer = self.get_serializer(prefs)
         return Response(serializer.data)
 
 
@@ -3072,3 +3080,186 @@ class ParentRecoveryConfirmView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+# ---------------------------------------------------------------------
+# QuickLock PIN Backup / Restore
+# ---------------------------------------------------------------------
+_QUICKLOCK_PIN_RE = re.compile(r"^\d{4,6}$")
+
+
+class QuickLockPinView(APIView):
+    """
+    POST   /api/v1/auth/quicklock-pin/        — save (or replace) a PIN
+    DELETE /api/v1/auth/quicklock-pin/        — clear the PIN
+    """
+    authentication_classes = JWT_AUTH
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        pin = str(request.data.get("pin", "")).strip()
+        if not _QUICKLOCK_PIN_RE.match(pin):
+            return Response(
+                {"detail": "PIN must be 4-6 digits."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        prefs, _ = ProfilePreferences.objects.get_or_create(user=request.user)
+        prefs.quicklock_pin_hash = make_password(pin)
+        prefs.save(update_fields=["quicklock_pin_hash", "updated_at"])
+        return Response({"ok": True}, status=status.HTTP_200_OK)
+
+    def delete(self, request):
+        prefs, _ = ProfilePreferences.objects.get_or_create(user=request.user)
+        prefs.quicklock_pin_hash = None
+        prefs.save(update_fields=["quicklock_pin_hash", "updated_at"])
+        return Response({"ok": True}, status=status.HTTP_200_OK)
+
+
+class QuickLockPinVerifyView(APIView):
+    """
+    POST /api/v1/auth/quicklock-pin/verify/  — verify a PIN without changing it
+    """
+    authentication_classes = JWT_AUTH
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        pin = str(request.data.get("pin", "")).strip()
+        if not _QUICKLOCK_PIN_RE.match(pin):
+            return Response({"valid": False}, status=status.HTTP_200_OK)
+        try:
+            prefs = ProfilePreferences.objects.get(user=request.user)
+        except ProfilePreferences.DoesNotExist:
+            return Response({"valid": False}, status=status.HTTP_200_OK)
+        stored_hash = prefs.quicklock_pin_hash
+        if not stored_hash:
+            return Response({"valid": False}, status=status.HTTP_200_OK)
+        valid = check_password(pin, stored_hash)
+        return Response({"valid": valid}, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------
+# GDPR Data Export
+# ---------------------------------------------------------------------
+
+class DataExportView(APIView):
+    """
+    GET /api/v1/auth/data-export/
+    Returns a JSON export of the authenticated user's personal data (GDPR Art. 20).
+    """
+    authentication_classes = JWT_AUTH
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        from apps.accounts.serializers import ProfileSerializer
+        user = request.user
+        profile = getattr(user, 'profile', None)
+
+        user_data = {
+            'id': str(user.id),
+            'phone': user.phone,
+            'email': user.email,
+            'username': user.username,
+            'display_name': user.display_name,
+            'country': user.country,
+            'tier': user.tier,
+            'status': user.status,
+            'locale': user.locale,
+            'timezone': user.timezone,
+            'email_verified': user.email_verified,
+            'created_at': user.created_at.isoformat() if hasattr(user, 'created_at') and user.created_at else None,
+            'last_login_at': user.last_login_at.isoformat() if user.last_login_at else None,
+        }
+
+        profile_data = None
+        if profile:
+            try:
+                profile_data = ProfileSerializer(profile, context={'request': request}).data
+            except Exception:
+                profile_data = {'id': str(profile.pk)}
+
+        return Response({
+            'exported_at': timezone.now().isoformat(),
+            'user': user_data,
+            'profile': profile_data,
+        })
+
+
+# ---------------------------------------------------------------------
+# Password Change
+# ---------------------------------------------------------------------
+
+class PasswordChangeView(APIView):
+    """
+    POST /api/v1/auth/password/change/
+    Body: { "current_password": str, "new_password": str }
+    """
+    authentication_classes = JWT_AUTH
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        current = str(request.data.get("current_password", "")).strip()
+        new_pw = str(request.data.get("new_password", "")).strip()
+
+        if not current or not new_pw:
+            return Response(
+                {"detail": "Both current_password and new_password are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(new_pw) < 8:
+            return Response(
+                {"detail": "New password must be at least 8 characters."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = request.user
+        if not user.check_password(current):
+            return Response(
+                {"detail": "Current password is incorrect."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user.set_password(new_pw)
+        user.save(update_fields=["password"])
+        return Response({"ok": True}, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------
+# Account Deletion
+# ---------------------------------------------------------------------
+
+class AccountDeletionView(APIView):
+    """
+    DELETE /api/v1/auth/account/
+    Body: { "password": str }
+    Verifies the password then permanently deletes the user's account.
+    Also blacklists the provided refresh token if the blacklist app is installed.
+    """
+    authentication_classes = JWT_AUTH
+    permission_classes = (IsAuthenticated,)
+
+    def delete(self, request):
+        password = str(request.data.get("password", "")).strip()
+        if not password:
+            return Response(
+                {"detail": "Password is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = request.user
+        if not user.check_password(password):
+            return Response(
+                {"detail": "Incorrect password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Optionally blacklist the refresh token before deleting
+        refresh = str(request.data.get("refresh", "")).strip()
+        if refresh:
+            try:
+                token = RefreshToken(refresh)
+                token.blacklist()
+            except Exception:
+                pass
+
+        user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

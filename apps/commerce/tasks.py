@@ -183,6 +183,9 @@ def auto_satisfy_marketplace_order(order_id: str):
 @shared_task(bind=True)
 def send_service_booking_reminders(self):
     from apps.notifications import services as notification_services
+    from apps.accounts.notification_i18n import get_notification_string, get_user_language
+    from django.contrib.auth import get_user_model
+    _User = get_user_model()
     now = timezone.now()
     window_end = now + timezone.timedelta(hours=24)
     upcoming = (
@@ -198,10 +201,13 @@ def send_service_booking_reminders(self):
     reminders_sent = 0
     for booking in upcoming:
         scheduled_label = booking.scheduled_at.strftime('%Y-%m-%d %H:%M %Z')
+        user_obj = _User.objects.filter(id=booking.user_id).first()
+        lang = get_user_language(user_obj) if user_obj else 'en'
+        reminder_label = get_notification_string(lang, 'booking_reminder')
         notification_services.create_notification(
             user_id=booking.user_id,
             type='commerce.service_booking.reminder',
-            title='Appointment reminder',
+            title=reminder_label,
             body=f"Reminder: your appointment for {booking.service.name} is scheduled for {scheduled_label}.",
             target_type='service_booking',
             target_id=booking.id,

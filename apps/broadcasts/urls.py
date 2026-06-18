@@ -84,6 +84,7 @@ from .views import (
     BroadcastVideoUploadView,
     BroadcastVideoStreamView,
     BroadcastLessonListView,
+    CreatorStudentListView,
     LessonEnrollmentActionView,
     LessonEnrollmentListView,
     ProfileCreationView,
@@ -300,6 +301,11 @@ urlpatterns = [
         "broadcasts/lessons/enrollments/",
         LessonEnrollmentListView.as_view(),
         name="lesson-enrollments",
+    ),
+    path(
+        "broadcasts/creator/students/",
+        CreatorStudentListView.as_view(),
+        name="creator-students",
     ),
     path(
         "broadcasts/lessons/<uuid:lesson_id>/enroll/",

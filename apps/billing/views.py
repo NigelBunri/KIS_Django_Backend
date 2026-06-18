@@ -1629,10 +1629,82 @@ class PromoCodeViewSet(viewsets.ModelViewSet):
     serializer_class = PromoCodeSerializer
     permission_classes = [IsAdminUser]
 
+    def get_permissions(self):
+        if self.action in ("validate", "redeem_code", "public"):
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
     @action(detail=False, methods=["get"], url_path="public")
     def public(self, request):
         active = PromoCode.objects.filter(is_active=True).order_by("-created_at")[:50]
         return Response({"results": PromoCodeSerializer(active, many=True).data}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"], url_path="validate")
+    def validate(self, request):
+        """Public-facing endpoint for authenticated users to look up a promo code by code value."""
+        code_value = request.query_params.get("code", "").strip().upper()
+        if not code_value:
+            return Response({"detail": "Provide a code query parameter."}, status=status.HTTP_400_BAD_REQUEST)
+        from django.utils import timezone as tz
+        try:
+            promo = PromoCode.objects.get(code=code_value, is_active=True)
+        except PromoCode.DoesNotExist:
+            return Response({"detail": "Code not found or already used."}, status=status.HTTP_404_NOT_FOUND)
+        now = tz.now()
+        if promo.starts_at and promo.starts_at > now:
+            return Response({"detail": "Code is not yet active."}, status=status.HTTP_400_BAD_REQUEST)
+        if promo.ends_at and promo.ends_at < now:
+            return Response({"detail": "Code has expired."}, status=status.HTTP_400_BAD_REQUEST)
+        if promo.usage_limit is not None and promo.used_count >= promo.usage_limit:
+            return Response({"detail": "Code has reached its usage limit."}, status=status.HTTP_400_BAD_REQUEST)
+        already_redeemed = PromoRedemption.objects.filter(user=request.user, promo=promo).exists()
+        return Response({
+            "id": str(promo.id),
+            "code": promo.code,
+            "description": promo.description,
+            "cash_bonus_cents": promo.cash_bonus_cents,
+            "credit_bonus": promo.credit_bonus,
+            "ends_at": promo.ends_at,
+            "is_active": promo.is_active,
+            "already_redeemed": already_redeemed,
+            "status": "redeemed" if already_redeemed else "active",
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="redeem-code")
+    def redeem_code(self, request):
+        """Authenticated users redeem a promo code to claim its bonus."""
+        code_value = str(request.data.get("code", "")).strip().upper()
+        if not code_value:
+            return Response({"detail": "Provide a code."}, status=status.HTTP_400_BAD_REQUEST)
+        from django.utils import timezone as tz
+        try:
+            promo = PromoCode.objects.get(code=code_value, is_active=True)
+        except PromoCode.DoesNotExist:
+            return Response({"detail": "Invalid or inactive code."}, status=status.HTTP_404_NOT_FOUND)
+        now = tz.now()
+        if promo.starts_at and promo.starts_at > now:
+            return Response({"detail": "Code is not yet active."}, status=status.HTTP_400_BAD_REQUEST)
+        if promo.ends_at and promo.ends_at < now:
+            return Response({"detail": "Code has expired."}, status=status.HTTP_400_BAD_REQUEST)
+        if promo.usage_limit is not None and promo.used_count >= promo.usage_limit:
+            return Response({"detail": "Code has reached its usage limit."}, status=status.HTTP_400_BAD_REQUEST)
+        _, created = PromoRedemption.objects.get_or_create(user=request.user, promo=promo)
+        if not created:
+            return Response({"detail": "You have already redeemed this code."}, status=status.HTTP_409_CONFLICT)
+        promo.used_count += 1
+        promo.save(update_fields=["used_count"])
+        # Apply credit bonus as loyalty points if applicable
+        if promo.credit_bonus:
+            try:
+                adjust_points(request.user, promo.credit_bonus, f"promo:{promo.code}")
+            except Exception:
+                pass
+        return Response({
+            "detail": "Code redeemed successfully.",
+            "code": promo.code,
+            "credit_bonus": promo.credit_bonus,
+            "cash_bonus_cents": promo.cash_bonus_cents,
+        }, status=status.HTTP_200_OK)
 
 
 class StripeWebhookView(APIView):

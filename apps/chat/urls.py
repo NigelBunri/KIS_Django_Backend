@@ -2,7 +2,7 @@ from django.urls import path, include
 from apps.chat.views_introspect import IntrospectView
 from rest_framework.routers import DefaultRouter
 
-from .views import ConversationViewSet, MessageThreadLinkViewSet
+from .views import ConversationViewSet, MessageThreadLinkViewSet, StickerPackListView
 
 app_name = "chat"
 

@@ -16,6 +16,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError, PermissionDenied
+from rest_framework.views import APIView
 from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from .models import (
@@ -1228,3 +1229,51 @@ class MessageThreadLinkViewSet(
             return Response(self.get_serializer(link).data, status=status.HTTP_200_OK)
 
         return Response(self.get_serializer(link).data, status=status.HTTP_201_CREATED)
+
+
+# ---------------------------------------------------------------------------
+# Sticker Packs
+# ---------------------------------------------------------------------------
+
+_BUILTIN_STICKER_PACKS = [
+    {
+        "id": "default",
+        "name": "Default",
+        "stickers": [
+            {"id": "default_thumbsup",   "url": "", "text": "👍"},
+            {"id": "default_heart",      "url": "", "text": "❤️"},
+            {"id": "default_laugh",      "url": "", "text": "😂"},
+            {"id": "default_wow",        "url": "", "text": "😮"},
+            {"id": "default_sad",        "url": "", "text": "😢"},
+            {"id": "default_pray",       "url": "", "text": "🙏"},
+            {"id": "default_fire",       "url": "", "text": "🔥"},
+            {"id": "default_clap",       "url": "", "text": "👏"},
+            {"id": "default_celebrate",  "url": "", "text": "🎉"},
+            {"id": "default_amen",       "url": "", "text": "🙌"},
+        ],
+    },
+    {
+        "id": "expressions",
+        "name": "Expressions",
+        "stickers": [
+            {"id": "expr_thinking",  "url": "", "text": "🤔"},
+            {"id": "expr_wink",      "url": "", "text": "😉"},
+            {"id": "expr_sunglasses","url": "", "text": "😎"},
+            {"id": "expr_angry",     "url": "", "text": "😠"},
+            {"id": "expr_shocked",   "url": "", "text": "😱"},
+            {"id": "expr_love",      "url": "", "text": "🥰"},
+        ],
+    },
+]
+
+
+class StickerPackListView(APIView):
+    """
+    GET /api/v1/stickers/packs/
+    Returns the list of available sticker packs (built-in).
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(_BUILTIN_STICKER_PACKS, status=status.HTTP_200_OK)

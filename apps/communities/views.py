@@ -314,7 +314,7 @@ class CommunityViewSet(viewsets.ModelViewSet):
 
         return Response({"added": added, "count": len(added)}, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=["post"], url_path="leave")
+    @action(detail=True, methods=["post", "delete"], url_path="leave")
     def leave(self, request, pk=None):
         community = self.get_object()
         membership = self._get_membership(community, request.user)

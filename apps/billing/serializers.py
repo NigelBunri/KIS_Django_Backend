@@ -544,6 +544,10 @@ class WalletTransactionSerializer(serializers.ModelSerializer):
     receipt_pdf_url = serializers.SerializerMethodField()
     amount_usd = serializers.SerializerMethodField()
     amount_usd_compact = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    payment_reference = serializers.SerializerMethodField()
+    payment_provider = serializers.SerializerMethodField()
+    direct_payment_intent_id = serializers.SerializerMethodField()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -594,6 +598,18 @@ class WalletTransactionSerializer(serializers.ModelSerializer):
 
     def get_amount_usd_compact(self, obj: WalletTransaction) -> str:
         return cents_to_usd_compact(int(obj.amount_cents or 0))
+
+    def get_payment_status(self, obj: WalletTransaction) -> str:
+        return str(obj.status or "")
+
+    def get_payment_reference(self, obj: WalletTransaction) -> str:
+        return str(obj.tx_ref or "")
+
+    def get_payment_provider(self, obj: WalletTransaction) -> str:
+        return str(obj.provider or "")
+
+    def get_direct_payment_intent_id(self, obj: WalletTransaction) -> str:
+        return str(obj.id)
 
 
 class PromoCodeSerializer(serializers.ModelSerializer):

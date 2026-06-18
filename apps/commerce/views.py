@@ -19,6 +19,7 @@ from django.utils import timezone
 import logging
 
 from apps.accounts.tiers import get_user_tier, get_feature_limit, normalize_limit_value
+from apps.accounts.notification_i18n import get_notification_string, get_user_language
 from apps.notifications import services as notification_services
 from apps.billing.documents import build_booking_receipt_urls
 from apps.billing.direct_payments import create_direct_payment_intent
@@ -1287,6 +1288,25 @@ class LoyaltyPointViewSet(viewsets.ReadOnlyModelViewSet):
             'redemption_options': POINT_REDEMPTION_OPTIONS,
         })
 
+    @action(detail=False, methods=['post'])
+    def redeem(self, request):
+        """Spend KIS Coins (loyalty points) from the authenticated user's balance."""
+        raw_points = request.data.get('points')
+        try:
+            points = int(raw_points)
+        except (TypeError, ValueError):
+            return Response({'detail': 'Provide a valid integer number of points to redeem.'}, status=400)
+        if points <= 0:
+            return Response({'detail': 'Points must be a positive integer.'}, status=400)
+        from django.db.models import Sum
+        total = LoyaltyPoint.objects.filter(user=request.user).aggregate(total=Sum('points'))['total'] or 0
+        if points > total:
+            return Response({'detail': f'You only have {int(total)} coins available.'}, status=400)
+        # Record a negative adjustment
+        LoyaltyPoint.objects.create(user=request.user, points=-points, reason='User redemption')
+        new_total = total - points
+        return Response({'detail': 'Coins redeemed.', 'points_spent': points, 'balance': int(new_total)})
+
 
 @class_doc_decorator('Follows')
 class ShopFollowViewSet(viewsets.ModelViewSet):
@@ -2063,10 +2083,13 @@ class ServiceBookingViewSet(
         if escrow:
             escrow.status = ServiceBookingEscrow.STATUS_AWAITING_SATISFACTION
             escrow.save(update_fields=["status"])
+        from django.contrib.auth import get_user_model as _get_user_model
+        _booking_recipient = _get_user_model().objects.filter(id=booking.user_id).first()
+        _booking_user_lang = get_user_language(_booking_recipient)
         notification_services.create_notification(
             user_id=str(booking.user_id),
             type="commerce.service_booking.completed",
-            title="Service marked complete",
+            title=get_notification_string(_booking_user_lang, 'booking_confirmed'),
             body=f"{booking.service.name} was marked complete by the provider.",
             target_type="service_booking",
             target_id=str(booking.id),

@@ -1,7 +1,7 @@
 # apps/channels/serializers.py
 from rest_framework import serializers
 
-from apps.channels.models import Channel
+from apps.channels.models import Channel, Subchannel
 from apps.partners.services import partner_user_can_send_channel
 from apps.chat.models import (
     BaseConversationRole,
@@ -234,3 +234,23 @@ class ChannelCreateSerializer(ChannelImageUrlSerializerMixin, serializers.ModelS
             **validated_data,
         )
         return channel
+
+
+class SubchannelSerializer(serializers.ModelSerializer):
+    channel_id = serializers.UUIDField(source="channel.id", read_only=True)
+    created_by_id = serializers.UUIDField(source="created_by.id", read_only=True)
+
+    class Meta:
+        model = Subchannel
+        fields = [
+            "id",
+            "channel_id",
+            "name",
+            "description",
+            "order",
+            "is_archived",
+            "created_by_id",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "channel_id", "created_by_id", "created_at", "updated_at"]

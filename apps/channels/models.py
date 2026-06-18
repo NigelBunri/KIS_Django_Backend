@@ -110,3 +110,38 @@ class Channel(models.Model):
     def save(self, *args, **kwargs):
         self.avatar_url = normalize_image_payload(self.avatar_url)
         super().save(*args, **kwargs)
+
+
+class Subchannel(models.Model):
+    """
+    A topic-specific sub-unit nested inside a parent Channel.
+    Members of the parent channel can post and read here.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    channel = models.ForeignKey(
+        Channel,
+        on_delete=models.CASCADE,
+        related_name="subchannels",
+    )
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    order = models.PositiveIntegerField(default=0)
+    is_archived = models.BooleanField(default=False)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_subchannels",
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "channel_subchannel"
+        ordering = ["order", "name"]
+        unique_together = [("channel", "name")]
+
+    def __str__(self) -> str:
+        return f"{self.channel.name} / {self.name}"

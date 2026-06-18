@@ -45,6 +45,15 @@ from .views import (
     DeviceRenameView,
     ParentRecoveryInitView,
     ParentRecoveryConfirmView,
+    # QuickLock PIN
+    QuickLockPinView,
+    QuickLockPinVerifyView,
+    # Password change
+    PasswordChangeView,
+    # Account deletion
+    AccountDeletionView,
+    # GDPR data export
+    DataExportView,
 )
 
 # Optional: SimpleJWT endpoints (convenience here too)
@@ -110,6 +119,11 @@ urlpatterns = [
     path("my-applications/", MyApplicationsView.as_view(), name="my-applications"),
     path("auth/recovery/initiate/", ParentRecoveryInitView.as_view(), name="parent-recovery-init"),
     path("auth/recovery/confirm/", ParentRecoveryConfirmView.as_view(), name="parent-recovery-confirm"),
+    path("auth/quicklock-pin/", QuickLockPinView.as_view(), name="auth-quicklock-pin"),
+    path("auth/quicklock-pin/verify/", QuickLockPinVerifyView.as_view(), name="auth-quicklock-pin-verify"),
+    path("auth/password/change/", PasswordChangeView.as_view(), name="auth-password-change"),
+    path("auth/account/", AccountDeletionView.as_view(), name="auth-account-delete"),
+    path("auth/data-export/", DataExportView.as_view(), name="auth-data-export"),
 
     path("", include(router.urls)),
 ]

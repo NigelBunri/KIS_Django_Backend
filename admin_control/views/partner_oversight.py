@@ -247,6 +247,55 @@ class AdminEngagementStatsView(APIView):
         })
 
 
+class AdminAnalyticsDashboardsView(APIView):
+    """
+    GET /control/admin/analytics/dashboards/
+    Aggregated dashboards payload: combines revenue + engagement stats.
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "dashboard.view"
+
+    def get(self, request):
+        from datetime import timedelta
+        from django.db.models import Sum
+        from apps.events.models import TicketSale
+        from apps.chat.models import Conversation
+        from apps.partners.models import PartnerPost
+
+        now = timezone.now()
+
+        def _revenue(qs):
+            return (qs.aggregate(total=Sum("total_cents"))["total"] or 0) / 100.0
+
+        total_revenue = _revenue(TicketSale.objects.filter(status="completed"))
+        revenue_30d = _revenue(
+            TicketSale.objects.filter(status="completed", purchased_at__gte=now - timedelta(days=30))
+        )
+        revenue_7d = _revenue(
+            TicketSale.objects.filter(status="completed", purchased_at__gte=now - timedelta(days=7))
+        )
+
+        posts_7d = PartnerPost.objects.filter(created_at__gte=now - timedelta(days=7)).count()
+        posts_30d = PartnerPost.objects.filter(created_at__gte=now - timedelta(days=30)).count()
+        conversations_7d = Conversation.objects.filter(created_at__gte=now - timedelta(days=7)).count()
+        conversations_30d = Conversation.objects.filter(created_at__gte=now - timedelta(days=30)).count()
+
+        return Response({
+            "generated_at": now.isoformat(),
+            "revenue": {
+                "total_revenue_usd": round(total_revenue, 2),
+                "revenue_30d_usd": round(revenue_30d, 2),
+                "revenue_7d_usd": round(revenue_7d, 2),
+            },
+            "engagement": {
+                "posts_7d": posts_7d,
+                "posts_30d": posts_30d,
+                "conversations_7d": conversations_7d,
+                "conversations_30d": conversations_30d,
+            },
+        })
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _get_partner_or_404(partner_id):

@@ -6,11 +6,12 @@ from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
-from apps.channels.models import Channel
+from apps.channels.models import Channel, Subchannel
 from apps.channels.serializers import (
     ChannelListSerializer,
     ChannelDetailSerializer,
     ChannelCreateSerializer,
+    SubchannelSerializer,
 )
 from apps.chat.models import BaseConversationRole, ConversationMember
 from apps.partners.serializers import PartnerChannelPermissionOverwriteSerializer
@@ -247,3 +248,53 @@ class ChannelViewSet(viewsets.ModelViewSet):
             "subscriber_count": subscriber_count,
             "message_count": message_count,
         }, status=status.HTTP_200_OK)
+
+
+class SubchannelViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for subchannels nested under a parent channel.
+
+    - list:     GET    /api/v1/subchannels/?channel={channel_id}
+    - create:   POST   /api/v1/subchannels/
+    - retrieve: GET    /api/v1/subchannels/{id}/
+    - update:   PATCH  /api/v1/subchannels/{id}/
+    - delete:   DELETE /api/v1/subchannels/{id}/
+    - members:  GET    /api/v1/subchannels/{id}/members/
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = SubchannelSerializer
+
+    def get_queryset(self):
+        qs = Subchannel.objects.select_related("channel", "created_by")
+        channel_id = self.request.query_params.get("channel")
+        if channel_id:
+            qs = qs.filter(channel_id=channel_id)
+        return qs
+
+    def perform_create(self, serializer):
+        channel_id = self.request.data.get("channel")
+        if not channel_id:
+            raise ValidationError({"channel": "This field is required."})
+        try:
+            channel = Channel.objects.get(pk=channel_id)
+        except Channel.DoesNotExist:
+            raise ValidationError({"channel": "Channel not found."})
+        serializer.save(channel=channel, created_by=self.request.user)
+
+    @action(detail=True, methods=["get"], url_path="members")
+    def members(self, request, pk=None):
+        """Return members of the parent channel for this subchannel."""
+        subchannel = self.get_object()
+        members = ConversationMember.objects.filter(
+            conversation=subchannel.channel.conversation,
+            left_at__isnull=True,
+        ).select_related("user")
+        data = [
+            {
+                "user_id": str(m.user_id),
+                "display_name": getattr(m.user, "display_name", "") or getattr(m.user, "username", ""),
+                "role": m.base_role,
+            }
+            for m in members
+        ]
+        return Response({"results": data, "count": len(data)})

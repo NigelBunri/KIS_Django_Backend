@@ -11,6 +11,7 @@ from rest_framework_simplejwt.views import (
     TokenVerifyView,       # POST: { token } -> {} if valid
 )
 from apps.accounts.views import DeviceBoundTokenRefreshView, LoginView
+from apps.chat.views import StickerPackListView
 from apps.media.views import UploadFileView
 
 from django.conf import settings
@@ -18,6 +19,9 @@ from django.conf.urls.static import static
 from django.http import JsonResponse
 from django.db import connection
 from django.core.cache import cache
+from rest_framework.decorators import api_view, permission_classes as drf_permission_classes
+from rest_framework.permissions import IsAuthenticated as DRFIsAuthenticated
+from rest_framework.response import Response as DRFResponse
 
 
 def health_check(request):
@@ -64,9 +68,23 @@ DocsSchemaView = SpectacularAPIView if settings.DEBUG else StaffOnlySpectacularA
 DocsSwaggerView = SpectacularSwaggerView if settings.DEBUG else StaffOnlySpectacularSwaggerView
 DocsRedocView = SpectacularRedocView if settings.DEBUG else StaffOnlySpectacularRedocView
 
+
+@api_view(['GET'])
+@drf_permission_classes([DRFIsAuthenticated])
+def ice_servers(request):
+    """Return STUN/TURN configuration for WebRTC peer connections."""
+    return DRFResponse({
+        "iceServers": [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": "stun:stun1.l.google.com:19302"},
+        ]
+    })
+
+
 urlpatterns = [
     path("", health_check, name="root"),
     path("health/", health_check, name="health-check"),
+    path("api/v1/calls/ice-servers/", ice_servers, name="calls-ice-servers"),
     path("admin/", admin.site.urls),
     path("control/admin/", include("admin_control.urls")),
 
@@ -84,6 +102,7 @@ urlpatterns = [
     path("api/v1/", include("apps.surveys.urls")),
     path("api/v1/", include("apps.bridge.urls")),
     path("api/v1/", include("apps.analytics.urls")),
+    path("api/v1/", include("apps.ai_integration.urls")),
     path("api/v1/", include("apps.tiers.urls")),
     path("api/v1/", include("apps.otp.urls")),
     path("api/v1/", include("apps.chat.urls", namespace="chat-root")),
@@ -105,6 +124,7 @@ urlpatterns = [
         include("apps.groups.chat_urls", namespace="chat-groups"),
     ),
     path("api/v1/partner-channels/", include("apps.channels.urls", namespace="channels")),
+    path("api/v1/", include("apps.channels.subchannel_urls")),
     path("api/v1/", include("apps.broadcasts.urls", namespace="broadcasts")),
     path("api/v1/", include("apps.health_ops.urls")),
     path("api/v1/", include("apps.health_dashboard.urls")),
@@ -115,6 +135,7 @@ urlpatterns = [
     path("api/v1/", include("apps.billing.urls")),
     path("api/v1/verification/", include("apps.verification.urls", namespace="verification")),
     path("api/v1/", include("apps.testimony.urls")),
+    path("api/v1/stickers/packs/", StickerPackListView.as_view(), name="sticker-packs"),
 
     # --- JWT auth endpoints (SimpleJWT) ---
     # Obtain access/refresh with username/password
@@ -126,8 +147,8 @@ urlpatterns = [
 
     # --- OpenAPI / Docs ---
     path("api/schema/", DocsSchemaView.as_view(), name="schema"),
-    path("api/docs/", DocsSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
-    path("api/docs/swagger/", DocsSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    path("api/docs/", DocsSwaggerView.as_view(url="/api/schema/?format=json"), name="swagger-ui"),
+    path("api/docs/swagger/", DocsSwaggerView.as_view(url="/api/schema/?format=json"), name="swagger-ui"),
     path("api/docs/redoc/", DocsRedocView.as_view(url_name="schema"), name="redoc"),
 
 

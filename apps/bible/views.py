@@ -884,7 +884,10 @@ class BibleBookmarkViewSet(viewsets.ModelViewSet):
         if book:
             qs = qs.filter(verse__chapter__book__code__iexact=book)
         if translation:
-            qs = qs.filter(verse__translation=get_public_translation(translation))
+            try:
+                qs = qs.filter(verse__translation=get_public_translation(translation))
+            except ValidationError:
+                return qs.none()
         return qs.order_by("-created_at")
 
     def perform_create(self, serializer):
@@ -903,7 +906,10 @@ class BibleNoteViewSet(viewsets.ModelViewSet):
         if book:
             qs = qs.filter(verse__chapter__book__code__iexact=book)
         if translation:
-            qs = qs.filter(verse__translation=get_public_translation(translation))
+            try:
+                qs = qs.filter(verse__translation=get_public_translation(translation))
+            except ValidationError:
+                return qs.none()
         if query:
             qs = qs.filter(text__icontains=query)
         return qs.order_by("-updated_at")
@@ -926,7 +932,10 @@ class BibleHighlightViewSet(viewsets.ModelViewSet):
         if book:
             qs = qs.filter(verse__chapter__book__code__iexact=book)
         if translation:
-            qs = qs.filter(verse__translation=get_public_translation(translation))
+            try:
+                qs = qs.filter(verse__translation=get_public_translation(translation))
+            except ValidationError:
+                return qs.none()
         return qs.order_by("-created_at")
 
     @action(detail=False, methods=["get"], url_path="colors")

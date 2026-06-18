@@ -405,6 +405,9 @@ class ProfilePreferencesSerializer(serializers.ModelSerializer):
             "social_proof",
             "ask_tags",
             "highlights",
+            "notification_preferences",
+            "consent_preferences",
+            "language_preference",
             "created_at",
             "updated_at",
         ]

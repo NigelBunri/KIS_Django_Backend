@@ -1280,7 +1280,7 @@ class PatientCanonicalHealthProfileSerializer(serializers.Serializer):
 
 
 class PatientHealthSummarySerializer(serializers.Serializer):
-    id = serializers.UUIDField(source="id", read_only=True)
+    id = serializers.UUIDField(read_only=True)
     patient_id = serializers.UUIDField(source="id", read_only=True)
     identity = serializers.SerializerMethodField()
     care_summary = serializers.SerializerMethodField()
