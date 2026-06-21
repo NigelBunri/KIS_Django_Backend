@@ -112,9 +112,11 @@ def verify_webhook(payload: bytes, sig_header: str) -> dict | None:
     stripe = _stripe()
     secret = getattr(settings, "STRIPE_WEBHOOK_SECRET", "") or ""
     if not secret:
-        logger.warning("STRIPE_WEBHOOK_SECRET not configured — webhook unverified.")
-        import json
-        return json.loads(payload)
+        logger.error(
+            "STRIPE_WEBHOOK_SECRET is not configured. Refusing to process unverified webhook. "
+            "Set STRIPE_WEBHOOK_SECRET in your environment to enable Stripe webhooks."
+        )
+        return None  # Reject — never accept unverified payment events in production
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, secret)
         return dict(event)

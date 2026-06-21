@@ -286,6 +286,9 @@ INSTALLED_APPS = [
     "apps.location.apps.LocationConfig",
     "admin_control.apps.AdminControlConfig",
     "apps.testimony.apps.TestimonyConfig",
+    "apps.family.apps.FamilyConfig",
+    "apps.government.apps.GovernmentConfig",
+    "apps.church.apps.ChurchConfig",
 ]
 
 MIDDLEWARE = [

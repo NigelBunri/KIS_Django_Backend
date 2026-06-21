@@ -135,6 +135,13 @@ urlpatterns = [
     path("api/v1/", include("apps.billing.urls")),
     path("api/v1/verification/", include("apps.verification.urls", namespace="verification")),
     path("api/v1/", include("apps.testimony.urls")),
+    path("api/v1/family/", include("apps.family.urls", namespace="family")),
+    path("api/v1/", include("apps.government.urls", namespace="government")),
+    path("api/v1/church/", include("apps.church.urls")),
+    path("api/v1/education/", include("apps.broadcasts.education_urls")),
+    path("api/v1/media/extended/", include("apps.broadcasts.media_extended_urls")),
+    path("api/v1/business/", include("apps.commerce.business_urls")),
+    path("api/v1/health/extended/", include("apps.health_ops.extended_urls")),
     path("api/v1/stickers/packs/", StickerPackListView.as_view(), name="sticker-packs"),
 
     # --- JWT auth endpoints (SimpleJWT) ---
