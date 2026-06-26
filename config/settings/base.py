@@ -416,6 +416,11 @@ if OBJECT_STORAGE_PROVIDER == "supabase":
         "default": {"BACKEND": "apps.media.storage_backends.SupabaseStorage"},
         "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
     }
+elif OBJECT_STORAGE_PROVIDER == "s3":
+    STORAGES = {
+        "default": {"BACKEND": "apps.media.storage_backends.S3MediaStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    }
 
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
