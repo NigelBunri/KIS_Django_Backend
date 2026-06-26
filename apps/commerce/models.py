@@ -76,6 +76,15 @@ class BaseEntity(models.Model):
 
 
 class Shop(BaseEntity):
+    STATUS_DRAFT = 'draft'
+    STATUS_ACTIVE = 'active'
+    STATUS_PAUSED = 'paused'
+    STATUS_CHOICES = (
+        (STATUS_DRAFT, 'Draft'),
+        (STATUS_ACTIVE, 'Active'),
+        (STATUS_PAUSED, 'Paused'),
+    )
+
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='shops')
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=255, unique=True)
@@ -83,6 +92,7 @@ class Shop(BaseEntity):
     employee_slots = models.PositiveIntegerField(default=1)
     branding = JSONField(default=dict, blank=True)
     image_file = models.ImageField(upload_to='commerce/shops/', null=True, blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE, db_index=True)
     is_verified = models.BooleanField(default=False)
     verification_status = models.CharField(max_length=20, default='UNVERIFIED')  # PENDING | VERIFIED | REJECTED
     rating_avg = models.FloatField(default=0.0)

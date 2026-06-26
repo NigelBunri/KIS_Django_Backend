@@ -602,7 +602,7 @@ def build_marketplace_receipt(order):
     y -= 18
     c.setFont('Helvetica', 11)
     for item in order.items.all():
-        line = f'- {item.product.name} x{item.quantity} @ {item.unit_price_cents / Decimal('100')} {order.currency}'
+        line = f"- {item.product.name} x{item.quantity} @ {item.unit_price_cents / Decimal('100')} {order.currency}"
         c.drawString(70, y, line)
         y -= 14
         if y < 80:

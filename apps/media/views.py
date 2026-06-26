@@ -32,7 +32,7 @@ from .safety import (
     validate_upload_file_safety,
 )
 
-MEDIA_SIGNED_URL_TTL_SECONDS = int(os.environ.get("MEDIA_SIGNED_URL_TTL_SECONDS", "300"))
+MEDIA_SIGNED_URL_TTL_SECONDS = int(os.environ.get("MEDIA_SIGNED_URL_TTL_SECONDS", "3600"))
 PRIVATE_VISIBILITY_VALUES = {"private", "restricted", "owner", "authenticated", "tenant"}
 PUBLIC_VISIBILITY_VALUES = {"public", "published", "open"}
 

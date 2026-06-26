@@ -715,7 +715,7 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
 
     def _is_owner_or_admin(self, community: Community, user):
         membership = self._get_membership(community, user)
-        if membership and membership.role in (CommunityRole.OWNER, CommunityRole.ADMIN):
+        if membership and membership.role in (CommunityRole.OWNER, CommunityRole.ADMIN, CommunityRole.MOD):
             return True
         partner = community.partner
         if not partner or not partner.main_conversation_id:

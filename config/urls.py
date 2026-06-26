@@ -13,6 +13,7 @@ from rest_framework_simplejwt.views import (
 from apps.accounts.views import DeviceBoundTokenRefreshView, LoginView
 from apps.chat.views import StickerPackListView
 from apps.media.views import UploadFileView
+from apps.broadcasts.views import BroadcastVideoUploadView
 
 from django.conf import settings
 from django.conf.urls.static import static
@@ -89,6 +90,10 @@ urlpatterns = [
     path("control/admin/", include("admin_control.urls")),
 
     path("uploads/file", UploadFileView.as_view(), name="upload-file"),
+    # Explicit top-level registration for the broadcast upload endpoints so they
+    # are resolved before any app-level URL ordering can shadow them.
+    path("api/v1/broadcasts/videos/upload/", BroadcastVideoUploadView.as_view(), name="broadcast-video-upload-root"),
+    path("api/v1/broadcasts/upload/", BroadcastVideoUploadView.as_view(), name="broadcast-upload-root"),
 
     # --- Versioned app routes ---
     path("api/v1/", include("apps.accounts.urls")),

@@ -53,8 +53,17 @@ elif TEST_DATABASE_URL:
 elif DATABASE_URL:
     DATABASES["default"] = dj_database_url.parse(
         DATABASE_URL,
-        conn_max_age=int(os.environ.get("PG_CONN_MAX_AGE", "600")),
+        # In local dev, use short-lived connections (60 s) instead of the
+        # production 600 s default. With the dev server running in threaded
+        # mode each thread holds a connection for the full conn_max_age, so
+        # 600 s × N threads can quickly exhaust PostgreSQL's max_connections.
+        conn_max_age=int(os.environ.get("PG_CONN_MAX_AGE", "60")),
     )
+
+# CONN_HEALTH_CHECKS: before reusing a persistent connection Django sends a
+# cheap "SELECT 1" ping. If the server has closed it (e.g. idle-timeout,
+# restart) Django opens a fresh one instead of getting an OperationalError.
+DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
 
 DATABASES["default"].setdefault("TEST", {})
 if DATABASES["default"].get("ENGINE") == "django.db.backends.sqlite3":

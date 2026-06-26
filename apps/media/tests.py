@@ -129,6 +129,26 @@ class PrivateMediaAccessTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["bucket_key"], self.private_key)
 
+    def test_primary_media_asset_route_still_serves_download(self):
+        self.client.force_authenticate(self.owner)
+
+        sign_response = self.client.post(f"/api/v1/media/assets/{self.private_asset.id}/sign/")
+
+        self.assertEqual(sign_response.status_code, 200)
+        self.client.force_authenticate(user=None)
+        parsed = urlparse(sign_response.data["signed_url"])
+        response = self.client.get(f"{parsed.path}?{parsed.query}")
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_legacy_media_asset_route_remains_available(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/assets/{self.private_asset.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(str(response.data["id"]), str(self.private_asset.id))
+
 
 class MediaSafetyUploadTests(APITestCase):
     def setUp(self):

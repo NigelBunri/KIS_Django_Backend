@@ -672,6 +672,11 @@ class ShopViewSet(viewsets.ModelViewSet):
         owner_id = self.request.query_params.get("owner")
         if owner_id:
             qs = qs.filter(owner_id=owner_id)
+        if self.action == 'list' and not self.request.user.is_staff:
+            if self.request.user.is_authenticated:
+                qs = qs.filter(Q(status=Shop.STATUS_ACTIVE) | Q(owner=self.request.user))
+            else:
+                qs = qs.filter(status=Shop.STATUS_ACTIVE)
         return qs
 
     def get_object(self):
@@ -692,15 +697,11 @@ class ShopViewSet(viewsets.ModelViewSet):
         if shop_limit is not None and existing >= shop_limit:
             raise ValidationError({"detail": f"Your current plan allows up to {shop_limit} shop{'s' if shop_limit != 1 else ''}. Upgrade to create more."})
         image_file = serializer.validated_data.get("image_file")
-        if not image_file:
-            raise ValidationError({"image_file": "Shop image is required."})
         _enforce_media_size_limit(self.request.user, image_file, field_name="image_file")
         serializer.save(owner=self.request.user)
 
     def perform_update(self, serializer):
         image_file = serializer.validated_data.get("image_file")
-        if not image_file and not serializer.instance.image_file:
-            raise ValidationError({"image_file": "Shop image is required."})
         _enforce_media_size_limit(self.request.user, image_file, field_name="image_file")
         super().perform_update(serializer)
 
@@ -742,7 +743,7 @@ class CommerceDiscoveryView(APIView):
         query = str(request.query_params.get('q') or '').strip()
         product_qs = Product.objects.select_related('shop').filter(is_active=True, is_deleted=False)
         service_qs = ShopService.objects.select_related('shop').filter(is_active=True, is_deleted=False, status='published')
-        shop_qs = Shop.objects.filter(is_deleted=False)
+        shop_qs = Shop.objects.filter(is_deleted=False, status=Shop.STATUS_ACTIVE)
         if query:
             product_qs = product_qs.filter(Q(name__icontains=query) | Q(description__icontains=query) | Q(shop__name__icontains=query))
             service_qs = service_qs.filter(Q(name__icontains=query) | Q(description__icontains=query) | Q(shop__name__icontains=query))

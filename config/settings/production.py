@@ -43,7 +43,9 @@ if _db_url.startswith("sqlite"):
     raise ImproperlyConfigured(
         "DATABASE_URL must point to PostgreSQL in production, not SQLite."
     )
-DATABASES["default"] = dj_database_url.parse(_db_url, conn_max_age=600, ssl_require=True)
+DATABASES["default"] = dj_database_url.parse(_db_url, conn_max_age=60, ssl_require=True)
+# Ping the connection before reuse so stale sockets are dropped silently.
+DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
 
 # Redis cache — REDIS_URL must be set explicitly; no dev-IP fallback allowed.
 _redis_url = os.environ.get("REDIS_URL", "").strip()
