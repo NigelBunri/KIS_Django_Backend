@@ -1,10 +1,9 @@
 # Production overrides
 from .base import *  # noqa
 import os
-import dj_database_url  # ensure this package is in production requirements
 from django.core.exceptions import ImproperlyConfigured
 
-from .base import _is_weak_secret
+from .base import _is_weak_secret, parse_database_url
 
 DEBUG = False
 ALLOWED_HOSTS = [host.strip() for host in os.environ.get("ALLOWED_HOSTS", "").split(",") if host.strip()]
@@ -43,7 +42,7 @@ if _db_url.startswith("sqlite"):
     raise ImproperlyConfigured(
         "DATABASE_URL must point to PostgreSQL in production, not SQLite."
     )
-DATABASES["default"] = dj_database_url.parse(_db_url, conn_max_age=60, ssl_require=True)
+DATABASES["default"] = parse_database_url(_db_url, conn_max_age=60)
 # Ping the connection before reuse so stale sockets are dropped silently.
 DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
 

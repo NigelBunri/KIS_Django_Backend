@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from datetime import timedelta
 from hashlib import sha256
+from urllib.parse import parse_qs, urlparse
 from django.core.management.utils import get_random_secret_key
 import dj_database_url
 
@@ -47,6 +48,42 @@ def _env_csv(name: str, default: str = "") -> list[str]:
 def _env_throttle_rate(name: str, *, dev_default: str, prod_default: str) -> str:
     default = dev_default if DEBUG else prod_default
     return os.environ.get(name, default).strip() or default
+
+
+def _database_url_sslmode(database_url: str) -> str:
+    try:
+        values = parse_qs(urlparse(database_url).query).get("sslmode") or []
+        return str(values[0]).strip() if values else ""
+    except Exception:
+        return ""
+
+
+def _database_url_host(database_url: str) -> str:
+    try:
+        return (urlparse(database_url).hostname or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _database_url_is_local_postgres(database_url: str) -> bool:
+    host = _database_url_host(database_url)
+    return host in {"postgres", "localhost", "127.0.0.1"} or host.startswith("172.")
+
+
+def parse_database_url(database_url: str, *, conn_max_age: int) -> dict:
+    """Parse DATABASE_URL without forcing SSL for local Docker Postgres."""
+    sslmode = _database_url_sslmode(database_url)
+    is_local_postgres = _database_url_is_local_postgres(database_url)
+    parsed = dj_database_url.parse(
+        database_url,
+        conn_max_age=conn_max_age,
+        ssl_require=False,
+    )
+    if sslmode:
+        parsed.setdefault("OPTIONS", {})["sslmode"] = sslmode
+    elif is_local_postgres and parsed.get("OPTIONS"):
+        parsed["OPTIONS"].pop("sslmode", None)
+    return parsed
 
 
 def _is_weak_secret(value: str | None) -> bool:
@@ -334,10 +371,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 if DATABASE_URL:
     DATABASES = {
-        "default": dj_database_url.parse(
+        "default": parse_database_url(
             DATABASE_URL,
             conn_max_age=int(os.environ.get("PG_CONN_MAX_AGE", "600")),
-            ssl_require=DATABASE_URL.startswith("postgres"),
         )
     }
 else:
