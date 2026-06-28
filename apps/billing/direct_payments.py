@@ -395,10 +395,33 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
         "direct_payment_intent_id": str(intent.id),
     }
     if intent.target_type == DirectPaymentIntent.TARGET_MARKETPLACE_ORDER:
+        from apps.commerce.models import MarketplaceOrderStatus
+        from apps.commerce.services import _schedule_marketplace_order_auto_satisfaction
+
         target.metadata = {**(target.metadata or {}), **paid_metadata}
         target.currency = "USD"
-        target.save(update_fields=["metadata", "currency", "updated_at"])
+        update_fields = ["metadata", "currency", "updated_at"]
+        pending_payment_statuses = {
+            MarketplaceOrderStatus.TEMPORAL,
+            "payment_pending",
+            "pending",
+            "provider_payment_pending",
+        }
+        if target.status in pending_payment_statuses:
+            target.status = MarketplaceOrderStatus.AWAITING_SATISFACTION
+            target.metadata = {
+                **(target.metadata or {}),
+                "awaiting_satisfaction_until": (
+                    timezone.now() + timezone.timedelta(days=3)
+                ).isoformat(),
+            }
+            update_fields.append("status")
+        target.save(update_fields=update_fields)
+        if "status" in update_fields:
+            _schedule_marketplace_order_auto_satisfaction(target.id)
     elif intent.target_type == DirectPaymentIntent.TARGET_SERVICE_BOOKING_PAYMENT:
+        from apps.commerce.models import ServiceBooking
+
         target.payment_status = target.STATUS_PAID
         target.payment_method = intent.provider
         target.currency = "USD"
@@ -409,7 +432,20 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
         booking = target.booking
         booking.metadata = {**(booking.metadata or {}), **paid_metadata}
         booking.payment_tx_ref = intent.tx_ref
-        booking.save(update_fields=["metadata", "payment_tx_ref", "updated_at"])
+        booking_update_fields = ["metadata", "payment_tx_ref", "updated_at"]
+        if booking.status in {ServiceBooking.STATUS_PENDING, "payment_pending", "provider_payment_pending"}:
+            booking.status = ServiceBooking.STATUS_CONFIRMED
+            booking_update_fields.append("status")
+        if str((intent.metadata or {}).get("source") or "").strip().lower() == "service_booking_remaining":
+            booking.deposit_cents = int(booking.price_cents or 0)
+            booking.balance_cents = 0
+            booking.metadata = {
+                **(booking.metadata or {}),
+                "remaining_payment_required": False,
+                "remaining_payment_status": "paid",
+            }
+            booking_update_fields.extend(["deposit_cents", "balance_cents"])
+        booking.save(update_fields=list(dict.fromkeys(booking_update_fields)))
     elif intent.target_type == DirectPaymentIntent.TARGET_EDUCATION_BOOKING:
         from apps.broadcasts.models import EducationBookingStatus
 

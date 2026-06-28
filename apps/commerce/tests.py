@@ -270,7 +270,14 @@ class MarketplaceUsdCheckoutTests(TestCase):
             items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
         )
         intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
-        payload = {'data': {'tx_ref': intent.tx_ref, 'status': 'successful', 'id': 'flw-test-001'}}
+        payload = {
+            'data': {
+                'tx_ref': intent.tx_ref,
+                'status': 'successful',
+                'id': 'flw-test-001',
+                'card': {'first_6digits': '424242', 'last_4digits': '4242'},
+            }
+        }
 
         ok, result, paid_intent = reconcile_direct_payment_callback(payload=payload, signature='test-webhook-secret')
         self.assertTrue(ok)
@@ -278,17 +285,18 @@ class MarketplaceUsdCheckoutTests(TestCase):
         self.assertEqual(paid_intent.status, DirectPaymentIntent.STATUS_PAID)
         order.refresh_from_db()
         self.assertEqual(order.metadata['payment_status'], 'paid')
+        self.assertFalse(order.metadata['payment_required'])
         self.assertEqual(order.metadata['provider_transaction_id'], 'flw-test-001')
-
-        mark_provider_completed(order)
-        order.refresh_from_db()
         self.assertEqual(order.status, MarketplaceOrderStatus.AWAITING_SATISFACTION)
         schedule_mock.assert_called_once()
+        audit_event = DirectPaymentAuditEvent.objects.get(intent=intent, event='callback.paid')
+        self.assertEqual(audit_event.metadata['data']['card'], '[redacted]')
 
         ok, result, _paid_intent = reconcile_direct_payment_callback(payload=payload, signature='test-webhook-secret')
         self.assertTrue(ok)
         self.assertEqual(result, 'paid')
         self.assertEqual(DirectPaymentAuditEvent.objects.filter(intent=intent, event='callback.paid').count(), 1)
+        schedule_mock.assert_called_once()
 
     def test_historical_kisc_marketplace_order_uses_safe_compatibility_label(self):
         order = place_marketplace_order(
@@ -335,9 +343,6 @@ class MarketplaceUsdCheckoutTests(TestCase):
             payload={'data': {'tx_ref': intent.tx_ref, 'status': 'successful', 'id': 'flw-auto-001'}},
             signature='test-webhook-secret',
         )
-        order.refresh_from_db()
-
-        mark_provider_completed(order)
         order.refresh_from_db()
 
         self.assertEqual(order.status, MarketplaceOrderStatus.AWAITING_SATISFACTION)
@@ -556,6 +561,7 @@ class MarketplaceOrderSettlementTests(TestCase):
         self.assertEqual(provider_wallet.balance_cents, 1_000_000)
 
 
+@override_settings(FLW_WEBHOOK_SECRET='test-webhook-secret')
 class ServiceBookingMoneyNormalizationTests(APITestCase):
     def setUp(self):
         User = get_user_model()
@@ -602,6 +608,72 @@ class ServiceBookingMoneyNormalizationTests(APITestCase):
         self.assertEqual(intent.target_type, DirectPaymentIntent.TARGET_SERVICE_BOOKING_PAYMENT)
         self.assertEqual(intent.target_id, payment.id)
         self.assertEqual(payment.transaction_reference, intent.tx_ref)
+
+        ok, result, paid_intent = reconcile_direct_payment_callback(
+            payload={'data': {'tx_ref': intent.tx_ref, 'status': 'successful', 'id': 'flw-service-001'}},
+            signature='test-webhook-secret',
+        )
+        self.assertTrue(ok)
+        self.assertEqual(result, 'paid')
+        self.assertEqual(paid_intent.status, DirectPaymentIntent.STATUS_PAID)
+        payment.refresh_from_db()
+        booking.refresh_from_db()
+        self.assertEqual(payment.payment_status, ServiceBookingPayment.STATUS_PAID)
+        self.assertEqual(payment.payment_method, 'flutterwave')
+        self.assertEqual(payment.transaction_reference, intent.tx_ref)
+        self.assertIsNotNone(payment.paid_at)
+        self.assertEqual(booking.status, ServiceBooking.STATUS_CONFIRMED)
+        self.assertEqual(booking.metadata['payment_status'], 'paid')
+        self.assertFalse(booking.metadata['payment_required'])
+        self.assertEqual(booking.metadata['provider_transaction_id'], 'flw-service-001')
+
+    def test_provider_remaining_payment_confirms_booking_and_clears_balance(self):
+        scheduled_at = timezone.now() + timedelta(days=2)
+        booking = ServiceBooking.objects.create(
+            service=self.service,
+            shop=self.shop,
+            user=self.customer,
+            scheduled_at=scheduled_at,
+            price_cents=10_000,
+            deposit_cents=2_500,
+            balance_cents=7_500,
+            payment_tx_ref='initial-deposit-ref',
+            metadata={'payment_status': 'paid', 'payment_required': False},
+        )
+        payment = ServiceBookingPayment.objects.create(
+            booking=booking,
+            amount_cents=7_500,
+            currency='USD',
+            payment_method='flutterwave',
+            payment_status=ServiceBookingPayment.STATUS_PENDING,
+            transaction_reference='remaining-ref',
+        )
+        intent = create_direct_payment_intent(
+            user=self.customer,
+            target_type=DirectPaymentIntent.TARGET_SERVICE_BOOKING_PAYMENT,
+            target_id=payment.id,
+            provider='flutterwave',
+            metadata={'source': 'service_booking_remaining', 'booking_id': str(booking.id)},
+        )
+
+        ok, result, paid_intent = reconcile_direct_payment_callback(
+            payload={'data': {'tx_ref': intent.tx_ref, 'status': 'successful', 'id': 'flw-service-remaining-001'}},
+            signature='test-webhook-secret',
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(result, 'paid')
+        self.assertEqual(paid_intent.status, DirectPaymentIntent.STATUS_PAID)
+        payment.refresh_from_db()
+        booking.refresh_from_db()
+        self.assertEqual(payment.payment_status, ServiceBookingPayment.STATUS_PAID)
+        self.assertEqual(booking.status, ServiceBooking.STATUS_CONFIRMED)
+        self.assertEqual(booking.deposit_cents, booking.price_cents)
+        self.assertEqual(booking.balance_cents, 0)
+        self.assertEqual(booking.metadata['payment_status'], 'paid')
+        self.assertFalse(booking.metadata['remaining_payment_required'])
+        self.assertEqual(booking.metadata['remaining_payment_status'], 'paid')
+        self.assertEqual(booking.metadata['provider_transaction_id'], 'flw-service-remaining-001')
 
     def test_service_booking_wallet_checkout_is_disabled_by_default(self):
         scheduled_at = timezone.now() + timedelta(days=2)
