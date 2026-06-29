@@ -121,8 +121,9 @@ OVERRIDE_OTP_CODE = getattr(settings, "OTP_OVERRIDE_CODE", "676139")
 
 def sms_configured() -> bool:
     return bool(
-        getattr(settings, "INFOBIP_API_KEY", "") and
-        getattr(settings, "INFOBIP_BASE", "")
+        getattr(settings, "TWILIO_ACCOUNT_SID", "") and
+        getattr(settings, "TWILIO_AUTH_TOKEN", "") and
+        getattr(settings, "TWILIO_FROM_NUMBER", "")
     )
 
 def whatsapp_configured() -> bool:
