@@ -229,6 +229,11 @@ SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "").strip()
 INFOBIP_API_KEY = os.environ.get("INFOBIP_API_KEY", "").strip()
 INFOBIP_BASE = os.environ.get("INFOBIP_BASE", "").strip().rstrip("/")
 
+# Twilio — SMS OTP delivery only. WhatsApp disabled for low-budget MVP.
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "").strip()
+
 # WhatsApp Business sender number (digits only, no leading +), e.g. 237676000000
 WHATSAPP_SENDER_NUMBER = os.environ.get("WHATSAPP_SENDER_NUMBER", "").strip()
 # Optional: Meta-approved template name for first-contact OTP delivery
