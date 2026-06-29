@@ -91,11 +91,17 @@ def _flutterwave_headers() -> dict[str, str]:
 
 
 def _provider_links_enabled(provider: str) -> bool:
-    return (
-        provider == "flutterwave"
-        and getattr(settings, "KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED", False)
-        and bool(getattr(settings, "FLW_SECRET_KEY", ""))
-    )
+    if not getattr(settings, "KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED", False):
+        return False
+    if provider == "flutterwave":
+        return bool(getattr(settings, "FLW_SECRET_KEY", ""))
+    if provider == "stripe":
+        try:
+            from apps.billing.stripe_payments import is_configured as stripe_is_configured
+        except Exception:
+            return False
+        return stripe_is_configured()
+    return False
 
 
 def _create_flutterwave_payment_link(intent: DirectPaymentIntent) -> tuple[str, dict]:
@@ -126,6 +132,41 @@ def _create_flutterwave_payment_link(intent: DirectPaymentIntent) -> tuple[str, 
     if response.status_code >= 300:
         raise ValueError(str(data.get("message") or "Failed to create payment link"))
     link = str((data.get("data") or {}).get("link") or "")
+    return link, redact_payment_payload(data)
+
+
+def _create_stripe_checkout_session(intent: DirectPaymentIntent) -> tuple[str, dict]:
+    from apps.billing.stripe_payments import create_checkout_session
+
+    metadata = {
+        "intent_id": str(intent.id),
+        "tx_ref": intent.tx_ref,
+        "target_type": intent.target_type,
+        "target_id": str(intent.target_id),
+        "user_id": str(intent.user_id),
+    }
+    product_name = str((intent.metadata or {}).get("description") or intent.target_type).replace("_", " ").title()
+    success_url = (
+        getattr(settings, "STRIPE_CHECKOUT_SUCCESS_URL", "")
+        or getattr(settings, "FLW_REDIRECT_URL", "")
+        or "https://kis.app/payments/complete"
+    )
+    cancel_url = (
+        getattr(settings, "STRIPE_CHECKOUT_CANCEL_URL", "")
+        or success_url
+    )
+    data = create_checkout_session(
+        amount_cents=int(intent.amount_cents or 0),
+        currency=(intent.currency or "USD").lower(),
+        product_name=product_name,
+        success_url=success_url,
+        cancel_url=cancel_url,
+        target_type=intent.target_type,
+        target_id=str(intent.target_id),
+        user_id=str(intent.user_id),
+        metadata=metadata,
+    )
+    link = str(data.get("checkout_url") or "")
     return link, redact_payment_payload(data)
 
 
@@ -178,7 +219,10 @@ def _ensure_provider_payment_link(intent: DirectPaymentIntent, *, actor=None) ->
     if intent.payment_url or not _provider_links_enabled(intent.provider):
         return intent
     try:
-        payment_url, provider_payload = _create_flutterwave_payment_link(intent)
+        if intent.provider == "stripe":
+            payment_url, provider_payload = _create_stripe_checkout_session(intent)
+        else:
+            payment_url, provider_payload = _create_flutterwave_payment_link(intent)
     except Exception as exc:  # pragma: no cover - live provider path is disabled in local validation.
         write_direct_payment_audit(
             event="intent.provider_link_failed",
@@ -380,6 +424,71 @@ def reconcile_direct_payment_callback(*, payload: dict, signature: str = "") -> 
         intent.save(update_fields=["provider_ref", "raw_callback", "updated_at"])
         write_direct_payment_audit(event="callback.ignored_status", intent=intent, metadata={"status": status_flag})
         return True, "ignored", intent
+
+
+def _stripe_event_target(event: dict) -> tuple[str, dict, DirectPaymentIntent | None]:
+    body = event if isinstance(event, dict) else {}
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    obj = data.get("object") if isinstance(data.get("object"), dict) else {}
+    metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+    intent = None
+    intent_id = str(metadata.get("intent_id") or "").strip()
+    tx_ref = str(metadata.get("tx_ref") or "").strip()
+    if intent_id:
+        try:
+            intent = DirectPaymentIntent.objects.filter(id=uuid.UUID(intent_id)).first()
+        except (TypeError, ValueError):
+            intent = None
+    if intent is None and tx_ref:
+        intent = DirectPaymentIntent.objects.filter(tx_ref=tx_ref).first()
+    return str(body.get("type") or "").strip(), obj, intent
+
+
+def reconcile_stripe_direct_payment_event(event: dict) -> tuple[bool, str, DirectPaymentIntent | None]:
+    event_type, obj, intent = _stripe_event_target(event)
+    if event_type not in {"checkout.session.completed", "payment_intent.succeeded"}:
+        return True, "ignored", None
+    if not intent:
+        write_direct_payment_audit(
+            event="stripe.callback.unmatched",
+            provider="stripe",
+            metadata=redact_payment_payload(event if isinstance(event, dict) else {}),
+        )
+        return False, "unmatched", None
+    if intent.provider != "stripe":
+        write_direct_payment_audit(
+            event="stripe.callback.provider_mismatch",
+            intent=intent,
+            provider="stripe",
+            metadata={"intent_provider": intent.provider, "stripe_event_type": event_type},
+        )
+        return False, "provider_mismatch", intent
+
+    with transaction.atomic():
+        intent = DirectPaymentIntent.objects.select_for_update().get(id=intent.id)
+        provider_ref = str(obj.get("payment_intent") or obj.get("id") or intent.provider_ref or "")
+        intent.raw_callback = redact_payment_payload(event if isinstance(event, dict) else {})
+        intent.provider_ref = provider_ref
+        if intent.status != DirectPaymentIntent.STATUS_PAID:
+            intent.status = DirectPaymentIntent.STATUS_PAID
+            intent.processed_at = timezone.now()
+            intent.save(update_fields=["status", "provider_ref", "raw_callback", "processed_at", "updated_at"])
+            _mark_target_paid(intent, {"id": provider_ref})
+            write_direct_payment_audit(
+                event="stripe.callback.paid",
+                intent=intent,
+                provider="stripe",
+                metadata=redact_payment_payload(event if isinstance(event, dict) else {}),
+            )
+            return True, "paid", intent
+        intent.save(update_fields=["provider_ref", "raw_callback", "updated_at"])
+        write_direct_payment_audit(
+            event="stripe.callback.duplicate_paid",
+            intent=intent,
+            provider="stripe",
+            metadata=redact_payment_payload(event if isinstance(event, dict) else {}),
+        )
+        return True, "paid", intent
 
 
 def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:

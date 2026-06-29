@@ -57,7 +57,11 @@ from .serializers import (
     PricingTierSerializer,
     RevenueLaunchEvidenceRecordSerializer,
 )
-from .direct_payments import create_direct_payment_intent, reconcile_direct_payment_callback
+from .direct_payments import (
+    create_direct_payment_intent,
+    reconcile_direct_payment_callback,
+    reconcile_stripe_direct_payment_event,
+)
 from .profitability_entitlements import get_profitability_entitlement_catalog
 from .profitability_analytics import get_profitability_command_center_summary
 from .profitability_beta_launch import get_profitability_beta_launch_plan
@@ -1720,10 +1724,20 @@ class StripeWebhookView(APIView):
 
         event_type = event.get("type", "")
         data_obj = (event.get("data") or {}).get("object") or {}
+        metadata = data_obj.get("metadata") if isinstance(data_obj.get("metadata"), dict) else {}
+
+        if event_type in {"checkout.session.completed", "payment_intent.succeeded"} and (
+            metadata.get("intent_id") or metadata.get("tx_ref")
+        ):
+            ok, result, intent = reconcile_stripe_direct_payment_event(event)
+            if not ok and result == "unmatched":
+                return Response({"detail": "unknown direct payment intent"}, status=status.HTTP_404_NOT_FOUND)
+            if not ok:
+                return Response({"detail": result}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"received": True, "result": result, "intent_id": str(intent.id) if intent else None})
 
         if event_type == "payment_intent.succeeded":
             intent_id = data_obj.get("id") or ""
-            metadata = data_obj.get("metadata") or {}
             target_type = metadata.get("target_type", "")
             target_id = metadata.get("target_id", "")
             user_id = metadata.get("user_id", "")
@@ -1781,7 +1795,6 @@ class StripeWebhookView(APIView):
 
         elif event_type == "checkout.session.completed":
             session_id = data_obj.get("id") or ""
-            metadata = data_obj.get("metadata") or {}
             logger.info("[Stripe] checkout.session.completed session=%s meta=%s", session_id, metadata)
 
         return Response({"received": True})

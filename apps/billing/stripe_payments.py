@@ -78,6 +78,12 @@ def create_checkout_session(
 ) -> dict[str, Any]:
     """Create a Stripe Checkout Session (hosted payment page). Returns checkout URL."""
     stripe = _stripe()
+    payment_metadata = {
+        "target_type": target_type,
+        "target_id": str(target_id),
+        "user_id": str(user_id),
+        **(metadata or {}),
+    }
     session = stripe.checkout.Session.create(
         payment_method_types=["card"],
         line_items=[{
@@ -91,12 +97,8 @@ def create_checkout_session(
         mode="payment",
         success_url=success_url,
         cancel_url=cancel_url,
-        metadata={
-            "target_type": target_type,
-            "target_id": str(target_id),
-            "user_id": str(user_id),
-            **(metadata or {}),
-        },
+        metadata=payment_metadata,
+        payment_intent_data={"metadata": payment_metadata},
     )
     return {
         "provider": "stripe",

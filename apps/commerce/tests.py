@@ -237,6 +237,45 @@ class MarketplaceUsdCheckoutTests(TestCase):
         self.assertEqual(order.metadata.get('payment_url'), 'https://checkout.example/kis-direct')
         self.assertEqual(post_mock.call_count, 1)
 
+    @override_settings(
+        KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED=True,
+        STRIPE_SECRET_KEY='sk_test_direct',
+        KIS_STRIPE_ENABLED=True,
+        FLW_REDIRECT_URL='https://example.test/payments/complete',
+    )
+    @patch('apps.billing.stripe_payments.create_checkout_session')
+    def test_stripe_direct_payment_intent_creates_checkout_link(self, create_session_mock):
+        create_session_mock.return_value = {
+            'provider': 'stripe',
+            'session_id': 'cs_test_direct_001',
+            'checkout_url': 'https://checkout.stripe.com/c/pay/cs_test_direct_001',
+            'amount': 1000,
+            'currency': 'USD',
+        }
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+        )
+
+        intent = create_direct_payment_intent(
+            user=self.buyer,
+            target_type=DirectPaymentIntent.TARGET_MARKETPLACE_ORDER,
+            target_id=order.id,
+            provider='stripe',
+        )
+
+        self.assertEqual(intent.provider, 'stripe')
+        self.assertEqual(intent.payment_url, 'https://checkout.stripe.com/c/pay/cs_test_direct_001')
+        self.assertEqual(intent.provider_payload['session_id'], 'cs_test_direct_001')
+        create_session_mock.assert_called_once()
+        kwargs = create_session_mock.call_args.kwargs
+        self.assertEqual(kwargs['metadata']['intent_id'], str(intent.id))
+        self.assertEqual(kwargs['metadata']['tx_ref'], intent.tx_ref)
+        self.assertEqual(kwargs['metadata']['target_type'], DirectPaymentIntent.TARGET_MARKETPLACE_ORDER)
+        self.assertEqual(kwargs['metadata']['target_id'], str(order.id))
+        self.assertEqual(kwargs['metadata']['user_id'], str(self.buyer.id))
+
     def test_wallet_marketplace_checkout_is_disabled_by_default(self):
         with self.assertRaises(ValidationError) as ctx:
             place_marketplace_order(
@@ -297,6 +336,89 @@ class MarketplaceUsdCheckoutTests(TestCase):
         self.assertEqual(result, 'paid')
         self.assertEqual(DirectPaymentAuditEvent.objects.filter(intent=intent, event='callback.paid').count(), 1)
         schedule_mock.assert_called_once()
+
+    @override_settings(STRIPE_WEBHOOK_SECRET='whsec_test', KIS_STRIPE_ENABLED=True, STRIPE_SECRET_KEY='sk_test_direct')
+    @patch('apps.commerce.services._schedule_marketplace_order_auto_satisfaction')
+    @patch('apps.billing.stripe_payments.verify_webhook')
+    def test_stripe_webhook_marks_marketplace_order_paid_idempotently(self, verify_webhook_mock, schedule_mock):
+        order = place_marketplace_order(
+            buyer=self.buyer,
+            shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+        )
+        intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
+        intent.provider = 'stripe'
+        intent.metadata = {**(intent.metadata or {}), 'description': 'Marketplace order payment'}
+        intent.save(update_fields=['provider', 'metadata', 'updated_at'])
+        order.metadata = {
+            **(order.metadata or {}),
+            'payment_status': 'pending',
+            'payment_required': True,
+            'payment_provider': 'stripe',
+            'payment_reference': intent.tx_ref,
+            'direct_payment_intent_id': str(intent.id),
+        }
+        order.status = MarketplaceOrderStatus.TEMPORAL
+        order.save(update_fields=['metadata', 'status', 'updated_at'])
+        event = {
+            'id': 'evt_test_direct_001',
+            'type': 'checkout.session.completed',
+            'data': {
+                'object': {
+                    'id': 'cs_test_direct_001',
+                    'payment_intent': 'pi_test_direct_001',
+                    'metadata': {
+                        'intent_id': str(intent.id),
+                        'tx_ref': intent.tx_ref,
+                        'target_type': DirectPaymentIntent.TARGET_MARKETPLACE_ORDER,
+                        'target_id': str(order.id),
+                        'user_id': str(self.buyer.id),
+                    },
+                }
+            },
+        }
+        verify_webhook_mock.return_value = event
+
+        response = self.client.post(
+            '/api/v1/billing/stripe/webhook/',
+            data=b'{}',
+            content_type='application/json',
+            HTTP_STRIPE_SIGNATURE='valid-signature',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        intent.refresh_from_db()
+        order.refresh_from_db()
+        self.assertEqual(intent.status, DirectPaymentIntent.STATUS_PAID)
+        self.assertEqual(intent.provider_ref, 'pi_test_direct_001')
+        self.assertEqual(order.metadata['payment_status'], 'paid')
+        self.assertFalse(order.metadata['payment_required'])
+        self.assertEqual(order.metadata['provider_transaction_id'], 'pi_test_direct_001')
+        self.assertEqual(order.status, MarketplaceOrderStatus.AWAITING_SATISFACTION)
+        schedule_mock.assert_called_once()
+
+        response = self.client.post(
+            '/api/v1/billing/stripe/webhook/',
+            data=b'{}',
+            content_type='application/json',
+            HTTP_STRIPE_SIGNATURE='valid-signature',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(DirectPaymentAuditEvent.objects.filter(intent=intent, event='stripe.callback.paid').count(), 1)
+        self.assertEqual(DirectPaymentAuditEvent.objects.filter(intent=intent, event='stripe.callback.duplicate_paid').count(), 1)
+        schedule_mock.assert_called_once()
+
+    @override_settings(STRIPE_WEBHOOK_SECRET='whsec_test', KIS_STRIPE_ENABLED=True, STRIPE_SECRET_KEY='sk_test_direct')
+    @patch('apps.billing.stripe_payments.verify_webhook', return_value=None)
+    def test_stripe_webhook_rejects_missing_or_invalid_signature(self, _verify_webhook_mock):
+        response = self.client.post(
+            '/api/v1/billing/stripe/webhook/',
+            data=b'{}',
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_historical_kisc_marketplace_order_uses_safe_compatibility_label(self):
         order = place_marketplace_order(
