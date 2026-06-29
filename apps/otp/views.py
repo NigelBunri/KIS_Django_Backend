@@ -140,10 +140,6 @@ def email_configured() -> bool:
 
 def send_sms_via_provider(phone: str, body: str) -> None:
     """Send SMS via Twilio Programmable Messaging. Silently skips if not configured."""
-    import base64
-    import urllib.parse
-    import urllib.request as _req
-
     account_sid = getattr(settings, "TWILIO_ACCOUNT_SID", "") or ""
     auth_token = getattr(settings, "TWILIO_AUTH_TOKEN", "") or ""
     from_number = getattr(settings, "TWILIO_FROM_NUMBER", "") or ""
@@ -152,33 +148,16 @@ def send_sms_via_provider(phone: str, body: str) -> None:
         logger.info("SMS not sent (Twilio not configured): %s", _masked_phone(phone))
         return
 
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
-    form_data = urllib.parse.urlencode({
-        "To": phone,
-        "From": from_number,
-        "Body": body,
-    }).encode("utf-8")
-
-    credentials = f"{account_sid}:{auth_token}".encode("utf-8")
-    auth_header = base64.b64encode(credentials).decode("ascii")
-
-    request = _req.Request(
-        url,
-        data=form_data,
-        headers={
-            "Authorization": f"Basic {auth_header}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        method="POST",
-    )
-
     try:
-        with _req.urlopen(request, timeout=15) as resp:
-            resp_body = resp.read().decode("utf-8", errors="replace")
-            if resp.status not in (200, 201):
-                logger.warning("Twilio SMS returned status %s for %s: %s", resp.status, _masked_phone(phone), resp_body[:300])
-            else:
-                logger.info("SMS sent via Twilio to %s", _masked_phone(phone))
+        from twilio.rest import Client
+
+        client = Client(account_sid, auth_token)
+        message = client.messages.create(
+            body=body,
+            from_=from_number,
+            to=phone,
+        )
+        logger.info("SMS sent via Twilio to %s; sid=%s", _masked_phone(phone), getattr(message, "sid", "unknown"))
     except Exception as exc:
         logger.warning("Twilio SMS failed for %s: %s", _masked_phone(phone), exc)
 
