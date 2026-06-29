@@ -139,41 +139,48 @@ def email_configured() -> bool:
     )
 
 def send_sms_via_provider(phone: str, body: str) -> None:
-    """Send SMS via Infobip. Silently skips if not configured (dev mode)."""
+    """Send SMS via Twilio Programmable Messaging. Silently skips if not configured."""
+    import base64
+    import urllib.parse
     import urllib.request as _req
-    import json as _json
-    api_key = getattr(settings, "INFOBIP_API_KEY", "") or ""
-    base = getattr(settings, "INFOBIP_BASE", "") or ""
-    if not api_key or not base:
-        logger.info("SMS not sent (Infobip not configured): %s", _masked_phone(phone))
+
+    account_sid = getattr(settings, "TWILIO_ACCOUNT_SID", "") or ""
+    auth_token = getattr(settings, "TWILIO_AUTH_TOKEN", "") or ""
+    from_number = getattr(settings, "TWILIO_FROM_NUMBER", "") or ""
+
+    if not account_sid or not auth_token or not from_number:
+        logger.info("SMS not sent (Twilio not configured): %s", _masked_phone(phone))
         return
-    url = f"{base.rstrip('/')}/sms/2/text/advanced"
-    payload = _json.dumps({
-        "messages": [{
-            "from": "KIS",
-            "destinations": [{"to": phone}],
-            "text": body,
-        }]
+
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    form_data = urllib.parse.urlencode({
+        "To": phone,
+        "From": from_number,
+        "Body": body,
     }).encode("utf-8")
+
+    credentials = f"{account_sid}:{auth_token}".encode("utf-8")
+    auth_header = base64.b64encode(credentials).decode("ascii")
+
     request = _req.Request(
         url,
-        data=payload,
+        data=form_data,
         headers={
-            "Authorization": f"App {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Authorization": f"Basic {auth_header}",
+            "Content-Type": "application/x-www-form-urlencoded",
         },
         method="POST",
     )
+
     try:
-        with _req.urlopen(request, timeout=10) as resp:
-            resp_status = resp.status
-            if resp_status not in (200, 201):
-                logger.warning("Infobip SMS returned status %s for %s", resp_status, _masked_phone(phone))
+        with _req.urlopen(request, timeout=15) as resp:
+            resp_body = resp.read().decode("utf-8", errors="replace")
+            if resp.status not in (200, 201):
+                logger.warning("Twilio SMS returned status %s for %s: %s", resp.status, _masked_phone(phone), resp_body[:300])
             else:
-                logger.info("SMS sent via Infobip to %s", _masked_phone(phone))
+                logger.info("SMS sent via Twilio to %s", _masked_phone(phone))
     except Exception as exc:
-        logger.warning("Infobip SMS failed for %s: %s", _masked_phone(phone), exc)
+        logger.warning("Twilio SMS failed for %s: %s", _masked_phone(phone), exc)
 
 def send_email_otp(to_email: str, code: str, purpose: str) -> bool:
     """Send OTP via email. Returns True if sent, False if not configured or failed."""
