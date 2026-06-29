@@ -150,7 +150,7 @@ class DirectPaymentIntent(BaseEntity):
     status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_PENDING)
     tx_ref = models.CharField(max_length=255, unique=True)
     provider_ref = models.CharField(max_length=255, blank=True)
-    payment_url = models.URLField(blank=True)
+    payment_url = models.TextField(blank=True, default="")
     idempotency_key = models.CharField(max_length=255, blank=True, db_index=True)
     metadata = models.JSONField(default=dict, blank=True)
     provider_payload = models.JSONField(default=dict, blank=True)

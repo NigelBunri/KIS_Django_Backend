@@ -245,10 +245,11 @@ class MarketplaceUsdCheckoutTests(TestCase):
     )
     @patch('apps.billing.stripe_payments.create_checkout_session')
     def test_stripe_direct_payment_intent_creates_checkout_link(self, create_session_mock):
+        long_checkout_url = 'https://checkout.stripe.com/c/pay/' + ('cs_test_direct_001_' * 20)
         create_session_mock.return_value = {
             'provider': 'stripe',
             'session_id': 'cs_test_direct_001',
-            'checkout_url': 'https://checkout.stripe.com/c/pay/cs_test_direct_001',
+            'checkout_url': long_checkout_url,
             'amount': 1000,
             'currency': 'USD',
         }
@@ -266,7 +267,10 @@ class MarketplaceUsdCheckoutTests(TestCase):
         )
 
         self.assertEqual(intent.provider, 'stripe')
-        self.assertEqual(intent.payment_url, 'https://checkout.stripe.com/c/pay/cs_test_direct_001')
+        self.assertGreater(len(long_checkout_url), 200)
+        self.assertEqual(intent.payment_url, long_checkout_url)
+        intent.refresh_from_db()
+        self.assertEqual(intent.payment_url, long_checkout_url)
         self.assertEqual(intent.provider_payload['session_id'], 'cs_test_direct_001')
         create_session_mock.assert_called_once()
         kwargs = create_session_mock.call_args.kwargs
