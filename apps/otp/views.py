@@ -121,9 +121,8 @@ OVERRIDE_OTP_CODE = getattr(settings, "OTP_OVERRIDE_CODE", "676139")
 
 def sms_configured() -> bool:
     return bool(
-        getattr(settings, "TWILIO_ACCOUNT_SID", "") and
-        getattr(settings, "TWILIO_AUTH_TOKEN", "") and
-        getattr(settings, "TWILIO_FROM_NUMBER", "")
+        getattr(settings, "INFOBIP_API_KEY", "") and
+        getattr(settings, "INFOBIP_BASE", "")
     )
 
 def whatsapp_configured() -> bool:
@@ -140,27 +139,47 @@ def email_configured() -> bool:
     )
 
 def send_sms_via_provider(phone: str, body: str) -> None:
-    """Send SMS via Twilio Programmable Messaging. Silently skips if not configured."""
-    account_sid = getattr(settings, "TWILIO_ACCOUNT_SID", "") or ""
-    auth_token = getattr(settings, "TWILIO_AUTH_TOKEN", "") or ""
-    from_number = getattr(settings, "TWILIO_FROM_NUMBER", "") or ""
+    """Send SMS OTP via Infobip SMS API. Silently skips if not configured."""
+    import requests
 
-    if not account_sid or not auth_token or not from_number:
-        logger.info("SMS not sent (Twilio not configured): %s", _masked_phone(phone))
+    api_key = getattr(settings, "INFOBIP_API_KEY", "") or ""
+    base = (getattr(settings, "INFOBIP_BASE", "") or "").rstrip("/")
+    sender = getattr(settings, "INFOBIP_SMS_SENDER", "") or "KIS"
+
+    if not api_key or not base:
+        logger.info("SMS not sent (Infobip not configured): %s", _masked_phone(phone))
         return
 
-    try:
-        from twilio.rest import Client
+    url = f"{base}/sms/2/text/advanced"
+    payload = {
+        "messages": [
+            {
+                "from": sender,
+                "destinations": [{"to": phone}],
+                "text": body,
+            }
+        ]
+    }
+    headers = {
+        "Authorization": f"App {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
-        client = Client(account_sid, auth_token)
-        message = client.messages.create(
-            body=body,
-            from_=from_number,
-            to=phone,
-        )
-        logger.info("SMS sent via Twilio to %s; sid=%s", _masked_phone(phone), getattr(message, "sid", "unknown"))
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        if response.status_code >= 400:
+            logger.warning(
+                "Infobip SMS failed for %s: status=%s body=%s",
+                _masked_phone(phone),
+                response.status_code,
+                response.text[:300],
+            )
+            return
+
+        logger.info("SMS sent via Infobip to %s", _masked_phone(phone))
     except Exception as exc:
-        logger.warning("Twilio SMS failed for %s: %s", _masked_phone(phone), exc)
+        logger.warning("Infobip SMS error for %s: %s", _masked_phone(phone), exc)
 
 def send_email_otp(to_email: str, code: str, purpose: str) -> bool:
     """Send OTP via email. Returns True if sent, False if not configured or failed."""
