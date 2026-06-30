@@ -228,6 +228,7 @@ SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "").strip()
 # Infobip — SMS and WhatsApp OTP delivery
 INFOBIP_API_KEY = os.environ.get("INFOBIP_API_KEY", "").strip()
 INFOBIP_BASE = os.environ.get("INFOBIP_BASE", "").strip().rstrip("/")
+INFOBIP_SMS_SENDER = os.environ.get("INFOBIP_SMS_SENDER", "").strip()
 
 # WhatsApp Business sender number (digits only, no leading +), e.g. 237676000000
 WHATSAPP_SENDER_NUMBER = os.environ.get("WHATSAPP_SENDER_NUMBER", "").strip()
