@@ -75,6 +75,3 @@ urllib3==2.5.0
 vine==5.1.0
 wcwidth==0.2.14
 whitenoise==6.12.0
-
-# Twilio SMS OTP delivery
-twilio>=9.0,<10.0

@@ -24,7 +24,7 @@ def expires_in(seconds: int = 5 * 60):
 
 def send_sms_infobip(phone: str, text: str) -> None:
     """
-    Replace this with your actual Infobip/Twilio client call.
+    Legacy helper retained for compatibility; active SMS delivery is implemented in apps/otp/views.py via Infobip.
     Never print the OTP body; production logs are often retained and exported.
     """
     logger.info("OTP SMS queued via Infobip-compatible provider.")
