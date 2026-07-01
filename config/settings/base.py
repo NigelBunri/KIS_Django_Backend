@@ -327,6 +327,7 @@ INSTALLED_APPS = [
     "apps.family.apps.FamilyConfig",
     "apps.government.apps.GovernmentConfig",
     "apps.church.apps.ChurchConfig",
+    "apps.localization.apps.LocalizationConfig",
 ]
 
 MIDDLEWARE = [

@@ -143,6 +143,7 @@ urlpatterns = [
     path("api/v1/family/", include("apps.family.urls", namespace="family")),
     path("api/v1/", include("apps.government.urls", namespace="government")),
     path("api/v1/church/", include("apps.church.urls")),
+    path("api/v1/localization/", include("apps.localization.urls")),
     path("api/v1/education/", include("apps.broadcasts.education_urls")),
     path("api/v1/media/extended/", include("apps.broadcasts.media_extended_urls")),
     path("api/v1/business/", include("apps.commerce.business_urls")),
