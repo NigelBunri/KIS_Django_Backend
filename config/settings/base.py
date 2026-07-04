@@ -142,6 +142,11 @@ SECURE_HSTS_PRELOAD = _env_bool("SECURE_HSTS_PRELOAD", not DEBUG)
 if _env_bool("USE_X_FORWARDED_PROTO", False):
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
+# Phone verification (OTP) gate. Suspended by default — accounts register and
+# log in without an SMS code. Set KIS_PHONE_VERIFICATION_ENABLED=true to restore
+# the requirement.
+KIS_PHONE_VERIFICATION_ENABLED = _env_bool("KIS_PHONE_VERIFICATION_ENABLED", False)
+
 # Payments / Wallet
 FLW_PUBLIC_KEY = os.environ.get("FLW_PUBLIC_KEY", "")
 FLW_SECRET_KEY = os.environ.get("FLW_SECRET_KEY", "")

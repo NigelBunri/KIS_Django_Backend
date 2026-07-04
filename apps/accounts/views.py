@@ -11,6 +11,7 @@ from typing import Optional, Iterable
 import datetime
 import os
 import re
+from django.conf import settings
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from django.db import transaction, IntegrityError
@@ -794,6 +795,35 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
                 send_welcome_email(to_email=user.email)
         except Exception:
             pass
+
+        # Verification is suspended (KIS_PHONE_VERIFICATION_ENABLED=false): skip the
+        # OTP step entirely and activate + log the account in immediately.
+        if not settings.KIS_PHONE_VERIFICATION_ENABLED:
+            v = dict(user.verification or {})
+            v["phone"] = {"verified": True, "verified_at": timezone.now().isoformat()}
+            user.verification = v
+            user.status = "active"
+            user.is_active = True
+            user.save(update_fields=["verification", "status", "is_active", "updated_at"])
+
+            tokens = issue_tokens_for_user(user, device_id=device_id)
+            return Response(
+                {
+                    "success": True,
+                    "pending_verification": False,
+                    "phone_verified": True,
+                    "access": tokens["access"],
+                    "refresh": tokens["refresh"],
+                    "user": {
+                        "id": user.id,
+                        "phone": getattr(user, "phone", None),
+                        "status": user.status,
+                        "is_active": user.is_active,
+                        "phone_verified": True,
+                    },
+                },
+                status=status.HTTP_201_CREATED,
+            )
 
         # Do NOT issue tokens yet — the account must be phone-verified first.
         # Tokens are issued by OtpVerifyView after successful code verification.

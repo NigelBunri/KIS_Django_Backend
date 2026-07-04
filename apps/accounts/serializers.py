@@ -3,6 +3,7 @@ Serializers for accounts app. Advanced validations, nested create/update and rea
 """
 from rest_framework import serializers
 from common.media_urls import absolutize_backend_media, normalize_image_payload
+from django.conf import settings
 from django.db import transaction, IntegrityError
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
@@ -1170,10 +1171,11 @@ class LoginSerializer(serializers.Serializer):
             })
 
         # Block login if phone has never been verified (account bypassed verification).
+        # Gated by KIS_PHONE_VERIFICATION_ENABLED — suspended deployments skip this entirely.
         phone_verified = bool(
             (getattr(user, "verification", None) or {}).get("phone", {}).get("verified")
         )
-        if not phone_verified:
+        if settings.KIS_PHONE_VERIFICATION_ENABLED and not phone_verified:
             user_phone = (
                 str(getattr(user, "phone", "") or "")
                 or _compose_phone(
