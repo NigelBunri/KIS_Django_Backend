@@ -660,6 +660,56 @@ def password_login_requires_qr(user: User, device_id: str) -> bool:
     return not active_devices.filter(device_id=normalized_device_id).exists()
 
 
+def sim_matches_account(user: User, sim_phone_number: Optional[str]) -> bool:
+    """
+    Best-effort SIM ownership check (Android only — iOS has no API for an app
+    to read its own device's phone number, so this is always False there).
+    Compares by digit suffix since carriers inconsistently include the country
+    code / trunk prefix in TelephonyManager's reported line number.
+    """
+    sim_digits = re.sub(r"\D", "", str(sim_phone_number or ""))
+    if len(sim_digits) < 7:
+        return False
+    account_digits = re.sub(r"\D", "", str(getattr(user, "phone_number", "") or ""))
+    if not account_digits:
+        return False
+    return sim_digits.endswith(account_digits) or account_digits.endswith(sim_digits)
+
+
+def promote_device_via_sim(
+    user: User,
+    device_id: str,
+    platform: Optional[str],
+    name: Optional[str],
+    request,
+) -> "Device":
+    """
+    SIM ownership is out-of-band proof this device belongs to the account
+    holder, so it becomes the sole primary ("parent") device — demoting any
+    other active parent (e.g. a stale record left behind by a deleted app on
+    the original device_id).
+    """
+    Device.objects.filter(
+        user=user, is_parent=True, revoked_at__isnull=True,
+    ).exclude(device_id=str(device_id)).update(is_parent=False)
+
+    device, _ = Device.objects.update_or_create(
+        user=user,
+        device_id=str(device_id),
+        defaults={
+            "platform": platform or "unknown",
+            "name": name or None,
+            "last_seen_at": timezone.now(),
+            "last_ip": request.META.get("REMOTE_ADDR") if request else None,
+            "user_agent": request.META.get("HTTP_USER_AGENT") if request else None,
+            "revoked_at": None,
+            "revoke_reason": "",
+            "is_parent": True,
+        },
+    )
+    return device
+
+
 def upsert_device(
     user: User,
     device_id: str,
@@ -766,12 +816,17 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
         device_id = (request.data.get("device_id") or "").strip()
         device_platform = (request.data.get("device_platform") or "").strip()
         device_name = (request.data.get("device_name") or "").strip()
+        # Best-effort SIM cross-check (Android only, no OTP available while
+        # KIS_PHONE_VERIFICATION_ENABLED is off): logged for review, never
+        # blocks account creation since many Android devices can't expose it.
+        sim_phone_number = (request.data.get("sim_phone_number") or "").strip()
         if not device_id:
             return Response({"detail": "Device id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             with transaction.atomic():
                 user = serializer.save()
+                sim_number_matched = sim_matches_account(user, sim_phone_number) if sim_phone_number else None
 
                 # Ensure a starting quota; avoids duplication with serializer (serializer no longer creates it)
                 UsageQuota.objects.get_or_create(
@@ -779,7 +834,11 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
                     defaults={"quotas_json": {}, "last_reset_at": timezone.now()},
                 )
 
-                AuditLog.log(actor=user, action="user.register", meta={"phone": user.phone, "country": user.country})
+                AuditLog.log(actor=user, action="user.register", meta={
+                    "phone": user.phone,
+                    "country": user.country,
+                    "sim_number_matched": sim_number_matched,
+                })
         except DRFValidationError:
             # Already well-formed for client
             raise
@@ -800,7 +859,11 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
         # OTP step entirely and activate + log the account in immediately.
         if not settings.KIS_PHONE_VERIFICATION_ENABLED:
             v = dict(user.verification or {})
-            v["phone"] = {"verified": True, "verified_at": timezone.now().isoformat()}
+            v["phone"] = {
+                "verified": True,
+                "verified_at": timezone.now().isoformat(),
+                "verified_via": "sim_match" if sim_number_matched else "unverified_otp_suspended",
+            }
             user.verification = v
             user.status = "active"
             user.is_active = True
@@ -911,8 +974,10 @@ class LoginView(APIView):
         device_id = serializer.validated_data.get("device_id")
         device_platform = serializer.validated_data.get("device_platform") or None
         device_name = serializer.validated_data.get("device_name") or None
+        sim_phone_number = serializer.validated_data.get("sim_phone_number")
+        sim_verified_primary = sim_matches_account(user, sim_phone_number)
         revoke_unapproved_secondary_devices(user)
-        if password_login_requires_qr(user, device_id):
+        if not sim_verified_primary and password_login_requires_qr(user, device_id):
             log_security_event(
                 user,
                 "security.auth.secondary_device_qr_required",
@@ -930,7 +995,18 @@ class LoginView(APIView):
                 },
                 status=status.HTTP_403_FORBIDDEN,
             )
-        upsert_device(user, device_id, device_platform, device_name, request)
+        if sim_verified_primary:
+            log_security_event(
+                user,
+                "security.auth.primary_device_sim_verified",
+                request=request,
+                severity="info",
+                device_id=device_id,
+                device_platform=device_platform,
+            )
+            promote_device_via_sim(user, device_id, device_platform, device_name, request)
+        else:
+            upsert_device(user, device_id, device_platform, device_name, request)
         tokens = issue_tokens_for_user(user, device_id=device_id)  # should return {access, refresh} or similar
 
         log_security_event(

@@ -190,14 +190,23 @@ class S3MediaStorage(Storage):
         except ImportError as exc:
             raise ImproperlyConfigured("S3 storage requires boto3. Add boto3 to requirements.") from exc
 
-        config_kwargs = {}
+        config_kwargs = {"signature_version": "s3v4"}
         if self.addressing_style:
             config_kwargs["s3"] = {"addressing_style": self.addressing_style}
+        # Presigned URLs must be generated against the bucket's *regional*
+        # endpoint (s3.<region>.amazonaws.com) — without an explicit
+        # endpoint_url, boto3 can resolve presigned URLs against the legacy
+        # global host (s3.amazonaws.com) for non-us-east-1 buckets, which S3
+        # then rejects with SignatureDoesNotMatch on every GET. Uploads
+        # (PUT) still succeed either way since those go through the SDK's
+        # own request signing, not a standalone presigned URL string — which
+        # is why this bug shows up as "save succeeded, image never loads."
+        endpoint_url = self.endpoint_url or f"https://s3.{self.region_name}.amazonaws.com"
         return boto3.client(
             "s3",
             region_name=self.region_name,
-            endpoint_url=self.endpoint_url or None,
-            config=Config(**config_kwargs) if config_kwargs else None,
+            endpoint_url=endpoint_url,
+            config=Config(**config_kwargs),
         )
 
     def _object_key(self, name: str) -> str:

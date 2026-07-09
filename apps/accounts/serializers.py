@@ -1075,6 +1075,10 @@ class LoginSerializer(serializers.Serializer):
     device_platform = serializers.CharField(write_only=True, required=False, allow_blank=True)
     device_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     otp_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    # Best-effort SIM line number read from the device (Android only — iOS has
+    # no API for an app to read its own number). Used to recognize a device as
+    # primary again after reinstall without requiring QR re-linking.
+    sim_phone_number = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
     def validate(self, attrs):
         phone_raw = (attrs.get("phone") or "").strip()

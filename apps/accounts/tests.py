@@ -295,6 +295,92 @@ class AccountsDeviceLoginPolicyTests(APITestCase):
         self.assertEqual(rogue.revoke_reason, "unapproved_secondary_device")
 
 
+class AccountsSimPrimaryDeviceTests(APITestCase):
+    """
+    Reinstalling the app wipes the locally stored device_id, so a login from
+    the same physical Android phone otherwise looks like a brand-new device
+    and gets bounced to QR re-linking. A matching SIM number is treated as
+    out-of-band proof of ownership, bypassing that requirement and promoting
+    the new device_id to primary in place of the stale one.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            phone="+237670000099",
+            password="TestPass123!",
+            country="CM",
+        )
+        self.user.phone_number = "670000099"
+        self.user.phone_country_code = "+237"
+        self.user.verification = {"phone": {"verified": True, "verified_at": timezone.now().isoformat()}}
+        self.user.status = "active"
+        self.user.is_active = True
+        self.user.save(update_fields=["phone_number", "phone_country_code", "verification", "status", "is_active"])
+        # Simulates the original install's device_id — still on record as
+        # parent server-side even though the app was deleted from the phone.
+        self.stale_parent_device = Device.objects.create(
+            user=self.user,
+            device_id="dev_stale_original_install",
+            platform="android",
+            name="Original Android install",
+            is_parent=True,
+            last_seen_at=timezone.now(),
+        )
+
+    def test_matching_sim_number_bypasses_qr_and_promotes_new_device(self):
+        response = self.client.post(
+            reverse("auth-login"),
+            {
+                "phone": "+237670000099",
+                "password": "TestPass123!",
+                "device_id": "dev_reinstalled",
+                "device_platform": "android",
+                "sim_phone_number": "0670000099",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.data)
+
+        new_device = Device.objects.get(user=self.user, device_id="dev_reinstalled")
+        self.assertTrue(new_device.is_parent)
+        self.stale_parent_device.refresh_from_db()
+        self.assertFalse(self.stale_parent_device.is_parent)
+
+    def test_mismatched_sim_number_still_requires_qr(self):
+        response = self.client.post(
+            reverse("auth-login"),
+            {
+                "phone": "+237670000099",
+                "password": "TestPass123!",
+                "device_id": "dev_reinstalled",
+                "device_platform": "android",
+                "sim_phone_number": "0699999999",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data["error_code"], "secondary_device_qr_required")
+        self.assertFalse(Device.objects.filter(user=self.user, device_id="dev_reinstalled").exists())
+
+    def test_no_sim_number_still_requires_qr(self):
+        response = self.client.post(
+            reverse("auth-login"),
+            {
+                "phone": "+237670000099",
+                "password": "TestPass123!",
+                "device_id": "dev_reinstalled",
+                "device_platform": "android",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data["error_code"], "secondary_device_qr_required")
+
+
 class AccountsE2EEBundleTests(APITestCase):
     def setUp(self):
         self.viewer = User.objects.create_user(
