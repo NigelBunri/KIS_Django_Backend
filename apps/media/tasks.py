@@ -1,6 +1,17 @@
 # media/tasks.py
 from celery import shared_task
 from .models import ProcessingJob, MediaAsset
+from .upload_intent import expire_abandoned_upload_intents
+
+
+@shared_task
+def expire_abandoned_media_uploads():
+    """Periodic sweep for presigned uploads that were never confirmed (S3
+    PUT never happened, or happened but the client never called confirm).
+    Schedule via Celery Beat; apps/media/management/commands/
+    expire_media_uploads.py wraps the same function for manual/cron use
+    where Beat isn't configured."""
+    return expire_abandoned_upload_intents()
 
 @shared_task(bind=True)
 def process_job_worker(self, job_id):

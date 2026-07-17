@@ -576,6 +576,25 @@ MEDIA_SAFETY_ALLOWED_MIME_PREFIXES = os.environ.get("MEDIA_SAFETY_ALLOWED_MIME_P
 MEDIA_SAFETY_ALLOWED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_ALLOWED_EXTENSIONS", "")
 MEDIA_SAFETY_BLOCKED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_BLOCKED_EXTENSIONS", "")
 
+# Direct-to-S3 presigned-PUT upload handshake (apps/media/upload_intent.py).
+# Secure-by-default: a conservative size cap, a short presign lifetime, and
+# an explicit MIME allow-list rather than trusting the client. No bucket
+# name, domain, or AWS key ever belongs in these — they're read from the
+# existing AWS_* / S3MediaStorage env vars.
+PROFILE_IMAGE_MAX_UPLOAD_BYTES = int(os.environ.get("PROFILE_IMAGE_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
+PROFILE_IMAGE_PRESIGN_EXPIRY_SECONDS = int(os.environ.get("PROFILE_IMAGE_PRESIGN_EXPIRY_SECONDS", 600))
+PROFILE_IMAGE_ALLOWED_CONTENT_TYPES = os.environ.get(
+    "PROFILE_IMAGE_ALLOWED_CONTENT_TYPES",
+    "image/jpeg,image/png,image/webp,image/heic,image/heif",
+)
+# Grace window past the presign's own expiry before an unconfirmed upload
+# intent is swept by expire_abandoned_media_uploads (apps/media/tasks.py) —
+# gives a client mid-upload right at the presign deadline room to still
+# confirm before cleanup marks the record expired.
+MEDIA_UPLOAD_INTENT_EXPIRY_SECONDS = int(
+    os.environ.get("MEDIA_UPLOAD_INTENT_EXPIRY_SECONDS", PROFILE_IMAGE_PRESIGN_EXPIRY_SECONDS + 300)
+)
+
 # NestJS internal webhook base + token for realtime event fanout
 NEST_INTERNAL_URL = os.environ.get(
     "NEST_INTERNAL_URL",

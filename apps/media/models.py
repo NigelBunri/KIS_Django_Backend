@@ -150,6 +150,79 @@ class MediaMetrics(BaseEntity):
         return self.carbon_grams
 
 
+class MediaUploadIntent(BaseEntity):
+    """
+    A server-issued reservation for a direct-to-S3 presigned-PUT upload.
+
+    Distinct from MediaAsset/MediaSafetyScan on purpose: those model an
+    asset that already exists (or is mid-processing) and carry a heavier
+    pipeline (variants, processing jobs, safety scans) this feature doesn't
+    need. A MediaUploadIntent instead tracks the handshake BEFORE the S3
+    object exists — key/content-type/size were decided by the server, the
+    client hasn't uploaded anything yet, and the record can legitimately
+    expire unconfirmed. `context` is deliberately generic (not
+    "profile_image_upload") so the same model/service serves any future
+    upload surface (feed images, product images, documents, video) without
+    a new table per surface.
+    """
+
+    STATUS_PENDING = "pending"
+    STATUS_UPLOADED = "uploaded"
+    STATUS_CONFIRMED = "confirmed"
+    STATUS_FAILED = "failed"
+    STATUS_EXPIRED = "expired"
+    STATUS_ABORTED = "aborted"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_UPLOADED, "Uploaded"),
+        (STATUS_CONFIRMED, "Confirmed"),
+        (STATUS_FAILED, "Failed"),
+        (STATUS_EXPIRED, "Expired"),
+        (STATUS_ABORTED, "Aborted"),
+    ]
+
+    owner = models.ForeignKey(USER, related_name="media_upload_intents", on_delete=models.CASCADE)
+    context = models.CharField(max_length=64, db_index=True)
+    # target_id lets a context attach to a specific non-singleton resource
+    # (e.g. a particular ProfileShowcase or Product row) instead of always
+    # updating a single owner-scoped record like Profile. Optional — most
+    # contexts implemented so far don't need it.
+    target_id = models.CharField(max_length=64, blank=True, default="")
+    original_filename = models.CharField(max_length=512, blank=True)
+    object_key = models.CharField(max_length=1024)
+    content_type = models.CharField(max_length=256)
+    size_bytes = models.BigIntegerField()
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True)
+    expires_at = models.DateTimeField(db_index=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    error_code = models.CharField(max_length=64, blank=True)
+    error_message = models.CharField(max_length=512, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["owner", "status"]),
+            models.Index(fields=["status", "expires_at"]),
+            models.Index(fields=["context", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.context} {self.status} {self.id}"
+
+    def is_expired(self) -> bool:
+        return timezone.now() >= self.expires_at
+
+    def mark_confirmed(self):
+        self.status = self.STATUS_CONFIRMED
+        self.confirmed_at = timezone.now()
+        self.save(update_fields=["status", "confirmed_at", "updated_at"])
+
+    def mark_failed(self, code: str, message: str):
+        self.status = self.STATUS_FAILED
+        self.error_code = code[:64]
+        self.error_message = message[:512]
+        self.save(update_fields=["status", "error_code", "error_message", "updated_at"])
+
+
 class MediaSafetyScan(BaseEntity):
     STATUS_CHOICES = [
         ("pending_review", "Pending Review"),

@@ -276,3 +276,37 @@ class S3MediaStorage(Storage):
         except Exception as exc:
             raise FileNotFoundError(name) from exc
         return int(response.get("ContentLength") or 0)
+
+    def generate_presigned_put(self, key: str, content_type: str, expires_in: int) -> str:
+        """Presigned PUT for direct-to-S3 client uploads (never returns credentials).
+
+        Reuses the exact same `_client()` (bucket, region, regional endpoint
+        override) as `.url()`'s presigned GET so PUT and GET presigning can't
+        drift into the SignatureDoesNotMatch bug documented in `_client()`.
+        Binding `ContentType` into `Params` means S3 itself enforces that the
+        client's PUT request sends the same Content-Type Django validated at
+        initiate time — a mismatched header fails the signature, not a
+        server-side re-check after the fact.
+        """
+        return self._client().generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self.bucket, "Key": self._object_key(key), "ContentType": content_type},
+            ExpiresIn=expires_in,
+        )
+
+    def head_object_meta(self, name: str) -> dict | None:
+        """Returns {'ContentLength', 'ContentType'} for an existing object, or None.
+
+        Used by the upload-confirm flow to verify what actually landed in S3
+        (size/MIME) against what the client declared — never trusts the
+        client's own report of what it uploaded.
+        """
+        key = self._object_key(name)
+        try:
+            response = self._client().head_object(Bucket=self.bucket, Key=key)
+        except Exception:
+            return None
+        return {
+            "ContentLength": int(response.get("ContentLength") or 0),
+            "ContentType": str(response.get("ContentType") or ""),
+        }

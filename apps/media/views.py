@@ -17,7 +17,8 @@ from django.shortcuts import get_object_or_404
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 from apps.accounts.jwt_auth import DeviceBoundJWTAuthentication
 
-from .models import MediaAsset, MediaVariant, ProcessingJob, MediaMetrics, MediaSafetyScan
+from . import upload_intent
+from .models import MediaAsset, MediaVariant, ProcessingJob, MediaMetrics, MediaSafetyScan, MediaUploadIntent
 from django.db import models
 from .serializers import (
     MediaAssetSerializer, MediaVariantSerializer, ProcessingJobSerializer, MediaMetricsSerializer, MediaSafetyScanSerializer
@@ -472,3 +473,61 @@ class UploadFileView(APIView):
         }
 
         return Response({"attachment": attachment}, status=status.HTTP_201_CREATED)
+
+
+class MediaUploadInitiateView(APIView):
+    """POST /api/v1/media/uploads/initiate/ — generic direct-to-S3 handshake
+    start. See apps/media/upload_intent.py for the full flow; this view is a
+    thin HTTP wrapper so the same logic backs both the generic route and the
+    profile-image-specific alias below."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [DeviceBoundJWTAuthentication]
+    throttle_scope = "upload"
+    locked_context: str | None = None
+
+    def post(self, request):
+        context = self.locked_context or str(request.data.get("context") or "").strip()
+        filename = request.data.get("filename")
+        content_type = request.data.get("content_type")
+        size_bytes = request.data.get("size_bytes")
+
+        upload_intent.validate_initiate_payload(
+            context=context, filename=filename, content_type=content_type, size_bytes=size_bytes
+        )
+        intent = upload_intent.create_upload_intent(
+            user=request.user,
+            context=context,
+            filename=filename,
+            content_type=str(content_type).strip().lower(),
+            size_bytes=int(size_bytes),
+            target_id=str(request.data.get("target_id") or ""),
+        )
+        return Response(upload_intent.build_initiate_response(intent), status=status.HTTP_201_CREATED)
+
+
+class ProfileImageUploadInitiateView(MediaUploadInitiateView):
+    """POST /api/v1/media/uploads/profile-image/initiate/ — the exact route
+    named in the task spec. `kind` in the body ("avatar" | "cover", default
+    "avatar") picks which profile field this upload targets; everything
+    else is identical to the generic initiate view."""
+
+    def post(self, request):
+        kind = str(request.data.get("kind") or "avatar").strip().lower()
+        self.locked_context = "profile_cover" if kind == "cover" else "profile_avatar"
+        return super().post(request)
+
+
+class MediaUploadConfirmView(APIView):
+    """POST /api/v1/media/uploads/<uuid:upload_id>/confirm/ — verifies the S3
+    object with head_object and attaches it via the context's handler. Works
+    for any context with a registered attach handler (see
+    apps.media.upload_intent.ATTACH_HANDLERS) — not profile-specific."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [DeviceBoundJWTAuthentication]
+    throttle_scope = "upload"
+
+    def post(self, request, upload_id=None):
+        result = upload_intent.confirm_upload_intent(user=request.user, upload_id=upload_id)
+        return Response(result, status=status.HTTP_200_OK)

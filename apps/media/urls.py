@@ -2,7 +2,14 @@
 from rest_framework.routers import DefaultRouter
 from django.urls import path, include, re_path
 from django.views.generic import RedirectView
-from .views import MediaAssetViewSet, ProcessingJobViewSet, MediaSafetyScanViewSet
+from .views import (
+    MediaAssetViewSet,
+    ProcessingJobViewSet,
+    MediaSafetyScanViewSet,
+    MediaUploadInitiateView,
+    ProfileImageUploadInitiateView,
+    MediaUploadConfirmView,
+)
 
 router = DefaultRouter()
 router.register(r"media/assets", MediaAssetViewSet, basename="asset")
@@ -16,6 +23,19 @@ router.register(r"media/media-safety-scans", MediaSafetyScanViewSet, basename="m
 
 urlpatterns = [
     path("", include(router.urls)),
+    # Direct-to-S3 presigned-PUT upload handshake (initiate/confirm) — see
+    # apps/media/upload_intent.py for the full flow.
+    path("media/uploads/initiate/", MediaUploadInitiateView.as_view(), name="media-upload-initiate"),
+    path(
+        "media/uploads/profile-image/initiate/",
+        ProfileImageUploadInitiateView.as_view(),
+        name="media-upload-profile-image-initiate",
+    ),
+    path(
+        "media/uploads/<uuid:upload_id>/confirm/",
+        MediaUploadConfirmView.as_view(),
+        name="media-upload-confirm",
+    ),
     # Some app builds and server-side signed URLs omit the trailing slash on the
     # /download action.  Redirect them permanently so the token is still usable.
     re_path(
