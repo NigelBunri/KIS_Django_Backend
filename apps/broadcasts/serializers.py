@@ -1,7 +1,5 @@
-import os
 from decimal import Decimal
 
-from django.conf import settings
 from django.urls import reverse
 from rest_framework import serializers
 
@@ -788,8 +786,9 @@ class BroadcastVideoSerializer(serializers.ModelSerializer):
         return build_media_url(request, rel)
 
     def get_media_file_path(self, obj: BroadcastVideo):
-        media_root = getattr(settings, "MEDIA_ROOT", "media")
-        return os.path.join(media_root, obj.storage_path)
+        # `storage_path` is a default_storage-relative key, not a local
+        # filesystem path — it may live on S3/Supabase, not MEDIA_ROOT.
+        return obj.storage_path
 
 
 class BroadcastLessonSerializer(serializers.ModelSerializer):

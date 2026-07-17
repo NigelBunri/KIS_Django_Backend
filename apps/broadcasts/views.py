@@ -4,6 +4,7 @@ import secrets
 import os
 import re
 import subprocess
+import tempfile
 import urllib.request
 from html import escape as html_escape
 from urllib.parse import quote, unquote, urlparse
@@ -16,9 +17,10 @@ import requests
 
 from django.apps import apps as django_apps
 from django.conf import settings
+from django.core.files.storage import FileSystemStorage, default_storage
 from django.db import IntegrityError, models, transaction
 from django.db.models import Q
-from django.http import FileResponse, Http404, HttpResponse
+from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
@@ -717,6 +719,31 @@ def _probe_video_duration(path: str) -> float:
             check=True,
         )
         return float(result.stdout.strip())
+    except Exception:  # pragma: no cover
+        return 0.0
+
+
+def _probe_video_duration_from_storage(relative_path: str) -> float:
+    """Probe duration for a `default_storage`-relative path.
+
+    Local FileSystemStorage exposes a real filesystem path via `.path()`, so
+    ffprobe can run against it directly. Remote backends (S3/Supabase) raise
+    NotImplementedError from `.path()` — for those, pull the bytes into a
+    temp file first since ffprobe needs a real file to open.
+    """
+    try:
+        local_path = default_storage.path(relative_path)
+    except NotImplementedError:
+        local_path = None
+    if local_path:
+        return _probe_video_duration(local_path)
+    try:
+        with default_storage.open(relative_path, "rb") as remote_file:
+            suffix = os.path.splitext(relative_path)[1] or ".mp4"
+            with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+                tmp.write(remote_file.read())
+                tmp.flush()
+                return _probe_video_duration(tmp.name)
     except Exception:  # pragma: no cover
         return 0.0
 
@@ -4833,17 +4860,15 @@ def _store_upload(file_obj, user=None) -> tuple[str, int]:
             limit_bytes = int(limit_mb) * 1024 * 1024
             if file_obj.size > limit_bytes:
                 raise ValidationError({"detail": "Media file exceeds your tier storage limit."})
-    media_root = getattr(settings, "MEDIA_ROOT", "media")
     rel_name = f"{uuid.uuid4().hex}{os.path.splitext(file_obj.name or '')[1] or '.mp4'}"
-    rel_path = os.path.join(MEDIA_SUBDIRECTORY, rel_name)
-    abs_path = os.path.join(media_root, rel_path)
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    size = 0
-    with open(abs_path, "wb") as destination:
-        for chunk in file_obj.chunks():
-            destination.write(chunk)
-            size += len(chunk)
-    return rel_path, size
+    rel_path = os.path.join(MEDIA_SUBDIRECTORY, rel_name).replace(os.sep, "/")
+    # Route through default_storage (not a raw open()/os.path.join(MEDIA_ROOT, ...)
+    # write) so this respects OBJECT_STORAGE_PROVIDER the same way profile/
+    # commerce ImageFields already do — otherwise broadcast/feed/education/
+    # health/market/partner uploads always land on local disk regardless of
+    # S3/Supabase config.
+    saved_path = default_storage.save(rel_path, file_obj)
+    return saved_path, file_obj.size
 
 
 HEALTH_INSTITUTION_TYPES = {
@@ -6815,16 +6840,10 @@ def _ensure_education_profile_structure(education: dict) -> dict:
 
 def _store_thumbnail_upload(file_obj) -> str:
     validate_upload_file_safety(file_obj, context="broadcast")
-    media_root = getattr(settings, "MEDIA_ROOT", "media")
     ext = os.path.splitext(file_obj.name or "")[1] or ".jpg"
     rel_name = f"{uuid.uuid4().hex}{ext}"
-    rel_path = os.path.join(THUMBNAIL_SUBDIRECTORY, rel_name)
-    abs_path = os.path.join(media_root, rel_path)
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    with open(abs_path, "wb") as destination:
-        for chunk in file_obj.chunks():
-            destination.write(chunk)
-    return rel_path
+    rel_path = os.path.join(THUMBNAIL_SUBDIRECTORY, rel_name).replace(os.sep, "/")
+    return default_storage.save(rel_path, file_obj)
 
 
 def _record_upload_safety(request, file_obj, *, context: str):
@@ -8703,8 +8722,7 @@ class BroadcastVideoUploadView(APIView):
         if channel_id:
             channel = Channel.objects.filter(id=channel_id).first()
         relative_path, _ = _store_upload(file_obj, user=request.user)
-        absolute_path = os.path.join(getattr(settings, "MEDIA_ROOT", "media"), relative_path)
-        duration = _probe_video_duration(absolute_path)
+        duration = _probe_video_duration_from_storage(relative_path)
         video_type = "short" if duration < LONG_VIDEO_MIN_SECONDS else "video"
         transcript_segments = _sanitize_transcript_segments(serializer.validated_data.get("transcript_segments", []))
         video = BroadcastVideo.objects.create(
@@ -8758,13 +8776,21 @@ class BroadcastVideoStreamView(APIView):
     def get(self, request, video_id):
         video = get_object_or_404(BroadcastVideo, id=video_id, is_active=True)
 
-        # 1) Real filesystem path (for open/exists)
+        # Remote backends (S3/Supabase) have no local filesystem path — hand
+        # the client a direct (signed, if private) URL instead of proxying
+        # bytes through Django. S3 GetObject natively honors Range headers,
+        # so seeking still works without reimplementing range-serving here.
+        if not isinstance(default_storage, FileSystemStorage):
+            if not default_storage.exists(video.storage_path):
+                raise Http404("Video not found.")
+            return HttpResponseRedirect(default_storage.url(video.storage_path))
+
+        # Local dev fallback: real filesystem path (for open/exists).
         file_path = os.path.join(settings.MEDIA_ROOT, video.storage_path)
 
         if not os.path.exists(file_path):
             raise Http404("Video not found.")
 
-        # 2) Public URL (for the client/browser)
         return self._serve_video(request, file_path, video)
 
     def _serve_video(self, request, file_path, video):
@@ -12772,7 +12798,7 @@ def _build_feed_attachment(request, file_obj):
             mime_type=file_obj.content_type or '',
             storage_path=rel_path,
             type='video',
-            duration_seconds=int(round(_probe_video_duration(os.path.join(getattr(settings, "MEDIA_ROOT", "media"), rel_path)))),
+            duration_seconds=int(round(_probe_video_duration_from_storage(rel_path))),
         )
         attachment['stream_url'] = build_absolute_url(
             request,

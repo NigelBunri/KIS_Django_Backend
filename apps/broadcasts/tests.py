@@ -2568,7 +2568,18 @@ class BroadcastVideoContractTests(APITestCase):
 
     @override_settings(MEDIA_ROOT=None)
     def test_video_stream_endpoint_supports_inline_and_range_requests(self):
-        with override_settings(MEDIA_ROOT=self.temp_media_dir.name):
+        # This test exercises the local-disk fallback path specifically, so
+        # force FileSystemStorage regardless of OBJECT_STORAGE_PROVIDER in
+        # the environment (e.g. local dev with real S3 creds configured) —
+        # otherwise default_storage would stay S3-backed and the raw file
+        # this test drops straight into temp_media_dir would never be found.
+        with override_settings(
+            MEDIA_ROOT=self.temp_media_dir.name,
+            STORAGES={
+                "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+                "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+            },
+        ):
             rel_path = 'broadcast_videos/test-video.mp4'
             absolute_dir = f'{self.temp_media_dir.name}/broadcast_videos'
             absolute_path = f'{absolute_dir}/test-video.mp4'
@@ -2604,6 +2615,37 @@ class BroadcastVideoContractTests(APITestCase):
             self.assertEqual(range_response['Accept-Ranges'], 'bytes')
             self.assertEqual(range_response['Content-Range'], 'bytes 0-3/16')
             self.assertEqual(range_response.content, b'0123')
+
+    def test_video_stream_endpoint_redirects_to_remote_storage_url(self):
+        # When default_storage is a remote backend (S3/Supabase), the stream
+        # view must hand back a redirect to storage.url(...) instead of
+        # trying (and failing) to read a local MEDIA_ROOT path — this is the
+        # behavior that broke before: uploads went to S3 but playback always
+        # read local disk regardless of OBJECT_STORAGE_PROVIDER.
+        video = BroadcastVideo.objects.create(
+            title='Remote clip',
+            description='',
+            creator=self.user,
+            video_url='https://bucket.s3.amazonaws.com/broadcast_videos/remote.mp4',
+            thumbnail_url='',
+            mime_type='video/mp4',
+            storage_path='broadcast_videos/remote.mp4',
+            type='video',
+            duration_seconds=16,
+        )
+
+        with patch('apps.broadcasts.views.default_storage') as mock_storage:
+            mock_storage.exists.return_value = True
+            mock_storage.url.return_value = 'https://bucket.s3.amazonaws.com/broadcast_videos/remote.mp4?sig=abc'
+            # Empty tuple as the isinstance() classinfo makes the check
+            # always False, standing in for "storage isn't FileSystemStorage".
+            with patch('apps.broadcasts.views.FileSystemStorage', ()):
+                response = self.client.get(f'/api/v1/broadcasts/videos/{video.id}/stream/')
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(response['Location'], 'https://bucket.s3.amazonaws.com/broadcast_videos/remote.mp4?sig=abc')
+        mock_storage.exists.assert_called_once_with('broadcast_videos/remote.mp4')
+        mock_storage.url.assert_called_once_with('broadcast_videos/remote.mp4')
 
     @override_settings(
         API_BASE_URL='http://10.14.20.99:8000',

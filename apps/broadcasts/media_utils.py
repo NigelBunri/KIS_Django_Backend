@@ -1,9 +1,12 @@
 import os
 import subprocess
+import tempfile
 import uuid
 from urllib.parse import urljoin, urlparse
 
 from django.conf import settings
+from django.core.files.base import File
+from django.core.files.storage import default_storage
 
 from apps.broadcasts.models import BroadcastVideo
 from common.media_urls import absolutize_backend_media, strip_backend_origin
@@ -53,11 +56,6 @@ def build_media_url(request, relative_path: str) -> str:
     return build_absolute_url(request, f"{media_url}/{path}")
 
 
-def _absolute_media_path(relative_path: str) -> str:
-    media_root = getattr(settings, "MEDIA_ROOT", "media")
-    return os.path.join(media_root, relative_path)
-
-
 def _create_thumbnail(source_path: str, dest_path: str) -> bool:
     cmd = [
         "ffmpeg",
@@ -87,18 +85,40 @@ def ensure_local_thumbnail(video: BroadcastVideo) -> str | None:
         return None
     if rel:
         cleaned = rel.lstrip("/")
-        abs_path = _absolute_media_path(cleaned)
-        if os.path.exists(abs_path):
+        if default_storage.exists(cleaned):
             return cleaned
-    source_path = _absolute_media_path(video.storage_path)
-    if not os.path.exists(source_path):
+
+    if not default_storage.exists(video.storage_path):
         return None
-    rel_name = os.path.join(THUMBNAIL_SUBDIRECTORY, f"{uuid.uuid4().hex}.jpg")
-    abs_target = _absolute_media_path(rel_name)
-    os.makedirs(os.path.dirname(abs_target), exist_ok=True)
-    success = _create_thumbnail(source_path, abs_target)
-    if not success:
-        return None
-    video.thumbnail_url = rel_name
+
+    rel_name = os.path.join(THUMBNAIL_SUBDIRECTORY, f"{uuid.uuid4().hex}.jpg").replace(os.sep, "/")
+
+    # ffmpeg needs real files on disk — for a remote backend (S3/Supabase)
+    # neither the source video nor the generated thumbnail have a local
+    # path, so both are staged through a temp dir and the result is pushed
+    # back through default_storage instead of written straight to
+    # MEDIA_ROOT (which would silently skip S3 the way this used to).
+    try:
+        source_local_path = default_storage.path(video.storage_path)
+    except NotImplementedError:
+        source_local_path = None
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        if source_local_path:
+            local_source = source_local_path
+        else:
+            suffix = os.path.splitext(video.storage_path)[1] or ".mp4"
+            local_source = os.path.join(tmp_dir, f"source{suffix}")
+            with default_storage.open(video.storage_path, "rb") as remote_file, open(local_source, "wb") as fh:
+                fh.write(remote_file.read())
+
+        local_thumb = os.path.join(tmp_dir, "thumb.jpg")
+        if not _create_thumbnail(local_source, local_thumb):
+            return None
+
+        with open(local_thumb, "rb") as thumb_fh:
+            saved_name = default_storage.save(rel_name, File(thumb_fh, name=os.path.basename(rel_name)))
+
+    video.thumbnail_url = saved_name
     video.save(update_fields=["thumbnail_url"])
-    return rel_name
+    return saved_name
