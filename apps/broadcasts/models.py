@@ -282,7 +282,10 @@ class ChannelContent(models.Model):
     description = models.TextField(blank=True, default="")
     text_plain = models.TextField(blank=True, default="")
     text_doc = models.JSONField(default=dict, blank=True)
-    thumbnail_url = models.URLField(blank=True, default="")
+    # Populated from feed attachment URLs, which can be presigned S3 GET
+    # URLs (signature/credential/expiry query string) — needs real headroom
+    # beyond URLField's default max_length=200.
+    thumbnail_url = models.URLField(max_length=2048, blank=True, default="")
     visibility = models.CharField(max_length=16, choices=Visibility.choices, default=Visibility.PUBLIC, db_index=True)
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.DRAFT, db_index=True)
     published_at = models.DateTimeField(null=True, blank=True, db_index=True)
@@ -330,14 +333,16 @@ class ChannelContentAsset(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     content = models.ForeignKey(ChannelContent, on_delete=models.CASCADE, related_name="assets")
     asset_type = models.CharField(max_length=32)
-    url = models.URLField(blank=True, default="")
+    # Same presigned-S3-URL headroom concern as ChannelContent.thumbnail_url
+    # above — these are populated straight from attachment["url"]/["thumbnail_url"].
+    url = models.URLField(max_length=2048, blank=True, default="")
     storage_path = models.CharField(max_length=512, blank=True, default="")
     mime_type = models.CharField(max_length=128, blank=True, default="")
     size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
     width = models.PositiveIntegerField(null=True, blank=True)
     height = models.PositiveIntegerField(null=True, blank=True)
     duration_seconds = models.PositiveIntegerField(null=True, blank=True)
-    thumbnail_url = models.URLField(blank=True, default="")
+    thumbnail_url = models.URLField(max_length=2048, blank=True, default="")
     caption = models.TextField(blank=True, default="")
     sort_order = models.PositiveIntegerField(default=0)
     processing_status = models.CharField(max_length=24, default="ready")
@@ -2902,8 +2907,13 @@ class BroadcastVideo(models.Model):
     description = models.TextField(blank=True)
     channel = models.ForeignKey(Channel, null=True, blank=True, on_delete=models.SET_NULL, related_name="videos")
     creator = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="videos")
-    video_url = models.URLField()
-    thumbnail_url = models.URLField(blank=True)
+    # Presigned S3 GET URLs carry a signature/credential/expiry query string
+    # and comfortably exceed URLField's default max_length=200 — that
+    # overflow used to be invisible because build_media_url() only ever
+    # produced short same-domain /media/... links; now that it can return a
+    # real presigned URL (private bucket), these need real headroom.
+    video_url = models.URLField(max_length=2048)
+    thumbnail_url = models.URLField(max_length=2048, blank=True)
     mime_type = models.CharField(max_length=256, blank=True)
     storage_path = models.CharField(max_length=1024, blank=True)
     type = models.CharField(max_length=16, choices=VIDEO_TYPES, default="video", db_index=True)

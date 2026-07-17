@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlparse
 
 from django.conf import settings
 from django.core.files.base import File
-from django.core.files.storage import default_storage
+from django.core.files.storage import FileSystemStorage, default_storage
 
 from apps.broadcasts.models import BroadcastVideo
 from common.media_urls import absolutize_backend_media, strip_backend_origin
@@ -51,8 +51,14 @@ def normalize_media_reference(value: str, request=None) -> str:
 
 
 def build_media_url(request, relative_path: str) -> str:
-    media_url = getattr(settings, "MEDIA_URL", "/media/").rstrip("/")
     path = relative_path.replace(os.sep, "/")
+    if not isinstance(default_storage, FileSystemStorage):
+        # Remote backend (S3/Supabase) — the object doesn't live under this
+        # server's MEDIA_URL at all, so hand back storage's own URL (public
+        # bucket URL, or a presigned GET for a private bucket) instead of a
+        # same-domain /media/... link that nothing actually serves.
+        return default_storage.url(path)
+    media_url = getattr(settings, "MEDIA_URL", "/media/").rstrip("/")
     return build_absolute_url(request, f"{media_url}/{path}")
 
 
