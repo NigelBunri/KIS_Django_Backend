@@ -27,6 +27,7 @@ from apps.billing.services import lock_wallet_funds_for_booking, release_locked_
 from apps.core.money import parse_decimal_amount
 from apps.media.safety import validate_upload_file_safety
 
+from . import media_uploads
 from .availability import format_date_key, get_day_key, normalize_availability_payload
 from .category_catalog import ensure_catalog_categories
 from .documents import render_marketplace_receipt_pdf
@@ -78,6 +79,7 @@ from .serializers import (
     ShopSerializer,
     ShopVerificationRequestSerializer,
     ProductSerializer,
+    ProductImageSerializer,
     ProductAuthenticityCheckSerializer,
     OrderSerializer,
     PaymentSerializer,
@@ -94,6 +96,7 @@ from .serializers import (
     ProductQuestionSerializer,
     CatalogCategorySerializer,
     ShopServiceSerializer,
+    ServiceImageSerializer,
     ShopTeamMemberSerializer,
     ServiceBookingSerializer,
     ServiceBookingCreateSerializer,
@@ -424,6 +427,16 @@ def _normalize_limit(value):
     return normalize_limit_value(value, default=None)
 
 
+def _presigned_get_expiry_seconds() -> int:
+    # Mirrors S3MediaStorage._env("AWS_S3_PRESIGNED_EXPIRY_SECONDS", "3600")
+    # exactly (same env var, same default) — informational only, the URL
+    # itself is already correctly time-limited by the storage backend
+    # regardless of what this reports.
+    import os
+
+    return int(os.environ.get("AWS_S3_PRESIGNED_EXPIRY_SECONDS", "3600").strip() or "3600")
+
+
 def _enforce_media_size_limit(user, file_obj, field_name="image_file"):
     if not file_obj:
         return
@@ -663,6 +676,40 @@ def _validate_group_capacity(validated_data, service):
 
 # --- ViewSets with OpenAPI annotations ---
 @class_doc_decorator('Shops')
+class CommerceUploadInitiateView(APIView):
+    """POST /api/v1/commerce/uploads/initiate/
+
+    Marketplace-specific entry point to the shared direct-to-S3 presigned
+    upload handshake (apps/media/upload_intent.py) — see
+    apps/commerce/media_uploads.py for why this needs its own initiate view
+    rather than reusing the generic one: commerce ownership varies by
+    purpose (shop owner-or-staff, product/service via their shop, order
+    buyer-or-shop-manager) and must be checked against a specific
+    shop/product/service/order BEFORE a presigned URL is ever issued.
+
+    Confirmation still goes through the existing, unmodified
+    POST /api/v1/media/uploads/<uuid:upload_id>/confirm/ — see
+    apps.media.upload_intent._confirm_only_media_descriptor.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        body = request.data
+        result = media_uploads.initiate_commerce_upload(
+            user=request.user,
+            purpose=str(body.get('purpose') or '').strip(),
+            filename=body.get('filename'),
+            content_type=body.get('contentType') or body.get('content_type'),
+            size_bytes=body.get('sizeBytes') or body.get('size_bytes'),
+            shop_id=body.get('shopId') or body.get('shop_id'),
+            product_id=body.get('productId') or body.get('product_id'),
+            service_id=body.get('serviceId') or body.get('service_id'),
+            order_id=body.get('orderId') or body.get('order_id'),
+        )
+        return Response(result, status=status.HTTP_201_CREATED)
+
+
 class ShopViewSet(viewsets.ModelViewSet):
     queryset = Shop.objects.all().order_by('-created_at')
     serializer_class = ShopSerializer
@@ -698,12 +745,37 @@ class ShopViewSet(viewsets.ModelViewSet):
             raise ValidationError({"detail": f"Your current plan allows up to {shop_limit} shop{'s' if shop_limit != 1 else ''}. Upgrade to create more."})
         image_file = serializer.validated_data.get("image_file")
         _enforce_media_size_limit(self.request.user, image_file, field_name="image_file")
-        serializer.save(owner=self.request.user)
+        shop = serializer.save(owner=self.request.user)
+        self._attach_pending_media(shop)
 
     def perform_update(self, serializer):
         image_file = serializer.validated_data.get("image_file")
         _enforce_media_size_limit(self.request.user, image_file, field_name="image_file")
         super().perform_update(serializer)
+        self._attach_pending_media(serializer.instance)
+
+    def _attach_pending_media(self, shop):
+        # Presigned-upload counterpart to the legacy `image_file` multipart
+        # field above: lets a client finish uploading a shop image via
+        # initiate -> S3 PUT -> confirm BEFORE the shop exists, then create
+        # (or update) the shop referencing the resulting mediaId in the
+        # same JSON request — no fake shop id required.
+        media_id = self.request.data.get("image_media_id")
+        if media_id:
+            media_uploads.attach_shop_image(user=self.request.user, shop_id=shop.id, media_id=media_id)
+
+    @doc_decorator(
+        summary="Attach a confirmed shop image",
+        description="Bind a confirmed direct-to-S3 upload (see /api/v1/commerce/uploads/initiate/) as this shop's image.",
+        request=None,
+        responses={200: OpenApiResponse(description="Attached") if SPECTACULAR else "Attached"},
+    )
+    @action(detail=True, methods=['post'], url_path='image/attach')
+    def image_attach(self, request, pk=None):
+        shop = self.get_object()
+        media_id = request.data.get('mediaId') or request.data.get('media_id')
+        updated = media_uploads.attach_shop_image(user=request.user, shop_id=shop.id, media_id=media_id)
+        return Response(self.get_serializer(updated).data)
 
     @doc_decorator(
         summary="Request shop verification",
@@ -878,7 +950,8 @@ class ProductViewSet(viewsets.ModelViewSet):
         for upload in self.request.FILES.getlist("images"):
             validate_upload_file_safety(upload, context="commerce")
 
-        serializer.save()
+        product = serializer.save()
+        self._attach_pending_media(product)
 
     def perform_update(self, serializer):
         main_image = serializer.validated_data.get("main_image")
@@ -887,6 +960,75 @@ class ProductViewSet(viewsets.ModelViewSet):
         for upload in self.request.FILES.getlist("images"):
             validate_upload_file_safety(upload, context="commerce")
         super().perform_update(serializer)
+        self._attach_pending_media(serializer.instance)
+
+    def _attach_pending_media(self, product):
+        # Presigned-upload counterpart to the legacy `main_image`/`images`
+        # multipart fields above: lets a client finish uploading photos via
+        # initiate -> S3 PUT -> confirm BEFORE the product exists, then
+        # create (or update) the product referencing the resulting
+        # mediaIds in the same JSON request — no fake product id required.
+        main_media_id = self.request.data.get("main_image_media_id")
+        if main_media_id:
+            media_uploads.attach_product_main_image(user=self.request.user, product_id=product.id, media_id=main_media_id)
+        gallery_media_ids = self.request.data.get("gallery_media_ids") or []
+        if isinstance(gallery_media_ids, str):
+            gallery_media_ids = [gallery_media_ids]
+        for media_id in gallery_media_ids:
+            media_uploads.attach_product_gallery_image(user=self.request.user, product_id=product.id, media_id=media_id)
+
+    @doc_decorator(
+        summary="Attach a confirmed product main image",
+        request=None,
+        responses={200: OpenApiResponse(description="Attached") if SPECTACULAR else "Attached"},
+    )
+    @action(detail=True, methods=['post'], url_path='main-image/attach')
+    def main_image_attach(self, request, pk=None):
+        product = self.get_object()
+        media_id = request.data.get('mediaId') or request.data.get('media_id')
+        updated = media_uploads.attach_product_main_image(user=request.user, product_id=product.id, media_id=media_id)
+        return Response(self.get_serializer(updated).data)
+
+    @doc_decorator(
+        summary="Attach a confirmed product gallery image",
+        request=None,
+        responses={201: OpenApiResponse(description="Attached") if SPECTACULAR else "Attached"},
+    )
+    @action(detail=True, methods=['post'], url_path='gallery/attach')
+    def gallery_attach(self, request, pk=None):
+        product = self.get_object()
+        media_id = request.data.get('mediaId') or request.data.get('media_id')
+        image = media_uploads.attach_product_gallery_image(user=request.user, product_id=product.id, media_id=media_id)
+        return Response(ProductImageSerializer(image, context=self.get_serializer_context()).data, status=status.HTTP_201_CREATED)
+
+    @doc_decorator(
+        summary="Remove a product gallery image",
+        request=None,
+        responses={204: OpenApiResponse(description="Removed") if SPECTACULAR else "Removed"},
+    )
+    # UUID-only pattern is deliberate, not cosmetic: without it this regex
+    # (originally `[^/.]+`) also matches the literal "reorder"/"attach"
+    # segments of the sibling gallery_reorder/gallery_attach actions below,
+    # and — depending on router registration order — can intercept those
+    # POST requests before they ever reach the intended action, returning a
+    # confusing 405 instead of running the reorder/attach.
+    @action(detail=True, methods=['delete'], url_path=r'gallery/(?P<image_id>[0-9a-fA-F-]{36})')
+    def gallery_remove(self, request, pk=None, image_id=None):
+        product = self.get_object()
+        media_uploads.remove_product_gallery_image(user=request.user, product_id=product.id, image_id=image_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @doc_decorator(
+        summary="Reorder product gallery images",
+        request=None,
+        responses={200: OpenApiResponse(description="Reordered") if SPECTACULAR else "Reordered"},
+    )
+    @action(detail=True, methods=['post'], url_path='gallery/reorder')
+    def gallery_reorder(self, request, pk=None):
+        product = self.get_object()
+        order = request.data.get('order') or []
+        images = media_uploads.reorder_product_gallery(user=request.user, product_id=product.id, ordered_image_ids=order)
+        return Response(ProductImageSerializer(images, many=True, context=self.get_serializer_context()).data)
 
     def perform_destroy(self, instance):
         shop = getattr(instance, 'shop', None)
@@ -1722,7 +1864,8 @@ class ShopServiceViewSet(viewsets.ModelViewSet):
             validate_upload_file_safety(image_file, context="commerce")
         for upload in self.request.FILES.getlist("images"):
             validate_upload_file_safety(upload, context="commerce")
-        serializer.save()
+        service = serializer.save()
+        self._attach_pending_media(service)
 
     def get_object(self):
         obj = super().get_object()
@@ -1738,6 +1881,52 @@ class ShopServiceViewSet(viewsets.ModelViewSet):
         for upload in self.request.FILES.getlist("images"):
             validate_upload_file_safety(upload, context="commerce")
         super().perform_update(serializer)
+        self._attach_pending_media(serializer.instance)
+
+    def _attach_pending_media(self, service):
+        media_id = self.request.data.get("image_media_id")
+        if media_id:
+            media_uploads.attach_service_image(user=self.request.user, service_id=service.id, media_id=media_id)
+        gallery_media_ids = self.request.data.get("gallery_media_ids") or []
+        if isinstance(gallery_media_ids, str):
+            gallery_media_ids = [gallery_media_ids]
+        for gallery_media_id in gallery_media_ids:
+            media_uploads.attach_service_gallery_image(user=self.request.user, service_id=service.id, media_id=gallery_media_id)
+
+    @doc_decorator(
+        summary="Attach a confirmed service image",
+        request=None,
+        responses={200: OpenApiResponse(description="Attached") if SPECTACULAR else "Attached"},
+    )
+    @action(detail=True, methods=['post'], url_path='image/attach')
+    def image_attach(self, request, pk=None):
+        service = self.get_object()
+        media_id = request.data.get('mediaId') or request.data.get('media_id')
+        updated = media_uploads.attach_service_image(user=request.user, service_id=service.id, media_id=media_id)
+        return Response(self.get_serializer(updated).data)
+
+    @doc_decorator(
+        summary="Attach a confirmed service gallery image",
+        request=None,
+        responses={201: OpenApiResponse(description="Attached") if SPECTACULAR else "Attached"},
+    )
+    @action(detail=True, methods=['post'], url_path='gallery/attach')
+    def gallery_attach(self, request, pk=None):
+        service = self.get_object()
+        media_id = request.data.get('mediaId') or request.data.get('media_id')
+        image = media_uploads.attach_service_gallery_image(user=request.user, service_id=service.id, media_id=media_id)
+        return Response(ServiceImageSerializer(image, context=self.get_serializer_context()).data, status=status.HTTP_201_CREATED)
+
+    @doc_decorator(
+        summary="Remove a service gallery image",
+        request=None,
+        responses={204: OpenApiResponse(description="Removed") if SPECTACULAR else "Removed"},
+    )
+    @action(detail=True, methods=['delete'], url_path=r'gallery/(?P<image_id>[0-9a-fA-F-]{36})')
+    def gallery_remove(self, request, pk=None, image_id=None):
+        service = self.get_object()
+        media_uploads.remove_service_gallery_image(user=request.user, service_id=service.id, image_id=image_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post', 'delete'], url_path='broadcast')
     def broadcast(self, request, pk=None):
@@ -2677,6 +2866,22 @@ class MarketplaceComplaintViewSet(viewsets.GenericViewSet, mixins.ListModelMixin
         return Response(serializer.data)
 
     def create(self, request, *args, **kwargs):
+        # New path: attachment already uploaded direct-to-S3 and confirmed
+        # (see /api/v1/commerce/uploads/initiate/), referenced by mediaId.
+        # Preferred going forward — bytes never pass through Django.
+        attachment_media_id = request.data.get('attachment_media_id') or request.data.get('attachmentMediaId')
+        if attachment_media_id:
+            complaint = media_uploads.attach_complaint_media(
+                user=request.user,
+                order_id=request.data.get('order_id') or request.data.get('orderId'),
+                text=str(request.data.get('text') or '').strip(),
+                media_id=attachment_media_id,
+            )
+            output = MarketplaceComplaintSerializer(complaint, context=self.get_serializer_context())
+            return Response(output.data, status=status.HTTP_201_CREATED)
+
+        # Legacy path: raw multipart file. Kept for backward compatibility
+        # with any client build that hasn't picked up the presigned flow.
         serializer = MarketplaceComplaintCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         attachment = serializer.validated_data.get('attachment')
@@ -2690,3 +2895,31 @@ class MarketplaceComplaintViewSet(viewsets.GenericViewSet, mixins.ListModelMixin
         )
         output = MarketplaceComplaintSerializer(complaint, context=self.get_serializer_context())
         return Response(output.data, status=status.HTTP_201_CREATED)
+
+    @doc_decorator(
+        summary="Authorized download URL for a complaint attachment",
+        description=(
+            "Returns a fresh short-lived presigned GET URL for this complaint's "
+            "attachment. Never returns a permanent or public URL; the caller must "
+            "be the complaint's author or an authorized manager of the order's shop."
+        ),
+        request=None,
+        responses={200: OpenApiResponse(description="Download URL") if SPECTACULAR else "Download URL"},
+    )
+    @action(detail=True, methods=['get'], url_path='attachment-download-url')
+    def attachment_download_url(self, request, pk=None):
+        # get_queryset() already scopes to Q(user=user) | Q(order__shop__owner=user)
+        # — reusing it here (rather than re-deriving authorization) means this
+        # endpoint can never be more permissive than the existing list/detail view.
+        complaint = get_object_or_404(self.get_queryset(), pk=pk)
+        if not complaint.attachment:
+            raise NotFound("This complaint has no attachment.")
+        # Storage.url() on the private-bucket backend already returns a
+        # freshly-signed, short-lived GET URL (AWS_S3_PRESIGNED_EXPIRY_SECONDS,
+        # default 3600s) — see apps/media/storage_backends.py S3MediaStorage.url.
+        # No separate presigning code needed; the authorization above IS the
+        # gate that matters.
+        return Response({
+            'downloadUrl': complaint.attachment.url,
+            'expiresInSeconds': _presigned_get_expiry_seconds(),
+        })

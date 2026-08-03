@@ -96,6 +96,13 @@ class StatusItemSerializer(serializers.ModelSerializer):
 
 
 class StatusCreateSerializer(serializers.ModelSerializer):
+    # Alternative to `file`: the opaque id of a MediaUploadIntent already
+    # confirmed via POST /api/v1/media/uploads/<uploadId>/confirm/ (context
+    # status_image|status_video|status_audio). Never a storage key, object
+    # key, URL, or filename — see apps/statuses/status_media.py. `file`
+    # (legacy multipart) and `media_id` (new direct-to-S3 flow) are mutually
+    # exclusive alternatives; existing multipart clients are unaffected.
+    media_id = serializers.UUIDField(required=False, allow_null=True, write_only=True)
     target_user_ids = serializers.ListField(
         child=serializers.UUIDField(),
         required=False,
@@ -122,6 +129,7 @@ class StatusCreateSerializer(serializers.ModelSerializer):
             "type",
             "text",
             "file",
+            "media_id",
             "style",
             "duration_ms",
             "visibility",
@@ -142,6 +150,7 @@ class StatusCreateSerializer(serializers.ModelSerializer):
         status_type = attrs.get("type")
         text = (attrs.get("text") or "").strip()
         file = attrs.get("file")
+        media_id = attrs.get("media_id")
         style = attrs.get("style")
         visibility = attrs.get("visibility") or StatusVisibility.CONTACTS
         target_user_ids = attrs.get("target_user_ids") or []
@@ -193,8 +202,8 @@ class StatusCreateSerializer(serializers.ModelSerializer):
 
         if status_type == StatusType.TEXT and not text:
             raise serializers.ValidationError({"text": "Text status requires text."})
-        if status_type != StatusType.TEXT and not file:
-            raise serializers.ValidationError({"file": "Media status requires a file."})
+        if status_type != StatusType.TEXT and not file and not media_id:
+            raise serializers.ValidationError({"file": "Media status requires a file or mediaId."})
         if file:
             request = self.context.get("request")
             user = getattr(request, "user", None)
@@ -225,6 +234,14 @@ class StatusCreateSerializer(serializers.ModelSerializer):
             )
             if decision.quarantine or decision.requires_review or decision.status in {"blocked", "failed", "pending_review"}:
                 raise serializers.ValidationError({"file": decision.user_message or USER_SAFE_REVIEW_MESSAGE})
+        elif media_id:
+            from apps.statuses.status_media import resolve_and_validate_status_media
+
+            request = self.context.get("request")
+            user = getattr(request, "user", None)
+            self._resolved_media_intent = resolve_and_validate_status_media(
+                user=user, media_id=media_id, status_type=status_type,
+            )
         if visibility in (StatusVisibility.CONTACTS_EXCEPT, StatusVisibility.ONLY_SHARE_WITH) and not target_user_ids:
             raise serializers.ValidationError(
                 {"target_user_ids": "Choose at least one contact for this audience setting."}
@@ -258,7 +275,25 @@ class StatusCreateSerializer(serializers.ModelSerializer):
         target_user_ids = validated_data.pop("target_user_ids", [])
         validated_data.pop("allowed_user_ids", None)
         validated_data.pop("excluded_user_ids", None)
+        validated_data.pop("media_id", None)
         item = super().create(validated_data)
+        intent = getattr(self, "_resolved_media_intent", None)
+        if intent is not None:
+            # Bind the already-uploaded S3 object without re-reading/
+            # re-uploading the bytes (same pattern as
+            # apps/commerce/media_uploads.py's attach_* functions), then mark
+            # the upload consumed only now that the StatusItem row is real —
+            # a failure earlier in this method never reaches here, so an
+            # upload is never silently consumed without a status to show for it.
+            item.file.name = intent.object_key
+            item.save(update_fields=["file"])
+            # Phase 2: keeps MediaAsset.attached_at/target_type/target_id in
+            # sync with this (Phase 1B) attach-at-create-time behavior —
+            # mark_attached() alone (the old call here) left the canonical
+            # asset's own attached_at/target fields unset.
+            from apps.media.services import lifecycle
+
+            lifecycle.sync_attachment(intent=intent, target_type="statuses.StatusItem", target_id=str(item.id))
         if target_user_ids:
             StatusAudienceTarget.objects.bulk_create(
                 [

@@ -136,3 +136,49 @@ class MediaSafetyScanSerializer(serializers.ModelSerializer):
             "updated_at",
         )
         read_only_fields = fields
+
+
+class CanonicalMediaAssetSerializer(serializers.ModelSerializer):
+    """Phase 2 of the KIS Universal Media Platform: the one response shape
+    every generic media endpoint (attach/cancel/delete) returns — never a
+    feature-specific shape. Deliberately excludes bucket/bucket_key/
+    storage_key/any raw object key or AWS information, matching
+    MediaAssetSerializer's existing bucket_key-hiding behavior for
+    non-staff (apps/media/views.py's to_representation), just made the
+    unconditional default here rather than a staff-only exception — nothing
+    that calls this serializer needs the raw key, only a signed URL
+    (GET .../signed-url/) does."""
+
+    mimeType = serializers.CharField(source="mime_type", read_only=True)
+    size = serializers.IntegerField(read_only=True)  # MediaAsset.size property (aliases .bytes)
+    originalFilename = serializers.CharField(source="original_filename", read_only=True)
+    durationMs = serializers.IntegerField(source="duration_ms", read_only=True)
+    moderationState = serializers.CharField(source="moderation_state", read_only=True)
+    confirmedAt = serializers.DateTimeField(source="confirmed_at", read_only=True)
+    attachedAt = serializers.DateTimeField(source="attached_at", read_only=True)
+    expiresAt = serializers.DateTimeField(source="expires_at", read_only=True)
+    targetType = serializers.CharField(source="target_type", read_only=True)
+    targetId = serializers.CharField(source="target_id", read_only=True)
+
+    class Meta:
+        model = MediaAsset
+        fields = (
+            "id",
+            "purpose",
+            "context",
+            "mimeType",
+            "size",
+            "originalFilename",
+            "width",
+            "height",
+            "durationMs",
+            "moderationState",
+            "visibility",
+            "status",
+            "confirmedAt",
+            "attachedAt",
+            "expiresAt",
+            "targetType",
+            "targetId",
+        )
+        read_only_fields = fields

@@ -208,6 +208,37 @@ class MediaAssetViewSet(viewsets.ModelViewSet):
                 raise ValidationError({"detail": "Storage limit reached for your plan."})
         serializer.save(owner=user)
 
+    def get_object(self):
+        # Phase 2: destroy() must remain idempotent — a repeated DELETE for
+        # an already-soft-deleted asset should 204 again, not 404, but
+        # get_queryset() (used by every other action) correctly still
+        # excludes is_deleted=True rows from list/retrieve/update. Bypass
+        # that exclusion for destroy only, so lifecycle.delete_asset's own
+        # idempotent "already deleted" branch is reachable a second time.
+        if self.action == "destroy":
+            from django.shortcuts import get_object_or_404
+
+            obj = get_object_or_404(MediaAsset.objects.select_related("owner"), pk=self.kwargs["pk"])
+            self.check_object_permissions(self.request, obj)
+            return obj
+        return super().get_object()
+
+    def perform_destroy(self, instance):
+        # Phase 2: was a raw instance.delete() (Django ModelViewSet's
+        # default) — a hard row delete, which for a canonical asset
+        # (Phase 1+) would silently discard confirmed_at/attached_at/
+        # target_type/target_id and orphan its MediaSafetyScan history.
+        # Routes through the same soft-delete service the new generic
+        # DELETE /api/v1/media/assets/:assetId/ endpoint uses (this method
+        # backs that exact URL — MediaAssetViewSet's router registration
+        # already owns it, so there's no second view/URL for it). Response
+        # shape is unchanged: DRF's destroy() always returns 204 No
+        # Content regardless of what perform_destroy does internally.
+        from .services import lifecycle as media_lifecycle
+
+        purpose = _resolve_purpose_for_asset(instance)
+        media_lifecycle.delete_asset(user=self.request.user, asset=instance, purpose=purpose)
+
     @schema_decorator(
         operation_description=(
             "Mark an upload as complete. Client should supply 'canonical_url' (optional). "
@@ -531,3 +562,110 @@ class MediaUploadConfirmView(APIView):
     def post(self, request, upload_id=None):
         result = upload_intent.confirm_upload_intent(user=request.user, upload_id=upload_id)
         return Response(result, status=status.HTTP_200_OK)
+
+
+# --------------------------------------------------------------------------
+# Phase 2: generic MediaAsset lifecycle endpoints. New features attach one
+# purpose registry entry (apps/media/purposes.py) and call these — no new
+# view, serializer, or URL of their own. Existing feature-specific
+# attach/download endpoints are untouched and continue calling their own
+# functions directly (see apps/commerce/views.py, apps/statuses/views.py);
+# the *same* functions are now also reachable through these generic routes
+# via the per-purpose hooks registered in each feature app's
+# AppConfig.ready() (apps/commerce/media_hooks.py etc.) — one
+# implementation, two doors in.
+# --------------------------------------------------------------------------
+
+from .serializers import CanonicalMediaAssetSerializer  # noqa: E402
+from .services import access as media_access  # noqa: E402
+from .services import attachments as media_attachments  # noqa: E402
+from .services import lifecycle as media_lifecycle  # noqa: E402
+
+
+class MediaAssetAttachView(APIView):
+    """POST /api/v1/media/assets/<uuid:asset_id>/attach/ — see
+    apps.media.services.attachments.attach_media for the full flow."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [DeviceBoundJWTAuthentication]
+    throttle_scope = "upload"
+
+    def post(self, request, asset_id=None):
+        target_type = str(request.data.get("targetType") or request.data.get("target_type") or "").strip()
+        target_id = str(request.data.get("targetId") or request.data.get("target_id") or "").strip()
+        slot = request.data.get("slot") or None
+        position = request.data.get("position")
+        if position is not None:
+            try:
+                position = int(position)
+            except (TypeError, ValueError):
+                raise ValidationError({"position": "Must be an integer."})
+
+        if not target_type:
+            raise ValidationError({"targetType": "This field is required."})
+        if not target_id:
+            raise ValidationError({"targetId": "This field is required."})
+
+        asset = media_attachments.attach_media(
+            user=request.user, asset_id=asset_id, target_type=target_type, target_id=target_id,
+            slot=slot, position=position,
+        )
+        return Response(CanonicalMediaAssetSerializer(asset).data, status=status.HTTP_200_OK)
+
+
+class MediaAssetSignedUrlView(APIView):
+    """GET /api/v1/media/assets/<uuid:asset_id>/signed-url/ — see
+    apps.media.services.access.get_signed_url. AllowAny at the DRF layer:
+    real authorization is fully centralized in can_user_access_media, which
+    some purposes (profile avatar/cover) deliberately allow anonymous
+    viewers through, matching current ProfileViewSet visibility — see
+    apps/accounts/media_hooks.py."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = [DeviceBoundJWTAuthentication]
+
+    def get(self, request, asset_id=None):
+        try:
+            asset = MediaAsset.objects.get(id=asset_id)
+        except (MediaAsset.DoesNotExist, ValueError, TypeError):
+            raise NotFound("Media not found.")
+
+        result = media_access.get_signed_url(user=request.user, asset=asset)
+        return Response(result, status=status.HTTP_200_OK)
+
+
+class MediaUploadCancelView(APIView):
+    """POST /api/v1/media/uploads/<uuid:upload_id>/cancel/ — deliberately
+    keyed by uploadId (MediaUploadIntent), not assetId. A pending upload
+    normally has no MediaAsset yet (_ensure_canonical_asset only runs at
+    confirm — apps/media/upload_intent.py), so an assetId-keyed cancel
+    route would have nothing to resolve for the overwhelmingly common case
+    (cancelling before confirm ever happens). See
+    apps.media.services.lifecycle.cancel_upload and the Phase 2 report."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [DeviceBoundJWTAuthentication]
+    throttle_scope = "upload"
+
+    def post(self, request, upload_id=None):
+        result = media_lifecycle.cancel_upload(user=request.user, upload_id=upload_id)
+        return Response(result, status=status.HTTP_200_OK)
+
+
+def _resolve_purpose_for_asset(asset: MediaAsset):
+    """Returns the registered MediaPurpose for `asset`, or a bare
+    placeholder (allow_delete=True, no hooks) for legacy multipart assets
+    or unregistered purposes — so lifecycle.delete_asset always has a
+    purpose object to read allow_delete/detach_handler from, without every
+    caller having to special-case "no purpose"."""
+    from . import purposes as purposes_module
+
+    if asset.purpose:
+        try:
+            return purposes_module.get_purpose(asset.purpose)
+        except KeyError:
+            pass
+    return purposes_module.MediaPurpose(
+        name=asset.purpose or "", context="", allowed_mime_types=(), max_bytes=0,
+        key_prefix="", moderation_context="", retention_days=None,
+    )

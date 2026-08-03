@@ -9,6 +9,9 @@ from .views import (
     MediaUploadInitiateView,
     ProfileImageUploadInitiateView,
     MediaUploadConfirmView,
+    MediaAssetAttachView,
+    MediaAssetSignedUrlView,
+    MediaUploadCancelView,
 )
 
 router = DefaultRouter()
@@ -35,6 +38,25 @@ urlpatterns = [
         "media/uploads/<uuid:upload_id>/confirm/",
         MediaUploadConfirmView.as_view(),
         name="media-upload-confirm",
+    ),
+    # Phase 2: generic MediaAsset lifecycle. DELETE on a single asset
+    # reuses the router-registered media/assets/<pk>/ route above
+    # (MediaAssetViewSet.perform_destroy) rather than a second URL for the
+    # same resource — see that method's docstring.
+    path(
+        "media/uploads/<uuid:upload_id>/cancel/",
+        MediaUploadCancelView.as_view(),
+        name="media-upload-cancel",
+    ),
+    path(
+        "media/assets/<uuid:asset_id>/attach/",
+        MediaAssetAttachView.as_view(),
+        name="media-asset-attach",
+    ),
+    path(
+        "media/assets/<uuid:asset_id>/signed-url/",
+        MediaAssetSignedUrlView.as_view(),
+        name="media-asset-signed-url",
     ),
     # Some app builds and server-side signed URLs omit the trailing slash on the
     # /download action.  Redirect them permanently so the token is still usable.

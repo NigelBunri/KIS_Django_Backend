@@ -1,7 +1,7 @@
 # media/tasks.py
 from celery import shared_task
 from .models import ProcessingJob, MediaAsset
-from .upload_intent import expire_abandoned_upload_intents
+from .upload_intent import expire_abandoned_upload_intents, expire_unattached_confirmed_intents
 
 
 @shared_task
@@ -12,6 +12,16 @@ def expire_abandoned_media_uploads():
     expire_media_uploads.py wraps the same function for manual/cron use
     where Beat isn't configured."""
     return expire_abandoned_upload_intents()
+
+
+@shared_task
+def expire_unattached_media_uploads():
+    """Periodic sweep for CONFIRMED uploads that were never attached to a
+    real resource (e.g. a marketplace flow where the client confirmed a
+    product photo but never finished creating the product). Never touches
+    an attached intent. Schedule via Celery Beat alongside
+    expire_abandoned_media_uploads."""
+    return expire_unattached_confirmed_intents()
 
 @shared_task(bind=True)
 def process_job_worker(self, job_id):

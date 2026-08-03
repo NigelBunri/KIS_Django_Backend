@@ -10,7 +10,7 @@ from django.utils import timezone
 from rest_framework.test import APITestCase
 from urllib.parse import urlparse
 
-from .models import MediaAsset, MediaSafetyScan, MediaUploadIntent, ProcessingJob
+from .models import MediaAsset, MediaModerationState, MediaSafetyScan, MediaUploadIntent, MediaVisibility, ProcessingJob
 from .upload_intent import expire_abandoned_upload_intents
 
 
@@ -559,3 +559,149 @@ class MediaUploadIntentTests(APITestCase):
         self.assertEqual(result["expired_count"], 1)
         intent = MediaUploadIntent.objects.get(id=upload_id)
         self.assertEqual(intent.status, MediaUploadIntent.STATUS_EXPIRED)
+
+
+@patch("apps.media.storage_backends.S3MediaStorage._client")
+class CanonicalMediaAssetTests(APITestCase):
+    """Phase 1 of the KIS Universal Media Platform: every confirmed
+    MediaUploadIntent now gets exactly one linked, canonical MediaAsset row
+    (see upload_intent._ensure_canonical_asset). These tests cover that
+    mechanism directly — MediaUploadIntentTests above already covers that
+    confirm()'s response shape/behavior is unchanged."""
+
+    INITIATE_URL = "/api/v1/media/uploads/profile-image/initiate/"
+    GENERIC_INITIATE_URL = "/api/v1/media/uploads/initiate/"
+
+    def _confirm_url(self, upload_id):
+        return f"/api/v1/media/uploads/{upload_id}/confirm/"
+
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(phone="+237670004101", password="TestPass123!", country="CM")
+
+    def _initiate_profile(self, mock_client, **overrides):
+        mock_client.return_value = _mock_s3_client()
+        self.client.force_authenticate(self.user)
+        body = {"filename": "avatar.jpg", "content_type": "image/jpeg", "size_bytes": 1_000_000, "kind": "avatar"}
+        body.update(overrides)
+        return self.client.post(self.INITIATE_URL, body, format="json")
+
+    def test_confirm_creates_exactly_one_canonical_asset(self, mock_client):
+        response = self._initiate_profile(mock_client)
+        upload_id = response.data["upload_id"]
+        object_key = response.data["object_key"]
+
+        confirm_response = self.client.post(self._confirm_url(upload_id), {}, format="json")
+
+        self.assertEqual(confirm_response.status_code, 200)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        intent = MediaUploadIntent.objects.get(id=upload_id)
+        self.assertIsNotNone(intent.canonical_asset_id)
+        asset = intent.canonical_asset
+        self.assertEqual(asset.owner_id, self.user.id)
+        self.assertEqual(asset.purpose, "profile_avatar")
+        self.assertEqual(asset.context, "profile")
+        self.assertEqual(asset.bucket_key, object_key)
+        self.assertEqual(asset.storage_key, object_key)  # alias property
+        self.assertEqual(asset.mime_type, "image/jpeg")
+        self.assertEqual(asset.bytes, 1_000_000)
+        self.assertEqual(asset.size, 1_000_000)  # alias property
+        self.assertEqual(asset.status, "ready")
+        self.assertEqual(asset.moderation_state, MediaModerationState.NOT_SCANNED)
+        self.assertEqual(asset.visibility, MediaVisibility.PRIVATE)
+        self.assertIsNotNone(asset.confirmed_at)
+        # Phase 2: profile auto-attach now syncs the canonical asset too
+        # (apps/media/upload_intent.py's _attach_profile_image calls
+        # lifecycle.sync_attachment) — was asserted None in Phase 1, before
+        # that sync existed.
+        self.assertIsNotNone(asset.attached_at)
+        self.assertEqual(asset.target_type, "accounts.Profile")
+
+    def test_repeated_confirm_does_not_create_duplicate_canonical_asset(self, mock_client):
+        response = self._initiate_profile(mock_client)
+        upload_id = response.data["upload_id"]
+
+        first = self.client.post(self._confirm_url(upload_id), {}, format="json")
+        second = self.client.post(self._confirm_url(upload_id), {}, format="json")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        intent = MediaUploadIntent.objects.get(id=upload_id)
+        # Same asset both times, not a second row.
+        first_asset_id = intent.canonical_asset_id
+        intent.refresh_from_db()
+        self.assertEqual(intent.canonical_asset_id, first_asset_id)
+
+    def test_canonical_asset_created_for_non_profile_context(self, mock_client):
+        """Proves the mechanism is generic (wired in confirm_upload_intent,
+        not profile-specific) by exercising it through the plain generic
+        initiate route with a status context, the same route
+        apps/statuses/status_media.py's real flow uses."""
+        mock_client.return_value = _mock_s3_client()
+        self.client.force_authenticate(self.user)
+        initiate = self.client.post(
+            self.GENERIC_INITIATE_URL,
+            {"context": "status_image", "filename": "status.jpg", "content_type": "image/jpeg", "size_bytes": 1_000_000},
+            format="json",
+        )
+        self.assertEqual(initiate.status_code, 201)
+        upload_id = initiate.data["uploadId"]
+
+        confirm_response = self.client.post(self._confirm_url(upload_id), {}, format="json")
+
+        self.assertEqual(confirm_response.status_code, 200)
+        intent = MediaUploadIntent.objects.get(id=upload_id)
+        self.assertIsNotNone(intent.canonical_asset_id)
+        asset = intent.canonical_asset
+        self.assertEqual(asset.purpose, "status_image")
+        self.assertEqual(asset.context, "status")
+
+    def test_canonical_asset_storage_key_hidden_from_non_staff_serializer(self, mock_client):
+        """The new storage_key/bucket_key must not become newly exposed —
+        reuses the exact assertion PrivateMediaAccessTests already makes for
+        legacy-multipart-created assets, against a canonical (presigned-
+        created) one instead."""
+        from .serializers import MediaAssetSerializer
+
+        response = self._initiate_profile(mock_client)
+        upload_id = response.data["upload_id"]
+        self.client.post(self._confirm_url(upload_id), {}, format="json")
+        asset = MediaUploadIntent.objects.get(id=upload_id).canonical_asset
+
+        data = MediaAssetSerializer(asset, context={"request": None}).data
+        self.assertNotIn("bucket_key", data)
+
+    def test_legacy_media_asset_row_loads_with_safe_defaults_for_new_fields(self, mock_client):
+        """A MediaAsset created the old way (UploadFileView-style, none of
+        the Phase 1 fields set explicitly) must keep loading and serializing
+        correctly — the whole point of making every new field nullable or
+        default-valued."""
+        legacy_asset = MediaAsset.objects.create(
+            owner=self.user, type="image", bucket_key="uploads/legacy/old.jpg",
+            mime_type="image/jpeg", bytes=2048, status="ready",
+        )
+        legacy_asset.refresh_from_db()
+        self.assertEqual(legacy_asset.purpose, "")
+        self.assertEqual(legacy_asset.context, "")
+        self.assertEqual(legacy_asset.moderation_state, MediaModerationState.NOT_SCANNED)
+        self.assertEqual(legacy_asset.visibility, MediaVisibility.PRIVATE)
+        self.assertIsNone(legacy_asset.attached_at)
+        self.assertIsNone(legacy_asset.thumbnail)
+        self.assertEqual(legacy_asset.storage_key, "uploads/legacy/old.jpg")
+
+    def test_legacy_media_upload_intent_row_loads_with_no_canonical_asset(self, mock_client):
+        """A MediaUploadIntent confirmed before Phase 1 (simulated by
+        creating the row directly, bypassing confirm()) never gets a
+        backfilled canonical_asset — Phase 1 does not retroactively touch
+        existing rows."""
+        intent = MediaUploadIntent.objects.create(
+            owner=self.user, context="profile_avatar", object_key="private/profile-images/x/old.jpg",
+            content_type="image/jpeg", size_bytes=1000,
+            status=MediaUploadIntent.STATUS_CONFIRMED,
+            expires_at=timezone.now() + timedelta(days=1),
+            confirmed_at=timezone.now(), attached_at=timezone.now(),
+        )
+        intent.refresh_from_db()
+        self.assertIsNone(intent.canonical_asset_id)
+        self.assertIsNone(intent.canonical_asset)

@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.urls import reverse
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
@@ -5,7 +7,8 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.accounts.models import User, UserContact
-from apps.media.models import MediaSafetyScan
+from apps.media.models import MediaSafetyScan, MediaUploadIntent
+from apps.media.tests import _mock_s3_client
 from apps.moderation.models import AuditLog, Flag, UserBlock
 from apps.statuses.models import (
     StatusAudienceTarget,
@@ -297,3 +300,145 @@ class StatusPrivacyContractTests(APITestCase):
         self.assertEqual(scan.owner, self.author)
         self.assertEqual(scan.status, "pending_review")
         self.assertTrue(scan.quarantine)
+
+
+INITIATE_URL = "/api/v1/media/uploads/initiate/"
+
+
+def _confirm_url(upload_id):
+    return f"/api/v1/media/uploads/{upload_id}/confirm/"
+
+
+@patch("apps.media.storage_backends.S3MediaStorage._client")
+class StatusMediaUploadTests(APITestCase):
+    """Covers the direct-to-S3 presigned-upload path for status media
+    (apps/statuses/status_media.py + StatusCreateSerializer's `media_id`
+    field) — the generic initiate/confirm views already have their own
+    coverage in apps/media/tests.py; these tests focus on the status-specific
+    attach step: context matching, one-time-use, moderation gating, and the
+    authorized media-url retrieval endpoint."""
+
+    def setUp(self):
+        self.author = User.objects.create_user(
+            phone="+2348000000201", password="password123", country="NG", display_name="Author",
+        )
+        self.contact = User.objects.create_user(
+            phone="+2348000000202", password="password123", country="NG", display_name="Contact",
+        )
+        self.stranger = User.objects.create_user(
+            phone="+2348000000203", password="password123", country="NG", display_name="Stranger",
+        )
+        UserContact.objects.create(
+            user=self.author, contact_user=self.contact,
+            contact_phone=self.contact.phone, contact_phone_number=self.contact.phone,
+            contact_display_name=self.contact.display_name,
+        )
+        UserContact.objects.create(
+            user=self.contact, contact_user=self.author,
+            contact_phone=self.author.phone, contact_phone_number=self.author.phone,
+            contact_display_name=self.author.display_name,
+        )
+
+    def _initiate_and_confirm(self, mock_client, *, context="status_image", content_type="image/jpeg", **overrides):
+        client = _mock_s3_client()
+        client.head_object.return_value = {"ContentLength": 1_000_000, "ContentType": content_type}
+        mock_client.return_value = client
+        self.client.force_authenticate(self.author)
+        body = {
+            "context": context,
+            "filename": "status.jpg",
+            "content_type": content_type,
+            "size_bytes": 1_000_000,
+        }
+        body.update(overrides)
+        initiate = self.client.post(INITIATE_URL, body, format="json")
+        assert initiate.status_code == 201, initiate.data
+        upload_id = initiate.data["uploadId"]
+        confirm = self.client.post(_confirm_url(upload_id), {}, format="json")
+        assert confirm.status_code == 200, confirm.data
+        return confirm.data["mediaId"]
+
+    def test_status_created_from_confirmed_media_binds_object_key(self, mock_client):
+        media_id = self._initiate_and_confirm(mock_client)
+
+        res = self.client.post(
+            "/api/v1/statuses/",
+            {"type": StatusType.IMAGE, "media_id": media_id, "visibility": StatusVisibility.CONTACTS},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        created = StatusItem.objects.get(id=res.data["id"])
+        intent = MediaUploadIntent.objects.get(id=media_id)
+        self.assertEqual(created.file.name, intent.object_key)
+        self.assertIsNotNone(intent.attached_at)
+
+    def test_status_media_context_must_match_declared_type(self, mock_client):
+        media_id = self._initiate_and_confirm(
+            mock_client, context="status_video", content_type="video/mp4", filename="status.mp4",
+        )
+
+        res = self.client.post(
+            "/api/v1/statuses/",
+            {"type": StatusType.IMAGE, "media_id": media_id, "visibility": StatusVisibility.CONTACTS},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(StatusItem.objects.filter(user=self.author).exists())
+
+    def test_confirmed_media_cannot_be_attached_twice(self, mock_client):
+        media_id = self._initiate_and_confirm(mock_client)
+        first = self.client.post(
+            "/api/v1/statuses/",
+            {"type": StatusType.IMAGE, "media_id": media_id, "visibility": StatusVisibility.CONTACTS},
+            format="json",
+        )
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+
+        second = self.client.post(
+            "/api/v1/statuses/",
+            {"type": StatusType.IMAGE, "media_id": media_id, "visibility": StatusVisibility.CONTACTS},
+            format="json",
+        )
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_settings(MEDIA_EXPLICIT_SCAN_REQUIRED=True, MEDIA_SAFETY_ENABLED=True)
+    def test_moderation_block_prevents_status_creation_and_leaves_media_unattached(self, mock_client):
+        media_id = self._initiate_and_confirm(mock_client)
+
+        res = self.client.post(
+            "/api/v1/statuses/",
+            {"type": StatusType.IMAGE, "media_id": media_id, "visibility": StatusVisibility.CONTACTS},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(StatusItem.objects.filter(user=self.author).exists())
+        intent = MediaUploadIntent.objects.get(id=media_id)
+        self.assertIsNone(intent.attached_at)
+        scan = MediaSafetyScan.objects.get(context="status", upload_id=str(media_id))
+        self.assertTrue(scan.quarantine)
+
+    def test_media_url_requires_view_authorization(self, mock_client):
+        media_id = self._initiate_and_confirm(mock_client)
+        create = self.client.post(
+            "/api/v1/statuses/",
+            {"type": StatusType.IMAGE, "media_id": media_id, "visibility": StatusVisibility.CONTACTS},
+            format="json",
+        )
+        status_id = create.data["id"]
+
+        self.client.force_authenticate(self.contact)
+        allowed = self.client.get(f"/api/v1/statuses/{status_id}/media-url/")
+        self.assertEqual(allowed.status_code, status.HTTP_200_OK)
+        self.assertIn("mediaUrl", allowed.data)
+
+        self.client.force_authenticate(self.stranger)
+        denied = self.client.get(f"/api/v1/statuses/{status_id}/media-url/")
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_media_url_404_for_unknown_status(self, mock_client):
+        self.client.force_authenticate(self.author)
+        res = self.client.get("/api/v1/statuses/00000000-0000-0000-0000-000000000000/media-url/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)

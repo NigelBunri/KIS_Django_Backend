@@ -37,6 +37,11 @@ urlpatterns = [
         views.CommerceDiscoveryView.as_view(),
         name='commerce-discovery',
     ),
+    path(
+        'uploads/initiate/',
+        views.CommerceUploadInitiateView.as_view(),
+        name='commerce-upload-initiate',
+    ),
     *router.urls,
     path(
         'payments/<uuid:payment_id>/satisfy/',

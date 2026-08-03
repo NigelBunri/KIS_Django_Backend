@@ -16,3 +16,7 @@ class CommerceConfig(AppConfig):
             ensure_catalog_categories()
         except (OperationalError, ProgrammingError):
             pass
+
+        from .media_hooks import register as register_media_hooks
+
+        register_media_hooks()

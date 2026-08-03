@@ -556,6 +556,28 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_SOFT_TIME_LIMIT = 300   # seconds — raises SoftTimeLimitExceeded for graceful cleanup
 CELERY_TASK_TIME_LIMIT = 360        # hard kill after 6 minutes
 
+# Periodic media-upload cleanup (apps/media/tasks.py). Both tasks wrap
+# functions in apps/media/upload_intent.py that were already correct but had
+# no scheduler actually invoking them — the management command
+# (expire_media_uploads) was the only working invocation path, requiring an
+# external cron. Without one of the two, abandoned upload intents and
+# confirmed-but-never-attached uploads accumulate indefinitely (S3 objects
+# included) in any deployment that runs `celery beat`.
+CELERY_BEAT_SCHEDULE = {
+    "expire-abandoned-media-uploads": {
+        "task": "apps.media.tasks.expire_abandoned_media_uploads",
+        # Matches the shortest default presign lifetime (10 min) with room
+        # to spare — see PROFILE_IMAGE_PRESIGN_EXPIRY_SECONDS below.
+        "schedule": 15 * 60,
+    },
+    "expire-unattached-media-uploads": {
+        "task": "apps.media.tasks.expire_unattached_media_uploads",
+        # MEDIA_UPLOAD_UNATTACHED_GRACE_SECONDS defaults to 24h, so there's
+        # no benefit to sweeping more often than hourly.
+        "schedule": 60 * 60,
+    },
+}
+
 # NEW: media-service URL for background removal microservice
 # This is what your Celery task uses to call the external service.
 MEDIA_SERVICE_URL = os.environ.get(

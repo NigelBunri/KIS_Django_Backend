@@ -84,10 +84,9 @@ class StatusViewSet(viewsets.ModelViewSet):
         return outgoing_contact_ids, incoming_contact_ids, mutual_contact_ids
 
     def _get_blocked_user_ids(self) -> set[str]:
-        user = self.request.user
-        blocked_by_me = UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
-        blocked_me = UserBlock.objects.filter(blocked=user).values_list("blocker_id", flat=True)
-        return {str(value) for value in blocked_by_me} | {str(value) for value in blocked_me}
+        from .services import get_blocked_user_ids
+
+        return get_blocked_user_ids(self.request.user)
 
     def _get_muted_user_ids(self) -> set[str]:
         return {
@@ -116,39 +115,20 @@ class StatusViewSet(viewsets.ModelViewSet):
         author_contact_ids: dict[str, set[str]] | None = None,
         mutual_contact_ids: set[str] | None = None,
     ) -> bool:
-        author_id = str(status_item.user_id)
-        if author_id == viewer_id:
-            return True
-        if author_id in blocked_user_ids or viewer_id in blocked_user_ids:
-            return False
+        # Extracted to apps/statuses/services.py in Phase 2 so
+        # apps/statuses/media_hooks.py's access_authorizer (used by the
+        # generic media signed-URL endpoint) can share the exact same logic
+        # instead of a second copy — this method is now a thin wrapper, zero
+        # behavior change, still covered by StatusPrivacyContractTests.
+        from .services import can_view_status
 
-        target_ids = {
-            str(target.target_user_id)
-            for target in getattr(status_item, "_prefetched_objects_cache", {}).get("audience_targets", [])
-        }
-        if not target_ids:
-            target_ids = {
-                str(value)
-                for value in status_item.audience_targets.values_list("target_user_id", flat=True)
-            }
-
-        contacts_for_author = (author_contact_ids or {}).get(author_id)
-        if contacts_for_author is None:
-            contacts_for_author = set(
-                str(value)
-                for value in UserContact.objects.filter(
-                    user_id=author_id,
-                    contact_user__isnull=False,
-                ).values_list("contact_user_id", flat=True)
-            )
-
-        if status_item.visibility == StatusVisibility.CONTACTS:
-            return viewer_id in contacts_for_author
-        if status_item.visibility == StatusVisibility.CONTACTS_EXCEPT:
-            return viewer_id in contacts_for_author and viewer_id not in target_ids
-        if status_item.visibility == StatusVisibility.ONLY_SHARE_WITH:
-            return viewer_id in target_ids
-        return False
+        return can_view_status(
+            status_item,
+            viewer_id=viewer_id,
+            blocked_user_ids=blocked_user_ids,
+            author_contact_ids=author_contact_ids,
+            mutual_contact_ids=mutual_contact_ids,
+        )
 
     def _base_status_queryset(self):
         now = timezone.now()
@@ -284,11 +264,12 @@ class StatusViewSet(viewsets.ModelViewSet):
         features = get_user_tier_features(user)
         limit_mb = normalize_limit_value(features.get("media_storage_mb"), default=None)
         if limit_mb is not None:
+            limit_bytes = int(limit_mb) * 1024 * 1024
             file_obj = self.request.FILES.get("file")
-            if file_obj:
-                limit_bytes = int(limit_mb) * 1024 * 1024
-                if file_obj.size > limit_bytes:
-                    raise ValidationError({"detail": "Status file exceeds your storage limit."})
+            resolved_intent = getattr(serializer, "_resolved_media_intent", None)
+            incoming_bytes = file_obj.size if file_obj else (resolved_intent.size_bytes if resolved_intent else None)
+            if incoming_bytes is not None and incoming_bytes > limit_bytes:
+                raise ValidationError({"detail": "Status file exceeds your storage limit."})
         retention_days = features.get("status_retention_days")
         expires_at = None
         if isinstance(retention_days, int) and retention_days > 0:
@@ -347,6 +328,37 @@ class StatusViewSet(viewsets.ModelViewSet):
             metadata={"author_id": str(status_item.user_id)},
         )
         return Response({"viewed": True, "id": str(status_item.id)}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="media-url")
+    def media_url(self, request, pk=None):
+        try:
+            status_item = self._base_status_queryset().get(id=pk)
+        except StatusItem.DoesNotExist:
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not status_item.file:
+            return Response({"detail": "This status has no media."}, status=status.HTTP_404_NOT_FOUND)
+
+        _, _, mutual_contact_ids = self._get_status_contacts()
+        blocked_user_ids = self._get_blocked_user_ids()
+        if not self._can_view_status(
+            status_item,
+            viewer_id=str(request.user.id),
+            blocked_user_ids=blocked_user_ids,
+            author_contact_ids=self._get_author_contact_ids({str(status_item.user_id)}),
+            mutual_contact_ids=mutual_contact_ids,
+        ):
+            return Response({"detail": "You cannot view this status."}, status=status.HTTP_403_FORBIDDEN)
+
+        from django.core.files.storage import default_storage
+
+        return Response(
+            {
+                "mediaUrl": status_item.file.url,
+                "expiresInSeconds": getattr(default_storage, "presigned_expiry", 3600),
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=False, methods=["get"], url_path="search")
     def search(self, request):

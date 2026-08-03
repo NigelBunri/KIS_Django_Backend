@@ -60,6 +60,18 @@ class SupabaseStorage(Storage):
       SUPABASE_STORAGE_API_URL=https://<project-ref>.storage.supabase.co/storage/v1
     """
 
+    # Capability marker checked by apps.media.apps.MediaConfig.ready() at
+    # startup. This backend has no generate_presigned_put()/
+    # head_object_meta() — apps/media/upload_intent.py's presigned-PUT
+    # handshake (profile/marketplace/status uploads) would previously
+    # AttributeError on the first real request rather than failing clearly.
+    # Selecting this provider now fails at startup instead — see
+    # _validate_storage_backend_capabilities in apps.py. Implementing a real
+    # Supabase-compatible presigned-upload flow (Supabase Storage's
+    # sign-upload-url API) is tracked as future work, not attempted here
+    # without a live instance to verify it against.
+    supports_presigned_uploads = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         base_url = _env("SUPABASE_STORAGE_API_URL") or f"{_env('SUPABASE_URL').rstrip('/')}/storage/v1"
@@ -170,6 +182,12 @@ class S3MediaStorage(Storage):
       AWS_S3_PUBLIC_BUCKET=True
       AWS_S3_PRESIGNED_EXPIRY_SECONDS=3600
     """
+
+    # See SupabaseStorage.supports_presigned_uploads — this backend
+    # implements the full contract (generate_presigned_put + head_object_meta
+    # below), so it's the only one apps.media.upload_intent's presigned
+    # handshake can safely run against today.
+    supports_presigned_uploads = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

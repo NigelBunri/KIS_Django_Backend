@@ -16,9 +16,50 @@ class BaseEntity(models.Model):
     class Meta:
         abstract = True
 
+class MediaModerationState(models.TextChoices):
+    """Projected, queryable moderation state on MediaAsset. Distinct from
+    MediaSafetyScan, which stays the append-only audit trail of every scan
+    attempt (provider, version, result history) — this field is just the
+    current, at-a-glance answer derived from that trail. Phase 1 sets every
+    canonical-asset row created from a presigned upload to NOT_SCANNED,
+    since none of the three migrated presigned flows (profile/commerce)
+    actually make a moderation decision before the asset exists today —
+    only statuses does, and that decision already lives entirely on
+    MediaSafetyScan. Wiring this field to real decisions is Phase 2+ work."""
+
+    NOT_SCANNED = "not_scanned", "Not scanned"
+    PASSED = "passed", "Passed"
+    PENDING_REVIEW = "pending_review", "Pending review"
+    QUARANTINED = "quarantined", "Quarantined"
+
+
+class MediaVisibility(models.TextChoices):
+    PRIVATE = "private", "Private"
+    PUBLIC = "public", "Public"
+
+
 class MediaAsset(BaseEntity):
     """
-    Core asset with packed advanced fields
+    Core asset with packed advanced fields.
+
+    Phase 1 of the KIS Universal Media Platform designates this model as
+    the canonical media entity going forward: every MediaUploadIntent that
+    reaches CONFIRMED now gets exactly one linked MediaAsset row (see
+    MediaUploadIntent.canonical_asset and
+    apps.media.upload_intent._ensure_canonical_asset), created once,
+    idempotently, inside the same transaction confirm() already uses.
+
+    The fields below `metadata` were added in that phase — all nullable or
+    default-valued, so every pre-Phase-1 row keeps loading unchanged and no
+    backfill migration was required. `bucket_key`/`bytes`/`status` (the
+    original fields above) are deliberately left as-is rather than renamed
+    to `storage_key`/`size`/a new lifecycle enum — `storage_key` and `size`
+    below are read-only aliases, and `status` keeps its original
+    pending/ready/blocked meaning for the legacy multipart path
+    (UploadFileView) that already depends on it; the presigned-upload path
+    always creates rows with status="ready" (see _ensure_canonical_asset)
+    since a MediaAsset is only ever created once the S3 object is already
+    confirmed to exist.
     """
     MEDIA_TYPES = [
         ("image", "Image"),
@@ -42,9 +83,50 @@ class MediaAsset(BaseEntity):
     storage = models.JSONField(default=dict, blank=True)       # { tier, retentionPolicy }
     metadata = models.JSONField(default=dict, blank=True)      # generic extensible metadata
 
+    # --- Phase 1 additions: canonical-asset metadata (all additive/nullable) ---
+    # `purpose` mirrors MediaUploadIntent.context's value exactly (e.g.
+    # "status_image") for rows created via the presigned flow; blank for
+    # legacy multipart rows (UploadFileView never had a purpose concept).
+    purpose = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    # `context` is the broader feature bucket a purpose belongs to (e.g.
+    # "status" for "status_image"/"status_video"/"status_audio") — see
+    # apps.media.purposes.MediaPurpose.context. Distinct from `purpose`
+    # itself the same way apps.media.safety's moderation contexts are
+    # already a coarser grouping than upload_intent's per-feature contexts.
+    context = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    target_type = models.CharField(max_length=64, blank=True, default="")
+    target_id = models.CharField(max_length=64, blank=True, default="")
+    original_filename = models.CharField(max_length=512, blank=True, default="")
+
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    duration_ms = models.PositiveIntegerField(null=True, blank=True)
+    thumbnail = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="thumbnail_of",
+    )
+
+    moderation_state = models.CharField(
+        max_length=20, choices=MediaModerationState.choices,
+        default=MediaModerationState.NOT_SCANNED, db_index=True,
+    )
+    visibility = models.CharField(
+        max_length=16, choices=MediaVisibility.choices, default=MediaVisibility.PRIVATE,
+    )
+
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    attached_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    error_code = models.CharField(max_length=64, blank=True, default="")
+    error_message = models.CharField(max_length=512, blank=True, default="")
+
     class Meta:
         indexes = [
             models.Index(fields=["type", "status"]),
+            models.Index(fields=["purpose", "status"]),
+            models.Index(fields=["owner", "purpose"]),
+            models.Index(fields=["target_type", "target_id"]),
         ]
 
     def __str__(self):
@@ -55,6 +137,18 @@ class MediaAsset(BaseEntity):
         if url:
             self.canonical_url = url
         self.save(update_fields=["status", "canonical_url", "updated_at"])
+
+    # Read-only naming aliases so Phase 2+ code (and the purpose registry)
+    # can use the canonical field names from the platform design doc without
+    # a migration renaming `bucket_key`/`bytes` — both already mean exactly
+    # this on every row, presigned-created or legacy-multipart-created.
+    @property
+    def storage_key(self) -> str:
+        return self.bucket_key
+
+    @property
+    def size(self) -> int:
+        return self.bytes
 
 class MediaVariant(BaseEntity):
     asset = models.ForeignKey(MediaAsset, related_name="variants", on_delete=models.CASCADE)
@@ -195,8 +289,28 @@ class MediaUploadIntent(BaseEntity):
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True)
     expires_at = models.DateTimeField(db_index=True)
     confirmed_at = models.DateTimeField(null=True, blank=True)
+    # Set once a confirmed upload has actually been attached to a real
+    # resource (e.g. a Shop/Product/Service image, a complaint attachment).
+    # Distinguishes "confirmed but orphaned" (never attached — safe to
+    # garbage-collect after a grace period) from "confirmed and in use"
+    # (must never be swept). Contexts that auto-attach at confirm time
+    # (profile_avatar, profile_cover) set this in the same call that sets
+    # confirmed_at; contexts with a separate explicit attach step (commerce)
+    # set it only when that attach call actually succeeds.
+    attached_at = models.DateTimeField(null=True, blank=True)
     error_code = models.CharField(max_length=64, blank=True)
     error_message = models.CharField(max_length=512, blank=True)
+
+    # Phase 1: link to the canonical MediaAsset row created once this intent
+    # reaches CONFIRMED (see apps.media.upload_intent._ensure_canonical_asset).
+    # Nullable/SET_NULL so every pre-Phase-1 row loads unchanged with no
+    # backfill — only intents confirmed after this field existed ever get it
+    # populated. One-to-one, not a FK, because an intent can never fan out to
+    # more than one canonical asset (mirrors attached_at's "exactly once"
+    # semantics one level up).
+    canonical_asset = models.OneToOneField(
+        MediaAsset, null=True, blank=True, on_delete=models.SET_NULL, related_name="source_intent",
+    )
 
     class Meta:
         indexes = [
@@ -216,11 +330,27 @@ class MediaUploadIntent(BaseEntity):
         self.confirmed_at = timezone.now()
         self.save(update_fields=["status", "confirmed_at", "updated_at"])
 
+    def mark_attached(self):
+        if self.attached_at is not None:
+            return
+        self.attached_at = timezone.now()
+        self.save(update_fields=["attached_at", "updated_at"])
+
     def mark_failed(self, code: str, message: str):
         self.status = self.STATUS_FAILED
         self.error_code = code[:64]
         self.error_message = message[:512]
         self.save(update_fields=["status", "error_code", "error_message", "updated_at"])
+
+    def mark_aborted(self):
+        """Phase 2: user-initiated cancellation of a not-yet-confirmed
+        upload. STATUS_ABORTED has existed since Phase 0/1's STATUS_CHOICES
+        but nothing wrote it until apps.media.services.lifecycle.cancel_upload —
+        no migration needed, this is a new method over an existing column."""
+        if self.status == self.STATUS_ABORTED:
+            return
+        self.status = self.STATUS_ABORTED
+        self.save(update_fields=["status", "updated_at"])
 
 
 class MediaSafetyScan(BaseEntity):
