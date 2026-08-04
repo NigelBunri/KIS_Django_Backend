@@ -255,6 +255,20 @@ class MediaSafetyUploadTests(APITestCase):
         self.assertIn("generic MIME type", str(response.data))
         self.assertEqual(MediaSafetyScan.objects.count(), 0)
 
+    def test_upload_rejects_a_zero_byte_voice_note_before_storage(self):
+        upload = SimpleUploadedFile("voice.m4a", b"", content_type="audio/mp4")
+
+        response = self.client.post(
+            "/uploads/file",
+            {"file": upload, "context": "chat", "visibility": "private"},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("empty", str(response.data).lower())
+        self.assertEqual(MediaSafetyScan.objects.count(), 0)
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
     def test_upload_blocks_mismatched_extension_and_mime_before_storage(self):
         upload = SimpleUploadedFile("photo.pdf", b"fake image bytes", content_type="image/jpeg")
 

@@ -13,6 +13,7 @@ from .views import (
     MediaAssetSignedUrlView,
     MediaUploadCancelView,
 )
+from .views_internal import ChatVoicePlaybackSignView
 
 router = DefaultRouter()
 router.register(r"media/assets", MediaAssetViewSet, basename="asset")
@@ -57,6 +58,14 @@ urlpatterns = [
         "media/assets/<uuid:asset_id>/signed-url/",
         MediaAssetSignedUrlView.as_view(),
         name="media-asset-signed-url",
+    ),
+    # Trusted-internal only (apps.chat.internal_auth) — Nest calls this to
+    # refresh an expired/expiring voice-note playback URL after verifying
+    # conversation membership itself. See apps/media/views_internal.py.
+    path(
+        "media/internal/chat-voice/sign/",
+        ChatVoicePlaybackSignView.as_view(),
+        name="media-internal-chat-voice-sign",
     ),
     # Some app builds and server-side signed URLs omit the trailing slash on the
     # /download action.  Redirect them permanently so the token is still usable.

@@ -216,7 +216,9 @@ def validate_upload_file_safety(upload, *, context: str = "general") -> None:
         raise ValidationError({"detail": "This file type is not allowed on KIS."})
     if ext and ext not in configured_allowed_extensions():
         raise ValidationError({"detail": "This file extension is not allowed on KIS."})
-    if getattr(upload, "size", 0) and int(upload.size) > max_bytes:
+    if not getattr(upload, "size", 0):
+        raise ValidationError({"detail": "This file is empty."})
+    if int(upload.size) > max_bytes:
         raise ValidationError({"detail": "File too large."})
     if not content_type:
         raise ValidationError({"detail": "Unable to identify the upload MIME type."})

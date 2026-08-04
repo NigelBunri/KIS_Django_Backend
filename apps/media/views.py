@@ -1,10 +1,8 @@
 # media/views.py
-import os
 import uuid
 from urllib.parse import quote
 
 from django.conf import settings
-from django.core import signing
 from django.core.files.storage import default_storage
 from django.http import FileResponse
 from django.utils.text import get_valid_filename
@@ -32,8 +30,12 @@ from .safety import (
     user_safe_upload_response,
     validate_upload_file_safety,
 )
+from .signing import (
+    MEDIA_SIGNED_URL_TTL_SECONDS,
+    sign_media_asset_token as _sign_media_asset,
+    token_allows_asset as _token_allows_asset,
+)
 
-MEDIA_SIGNED_URL_TTL_SECONDS = int(os.environ.get("MEDIA_SIGNED_URL_TTL_SECONDS", "3600"))
 PRIVATE_VISIBILITY_VALUES = {"private", "restricted", "owner", "authenticated", "tenant"}
 PUBLIC_VISIBILITY_VALUES = {"public", "published", "open"}
 
@@ -84,23 +86,6 @@ def _user_can_access_asset(user, asset: MediaAsset) -> bool:
         return False
     return bool(user.is_staff or asset.owner_id == user.id)
 
-
-def _sign_media_asset(asset: MediaAsset) -> str:
-    signer = signing.TimestampSigner(salt="kis-media-download")
-    return signer.sign(str(asset.id))
-
-
-def _token_allows_asset(token: str | None, asset: MediaAsset) -> bool:
-    if not token:
-        return False
-    signer = signing.TimestampSigner(salt="kis-media-download")
-    try:
-        value = signer.unsign(token, max_age=MEDIA_SIGNED_URL_TTL_SECONDS)
-    except signing.BadSignature:
-        return False
-    except signing.SignatureExpired:
-        return False
-    return str(value) == str(asset.id)
 
 # --- Swagger / OpenAPI compatibility shim (drf-yasg first, then drf-spectacular) ---
 try:

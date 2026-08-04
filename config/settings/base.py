@@ -489,6 +489,12 @@ REST_FRAMEWORK = {
         "upload": _env_throttle_rate("THROTTLE_UPLOAD", dev_default="6000/min", prod_default="300/min"),
         "search": _env_throttle_rate("THROTTLE_SEARCH", dev_default="6000/min", prod_default="600/min"),
         "messaging": _env_throttle_rate("THROTTLE_MESSAGING", dev_default="6000/min", prod_default="1200/min"),
+        # Trusted-internal Nest->Django chat-voice URL signing. Keyed by IP
+        # (AllowAny + internal-token auth means there's no request.user) —
+        # a blanket cap on the whole endpoint if the internal token ever
+        # leaked, not per-end-user limiting (Nest already rate-limits the
+        # RN-facing playback-url endpoint per user).
+        "chat_voice_sign": _env_throttle_rate("THROTTLE_CHAT_VOICE_SIGN", dev_default="6000/min", prod_default="1200/min"),
         "broadcast_profile_create": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_CREATE", dev_default="6000/min", prod_default="60/min"),
         "broadcast_profile_manage": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_MANAGE", dev_default="6000/min", prod_default="300/min"),
         "broadcast_profile_attachment": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_ATTACHMENT", dev_default="6000/min", prod_default="300/min"),

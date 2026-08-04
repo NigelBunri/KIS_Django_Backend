@@ -295,6 +295,19 @@ class S3MediaStorage(Storage):
             raise FileNotFoundError(name) from exc
         return int(response.get("ContentLength") or 0)
 
+    def generate_presigned_get(self, key: str, expires_in: int) -> str:
+        """Presigned GET with a caller-specified TTL, independent of
+        self.presigned_expiry (which backs the general-purpose .url() above).
+        Used by apps.media.services.chat_voice_playback to issue short-lived
+        chat-voice playback URLs without changing the site-wide default.
+        Reuses the same _client() as .url()/generate_presigned_put — see that
+        method's docstring for why (SignatureDoesNotMatch avoidance)."""
+        return self._client().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket, "Key": self._object_key(key)},
+            ExpiresIn=expires_in,
+        )
+
     def generate_presigned_put(self, key: str, content_type: str, expires_in: int) -> str:
         """Presigned PUT for direct-to-S3 client uploads (never returns credentials).
 
