@@ -1,5 +1,5 @@
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from . import models
 from .realtime import notify_main_tab_badges_updated
@@ -205,25 +205,37 @@ def create_notification(user_id, type, template_key=None, context=None, channel=
         except models.NotificationTemplate.DoesNotExist:
             template = None
 
-    notif = models.Notification.objects.create(
-        user_id=user_id,
-        template=template,
-        type=type,
-        title=title or "",
-        body=body or "",
-        target_type=kwargs.get("target_type"),
-        target_id=kwargs.get("target_id"),
-        channel="IN_APP",
-        priority=priority,
-        actions_json=kwargs.get("actions_json", []),
-        personalization_score=kwargs.get("personalization_score", 0.0),
-        sentiment=kwargs.get("sentiment", "NEUTRAL"),
-        reward_points=kwargs.get("reward_points"),
-        is_snoozed=kwargs.get("is_snoozed", False),
-        snoozed_until=kwargs.get("snoozed_until"),
-        context_data=context_data,
-        dedup_key=dedup_key,
-    )
+    try:
+        with transaction.atomic():
+            notif = models.Notification.objects.create(
+                user_id=user_id,
+                template=template,
+                type=type,
+                title=title or "",
+                body=body or "",
+                target_type=kwargs.get("target_type"),
+                target_id=kwargs.get("target_id"),
+                channel="IN_APP",
+                priority=priority,
+                actions_json=kwargs.get("actions_json", []),
+                personalization_score=kwargs.get("personalization_score", 0.0),
+                sentiment=kwargs.get("sentiment", "NEUTRAL"),
+                reward_points=kwargs.get("reward_points"),
+                is_snoozed=kwargs.get("is_snoozed", False),
+                snoozed_until=kwargs.get("snoozed_until"),
+                context_data=context_data,
+                dedup_key=dedup_key,
+            )
+    except IntegrityError:
+        if not dedup_key:
+            raise
+        # Lost a race against a concurrent caller creating the same
+        # (user_id, dedup_key) notification — e.g. two overlapping webhook
+        # redeliveries both passed the existence check above before either
+        # committed. Reuse the winner's row instead of erroring out.
+        notif = models.Notification.objects.get(user_id=user_id, dedup_key=dedup_key, is_deleted=False)
+        ensure_notification_deliveries(notif, kwargs.get("channels"))
+        return notif
 
     # Create delivery records. Every in-app notification also gets a related push delivery.
     preferred_channels = []

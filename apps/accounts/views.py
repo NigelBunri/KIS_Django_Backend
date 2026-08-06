@@ -9,6 +9,7 @@ Changes:
 
 from typing import Optional, Iterable
 import datetime
+import logging
 import os
 import re
 from django.conf import settings
@@ -2666,29 +2667,50 @@ class GlobalJobBoardView(generics.ListAPIView):
 # Multi-device QR Login Views
 # ===========================================================================
 
+logger = logging.getLogger(__name__)
+
 IS_AUTH = (IsAuthenticated,)
 _QR_JWT_AUTH = (DeviceBoundJWTAuthentication,)
 
 
-def _send_push_to_device(user: User, device: Device, title: str, body: str) -> None:
-    """Best-effort push notification to a specific device. Swallows all errors."""
+def _send_push_to_device(user: User, device: Device, title: str, body: str, dedup_key: str | None = None) -> None:
+    """Best-effort account-security notification ("new device linked").
+
+    Was previously an ad-hoc direct call into apps.notifications.firebase
+    that referenced fields that don't exist on either model involved
+    (NotificationDeviceToken has no `user`/`token` fields — it's `user_id`/
+    `push_token`; Notification has no `user`/`notification_type` fields —
+    it's `user_id`/`type`), so every call raised inside the try/except and
+    was silently swallowed — this notification has never actually been
+    delivered. Routed through the canonical apps.notifications.services
+    entrypoint instead, which is also the only path that creates the in-app
+    record, applies the user's notification preferences/quiet hours, and
+    tracks delivery — none of which the old code did even when it worked.
+
+    Goes to all of the user's registered devices/tokens (not just the named
+    `device` parameter) — this is a security-relevant alert about the
+    account, not a per-device chat message, so every device should see it,
+    matching how a "new device linked" notice works on mainstream messaging
+    apps.
+    """
     try:
-        from apps.notifications.models import NotificationDeviceToken, Notification
-        from apps.notifications.firebase import send_push
-        token_obj = NotificationDeviceToken.objects.filter(
-            user=user, device_id=str(device.device_id)
-        ).first()
-        if token_obj and token_obj.token:
-            notif = Notification(
-                user=user,
-                title=title,
-                body=body,
-                notification_type="device.linked",
-                channel="PUSH",
-            )
-            send_push(token_obj.token, notif)
+        from apps.notifications.services import create_notification
+
+        create_notification(
+            user_id=user.id,
+            type="device.linked",
+            title=title,
+            body=body,
+            target_type="accounts.Device",
+            # Notification.target_id is a UUIDField — Device.device_id is an
+            # arbitrary client-supplied string, not guaranteed to be a UUID.
+            # Device.id (the row's own UUID primary key) is the field that
+            # actually satisfies that constraint.
+            target_id=device.id,
+            dedup_key=dedup_key,
+        )
     except Exception:
-        pass
+        logger.exception("device.linked notification failed for user_id=%s", getattr(user, "id", None))
 
 
 def _send_recovery_email(user: User, recovery_code: str) -> None:
@@ -2842,6 +2864,11 @@ class DeviceQRLoginView(APIView):
                 qr_token.parent_device,
                 title="New device linked",
                 body=f"New device linked: {device_name or device_id}",
+                # Keyed to this specific QR token rather than the device, so a
+                # client retry of the same login POST (racing DeviceQRToken.consume's
+                # own unguarded read-then-write) can't fan out a second push for
+                # the same login event, while a genuine future relink still notifies.
+                dedup_key=f"device.linked:qr_token:{qr_token.id}",
             )
 
         return Response(

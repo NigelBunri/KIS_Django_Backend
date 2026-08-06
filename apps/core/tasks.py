@@ -115,6 +115,7 @@ def send_medication_adherence_reminders(self):
                 "patient_id": str(reminder.patient_id),
                 "medication_order_id": str(reminder.medication_order_id) if reminder.medication_order_id else None,
             },
+            dedup_key=f"medication:adherence:{reminder.id}",
         )
         reminder.status = models.MedicationAdherenceReminder.STATUS_SENT
         reminder.save(update_fields=["status"])

@@ -46,12 +46,25 @@ def process_notification_delivery(self, notification_id):
 
                 sent = False
                 errors = []
+                stale_token_ids = []
                 for token in tokens:
-                    ok, result = firebase.send_push(token.push_token, notif)
+                    ok, result, is_stale = firebase.send_push(token.push_token, notif)
                     if ok:
                         sent = True
                     else:
                         errors.append(result)
+                        if is_stale:
+                            stale_token_ids.append(token.id)
+                if stale_token_ids:
+                    # Permanently invalid — deactivate now rather than
+                    # re-attempting (and re-failing) on every future
+                    # notification to this user. Mirrors Nest's identical
+                    # bulkDeactivate-on-stale-response behavior.
+                    deactivated = models.NotificationDeviceToken.objects.filter(
+                        id__in=stale_token_ids
+                    ).update(enabled=False)
+                    if deactivated:
+                        logger.info("Deactivated %d stale push token(s).", deactivated)
                 if sent:
                     delivery.status = "SENT"
                     delivery.delivered_at = timezone.now()

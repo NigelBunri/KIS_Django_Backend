@@ -91,6 +91,18 @@ class Notification(BaseEntity):
         indexes = [
             models.Index(fields=["user_id", "is_read", "created_at"]),
         ]
+        constraints = [
+            # Closes a race window in services.create_notification: two concurrent
+            # callers (e.g. overlapping webhook redeliveries) with the same
+            # dedup_key could both pass the "does it exist?" check before either
+            # commits. This constraint makes the DB the final arbiter so at most
+            # one active (non-deleted) Notification can exist per (user, dedup_key).
+            models.UniqueConstraint(
+                fields=["user_id", "dedup_key"],
+                condition=models.Q(dedup_key__isnull=False, is_deleted=False),
+                name="uniq_active_notification_user_dedup_key",
+            ),
+        ]
 
     def mark_read(self):
         if not self.is_read:

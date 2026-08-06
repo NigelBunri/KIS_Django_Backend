@@ -489,24 +489,28 @@ class MentionNotificationView(APIView):
             if str(user.id) == str(request.user.id):
                 continue  # don't notify yourself
 
-            notif = models.Notification.objects.create(
+            # Routed through the canonical create_notification entrypoint (like
+            # every other producer) instead of building the Notification row by
+            # hand — that path both applies user preferences/deliveries and,
+            # via dedup_key, prevents a client retry of this endpoint (or a
+            # duplicate mention submission for the same message) from fanning
+            # out a second mention push. Without a message_id there's no stable
+            # identity to dedupe against, so dedup is skipped in that case
+            # rather than risking suppressing an unrelated, legitimate mention.
+            dedup_key = f"mention:{conversation_id}:{message_id}:{user.id}" if message_id else None
+            services.create_notification(
                 user_id=user.id,
                 type="mention",
                 title=f"{sender_name} mentioned you",
                 body=preview or f"{sender_name} mentioned you in a conversation.",
-                context_data={
+                context={
                     "conversation_id": conversation_id,
                     "message_id": message_id,
                     "sender_id": str(request.user.id),
                     "sender_name": sender_name,
                 },
+                dedup_key=dedup_key,
             )
-            # trigger async delivery
-            try:
-                from .tasks import process_notification_delivery
-                process_notification_delivery.delay(str(notif.id))
-            except Exception:
-                pass
             created += 1
 
         return Response({"created": created})

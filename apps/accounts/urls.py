@@ -1,6 +1,7 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
+from .views_internal import NotificationPreferencesInternalView
 from .views import (
     CheckContact,
     EducationViewSet,
@@ -108,6 +109,14 @@ urlpatterns = [
     path("auth/devices/<str:device_id>/rename/", DeviceRenameView.as_view(), name="device-rename"),
     path("auth/devices/<str:device_id>/", DeviceSessionDetailView.as_view(), name="auth-device-detail"),
     path("profile-preferences/family-accessibility/", FamilyAccessibilityPreferencesView.as_view(), name="family-accessibility-preferences"),
+    # Trusted-internal only (apps.chat.internal_auth) — Nest calls this to
+    # check a user's chat/call notification preferences before sending a
+    # push. See apps/accounts/views_internal.py.
+    path(
+        "profile-preferences/internal/notification-prefs/",
+        NotificationPreferencesInternalView.as_view(),
+        name="profile-preferences-internal-notification-prefs",
+    ),
 
     # Optional: direct SimpleJWT endpoints (tooling-friendly)
     path("auth/jwt/create/",  LoginView.as_view(), name="jwt-create"),
