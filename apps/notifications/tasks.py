@@ -191,9 +191,10 @@ def compile_and_send_digests(period_start_iso: str, period_end_iso: str):
         if email_addr:
             from apps.notifications.email_service import send_notification_email
             lines = "\n".join(f"• {n['title']}: {n['summary']}" for n in payload[:20])
-            send_notification_email(
+            if not send_notification_email(
                 to_email=email_addr,
                 title=f"Your KIS digest — {len(payload)} update(s)",
                 body=lines,
-            )
+            ):
+                logger.warning("Digest email failed for user_id=%s digest_id=%s", uid, digest.id)
     return True

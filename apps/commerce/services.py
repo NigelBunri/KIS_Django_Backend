@@ -162,16 +162,23 @@ def build_recommendations(user_id) -> List[Dict[str, Any]]:
     """
     Use simple collaborative/content hybrid stub:
     - fetch popular products
-    - score by ai_score and shop trust
+    - score by featured status and shop trust
     Returns list of {type:'Product', id:uuid, score:float, reason:str}
+
+    Previously ordered by `-ai_score`, a field that has never existed on
+    Product (confirmed via the model's real field list) — every call to
+    this function raised FieldError. No AI scoring mechanism exists
+    anywhere in this codebase to compute such a field, so rather than add
+    a speculative new column, this uses Product.is_featured (a real,
+    already-existing signal) as the popularity proxy instead.
     """
-    popular = Product.objects.filter(is_active=True).order_by('-ai_score')[:10]
+    popular = Product.objects.filter(is_active=True).order_by('-is_featured', '-created_at')[:10]
     out = []
     for p in popular:
-        score = float(p.ai_score or 0.0)
+        score = 1.0 if p.is_featured else 0.5
         if p.shop.is_verified:
             score += 0.1
-        out.append({'type':'Product','id':p.id,'score':score,'reason':'popular/ai_score'})
+        out.append({'type': 'Product', 'id': p.id, 'score': score, 'reason': 'popular/featured'})
     return out
 
 

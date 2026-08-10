@@ -992,18 +992,22 @@ class GroupsAndCommunitiesTests(TestCase):
         self.assertIn(res.status_code, [200, 201, 400])
 
     def test_create_group(self):
-        """User can create a group."""
-        res = self.client.post("/api/v1/groups/", {
+        """User can create a group.
+
+        /api/v1/groups/ was apps.core's dead, superseded generic Group
+        implementation (removed in Phase 8 — it was shadowing the real
+        apps.communities app at a different path). The real, chat-backed
+        group creation endpoint has always been /api/v1/chat-groups/
+        (apps.groups.chat_urls) — this test now points there.
+        """
+        res = self.client.post("/api/v1/chat-groups/", {
             "name": "Bible Study Group",
-            "description": "Weekly Bible study and fellowship",
-            "is_private": True,
-            "max_members": 50,
         }, format="json")
         self.assertIn(res.status_code, [200, 201, 400])
 
     def test_list_groups(self):
         """Groups list responds."""
-        res = self.client.get("/api/v1/groups/")
+        res = self.client.get("/api/v1/chat-groups/")
         self.assertIn(res.status_code, [200, 404])
 
 

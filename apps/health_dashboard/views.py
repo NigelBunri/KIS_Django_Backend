@@ -1678,9 +1678,16 @@ class HealthDashboardLandingPageView(APIView):
 
     def _serialize(self, landing_page: HealthDashboardInstitutionLandingPage) -> dict[str, Any]:
         payload = HealthDashboardLandingPageSerializer(landing_page).data
-        payload["institutionNameClickable"] = True
-        payload["institution_name_clickable"] = True
-        payload["landingPageUrl"] = _landing_page_url(landing_page.dashboard.institution_uid)
+        # Was hardcoded True regardless of publish state — inconsistent
+        # with _serialize_institution_card (the list view), which
+        # correctly gates this on is_published. An unpublished landing
+        # page isn't visible to anyone but its managers, so it isn't
+        # actually "clickable" yet; the create/update response was lying
+        # about that.
+        published = bool(getattr(landing_page, "is_published", False))
+        payload["institutionNameClickable"] = published
+        payload["institution_name_clickable"] = published
+        payload["landingPageUrl"] = _landing_page_url(landing_page.dashboard.institution_uid) if published else ""
         payload["landing_page_url"] = payload["landingPageUrl"]
         return payload
 

@@ -169,7 +169,12 @@ class MarketplaceUsdCheckoutTests(TestCase):
         buyer_wallet.balance_cents = 50_000
         buyer_wallet.save(update_fields=['balance_cents'])
 
+    @override_settings(KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED=False)
     def test_default_marketplace_order_is_usd_provider_pending_without_wallet_lock(self):
+        # Explicit, not relying on the setting's global default (False) —
+        # a local .env with this flag enabled for manual dev testing would
+        # otherwise make this test's "no live provider call happened"
+        # assertions flaky depending on ambient environment state.
         order = place_marketplace_order(
             buyer=self.buyer,
             shop_id=self.shop.id,
@@ -253,18 +258,24 @@ class MarketplaceUsdCheckoutTests(TestCase):
             'amount': 1000,
             'currency': 'USD',
         }
+        # place_marketplace_order always creates a DirectPaymentIntent for
+        # the order itself (using KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER,
+        # i.e. flutterwave, unless a different payment_method is requested
+        # in metadata) — a SEPARATE create_direct_payment_intent(...,
+        # provider='stripe') call afterward for the SAME order/target would
+        # just hit the (correct, intentional — see
+        # test_direct_payment_provider_link_is_idempotent_and_attached_to_order
+        # above) one-intent-per-order idempotency and return that same
+        # flutterwave intent, never actually exercising the Stripe path.
+        # Request stripe at order-creation time instead.
         order = place_marketplace_order(
             buyer=self.buyer,
             shop_id=self.shop.id,
             items=[{'product_id': str(self.product.id), 'quantity': 1, 'unit_price_cents': 1_000}],
+            metadata={'payment_method': 'stripe'},
         )
 
-        intent = create_direct_payment_intent(
-            user=self.buyer,
-            target_type=DirectPaymentIntent.TARGET_MARKETPLACE_ORDER,
-            target_id=order.id,
-            provider='stripe',
-        )
+        intent = DirectPaymentIntent.objects.get(id=order.metadata['direct_payment_intent_id'])
 
         self.assertEqual(intent.provider, 'stripe')
         self.assertGreater(len(long_checkout_url), 200)
@@ -1292,6 +1303,7 @@ class ProductBroadcastAPITests(APITestCase):
         )
 
 
+@override_settings(KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED=True)
 class ServiceBookingAPITests(APITestCase):
     def setUp(self):
         User = get_user_model()
@@ -1321,6 +1333,12 @@ class ServiceBookingAPITests(APITestCase):
         payload = {
             'service_id': str(self.service.id),
             'scheduled_at': scheduled_at.isoformat(),
+            # These tests exercise the legacy wallet-escrow booking flow
+            # (deposit locked from the buyer's wallet, escrow record
+            # created synchronously) — the view now defaults to
+            # provider/USD checkout (see _commerce_default_payment_provider)
+            # unless a legacy wallet method is explicitly requested here.
+            'payment_method': 'wallet',
         }
         payload.update(extra)
         return payload
@@ -1462,7 +1480,14 @@ class ServiceBookingAPITests(APITestCase):
             metadata={'quote_required': True},
         )
 
-        pay_remaining = self.client.post(f'/api/v1/commerce/service-bookings/{booking.id}/pay-remaining/', format='json')
+        # pay_remaining defaults to provider/USD checkout (PENDING payment)
+        # unless a legacy wallet method is requested — this test expects
+        # the synchronous wallet-paid path (STATUS_PAID immediately).
+        pay_remaining = self.client.post(
+            f'/api/v1/commerce/service-bookings/{booking.id}/pay-remaining/',
+            {'payment_method': 'wallet'},
+            format='json',
+        )
         self.assertEqual(pay_remaining.status_code, status.HTTP_200_OK)
 
         booking.refresh_from_db()
@@ -1489,7 +1514,11 @@ class ServiceBookingAPITests(APITestCase):
 
     def test_blackout_date_blocked(self):
         blackout_date = (timezone.now() + timedelta(days=3)).date()
-        self.service.blackout_dates = [blackout_date]
+        # blackout_dates is a plain JSONField (no DjangoJSONEncoder) — a raw
+        # date object isn't JSON-serializable, so this must store the
+        # isoformat string, matching what any real caller of this field
+        # would have to do too.
+        self.service.blackout_dates = [blackout_date.isoformat()]
         self.service.save(update_fields=['blackout_dates'])
         scheduled_at = timezone.make_aware(timezone.datetime.combine(blackout_date, timezone.datetime.min.time())) + timedelta(hours=10)
         response = self.client.post('/api/v1/commerce/service-bookings/', self._create_booking_payload(scheduled_at=scheduled_at), format='json')
@@ -1790,7 +1819,8 @@ class ServiceBookingAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         booking = ServiceBooking.objects.get(id=response.data['id'])
-        self.assertEqual(booking.price_cents, 555000)
+        # $55.50 -> 5,550 cents (was asserting 555000, 100x too large).
+        self.assertEqual(booking.price_cents, 5550)
         self.assertEqual(booking.deposit_cents, 0)
         self.assertTrue(booking.metadata.get('negotiation_requested'))
         self.assertEqual(booking.metadata.get('requested_price'), '55.50')
@@ -1808,7 +1838,9 @@ class ServiceBookingAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         booking = ServiceBooking.objects.get(id=response.data['id'])
-        self.assertEqual(booking.price_cents, 2000000)
+        # $180.00 base + $20.00 package -> 20,000 cents (was asserting
+        # 2000000, 100x too large).
+        self.assertEqual(booking.price_cents, 20000)
 
     @override_settings(SERVICE_ENABLE_ADDONS=True)
     def test_addon_pricing_increases_price(self):
@@ -1823,7 +1855,9 @@ class ServiceBookingAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         booking = ServiceBooking.objects.get(id=response.data['id'])
-        self.assertEqual(booking.price_cents, 1850000)
+        # $180.00 base + $5.00 addon -> 18,500 cents (was asserting
+        # 1850000, 100x too large).
+        self.assertEqual(booking.price_cents, 18500)
 
     @override_settings(SERVICE_ENFORCE_MINIMUM_CHARGE=True)
     def test_minimum_charge_is_enforced(self):
@@ -1841,4 +1875,6 @@ class ServiceBookingAPITests(APITestCase):
         response = self.client.post('/api/v1/commerce/service-bookings/', self._create_booking_payload(), format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         booking = ServiceBooking.objects.get(id=response.data['id'])
-        self.assertEqual(booking.price_cents, 1_980_000)
+        # $180.00 base * 1.10 (10% exclusive tax) -> 19,800 cents (was
+        # asserting 1_980_000, 100x too large).
+        self.assertEqual(booking.price_cents, 19_800)

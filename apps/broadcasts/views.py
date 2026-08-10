@@ -4571,15 +4571,25 @@ def _sync_core_patient_from_health_profile(user, health_payload: dict[str, Any])
     identity = _extract_identity_payload(health_payload)
     emergency = _extract_emergency_payload(health_payload)
 
-    primary_contact = health_payload.get("primary_contact")
+    # Prefer the nested identity/emergency values (built from THIS update's
+    # health_payload["identity"/"emergency"], just merged in by
+    # _merge_health_profile_core_fields) over the top-level
+    # primary_contact/emergency_contact keys, which are only a stale
+    # denormalized mirror written by _merge_core_patient_into_health_profile
+    # from the patient record's *pre-update* state (see _load_user_profiles,
+    # which runs that merge before this update is even applied). Checking
+    # the top-level mirror first — as this used to — meant a fresh
+    # emergency_contact/primary_contact update could never take effect: the
+    # old mirrored dict always satisfied isinstance(..., dict) first.
+    primary_contact = identity.get("primary_contact")
     if not isinstance(primary_contact, dict):
-        primary_contact = identity.get("primary_contact")
+        primary_contact = health_payload.get("primary_contact")
     if not isinstance(primary_contact, dict) or not primary_contact:
         primary_contact = _default_primary_contact_for_user(user)
 
-    emergency_contact = health_payload.get("emergency_contact")
+    emergency_contact = emergency.get("emergency_contact")
     if not isinstance(emergency_contact, dict):
-        emergency_contact = emergency.get("emergency_contact")
+        emergency_contact = health_payload.get("emergency_contact")
     if not isinstance(emergency_contact, dict):
         emergency_contact = {}
 
@@ -4600,7 +4610,20 @@ def _sync_core_patient_from_health_profile(user, health_payload: dict[str, Any])
         or health_payload.get("gender")
         or PatientMasterRecord.GENDER_UNKNOWN
     ).strip() or PatientMasterRecord.GENDER_UNKNOWN
-    dob_value = identity.get("dob") or health_payload.get("dob")
+    dob_raw = identity.get("dob") or health_payload.get("dob")
+    dob_value = dob_raw
+    if isinstance(dob_raw, str):
+        # health_payload/identity come straight off the request JSON, so
+        # dob arrives as a plain string. PatientMasterRecord.dob is a real
+        # DateField, but Django only coerces field values to Python types
+        # when a row is loaded from the DB — assigning a raw string via
+        # setattr()+save() below leaves this in-memory instance holding a
+        # str, so any later patient.dob.isoformat() call (see
+        # _merge_core_patient_into_health_profile) crashes with
+        # AttributeError. Parse it up front instead.
+        from django.utils.dateparse import parse_date
+
+        dob_value = parse_date(dob_raw)
 
     metadata = dict(patient.metadata if patient and isinstance(patient.metadata, dict) else {})
     for key, value in {
@@ -7830,22 +7853,13 @@ class BroadcastFeedView(APIView):
         for item in profile_broadcasts:
             metadata = item.metadata or {}
             entry = metadata.get("entry") or {}
-            attachments = []
-            if isinstance(entry.get("attachment"), dict):
-                normalized_attachment = _normalize_feed_attachment(request, entry["attachment"])
-                if normalized_attachment:
-                    attachments.append(normalized_attachment)
-            attachments.extend(
-                [
-                    normalized_attachment
-                    for normalized_attachment in (
-                        _normalize_feed_attachment(request, att)
-                        for att in (entry.get("attachments") or [])
-                        if isinstance(att, dict)
-                    )
-                    if normalized_attachment
-                ]
-            )
+            # _normalize_feed_attachments already merges entry.attachment +
+            # entry.attachments and de-duplicates by path/video_id/url/name/id
+            # (see _feed_attachment_identity) — building this list by hand
+            # here duplicated the primary attachment whenever it also
+            # appeared in entry.attachments (the common case: callers set
+            # both attachment and attachments to the same item).
+            attachments = _normalize_feed_attachments(request, entry)
             text_plain = entry.get("text_plain") or entry.get("summary") or entry.get("title") or ""
             profile_id = metadata.get("profile_id") or "main"
             profile_name = metadata.get("profile_name") or "My broadcast feed"
@@ -18443,13 +18457,21 @@ class ChannelMembershipView(APIView):
             try:
                 if getattr(request.user, "email", None):
                     from apps.notifications.email_service import send_membership_email
-                    send_membership_email(
+                    if not send_membership_email(
                         to_email=request.user.email,
                         tier_title=tier.title,
                         channel_name=channel.name,
-                    )
-            except Exception:
-                pass
+                    ):
+                        from apps.accounts.models import AuditLog as _GeneralAuditLog
+                        logger.warning("Membership email failed for user_id=%s channel_id=%s", request.user.id, channel.id)
+                        _GeneralAuditLog.log(actor=request.user, action="email.membership.failed", meta={"channel_id": str(channel.id)})
+            except Exception as _exc:
+                from apps.accounts.models import AuditLog as _GeneralAuditLog
+                logger.warning("Membership email raised for user_id=%s: %s", request.user.id, _exc.__class__.__name__)
+                _GeneralAuditLog.log(
+                    actor=request.user, action="email.membership.failed",
+                    meta={"channel_id": str(channel.id), "error": _exc.__class__.__name__},
+                )
             return Response({"joined": True, "tier_id": str(tier.id), "created": created}, status=201 if created else 200)
 
     def delete(self, request, channel_id):

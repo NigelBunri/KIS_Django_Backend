@@ -338,7 +338,11 @@ class BillingWalletFlowTests(TestCase):
         self.assertFalse(res.data["workflows"]["flutterwave_sandbox_payment_link"]["live_provider_call"])
         self.assertFalse(res.data["workflows"]["signed_webhook_replay"]["stores_raw_payload"])
 
+    @override_settings(KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED=False)
     def test_production_go_no_go_checks_are_staff_only_and_block_live_launch(self):
+        # Explicit, not relying on the setting's global default (False) — a
+        # local .env with this flag enabled for manual dev testing would
+        # otherwise make monetization_flags_disabled report not-ready here.
         self.client.force_authenticate(self.sender)
         denied = self.client.get(_api_url("billing-profitability-production-go-no-go"), secure=True)
         self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
@@ -493,7 +497,12 @@ class BillingWalletFlowTests(TestCase):
         self.assertEqual(redacted["items"][0]["cvv"], "[redacted]")
         self.assertEqual(redacted["items"][0]["amount"], 2500)
 
+    @override_settings(KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED=False)
     def test_verify_payment_launch_command_passes_default_local_guardrails(self):
+        # Explicit, not relying on the setting's global default (False) — a
+        # local .env with this flag enabled for manual dev testing would
+        # otherwise fail this on both the flag itself and the (only
+        # required when the flag is on) FLW_REDIRECT_URL HTTPS check.
         out = StringIO()
 
         call_command("verify_payment_launch", stdout=out)
@@ -809,21 +818,24 @@ class WalletSubscriptionLifecycleApiTests(TestCase):
         )
         self.client.force_authenticate(self.user)
 
+        # Explicit rank required for every fixture tier since AccountTier.rank
+        # is now the sole authoritative ordering (no more inferring "Pro" >
+        # "Free" from a name substring) — see apps.accounts.tiers.tier_rank.
         self.free_tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Free",
-            defaults={"price_cents": 0},
+            defaults={"price_cents": 0, "rank": 0},
         )
         self.pro_tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Pro",
-            defaults={"price_cents": 500},
+            defaults={"price_cents": 500, "rank": 1},
         )
         self.business_tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Business",
-            defaults={"price_cents": 2000},
+            defaults={"price_cents": 2000, "rank": 2},
         )
         self.business_pro_tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Business Pro",
-            defaults={"price_cents": 4000},
+            defaults={"price_cents": 4000, "rank": 3},
         )
 
     def _make_active_subscription(self, tier: AccountTier) -> Subscription:
@@ -1010,7 +1022,7 @@ class WalletUpgradeApiTests(TestCase):
     def test_upgrade_endpoint_succeeds_with_credits(self):
         tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Pro Upgrade",
-            defaults={"price_cents": 100},
+            defaults={"price_cents": 100, "rank": 1},
         )
         tier.price_cents = 100
         tier.save(update_fields=["price_cents", "updated_at"])
@@ -1036,7 +1048,7 @@ class WalletUpgradeApiTests(TestCase):
     def test_upgrade_endpoint_rejects_wallet_payment_by_default(self):
         tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Pro Wallet Disabled",
-            defaults={"price_cents": 100},
+            defaults={"price_cents": 100, "rank": 1},
         )
         tier.price_cents = 100
         tier.save(update_fields=["price_cents", "updated_at"])
@@ -1059,17 +1071,19 @@ class WalletUpgradeApiTests(TestCase):
     def test_upgrade_endpoint_rejects_same_or_lower_tier(self):
         current_tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Business Current",
-            defaults={"price_cents": 1000},
+            defaults={"price_cents": 1000, "rank": 2},
         )
         current_tier.price_cents = 1000
-        current_tier.save(update_fields=["price_cents", "updated_at"])
+        current_tier.rank = 2
+        current_tier.save(update_fields=["price_cents", "rank", "updated_at"])
 
         target_tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Pro Lower",
-            defaults={"price_cents": 200},
+            defaults={"price_cents": 200, "rank": 1},
         )
         target_tier.price_cents = 200
-        target_tier.save(update_fields=["price_cents", "updated_at"])
+        target_tier.rank = 1
+        target_tier.save(update_fields=["price_cents", "rank", "updated_at"])
 
         Subscription.objects.create(
             user=self.user,
@@ -1097,7 +1111,7 @@ class WalletUpgradeApiTests(TestCase):
         Subscription.objects.filter(user=self.user, status="active").update(status="ended")
         tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Pro Free Upgrade",
-            defaults={"price_cents": 0},
+            defaults={"price_cents": 0, "rank": 1},
         )
         tier.price_cents = 0
         tier.save(update_fields=["price_cents", "updated_at"])
@@ -1123,7 +1137,7 @@ class WalletUpgradeApiTests(TestCase):
     def test_upgrade_endpoint_card_mock_marks_transaction_success(self):
         tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Business Upgrade Paid",
-            defaults={"price_cents": 350},
+            defaults={"price_cents": 350, "rank": 2},
         )
         tier.price_cents = 350
         tier.save(update_fields=["price_cents", "updated_at"])
@@ -1165,7 +1179,7 @@ class WalletUpgradeApiTests(TestCase):
 
         tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Partner Upgrade Paid",
-            defaults={"price_cents": 500},
+            defaults={"price_cents": 500, "rank": 4},
         )
         tier.price_cents = 500
         tier.save(update_fields=["price_cents", "updated_at"])
@@ -1190,7 +1204,7 @@ class WalletUpgradeApiTests(TestCase):
     def test_upgrade_endpoint_card_marks_transaction_failed_when_payments_not_configured(self):
         tier, _ = AccountTier.objects.get_or_create(
             name="Phase5 Partner Pro Upgrade Paid",
-            defaults={"price_cents": 900},
+            defaults={"price_cents": 900, "rank": 5},
         )
         tier.price_cents = 900
         tier.save(update_fields=["price_cents", "updated_at"])

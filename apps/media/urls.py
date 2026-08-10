@@ -24,6 +24,11 @@ router.register(r"media/assets", MediaAssetViewSet, basename="asset")
 router.register(r"assets", MediaAssetViewSet, basename="legacy-asset")
 router.register(r"media/jobs", ProcessingJobViewSet, basename="job")
 router.register(r"media/media-safety-scans", MediaSafetyScanViewSet, basename="media-safety-scan")
+# Bare alias for the same reason as legacy-asset above — apps.accounts's
+# verify_profile_launch launch-readiness check (and any client following
+# the same /api/v1/assets/-style convention) expects this to resolve at
+# /api/v1/media-safety-scans/, not only under the media/ prefix.
+router.register(r"media-safety-scans", MediaSafetyScanViewSet, basename="legacy-media-safety-scan")
 
 urlpatterns = [
     path("", include(router.urls)),

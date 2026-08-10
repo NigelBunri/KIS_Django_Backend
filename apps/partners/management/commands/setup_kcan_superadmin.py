@@ -98,9 +98,6 @@ class Command(BaseCommand):
             if not user.is_staff:
                 user.is_staff = True
                 changed.append("is_staff")
-            if user.tier != SUPERADMIN_TIER:
-                user.tier = SUPERADMIN_TIER
-                changed.append("tier")
             if not user.email:
                 user.email = SUPERADMIN_EMAIL
                 changed.append("email")
@@ -122,6 +119,10 @@ class Command(BaseCommand):
         else:
             if not password:
                 raise CommandError("Cannot create a new account without a password.")
+            # Tier is granted separately below via apply_tier_upgrade — not
+            # passed here, so it isn't set twice through two different code
+            # paths (this used to also silently re-apply it a second time
+            # via a raw .update() to work around post_save signal timing).
             user = User.objects.create_superuser(
                 email=SUPERADMIN_EMAIL,
                 password=password,
@@ -129,15 +130,48 @@ class Command(BaseCommand):
                 country=SUPERADMIN_COUNTRY,
                 username=SUPERADMIN_USERNAME,
                 display_name=SUPERADMIN_DISPLAY_NAME,
-                tier=SUPERADMIN_TIER,
             )
-            # Re-apply tier after post_save signals that may override it.
-            if user.tier != SUPERADMIN_TIER:
-                User.objects.filter(id=user.id).update(tier=SUPERADMIN_TIER)
-                user.tier = SUPERADMIN_TIER
             self.stdout.write(f"  [user] created — {user.email}")
 
+        self._ensure_superadmin_tier_grant(user)
         return user
+
+    def _ensure_superadmin_tier_grant(self, user) -> None:
+        """
+        Routed through the same canonical apply_tier_upgrade() used by real
+        paid upgrades — previously this set user.tier directly with no
+        Subscription row and no audit trail. Grants an indefinite (never-
+        expiring) Subscription tagged source="admin_grant", distinct from
+        real payment sources, so referral-commission logic (once it exists)
+        can exclude administrative grants from generating commission.
+        Idempotent: a rerun that finds the grant already in place makes no
+        further database changes.
+        """
+        from apps.accounts.models import AccountTier, Subscription
+        from apps.accounts.tiers import ensure_default_account_tiers
+        from apps.billing.services import apply_tier_upgrade
+
+        ensure_default_account_tiers()
+        tier = AccountTier.objects.filter(name__iexact=SUPERADMIN_TIER).first()
+        if not tier:
+            self.stdout.write(self.style.WARNING(
+                f"  [tier] AccountTier '{SUPERADMIN_TIER}' not found — skipping tier grant."
+            ))
+            return
+
+        already_granted = Subscription.objects.filter(
+            user=user,
+            tier=tier,
+            status="active",
+            ends_at__isnull=True,
+            billing_meta__source="admin_grant",
+        ).exists()
+        if already_granted and user.tier == tier.name:
+            self.stdout.write(f"  [tier] already granted — {tier.name} (indefinite)")
+            return
+
+        apply_tier_upgrade(user=user, tier=tier, source="admin_grant", amount_cents=0, indefinite=True)
+        self.stdout.write(f"  [tier] granted — {tier.name} (indefinite, source=admin_grant)")
 
     def _ensure_kcan_partner(self, owner):
         from apps.partners.models import Partner, PartnerMembership

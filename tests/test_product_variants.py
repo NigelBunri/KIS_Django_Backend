@@ -1,19 +1,33 @@
+"""
+Regression tests for ProductSerializer._sanitize_variants — the actual,
+current mechanism for product variants.
+
+This file previously tested ProductViewSet._sync_product_variants(), a
+method that no longer exists anywhere in the codebase. Product variants
+were refactored at some point from a separate ProductVariant model (still
+present, still admin-registered, but no longer written to by any live code
+path) to a normalized JSON blob stored directly on Product.variants via
+ProductSerializer._sanitize_variants(). This file was never updated for
+that refactor, so every test in it failed with AttributeError regardless
+of the actual variant-handling code's correctness. Rewritten to test the
+real, current implementation.
+"""
 from decimal import Decimal
-from types import SimpleNamespace
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from apps.commerce.models import Product, ProductVariant, Shop
-from apps.commerce.views import ProductViewSet
+from apps.commerce.models import Product, Shop
+from apps.commerce.serializers import ProductSerializer
 
 
-class ProductVariantSyncTests(TestCase):
+class ProductVariantSanitizationTests(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(
-            username='variant-owner',
+            phone='+237699930002',
             email='variant@example.com',
             password='strong-pass-123',
+            country='CM',
         )
         self.shop = Shop.objects.create(owner=self.user, name='Variant Shop', slug='variant-shop')
         self.product = Product.objects.create(
@@ -24,64 +38,62 @@ class ProductVariantSyncTests(TestCase):
             price=Decimal('9.00'),
             stock_qty=10,
         )
-        self.view = ProductViewSet()
+        self.serializer = ProductSerializer()
 
-    def _build_stub(self, payload):
-        return SimpleNamespace(_variants_payload=payload, _variants_provided=True)
-
-    def test_sync_creates_variants_from_payload(self):
+    def test_sanitizes_a_new_variant_payload(self):
         payload = [
             {
                 'sku': 'VAR-001',
-                'size': 'M',
-                'color': 'Blue',
+                'name': 'Medium Blue',
                 'price': '14.50',
+                'sale_price': '12.00',
                 'stock_qty': 5,
-                'image_url': 'https://example.com/variant.png',
+                'options': {'size': 'M', 'color': 'Blue'},
             },
         ]
-        self.view._sync_product_variants(self.product, self._build_stub(payload))
-        variants = list(ProductVariant.objects.filter(product=self.product))
-        self.assertEqual(len(variants), 1)
-        variant = variants[0]
-        self.assertEqual(variant.sku, 'VAR-001')
-        self.assertEqual(variant.size, 'M')
-        self.assertEqual(variant.color, 'Blue')
-        self.assertEqual(variant.price, Decimal('14.50'))
-        self.assertEqual(variant.stock_qty, 5)
-        self.assertEqual(variant.image_url, 'https://example.com/variant.png')
+        sanitized = self.serializer._sanitize_variants(payload)
 
-    def test_sync_updates_and_removes_variants(self):
-        existing = ProductVariant.objects.create(
-            product=self.product,
-            sku='EXIST-001',
-            price=Decimal('10.00'),
-            stock_qty=2,
-        )
-        payload = [
-            {
-                'id': str(existing.id),
-                'sku': 'EXIST-001',
-                'size': 'L',
-                'color': 'Red',
-                'price': '12.00',
-                'stock_qty': 3,
-            },
-            {
-                'sku': 'NEW-002',
-                'size': 'S',
-                'color': 'Black',
-                'price': '5.00',
-                'stock_qty': 1,
-            },
-        ]
-        self.view._sync_product_variants(self.product, self._build_stub(payload))
-        variants = list(ProductVariant.objects.filter(product=self.product).order_by('sku'))
-        self.assertEqual(len(variants), 2)
-        updated = ProductVariant.objects.get(id=existing.id)
-        self.assertEqual(updated.size, 'L')
-        self.assertEqual(updated.color, 'Red')
-        self.assertEqual(updated.price, Decimal('12.00'))
-        # Now clearing the variants should delete them
-        self.view._sync_product_variants(self.product, self._build_stub([]))
-        self.assertFalse(ProductVariant.objects.filter(product=self.product).exists())
+        self.assertEqual(len(sanitized), 1)
+        variant = sanitized[0]
+        self.assertEqual(variant['sku'], 'VAR-001')
+        self.assertEqual(variant['name'], 'Medium Blue')
+        self.assertEqual(variant['price'], '14.50')
+        self.assertEqual(variant['sale_price'], '12.00')
+        self.assertEqual(variant['stock_qty'], 5)
+        self.assertEqual(variant['options'], {'size': 'M', 'color': 'Blue'})
+        self.assertTrue(variant['is_active'])
+        self.assertTrue(variant['id'])  # auto-generated when not supplied
+
+    def test_missing_price_defaults_to_zero_rather_than_erroring(self):
+        sanitized = self.serializer._sanitize_variants([{'sku': 'VAR-002'}])
+        self.assertEqual(sanitized[0]['price'], '0.00')
+        self.assertIsNone(sanitized[0]['sale_price'])
+
+    def test_non_dict_entries_in_the_payload_are_dropped_not_erroring(self):
+        sanitized = self.serializer._sanitize_variants(['not-a-dict', 42, {'sku': 'VAR-003'}])
+        self.assertEqual(len(sanitized), 1)
+        self.assertEqual(sanitized[0]['sku'], 'VAR-003')
+
+    def test_non_list_payload_sanitizes_to_an_empty_list(self):
+        self.assertEqual(self.serializer._sanitize_variants({'not': 'a list'}), [])
+        self.assertEqual(self.serializer._sanitize_variants(None), [])
+
+    def test_saving_a_product_persists_sanitized_variants_and_a_later_save_replaces_them(self):
+        # Mirrors the real create/update flow: PATCHing `variants` replaces
+        # the whole list (it's a JSON blob, not synced rows), so "removing"
+        # a variant means simply not including it in the next payload.
+        self.product.variants = self.serializer._sanitize_variants([
+            {'id': 'existing-1', 'sku': 'EXIST-001', 'name': 'Large Red', 'price': '12.00', 'stock_qty': 3},
+            {'sku': 'NEW-002', 'name': 'Small Black', 'price': '5.00', 'stock_qty': 1},
+        ])
+        self.product.save(update_fields=['variants'])
+        self.product.refresh_from_db()
+        self.assertEqual(len(self.product.variants), 2)
+
+        self.product.variants = self.serializer._sanitize_variants([
+            {'id': 'existing-1', 'sku': 'EXIST-001', 'name': 'Large Red Updated', 'price': '13.00', 'stock_qty': 2},
+        ])
+        self.product.save(update_fields=['variants'])
+        self.product.refresh_from_db()
+        self.assertEqual(len(self.product.variants), 1)
+        self.assertEqual(self.product.variants[0]['name'], 'Large Red Updated')

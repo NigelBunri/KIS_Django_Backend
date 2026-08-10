@@ -57,6 +57,7 @@ class AuthSessionTests(TestCase):
     def setUp(self):
         self.client = APIClient()
 
+    @override_settings(KIS_PHONE_VERIFICATION_ENABLED=True)
     def test_register_creates_unverified_user(self):
         """Registration succeeds and marks phone as pending verification."""
         res = self.client.post("/api/v1/auth/register/", {
@@ -75,6 +76,7 @@ class AuthSessionTests(TestCase):
         user = User.objects.get(phone="+237670000101")
         self.assertFalse(user.verification.get("phone", {}).get("verified"))
 
+    @override_settings(KIS_PHONE_VERIFICATION_ENABLED=True)
     def test_login_blocked_for_unverified_phone(self):
         """Unverified user cannot log in — gets phone_not_verified error."""
         User.objects.create_user(phone="+237670000102", password="TestPass12!", country="CM")
@@ -311,9 +313,14 @@ class DeviceManagementTests(TestCase):
 
     def test_revoke_secondary_device(self):
         """A secondary device can be revoked."""
+        # linked_via_qr=True: revoke_unapproved_secondary_devices() (run on
+        # every authenticated request from the parent device — see
+        # apps.accounts.jwt_auth) auto-revokes any secondary device that
+        # hasn't gone through QR linking, which would otherwise kill this
+        # device before the DELETE call's own lookup ever runs.
         secondary = Device.objects.create(
             user=self.user, device_id=DEVICE_ID_2, platform="ios",
-            is_parent=False, token_version=1, last_seen_at=timezone.now(),
+            is_parent=False, linked_via_qr=True, token_version=1, last_seen_at=timezone.now(),
         )
         res = self.client.delete(f"/api/v1/auth/devices/{DEVICE_ID_2}/")
         self.assertEqual(res.status_code, 204)
@@ -716,7 +723,7 @@ class OTPVerificationFlowTests(TestCase):
     def setUp(self):
         self.client = APIClient()
 
-    @override_settings(OTP_OVERRIDE_CODE="676139")
+    @override_settings(OTP_OVERRIDE_ENABLED=True, OTP_OVERRIDE_CODE="676139")
     def test_override_code_verifies_without_real_otp_delivery(self):
         """Override code 676139 passes verification even without SMS delivery."""
         from apps.otp.models import PhoneOTP
@@ -746,7 +753,7 @@ class OTPVerificationFlowTests(TestCase):
         self.assertTrue(res.data["success"])
         self.assertIn("access", res.data)
 
-    @override_settings(OTP_OVERRIDE_CODE="676139")
+    @override_settings(OTP_OVERRIDE_ENABLED=True, OTP_OVERRIDE_CODE="676139")
     def test_override_code_works_without_any_prior_otp_record(self):
         """Override code works even if no OTP was ever initiated."""
         make_verified_user("+237670012002")

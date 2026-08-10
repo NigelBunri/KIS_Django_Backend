@@ -1961,9 +1961,32 @@ class ServiceBookingPaymentSerializer(serializers.ModelSerializer):
         metadata = getattr(getattr(obj, 'booking', None), 'metadata', None)
         return str((metadata or {}).get('direct_payment_intent_id') or '') or None
 
+    def get_direct_payment_intent_id(self, obj):
+        # The `direct_payment_intent_id` SerializerMethodField (declared
+        # above, in Meta.fields) never had a matching get_ method on this
+        # class — DRF requires one for every SerializerMethodField, so
+        # serializing ANY ServiceBookingPayment raised AttributeError
+        # unconditionally. Both fields read the same metadata key here (see
+        # get_payment_intent_id above), matching the equivalent pattern
+        # already used correctly elsewhere in this file for marketplace
+        # orders.
+        return self.get_payment_intent_id(obj)
+
     def get_payment_url(self, obj):
         metadata = getattr(getattr(obj, 'booking', None), 'metadata', None)
         return str((metadata or {}).get('payment_url') or '') or None
+
+    def get_payment_reference(self, obj):
+        # Same missing-getter class of bug as get_direct_payment_intent_id
+        # above — `payment_reference` was declared as a field with no
+        # matching get_ method at all, so serializing ANY ServiceBookingPayment
+        # raised AttributeError unconditionally. Prefers the provider-side
+        # reference recorded in booking metadata (matching this class's own
+        # get_payment_intent_id/get_payment_url pattern above), falling back
+        # to the model's own transaction_reference column.
+        metadata = getattr(getattr(obj, 'booking', None), 'metadata', None)
+        from_metadata = str((metadata or {}).get('payment_reference') or '').strip()
+        return from_metadata or (str(obj.transaction_reference).strip() or None)
 
     def get_currency_label(self, obj):
         return _commerce_currency_label(obj.currency)

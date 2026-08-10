@@ -490,6 +490,16 @@ class UserSerializer(serializers.ModelSerializer):
             "last_login_at",
             "last_password_change_at",
             "email_verified",
+            # tier/status/is_active must never be settable via a raw PATCH to
+            # this generic serializer — tier changes belong exclusively to
+            # apps.billing's apply_tier_upgrade flow (Phase 3), and status/
+            # is_active belong to the dedicated suspend/moderation actions.
+            # Both are model-field writes there (bypass this serializer
+            # entirely), so making them read-only here only closes the
+            # public API path, not those legitimate internal ones.
+            "tier",
+            "status",
+            "is_active",
         )
 
     def validate(self, attrs):
@@ -532,6 +542,32 @@ class UserSerializer(serializers.ModelSerializer):
         from apps.verification.services import verification_summary
 
         return verification_summary(VerificationSubjectType.USER, obj.id)
+
+
+class PublicUserSerializer(serializers.ModelSerializer):
+    """
+    Safe, minimal view of another user's record — used by UserViewSet for
+    list/search and for retrieving anyone other than self/staff. Omits
+    email, phone, verification detail, and preferences: UserSerializer's
+    exclude-based field list (everything except password/is_superuser/
+    is_staff/user_permissions/groups) was never actually safe to hand back
+    for a request about someone ELSE's account, only for the user's own.
+    """
+    profile = ProfileSerializer(read_only=True)
+
+    class Meta:
+        model = User
+        fields = (
+            "id",
+            "display_name",
+            "username",
+            "tier",
+            "trust_score",
+            "country",
+            "profile",
+            "created_at",
+        )
+        read_only_fields = fields
 
 
 class UserCreateSerializer(serializers.ModelSerializer):
@@ -680,18 +716,11 @@ class AccountTierSerializer(serializers.ModelSerializer):
         return (obj.name or "").strip().lower()
 
     def _tier_rank(self, obj: AccountTier) -> int:
-        key = self._tier_key(obj)
-        if "partner pro" in key:
-            return 5
-        if "partner" in key:
-            return 4
-        if "business pro" in key:
-            return 3
-        if "business" in key:
-            return 2
-        if "pro" in key:
-            return 1
-        return 0
+        # Was a hand-rolled substring-matching heuristic (order-dependent —
+        # "partner" also matches "Partner Pro"), duplicated again in
+        # apps/billing/views.py. Both now defer to the single database-backed
+        # AccountTier.rank column instead.
+        return obj.rank
 
     def _tier_segment(self, obj: AccountTier) -> str:
         key = self._tier_key(obj)
@@ -858,6 +887,7 @@ class AccountTierSerializer(serializers.ModelSerializer):
             "feature_highlight",
             "tier_segment",
             "tier_rank",
+            "billing_period_days",
             "created_at",
             "updated_at",
         )
@@ -872,11 +902,58 @@ class SubscriptionSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "created_at", "updated_at")
 
     def validate(self, attrs):
-        if not attrs.get("user"):
-            raise serializers.ValidationError({"user": "Subscription must be associated with a user."})
-        if not attrs.get("tier"):
-            raise serializers.ValidationError({"tier": "Subscription must reference an AccountTier."})
+        # Only require user/tier on create — a PATCH legitimately omits
+        # fields it isn't touching (e.g. a staff-only status change), and
+        # both are already set on self.instance for any update.
+        if self.instance is None:
+            if not attrs.get("user"):
+                raise serializers.ValidationError({"user": "Subscription must be associated with a user."})
+            if not attrs.get("tier"):
+                raise serializers.ValidationError({"tier": "Subscription must reference an AccountTier."})
+
+        # uniq_active_subscription_per_user (DB-level) only fires as a raw
+        # IntegrityError/500 — surface the same rule here as a clean 400 so
+        # staff get an actionable error instead of a server crash.
+        target_status = attrs.get("status", self.instance.status if self.instance else None)
+        target_user = attrs.get("user", self.instance.user if self.instance else None)
+        if target_status == Subscription.STATUS_ACTIVE and target_user is not None:
+            clash = Subscription.objects.filter(user=target_user, status=Subscription.STATUS_ACTIVE)
+            if self.instance is not None:
+                clash = clash.exclude(pk=self.instance.pk)
+            if clash.exists():
+                raise serializers.ValidationError(
+                    {"status": "This user already has an active subscription."}
+                )
         return attrs
+
+
+class SubscriptionSelfSerializer(serializers.ModelSerializer):
+    """
+    Read-only, own-record view of a Subscription for non-staff users via
+    SubscriptionViewSet. Deliberately omits `user` (redundant — it's always
+    "me") and `billing_meta` (internal provider evidence) — normal users
+    have no need to see provider-internal bookkeeping for their own record.
+    """
+    tier = AccountTierSerializer(read_only=True)
+    pending_tier = AccountTierSerializer(read_only=True)
+
+    class Meta:
+        model = Subscription
+        ref_name = "AccountsSubscriptionSelf"
+        fields = (
+            "id",
+            "tier",
+            "status",
+            "started_at",
+            "ends_at",
+            "cancel_at_period_end",
+            "canceled_at",
+            "grace_ends_at",
+            "pending_tier",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
 
 
 class SessionSerializer(serializers.ModelSerializer):
@@ -889,6 +966,15 @@ class SessionSerializer(serializers.ModelSerializer):
         if not validated_data.get("expires_at"):
             validated_data["expires_at"] = timezone.now() + datetime.timedelta(days=30)
         return super().create(validated_data)
+
+
+class SessionSelfSerializer(serializers.ModelSerializer):
+    """Read-only, own-record view of a Session for non-staff users."""
+    class Meta:
+        model = Session
+        ref_name = "AccountsSessionSelf"
+        fields = ("id", "expires_at", "ip_address", "user_agent", "created_at")
+        read_only_fields = fields
 
 
 class DeviceSessionSerializer(serializers.ModelSerializer):

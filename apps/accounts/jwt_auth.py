@@ -2,6 +2,8 @@ from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.utils import timezone
 
+from apps.chat.internal_auth import require_internal_auth
+
 from .models import Device, E2EDeviceKey, E2EPreKey
 
 
@@ -28,11 +30,69 @@ def revoke_unapproved_secondary_devices(user) -> int:
     return len(devices)
 
 
+def validate_device_bound_token(user, validated_token, *, header_device_id=None, require_header=True):
+    """
+    The authoritative device-bound revocation check: does a live, non-revoked
+    Device row exist for the token's own device_id claim, and does the
+    token's token_version claim still match that device's current value.
+
+    Shared by two callers that need the EXACT same policy:
+      - DeviceBoundJWTAuthentication.authenticate() — normal Django REST
+        auth. header_device_id is REQUIRED here (require_header=True): a
+        request with no matching X-Device-Id is rejected, unchanged from
+        before this was extracted into a shared function.
+      - apps.chat.views_introspect.IntrospectView — the endpoint Nest.js
+        calls to validate a token on behalf of chat/calls/notifications.
+        header_device_id is OPTIONAL there (require_header=False): Nest is
+        relaying a client's token rather than originating the request, so it
+        may have no X-Device-Id to forward. When one IS forwarded it is
+        still cross-checked for consistency. This is what makes
+        introspection enforce the same revocation guarantees as normal
+        Django auth — previously it only checked that a device_id claim
+        existed on the token, never whether a live Device row backed it.
+
+    Raises rest_framework.exceptions.AuthenticationFailed on any failure.
+    Returns the Device row on success.
+    """
+    token_device_id = validated_token.get("device_id")
+    if not token_device_id:
+        raise AuthenticationFailed("Device-bound token required")
+
+    if require_header and not header_device_id:
+        raise AuthenticationFailed("Missing X-Device-Id")
+
+    if header_device_id and str(token_device_id) != str(header_device_id):
+        raise AuthenticationFailed("Device mismatch")
+
+    device = Device.objects.filter(user=user, device_id=str(token_device_id)).first()
+    if not device:
+        raise AuthenticationFailed("Device session revoked")
+
+    revoke_unapproved_secondary_devices(user)
+    device.refresh_from_db()
+    if device.revoked_at:
+        raise AuthenticationFailed("Device session revoked")
+
+    token_version = validated_token.get("token_version")
+    if token_version is not None:
+        try:
+            token_version_matches = int(token_version) == int(device.token_version)
+        except (TypeError, ValueError):
+            token_version_matches = False
+        if not token_version_matches:
+            raise AuthenticationFailed("Device session expired")
+
+    Device.objects.filter(pk=device.pk).update(last_seen_at=timezone.now())
+    return device
+
+
 class DeviceBoundJWTAuthentication(JWTAuthentication):
     """
     Enforce device-bound access tokens.
     Clients must send X-Device-Id to match the device_id claim in the token.
-    Internal service calls can bypass by using X-Internal-Auth.
+    A cryptographically-verified internal service call (Nest proxying a
+    user's own JWT, e.g. for /auth/devices/ management where there's no
+    natural "current device" to bind to) can bypass the device check.
     """
 
     def authenticate(self, request):
@@ -42,42 +102,25 @@ class DeviceBoundJWTAuthentication(JWTAuthentication):
 
         user, validated_token = result
         if request.headers.get("X-Internal-Auth"):
+            # require_internal_auth does the real check (HMAC-signed
+            # token + timestamp + nonce, via apps.chat.internal_auth) —
+            # previously this branch only checked that SOME value was
+            # present in the header, which let anyone holding a valid but
+            # otherwise-rejectable token (wrong device, or a REVOKED
+            # device) skip device-binding entirely by sending any string
+            # here. It raises AuthenticationFailed on anything that isn't
+            # a genuine, correctly-signed internal call.
+            require_internal_auth(request)
             return (user, validated_token)
-
-        token_device_id = validated_token.get("device_id")
-        if not token_device_id:
-            raise AuthenticationFailed("Device-bound token required")
 
         header_device_id = (
             request.headers.get("X-Device-Id")
             or request.headers.get("X-Device-ID")
             or request.headers.get("X-DeviceId")
         )
-        if not header_device_id:
-            raise AuthenticationFailed("Missing X-Device-Id")
-
-        if str(token_device_id) != str(header_device_id):
-            raise AuthenticationFailed("Device mismatch")
-
-        device = Device.objects.filter(user=user, device_id=str(token_device_id)).first()
-        if not device:
-            raise AuthenticationFailed("Device session revoked")
-
-        revoke_unapproved_secondary_devices(user)
-        device.refresh_from_db()
-        if device.revoked_at:
-            raise AuthenticationFailed("Device session revoked")
-
-        token_version = validated_token.get("token_version")
-        if token_version is not None:
-            try:
-                token_version_matches = int(token_version) == int(device.token_version)
-            except (TypeError, ValueError):
-                token_version_matches = False
-            if not token_version_matches:
-                raise AuthenticationFailed("Device session expired")
-
-        Device.objects.filter(pk=device.pk).update(last_seen_at=timezone.now())
+        validate_device_bound_token(
+            user, validated_token, header_device_id=header_device_id, require_header=True,
+        )
 
         return (user, validated_token)
 

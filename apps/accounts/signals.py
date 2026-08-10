@@ -49,12 +49,12 @@ def create_profile_and_quota(sender, instance: User, created: bool, **kwargs):
         if not ProfilePreferences.objects.filter(user=instance).exists():
             ProfilePreferences.objects.create(user=instance)
 
-        # Default tier assignment (if exists)
+        # Default tier assignment. "Free" is guaranteed to exist via
+        # apps.accounts.tiers.ensure_default_account_tiers() (called on
+        # every /api/v1/tiers/ request); the "Basic" fallback here predated
+        # that tier's rename and is no longer needed.
         try:
-            default_tier = (
-                AccountTier.objects.filter(name__iexact="Free").first()
-                or AccountTier.objects.filter(name__iexact="Basic").first()
-            )
+            default_tier = AccountTier.objects.filter(name__iexact="Free").first()
             if default_tier and instance.tier != default_tier.name:
                 instance.tier = default_tier.name
                 instance.save(update_fields=["tier", "updated_at"])

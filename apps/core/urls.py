@@ -7,14 +7,6 @@ from .views import (
     RoleViewSet,
     RoleAssignmentViewSet,
     AccessControlEntryViewSet,
-    CommunityViewSet,
-    GroupViewSet,
-    ChannelViewSet,
-    MembershipViewSet,
-    MembershipInviteViewSet,
-    ModerationActionViewSet,
-    GroupSettingsViewSet,
-    ChannelSettingsViewSet,
     HealthcareOrganizationViewSet,
     MedicalProfileViewSet,
     StaffProfileViewSet,
@@ -78,14 +70,25 @@ router.register(r"permissions", PermissionViewSet, basename="permission")
 router.register(r"roles", RoleViewSet, basename="role")
 router.register(r"role-assignments", RoleAssignmentViewSet, basename="roleassignment")
 router.register(r"aces", AccessControlEntryViewSet, basename="ace")
-router.register(r"communities", CommunityViewSet, basename="community")
-router.register(r"groups", GroupViewSet, basename="group")
-router.register(r"channels", ChannelViewSet, basename="channel")
-router.register(r"memberships", MembershipViewSet, basename="membership")
-router.register(r"invites", MembershipInviteViewSet, basename="invite")
-router.register(r"moderation-actions", ModerationActionViewSet, basename="moderationaction")
-router.register(r"group-settings", GroupSettingsViewSet, basename="groupsettings")
-router.register(r"channel-settings", ChannelSettingsViewSet, basename="channelsettings")
+# apps.core's generic Community/Group/Channel/Membership/Invite/
+# ModerationAction/*Settings viewsets (and the RBAC Permission/Role/
+# RoleAssignment/ACE system's Group.has_permission()/Community equivalents
+# that back them) are an early, superseded generic social-platform scaffold
+# — apps.communities, apps.groups, apps.channels, and apps.chat's own
+# moderation each replaced this with real, chat/conversation-integrated
+# implementations, but these registrations were never removed.
+# Deregistering them here is NOT cosmetic: apps.core.urls is included
+# BEFORE apps.communities.urls in config/urls.py, so CommunityViewSet here
+# was silently shadowing ALL of /api/v1/communities/ — confirmed via
+# django.urls.resolve() that every request there (list/retrieve/even
+# /communities/posts/) was being handled by this dead viewset instead of
+# apps.communities.views.CommunityViewSet, which only became reachable
+# again once this line was removed. /api/v1/groups/ and /api/v1/channels/
+# had no such live collision (apps.groups/apps.channels were already
+# rerouted to /api/v1/chat-groups/ and /api/v1/partner-channels/ before
+# this change), so removing them here is pure dead-surface cleanup.
+# Models/migrations are untouched — any stray existing rows remain
+# accessible via the ORM/admin, matching apps.tiers's quarantine pattern.
 router.register(r"medical/organizations", HealthcareOrganizationViewSet, basename="healthcareorganization")
 router.register(r"medical/profiles", MedicalProfileViewSet, basename="medicalprofile")
 router.register(r"medical/staff", StaffProfileViewSet, basename="medicalstaff")

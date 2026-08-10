@@ -814,7 +814,14 @@ class PatientCanonicalHealthProfileTests(TestCase):
         self.assertEqual(1, payload["affiliations"]["total_institutions"])
         self.assertEqual("KIS Prime Hospital", payload["affiliations"]["owned_institutions"][0]["name"])
 
-    def test_my_health_profile_returns_not_found_when_user_is_not_linked(self):
+    def test_my_health_profile_auto_provisions_a_patient_record_when_user_is_not_linked(self):
+        # Unlike its sibling actions (my-health-summary, my-emergency-card,
+        # ...), my_health_profile deliberately self-provisions a
+        # PatientMasterRecord the first time a user with no linked patient
+        # calls it (see apps.core.views.PatientMasterRecordViewSet.my_health_profile) —
+        # it's the bootstrap entry point, not a strict "must already exist"
+        # read. This test previously asserted the strict-404 contract that
+        # only the other, read-only actions actually have.
         other_user = User.objects.create_user(
             phone="+237670000003",
             password="StrongPass123",
@@ -825,8 +832,14 @@ class PatientCanonicalHealthProfileTests(TestCase):
 
         response = self.client.get("/api/v1/patients/master/my-health-profile/")
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual("patient_profile_not_linked", response.json()["code"])
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(str(other_user.id), payload["linked_user_id"])
+        self.assertTrue(
+            models.PatientMasterRecord.objects.filter(
+                id=payload["patient_id"], primary_contact__user_id=str(other_user.id)
+            ).exists()
+        )
 
     def test_legacy_broadcast_health_profile_write_syncs_core_patient_fields(self):
         response = self.client.post(

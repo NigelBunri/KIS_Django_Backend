@@ -10,6 +10,7 @@ from django.conf import settings
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
+from django.db import transaction
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 
@@ -25,6 +26,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from apps.core.money import parse_frontend_money_to_cents
 
 from apps.accounts.models import User, AccountTier, Subscription, AuditLog
+from apps.accounts.tiers import tier_rank as _tier_rank
 from apps.partners.services import ensure_partner_profiles_for_user
 from apps.core.phone_utils import to_e164
 from apps.core.models import HealthcareOrganization, MedicalProfile
@@ -87,6 +89,8 @@ from .services import (
     transfer_balance,
     upgrade_with_credits,
     apply_tier_upgrade,
+    finalize_expired_subscription,
+    reverse_tier_upgrade_payment,
     cents_to_credits,
     cents_to_usd,
     cents_to_usd_compact,
@@ -117,21 +121,6 @@ def _flutterwave_payment_link(payload: dict) -> dict:
 def _ensure_payments_ready() -> None:
     if not getattr(settings, "FLW_SECRET_KEY", None):
         raise ValueError("FLW_SECRET_KEY is not configured")
-
-
-def _tier_rank(name: str) -> int:
-    key = (name or "").strip().lower()
-    if "partner pro" in key:
-        return 5
-    if "partner" in key:
-        return 4
-    if "business pro" in key:
-        return 3
-    if "business" in key:
-        return 2
-    if "pro" in key:
-        return 1
-    return 0
 
 
 def _parse_int_field(value, field_name: str) -> int:
@@ -516,7 +505,7 @@ class RevenueLaunchEvidenceRecordViewSet(viewsets.ModelViewSet):
 
 
 def _current_subscription(user: User) -> Subscription | None:
-    return Subscription.objects.filter(user=user, status="active").select_related("tier").first()
+    return Subscription.objects.filter(user=user, status=Subscription.STATUS_ACTIVE).select_related("tier").first()
 
 
 def _calculate_proration(current: AccountTier, target: AccountTier, sub: Subscription) -> int:
@@ -528,31 +517,6 @@ def _calculate_proration(current: AccountTier, target: AccountTier, sub: Subscri
         return 0
     diff = max(current.price_cents - target.price_cents, 0)
     return int(round(diff * (remaining_seconds / total_seconds)))
-
-
-def _finalize_pending_downgrade(sub: Subscription) -> Subscription:
-    if not sub.ends_at or sub.ends_at > timezone.now():
-        return sub
-    if not sub.cancel_at_period_end:
-        return sub
-    target = sub.pending_tier or AccountTier.objects.filter(name__iexact="Free").first()
-    sub.status = "ended"
-    sub.cancel_at_period_end = False
-    sub.pending_tier = None
-    sub.save(update_fields=["status", "cancel_at_period_end", "pending_tier", "updated_at"])
-    if target:
-        Subscription.objects.create(
-            user=sub.user,
-            tier=target,
-            status="active",
-            started_at=timezone.now(),
-            ends_at=timezone.now() + timedelta(days=30),
-            billing_meta={"source": "downgrade"},
-        )
-        sub.user.tier = target.name
-        sub.user.save(update_fields=["tier", "updated_at"])
-        ensure_partner_profiles_for_user(sub.user, target.name)
-    return sub
 
 
 class WalletViewSet(viewsets.ViewSet):
@@ -628,7 +592,7 @@ class WalletViewSet(viewsets.ViewSet):
         sub = _current_subscription(request.user)
         if not sub:
             return Response({"subscription": None}, status=status.HTTP_200_OK)
-        sub = _finalize_pending_downgrade(sub)
+        sub = finalize_expired_subscription(sub)
         return Response(
             {"subscription": SubscriptionSerializer(sub).data},
             status=status.HTTP_200_OK,
@@ -641,7 +605,7 @@ class WalletViewSet(viewsets.ViewSet):
         transactions = WalletTransaction.objects.filter(user=request.user, is_deleted=False).order_by("-created_at")[:50]
         sub = _current_subscription(request.user)
         if sub:
-            sub = _finalize_pending_downgrade(sub)
+            sub = finalize_expired_subscription(sub)
         transaction_data = WalletTransactionSerializer(transactions, many=True, context={"request": request}).data
         invoice_links = (None, None)
         if sub:
@@ -664,7 +628,7 @@ class WalletViewSet(viewsets.ViewSet):
             return Response({"detail": "No active subscription."}, status=status.HTTP_400_BAD_REQUEST)
         immediate = bool(request.data.get("immediate"))
         if immediate:
-            sub.status = "cancelled"
+            sub.status = Subscription.STATUS_CANCELLED
             sub.ends_at = timezone.now()
             sub.cancel_at_period_end = False
             sub.canceled_at = timezone.now()
@@ -862,11 +826,71 @@ class WalletViewSet(viewsets.ViewSet):
             tx.status = "cancelled"
             tx.meta = {**tx.meta, "refund_reason": reason, "refund_response": data}
             tx.save(update_fields=["status", "meta", "updated_at"])
-            return Response({"detail": "Refund initiated", "provider_response": data})
+
+            reversal = None
+            if (tx.meta or {}).get("intent") == "tier_upgrade":
+                # Previously nothing happened here — a user could pay for a
+                # tier, immediately self-refund via this endpoint, and keep
+                # that tier active until its natural expiry.
+                reversal = reverse_tier_upgrade_payment(
+                    transaction_obj=tx, reason=reason, event_type="refund",
+                )
+
+            response_body = {"detail": "Refund initiated", "provider_response": data}
+            if reversal is not None:
+                response_body["subscription_reversal"] = reversal
+            return Response(response_body)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
             return Response({"detail": "Refund service unavailable"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    @action(
+        detail=False, methods=["post"], url_path="admin/reverse-payment",
+        permission_classes=[IsAdminUser],
+    )
+    def admin_reverse_payment(self, request):
+        """
+        Staff-only equivalent of the self-service refund flow above, for
+        processing a chargeback (or any other provider-side reversal)
+        support learns about out-of-band. No Flutterwave chargeback webhook
+        receiver exists in this codebase — there's no verified payload
+        contract to build one against safely, so this is the documented
+        interim path: for a chargeback the provider/bank has already
+        reversed the payment, this only needs to sync KIS's own
+        Subscription/ledger state, so unlike the self-service action it
+        does not call any payment provider API.
+        """
+        tx_ref = request.data.get("tx_ref")
+        reason = str(request.data.get("reason") or "Chargeback")[:255]
+        event_type = str(request.data.get("event_type") or "chargeback")
+        if event_type not in ("chargeback", "refund"):
+            return Response(
+                {"detail": "event_type must be 'chargeback' or 'refund'."}, status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not tx_ref:
+            return Response({"detail": "tx_ref required"}, status=status.HTTP_400_BAD_REQUEST)
+        tx = WalletTransaction.objects.filter(tx_ref=tx_ref, is_deleted=False).first()
+        if not tx:
+            return Response({"detail": "Transaction not found"}, status=status.HTTP_404_NOT_FOUND)
+        if tx.status != "success":
+            return Response(
+                {"detail": "Only successful transactions can be reversed."}, status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reversal = reverse_tier_upgrade_payment(transaction_obj=tx, reason=reason, event_type=event_type)
+        AuditLog.log(
+            request.user,
+            "billing.admin.payment_reversed",
+            {
+                "transaction_id": str(tx.id),
+                "tx_ref": tx.tx_ref,
+                "target_user_id": str(tx.user_id),
+                "event_type": event_type,
+                "reason": reason,
+            },
+        )
+        return Response({"detail": "Reversal processed", "reversal": reversal})
 
     @action(detail=False, methods=["get"], url_path="invoice")
     def invoice(self, request):
@@ -1140,7 +1164,9 @@ class WalletViewSet(viewsets.ViewSet):
                 "payment_method": payment_method,
             },
         )
-        current_sub = Subscription.objects.filter(user=request.user, status="active").select_related("tier").first()
+        current_sub = Subscription.objects.filter(
+            user=request.user, status=Subscription.STATUS_ACTIVE,
+        ).select_related("tier").first()
         current_tier = current_sub.tier if current_sub and current_sub.tier else AccountTier.objects.filter(
             name__iexact=request.user.tier
         ).first()
@@ -1459,11 +1485,29 @@ class FlutterwaveWebhookView(APIView):
             return Response({"detail": "unknown transaction"}, status=status.HTTP_404_NOT_FOUND)
 
         transaction_obj.raw_payload = payload
-        if status_flag == "successful" and transaction_obj.status != "success":
-            transaction_obj.status = "success"
-            transaction_obj.provider_ref = data.get("id", "")
-            transaction_obj.processed_at = timezone.now()
-            transaction_obj.save(update_fields=["status", "provider_ref", "processed_at", "raw_payload", "updated_at"])
+        if status_flag == "successful":
+            # Re-fetch under a row lock and re-check the status guard inside
+            # it — the previous plain read-then-write here had a real race
+            # window: two genuinely concurrent redeliveries of the same
+            # webhook event could both read status != "success" before
+            # either commits, and both call apply_tier_upgrade for the same
+            # payment. select_for_update() serializes them so the second
+            # one to arrive sees the first one's committed "success" status
+            # and correctly no-ops.
+            with transaction.atomic():
+                transaction_obj = WalletTransaction.objects.select_for_update().get(id=transaction_obj.id)
+                already_processed = transaction_obj.status == "success"
+                transaction_obj.raw_payload = payload
+                if not already_processed:
+                    transaction_obj.status = "success"
+                    transaction_obj.provider_ref = data.get("id", "")
+                    transaction_obj.processed_at = timezone.now()
+                transaction_obj.save(
+                    update_fields=["status", "provider_ref", "processed_at", "raw_payload", "updated_at"],
+                )
+                if already_processed:
+                    return Response({"status": "ok", "note": "already processed"})
+
             intent = (transaction_obj.meta or {}).get("intent")
             if intent == "tier_upgrade":
                 tier_id = (transaction_obj.meta or {}).get("tier_id")
@@ -1508,14 +1552,16 @@ class FlutterwaveWebhookView(APIView):
                 _user_obj = _User.objects.filter(id=str(user_id or "")).first() if user_id else None
                 if _user_obj and getattr(_user_obj, "email", None):
                     from apps.notifications.email_service import send_payment_receipt_email
-                    send_payment_receipt_email(
+                    if not send_payment_receipt_email(
                         to_email=_user_obj.email,
                         amount=str(amount or ""),
                         currency=str(currency or "USD"),
                         tx_ref=str(tx_ref or ""),
-                    )
-            except Exception:
-                pass
+                    ):
+                        logger.warning("[FLW webhook] payment receipt email failed for tx_ref=%s", tx_ref)
+                        AuditLog.log(actor=_user_obj, action="email.payment_receipt.failed", meta={"tx_ref": str(tx_ref or "")})
+            except Exception as _exc:
+                logger.warning("[FLW webhook] payment receipt email raised: %s", _exc.__class__.__name__)
         elif status_flag in ("failed", "cancelled"):
             transaction_obj.status = "failed" if status_flag == "failed" else "cancelled"
             meta = transaction_obj.meta or {}
@@ -1768,13 +1814,19 @@ class StripeWebhookView(APIView):
                             membership = ChannelMembership.objects.select_related("tier__channel").filter(id=target_id).first()
                             if membership:
                                 from apps.notifications.email_service import send_membership_email
-                                send_membership_email(
+                                if not send_membership_email(
                                     to_email=user_obj.email,
                                     tier_title=membership.tier.title,
                                     channel_name=membership.tier.channel.name,
-                                )
-                        except Exception:
-                            pass
+                                ):
+                                    logger.warning("[Stripe] membership email failed for user_id=%s", user_id)
+                                    AuditLog.log(actor=user_obj, action="email.membership.failed", meta={"membership_id": str(target_id)})
+                        except Exception as _email_exc:
+                            logger.warning("[Stripe] membership email raised: %s", _email_exc.__class__.__name__)
+                            AuditLog.log(
+                                actor=user_obj, action="email.membership.failed",
+                                meta={"membership_id": str(target_id), "error": _email_exc.__class__.__name__},
+                            )
                 except Exception as exc:
                     logger.warning("[Stripe] membership activation failed: %s", exc)
             # Send payment receipt email
@@ -1784,14 +1836,16 @@ class StripeWebhookView(APIView):
                 user_obj = _User.objects.filter(id=user_id).first()
                 if user_obj and getattr(user_obj, "email", None):
                     from apps.notifications.email_service import send_payment_receipt_email
-                    send_payment_receipt_email(
+                    if not send_payment_receipt_email(
                         to_email=user_obj.email,
                         amount=f"{amount / 100:.2f}",
                         currency=currency,
                         tx_ref=intent_id,
-                    )
-            except Exception:
-                pass
+                    ):
+                        logger.warning("[Stripe] payment receipt email failed for tx_ref=%s", intent_id)
+                        AuditLog.log(actor=user_obj, action="email.payment_receipt.failed", meta={"tx_ref": str(intent_id or "")})
+            except Exception as _exc:
+                logger.warning("[Stripe] payment receipt email raised: %s", _exc.__class__.__name__)
 
         elif event_type == "checkout.session.completed":
             session_id = data_obj.get("id") or ""

@@ -706,6 +706,18 @@ class AccountTier(BaseEntity):
     name = models.CharField(max_length=50, unique=True)
     price_cents = models.BigIntegerField(default=0)
     features_json = models.JSONField(default=dict)
+    # Database-backed hierarchy — the single authoritative ordering for tier
+    # comparisons (upgrade/downgrade eligibility, isPremium, feature
+    # aggregation). Previously this hierarchy existed only as a hardcoded
+    # Python list in apps.accounts.tiers plus two independent, drift-prone
+    # substring-matching re-implementations elsewhere in the codebase.
+    # Higher rank = more privileged; 0 is the free/base tier.
+    rank = models.PositiveSmallIntegerField(default=0, db_index=True)
+    # How many days an active Subscription to this tier normally lasts
+    # before renewal/expiry processing applies. Schema only in this phase —
+    # apps.billing's renewal/expiry state machine (Phase 3) is what actually
+    # consumes this instead of the current hardcoded 30-day assumption.
+    billing_period_days = models.PositiveIntegerField(default=30)
 
     class Meta:
         verbose_name = "Account Tier"
@@ -715,16 +727,39 @@ class AccountTier(BaseEntity):
         return self.name
 
 class Subscription(BaseEntity):
+    # Consolidated state vocabulary — previously `status` had no choices=
+    # constraint at all (any string was accepted), and three different
+    # terminal-state spellings existed for "no longer active" depending on
+    # which code path ended the row: "superseded" (upgrade replaced it),
+    # "ended" (a scheduled downgrade completed), "cancelled" (immediate
+    # cancel). "ended" is consolidated into EXPIRED below (a migration
+    # renames existing rows) since that's what it actually means — the
+    # subscription reached its ends_at. SUPERSEDED stays distinct: it's not
+    # wrong or lapsed, it was deliberately replaced by a newer row for the
+    # same user. No trialing/pending/past_due states exist — nothing in
+    # this codebase drives them (no trial mechanism, no invoice-based
+    # dunning); adding unused enum values would be speculative.
+    STATUS_ACTIVE = "active"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_EXPIRED = "expired"
+    STATUS_SUPERSEDED = "superseded"
+    STATUS_REFUNDED = "refunded"
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_CANCELLED, "Cancelled"),
+        (STATUS_EXPIRED, "Expired"),
+        (STATUS_SUPERSEDED, "Superseded"),
+        (STATUS_REFUNDED, "Refunded"),
+    ]
+
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="subscriptions")
     tier = models.ForeignKey(AccountTier, on_delete=models.SET_NULL, null=True)
-    status = models.CharField(max_length=50, default="active")
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
     started_at = models.DateTimeField(default=timezone.now)
     ends_at = models.DateTimeField(null=True, blank=True)
     cancel_at_period_end = models.BooleanField(default=False)
     canceled_at = models.DateTimeField(null=True, blank=True)
     grace_ends_at = models.DateTimeField(null=True, blank=True)
-    retry_count = models.IntegerField(default=0)
-    next_retry_at = models.DateTimeField(null=True, blank=True)
     pending_tier = models.ForeignKey(
         AccountTier,
         null=True,
@@ -735,7 +770,24 @@ class Subscription(BaseEntity):
     billing_meta = models.JSONField(default=dict, blank=True)
 
     class Meta:
-        indexes = [models.Index(fields=["user", "status"])]
+        indexes = [
+            models.Index(fields=["user", "status"]),
+            # Serves the expiry-sweep's bulk query (all active subscriptions
+            # past their ends_at), which doesn't filter by user.
+            models.Index(fields=["status", "ends_at"]),
+        ]
+        constraints = [
+            # A user must never have two simultaneously-active subscriptions
+            # — every creation path (apply_tier_upgrade, the downgrade
+            # finalize path) already supersedes/ends the prior active row
+            # before creating a new one, so this codifies an invariant the
+            # code already maintains rather than changing behavior.
+            models.UniqueConstraint(
+                fields=["user"],
+                condition=models.Q(status="active"),
+                name="uniq_active_subscription_per_user",
+            ),
+        ]
 
 # ---------------------------------------------------------------------
 # Usage Quota

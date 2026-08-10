@@ -117,7 +117,22 @@ def make_code_hash(phone: str, purpose: str, code: str) -> str:
     key = settings.SECRET_KEY.encode("utf-8")
     return hmac.new(key, msg, sha256).hexdigest()
 
-OVERRIDE_OTP_CODE = getattr(settings, "OTP_OVERRIDE_CODE", "676139")
+def _override_otp_active(code: str) -> bool:
+    """
+    True only when a dev/QA override code was actually submitted. Reads
+    settings live (not a module-level constant captured at import time) so
+    OTP_OVERRIDE_ENABLED/OTP_OVERRIDE_CODE behave correctly under
+    django.test.override_settings and can never be "stuck" from whatever
+    value was configured at process start. Both settings default to
+    off/empty, and config.settings.production refuses to boot if either is
+    configured — there is no default override code.
+    """
+    if not getattr(settings, "OTP_OVERRIDE_ENABLED", False):
+        return False
+    override_code = str(getattr(settings, "OTP_OVERRIDE_CODE", "") or "").strip()
+    if not override_code:
+        return False
+    return hmac.compare_digest(code, override_code)
 
 def sms_configured() -> bool:
     return bool(
@@ -457,8 +472,9 @@ class OtpVerifyView(APIView):
         if purpose not in ALLOWED_PURPOSES:
             return Response({"success": False, "message": "invalid purpose"}, status=400)
 
-        # Override code: always passes verification (used for testing/QA).
-        is_override = hmac.compare_digest(code, OVERRIDE_OTP_CODE)
+        # Override code: always passes verification — only when explicitly
+        # enabled via OTP_OVERRIDE_ENABLED (dev/QA only; refused in production).
+        is_override = _override_otp_active(code)
 
         now = timezone.now()
         # Use variant-aware OTP lookup so slight format differences don't block verification
@@ -519,6 +535,10 @@ class OtpVerifyView(APIView):
         user.status = "active"
         user.is_active = True
         user.save(update_fields=["verification", "status", "is_active", "updated_at"])
+
+        if purpose == "register":
+            from apps.referrals.services import apply_referral_reward_if_pending
+            apply_referral_reward_if_pending(user)
 
         # Issue auth tokens now that the account is verified
         from apps.accounts.views import issue_tokens_for_user, upsert_device

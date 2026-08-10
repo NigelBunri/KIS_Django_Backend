@@ -1280,7 +1280,15 @@ class BroadcastProfileManageTests(APITestCase):
         profile = second.data.get('profile') or {}
         attachments = profile.get('attachments') or []
         self.assertEqual(len(attachments), 2)
-        self.assertEqual(profile.get('shops') or [], [{'id': 'shop_1', 'name': 'Shop One'}])
+        # _sanitize_shop (run on the first call, since 'shops' was in that
+        # update) normalizes a raw shop entry into a full storefront record
+        # (slug, tagline, category, metrics, ...) — this assertion only
+        # cares that the shop set on the first call survives untouched
+        # through a second update that doesn't mention shops at all.
+        shops = profile.get('shops') or []
+        self.assertEqual(len(shops), 1)
+        self.assertEqual(shops[0].get('id'), 'shop_1')
+        self.assertEqual(shops[0].get('name'), 'Shop One')
 
     def test_manage_education_profile_bootstraps_structure_and_appends_modules(self):
         response = self.client.post(
@@ -2072,6 +2080,17 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
             password="secret",
             country="NG",
         )
+        # EducationInstitutionListView.post correctly enforces a real,
+        # intentional Business-Pro-and-up paywall via _resolve_profile_limit
+        # (see apps.accounts.tier_presets: "education_profiles" is 0 on
+        # lower tiers) — these tests predate that gate and need a
+        # qualifying tier to exercise institution creation itself rather
+        # than being blocked by the (correct) paywall.
+        from apps.accounts.tiers import ensure_default_account_tiers
+
+        ensure_default_account_tiers()
+        self.user.tier = "Business Pro"
+        self.user.save(update_fields=["tier"])
         self.client.force_authenticate(user=self.user)
 
     def test_direct_owner_without_membership_can_manage_education_institution(self):
@@ -2543,6 +2562,16 @@ class BroadcastVideoContractTests(APITestCase):
             MEDIA_ROOT=self.temp_media_dir.name,
             API_BASE_URL='http://192.168.110.62:8000',
             SITE_URL='http://192.168.110.62:8000',
+            # Explicit, not relying on ambient OBJECT_STORAGE_PROVIDER (a
+            # local .env set to "s3" for manual dev testing switches
+            # settings.STORAGES to S3MediaStorage) — build_media_url only
+            # does the loopback/public-host URL rewrite this test checks
+            # for under FileSystemStorage; a remote backend short-circuits
+            # to default_storage.url() (a real, signed bucket URL) instead.
+            STORAGES={
+                "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+                "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+            },
         ):
             upload = SimpleUploadedFile('clip.mp4', b'fake-video-bytes', content_type='video/mp4')
             with patch('apps.broadcasts.views._probe_video_duration', return_value=12.4):
@@ -2651,6 +2680,11 @@ class BroadcastVideoContractTests(APITestCase):
         API_BASE_URL='http://10.14.20.99:8000',
         SITE_URL='http://10.14.20.99:8000',
         ALLOWED_HOSTS=['testserver', '127.0.0.1'],
+        # See the comment in test_feed_entry_create_uses_public_api_base_when_request_host_is_loopback above.
+        STORAGES={
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+            "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+        },
     )
     def test_feed_entries_get_normalizes_stored_loopback_image_attachment_urls(self):
         response = self.client.post(

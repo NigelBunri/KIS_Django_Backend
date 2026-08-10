@@ -5,7 +5,6 @@ Tests for security fixes applied during the Phase 1/2 hardening pass:
   - Phone enumeration block on UserViewSet.me()
 """
 import ipaddress
-import pytest
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework import status
@@ -42,7 +41,7 @@ class IpRestrictionTest(TestCase):
 
     def setUp(self):
         from apps.accounts.models import ApiToken
-        self.user = User.objects.create_user(phone="+10000000002", password="Test1234!")
+        self.user = User.objects.create_user(phone="+10000000002", password="Test1234!", country="US")
         self.token_obj, self.token_plain = self.user.create_api_token(name="test")
 
     def _set_restrictions(self, restrictions):

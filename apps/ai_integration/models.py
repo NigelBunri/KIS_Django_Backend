@@ -88,7 +88,13 @@ class AIJob(BaseEntity):
     completed_at = models.DateTimeField(null=True, blank=True)
     retries = models.IntegerField(default=0)
     metadata = JSONField(default=dict, blank=True)
-    triggered_by = models.CharField(max_length=20, default='USER')
+    # 64, not 20: apps.ai_integration.views stores str(request.user.id) here
+    # (a 36-char UUID) on every real job/pipeline creation — the previous
+    # max_length=20 made every such insert fail with a DB-level
+    # DataError, unconditionally. AIJobFeedback's own triggered_by
+    # (below) already uses max_length=50 for the same value shape; 64
+    # gives headroom beyond a bare UUID without being unbounded.
+    triggered_by = models.CharField(max_length=64, default='USER')
 
     def __str__(self):
         return f"AIJob {self.id} ({self.job_type})"

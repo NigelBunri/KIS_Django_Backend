@@ -1,3 +1,12 @@
+# NOTE ON THE WORKER/BEAT/REDIS SERVICES BELOW: this blueprint file only
+# describes infrastructure — applying it (via `render blueprint launch` or
+# connecting this repo as a Blueprint in the Render dashboard) is what
+# actually provisions and starts billing for these services, and that step
+# is intentionally left for a human to trigger explicitly. Render's free
+# plan does not support background worker services or a managed Redis
+# instance at production-usable size — celery-worker and celery-beat below
+# are on `plan: starter` (Render's cheapest paid tier); size the redis
+# service to your expected queue volume before launching.
 services:
   - type: web
     name: kis-django-backend
@@ -12,6 +21,12 @@ services:
 
     startCommand: |
       gunicorn config.wsgi:application
+
+    # Lets Render gate zero-downtime deploys/restarts on real DB+cache
+    # connectivity (config/urls.py health_check) instead of just "the
+    # process is listening" — a deploy that boots but can't reach the
+    # database now fails the health check instead of serving 500s live.
+    healthCheckPath: /health/
 
     envVars:
 
@@ -56,3 +71,91 @@ services:
 
       - key: JWT_AUDIENCE
         value: messaging-platform
+
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: kis-redis
+          property: connectionString
+
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: kis-redis
+          property: connectionString
+
+  - type: worker
+    name: kis-celery-worker
+    runtime: python
+    plan: starter
+
+    buildCommand: |
+      pip install -r requirements.txt
+
+    startCommand: |
+      celery -A config worker --loglevel=info --concurrency=2
+
+    envVars:
+      - key: DJANGO_ENV
+        value: production
+      - key: DEBUG
+        value: False
+      - key: SECRET_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: kis-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: kis-redis
+          property: connectionString
+
+  - type: worker
+    name: kis-celery-beat
+    runtime: python
+    plan: starter
+
+    buildCommand: |
+      pip install -r requirements.txt
+
+    startCommand: |
+      celery -A config beat --loglevel=info
+
+    envVars:
+      - key: DJANGO_ENV
+        value: production
+      - key: DEBUG
+        value: False
+      - key: SECRET_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: kis-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: kis-redis
+          property: connectionString
+
+# Beat's schedule state lives in Postgres (CELERY_BEAT_SCHEDULER =
+# DatabaseScheduler, see config/settings/base.py) specifically so it
+# survives this service redeploying/restarting — do not run more than one
+# kis-celery-beat instance at a time, or the same periodic task can fire
+# more than once per interval.
+redisInstances:
+  - name: kis-redis
+    plan: starter
+    ipAllowList: []

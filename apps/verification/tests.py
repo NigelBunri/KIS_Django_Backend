@@ -31,9 +31,23 @@ from .services import (
 )
 
 
+def _grant_verification_badge_feature(user) -> None:
+    # UserVerificationStartView correctly enforces require_feature(user,
+    # "verification_badge", ...) — a real, intentional Business-Pro-and-up
+    # paywall (see apps/accounts/tier_presets.py). These tests predate that
+    # gate and need a qualifying tier to exercise the verification flow
+    # itself rather than being blocked by the (correct) paywall.
+    from apps.accounts.tiers import ensure_default_account_tiers
+
+    ensure_default_account_tiers()
+    user.tier = "Business Pro"
+    user.save(update_fields=["tier"])
+
+
 class UserVerificationFlowTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(phone="+237670020001", password="TestPass123!", country="CM")
+        _grant_verification_badge_feature(self.user)
         self.staff = User.objects.create_user(phone="+237670020002", password="TestPass123!", country="CM")
         self.staff.is_staff = True
         self.staff.save(update_fields=["is_staff"])
@@ -184,6 +198,7 @@ class UserVerificationFlowTests(APITestCase):
 class StaffVerificationOperationsTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(phone="+237670020011", password="TestPass123!", country="CM")
+        _grant_verification_badge_feature(self.user)
         self.staff = User.objects.create_user(phone="+237670020012", password="TestPass123!", country="CM")
         self.staff.is_staff = True
         self.staff.save(update_fields=["is_staff"])

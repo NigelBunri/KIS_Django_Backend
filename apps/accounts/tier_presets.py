@@ -12,6 +12,8 @@ TIER_PRESETS: list[dict[str, Any]] = [
     {
         "name": "Free",
         "price_cents": 0,
+        "rank": 0,
+        "billing_period_days": 30,
         "features_json": {
             "feature_tagline": "Start free, upgrade anytime",
             "feature_highlight": "Everything you need to begin",
@@ -46,6 +48,8 @@ TIER_PRESETS: list[dict[str, Any]] = [
     {
         "name": "Pro",
         "price_cents": 1000,
+        "rank": 1,
+        "billing_period_days": 30,
         "features_json": {
             "feature_tagline": "Creators and power users",
             "feature_highlight": "Enhanced profile + higher limits",
@@ -80,6 +84,8 @@ TIER_PRESETS: list[dict[str, Any]] = [
     {
         "name": "Business",
         "price_cents": 2500,
+        "rank": 2,
+        "billing_period_days": 30,
         "features_json": {
             "feature_tagline": "Teams, growth, and visibility",
             "feature_highlight": "KIS Business broadcast + storefront",
@@ -117,6 +123,8 @@ TIER_PRESETS: list[dict[str, Any]] = [
     {
         "name": "Business Pro",
         "price_cents": 3500,
+        "rank": 3,
+        "billing_period_days": 30,
         "features_json": {
             "feature_tagline": "High-impact teams and creators",
             "feature_badge": "Most popular",
@@ -161,6 +169,8 @@ TIER_PRESETS: list[dict[str, Any]] = [
     {
         "name": "Partner",
         "price_cents": 6000,
+        "rank": 4,
+        "billing_period_days": 30,
         "features_json": {
             "feature_tagline": "Organizations, ministries, and enterprises",
             "feature_badge": "Partner",
@@ -216,6 +226,8 @@ TIER_PRESETS: list[dict[str, Any]] = [
     {
         "name": "Partner Pro",
         "price_cents": 12000,
+        "rank": 5,
+        "billing_period_days": 30,
         "features_json": {
             "feature_tagline": "Global partner networks & enterprise ops",
             "feature_badge": "Partner Pro",

@@ -28,7 +28,12 @@ class RequestLoggingMiddleware(MiddlewareMixin):
     def process_response(self, request, response):
         duration = (time.time() - getattr(request, "_start_time", time.time())) * 1000.0
         rid = getattr(request, "request_id", "-")
-        logger.debug(
+        # INFO, not DEBUG: config.settings.production sets LOG_LEVEL=INFO by
+        # default (the only sane production level — DEBUG floods logs with
+        # every library's internal chatter), so this was the standard
+        # "access log" line this middleware exists to produce, and it was
+        # never actually reaching production logs at all.
+        logger.info(
             "REQ END %s %s %s %.2fms rid=%s",
             request.method,
             redact_url(request.get_full_path()),

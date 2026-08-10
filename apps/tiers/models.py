@@ -1,3 +1,5 @@
+# QUARANTINED — see apps/tiers/apps.py's docstring. Superseded by
+# apps.accounts + apps.billing; not URL-exposed; do not extend.
 from django.db import models
 import uuid
 from django.utils import timezone

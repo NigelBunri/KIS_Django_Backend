@@ -38,6 +38,17 @@ SIMPLE_JWT = {
 IS_TEST_RUN = len(sys.argv) > 1 and sys.argv[1] == "test"
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", None)
 
+# Without this, a test that calls some_task.delay() silently enqueues to
+# whatever real broker CELERY_BROKER_URL points at and passes regardless of
+# whether the task logic actually works — nothing in the test process ever
+# consumes it. Eager mode runs the task body synchronously and in-process
+# instead, and EAGER_PROPAGATES surfaces a real task exception as a test
+# failure rather than swallowing it. Local/CI test runs only — production
+# must never run tasks synchronously in the request/response cycle.
+if IS_TEST_RUN:
+    CELERY_TASK_ALWAYS_EAGER = True
+    CELERY_TASK_EAGER_PROPAGATES = True
+
 # Local DB: leave default sqlite unless DATABASE_URL provided.
 DATABASE_URL = os.environ.get("DATABASE_URL", None)
 if IS_TEST_RUN and not TEST_DATABASE_URL:

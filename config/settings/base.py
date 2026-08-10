@@ -147,6 +147,12 @@ if _env_bool("USE_X_FORWARDED_PROTO", False):
 # the requirement.
 KIS_PHONE_VERIFICATION_ENABLED = _env_bool("KIS_PHONE_VERIFICATION_ENABLED", False)
 
+# Email provider — Resend (HTTP API). See config/settings/production.py for
+# how this selects EMAIL_BACKEND; local/test environments never send real
+# email regardless (console backend / eager test settings), so this is safe
+# to leave blank there.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+
 # Payments / Wallet
 FLW_PUBLIC_KEY = os.environ.get("FLW_PUBLIC_KEY", "")
 FLW_SECRET_KEY = os.environ.get("FLW_SECRET_KEY", "")
@@ -241,8 +247,12 @@ WHATSAPP_SENDER_NUMBER = os.environ.get("WHATSAPP_SENDER_NUMBER", "").strip()
 WHATSAPP_TEMPLATE_NAME = os.environ.get("WHATSAPP_TEMPLATE_NAME", "").strip()
 WHATSAPP_TEMPLATE_LANGUAGE = os.environ.get("WHATSAPP_TEMPLATE_LANGUAGE", "en").strip() or "en"
 
-# Override OTP code that always passes verification (testing only — never commit a real value here).
-OTP_OVERRIDE_CODE = os.environ.get("OTP_OVERRIDE_CODE", "676139").strip()
+# Override OTP code that always passes verification — development/QA only.
+# No default value: an override is only active when BOTH OTP_OVERRIDE_ENABLED
+# is explicitly true AND OTP_OVERRIDE_CODE is set. production.py refuses to
+# start if either is configured. Never commit a real value for either.
+OTP_OVERRIDE_ENABLED = _env_bool("OTP_OVERRIDE_ENABLED", False)
+OTP_OVERRIDE_CODE = os.environ.get("OTP_OVERRIDE_CODE", "").strip()
 
 # Verification / KYC / KYB providers.
 # Phase 1 only reads configuration. Live provider calls are introduced in later phases.
@@ -314,6 +324,7 @@ INSTALLED_APPS = [
     "apps.statuses.apps.StatusesConfig",
     "apps.billing.apps.BillingConfig",
     "apps.verification.apps.VerificationConfig",
+    "apps.referrals.apps.ReferralsConfig",
 
     # chats
     "apps.chat.apps.ChatConfig",
@@ -562,6 +573,26 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_SOFT_TIME_LIMIT = 300   # seconds — raises SoftTimeLimitExceeded for graceful cleanup
 CELERY_TASK_TIME_LIMIT = 360        # hard kill after 6 minutes
 
+# Redeploy-safe periodic scheduling: django_celery_beat has been installed
+# (and migrated) since before this phase, but nothing ever pointed Celery
+# Beat at it — the default PersistentScheduler persists "last run" state to
+# a local file, which does not survive a redeploy on an ephemeral
+# filesystem (e.g. Render). DatabaseScheduler persists that state to
+# Postgres instead, and seeds CELERY_BEAT_SCHEDULE into the PeriodicTask
+# table on first boot; the DB then becomes the source of truth, so a
+# schedule can also be tweaked at runtime via /admin without a redeploy.
+CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
+
+# Reliability pairing: acks_late means a task is only acknowledged (removed
+# from the broker) after it finishes, not the moment a worker picks it up —
+# so a worker crashing/OOM-killing mid-task gets that task redelivered
+# instead of silently losing it. prefetch_multiplier=1 stops a worker from
+# hoarding a batch of tasks in memory ahead of when it can actually work on
+# them, which matters once acks_late is on (a hoarded-but-uncompleted batch
+# would otherwise all get redelivered together after a crash).
+CELERY_TASK_ACKS_LATE = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+
 # Periodic media-upload cleanup (apps/media/tasks.py). Both tasks wrap
 # functions in apps/media/upload_intent.py that were already correct but had
 # no scheduler actually invoking them — the management command
@@ -580,6 +611,18 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.media.tasks.expire_unattached_media_uploads",
         # MEDIA_UPLOAD_UNATTACHED_GRACE_SECONDS defaults to 24h, so there's
         # no benefit to sweeping more often than hourly.
+        "schedule": 60 * 60,
+    },
+    # Subscription expiry (apps/billing/tasks.py, apps/billing/services.py
+    # sweep_expired_subscriptions). Previously a subscription that lapsed
+    # without the user explicitly cancelling/downgrading stayed "active" —
+    # and the user's paid tier stayed in effect — indefinitely, since the
+    # only expiry processing was a lazy check on two GET endpoints the user
+    # had to happen to hit. Hourly matches the media-upload sweep cadence;
+    # a subscription being briefly (up to an hour) late to expire has no
+    # meaningful revenue/security impact worth a tighter interval.
+    "expire-subscriptions": {
+        "task": "apps.billing.tasks.expire_subscriptions",
         "schedule": 60 * 60,
     },
 }

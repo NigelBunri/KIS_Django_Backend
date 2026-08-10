@@ -7,7 +7,7 @@ User = get_user_model()
 
 class ContentMetricsTests(TestCase):
     def setUp(self):
-        self.user = User.objects.create_user(username="tester", password="pass")
+        self.user = User.objects.create_user(phone="+237699930001", password="pass", country="CM")
         self.content = Content.objects.create(author=self.user, title="T", body="B", is_published=True)
 
     def test_views_recalc(self):

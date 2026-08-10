@@ -26,6 +26,8 @@ from apps.core.phone_utils import to_e164
 from common.media_urls import absolutize_backend_media
 from django.utils.translation import gettext_lazy as _
 from django.contrib.auth.hashers import make_password, check_password
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 import pyotp
 import phonenumbers as _phonenumbers
 
@@ -87,6 +89,7 @@ from .security_events import log_security_event, record_failed_auth, request_met
 
 from .serializers import (
     UserSerializer,
+    PublicUserSerializer,
     UserCreateSerializer,
     ProfileSerializer,
     ProfileFieldVisibilitySerializer,
@@ -96,7 +99,9 @@ from .serializers import (
     ProfileShowcaseSerializer,
     AccountTierSerializer,
     SubscriptionSerializer,
+    SubscriptionSelfSerializer,
     SessionSerializer,
+    SessionSelfSerializer,
     DeviceSessionSerializer,
     E2EEDeviceBundleSerializer,
     ExperienceSerializer,
@@ -614,6 +619,99 @@ class IsOwnerOrReadOnly(permissions.BasePermission):
             return False
         return owner == request.user
 
+
+class IsOwnerReadOnlyOrStaff(permissions.BasePermission):
+    """
+    For records that hold financial/session evidence (subscriptions, login
+    sessions): staff get full CRUD; a normal authenticated user may only
+    read their own record. Direct mutation by non-staff is blocked at the
+    view level (has_permission) so POST/PUT/PATCH/DELETE never even reach
+    per-object checks — those records must only change via the controlled
+    billing/device services, not this generic REST surface.
+    """
+    def has_permission(self, request, view):
+        user = request.user
+        if not (user and user.is_authenticated):
+            return False
+        if user.is_staff:
+            return True
+        return request.method in permissions.SAFE_METHODS
+
+    def has_object_permission(self, request, view, obj):
+        user = request.user
+        if user.is_staff:
+            return True
+        if request.method not in permissions.SAFE_METHODS:
+            return False
+        return getattr(obj, "user_id", None) == user.id
+
+
+class IsAdminOrReadOnly(permissions.BasePermission):
+    """
+    For platform-wide, not-per-user resources (AccountTier pricing/feature
+    definitions): IsAuthenticatedOrReadOnly previously let ANY authenticated
+    user write here — since AccountTier rows are shared across every user
+    (not owned by anyone), that meant any registered account could rewrite
+    another tier's price_cents/features_json/rank, affecting the whole
+    platform's billing, not just their own account. Read stays open to
+    everyone (including anonymous — this is public pricing-page data);
+    only staff may write.
+    """
+    def has_permission(self, request, view):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return bool(request.user and request.user.is_authenticated and request.user.is_staff)
+
+
+class IsProfileOwnerOrStaffForWrites(permissions.BasePermission):
+    """
+    ProfileViewSet's base update/partial_update/destroy actions had no
+    object-level check at all — any authenticated user could PATCH or
+    DELETE another user's Profile (bio, headline, industry, visibility,
+    avatar/cover) via /api/v1/profiles/<id>/. list/retrieve/discover/view
+    stay open to any authenticated user (unchanged) since ProfileSerializer
+    doesn't expose raw phone/email — this only closes the write path.
+    """
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated)
+
+    def has_object_permission(self, request, view, obj):
+        user = request.user
+        if user.is_staff:
+            return True
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return obj.user_id == user.id
+
+
+class IsSelfOrStaffForUserWrites(permissions.BasePermission):
+    """
+    For UserViewSet specifically: any authenticated user may READ (list,
+    search, retrieve) any account — the view layer swaps in
+    PublicUserSerializer for anyone who isn't the target themselves or
+    staff, so a read never actually exposes phone/email/verification/
+    preferences for someone else's account. Writes (update, partial_update,
+    destroy) are restricted to the account's own owner or staff — 'create'
+    is staff-only, since real account creation goes through RegisterView
+    (a UserCreateSerializer flow with password handling this viewset's
+    UserSerializer doesn't have), not this generic REST surface.
+    """
+    def has_permission(self, request, view):
+        user = request.user
+        if not (user and user.is_authenticated):
+            return False
+        if getattr(view, "action", None) == "create":
+            return bool(user.is_staff)
+        return True
+
+    def has_object_permission(self, request, view, obj):
+        user = request.user
+        if user.is_staff:
+            return True
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return obj.id == user.id
+
 # -----------------------------
 # JWT helpers
 # -----------------------------
@@ -824,6 +922,8 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
         if not device_id:
             return Response({"detail": "Device id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
+        referral_code = (request.data.get("referral_code") or "").strip()
+
         try:
             with transaction.atomic():
                 user = serializer.save()
@@ -834,6 +934,10 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
                     user=user,
                     defaults={"quotas_json": {}, "last_reset_at": timezone.now()},
                 )
+
+                if referral_code:
+                    from apps.referrals.services import register_referral
+                    register_referral(referred_user=user, referral_code=referral_code, device_id=device_id)
 
                 AuditLog.log(actor=user, action="user.register", meta={
                     "phone": user.phone,
@@ -848,13 +952,19 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
             raise DRFValidationError({"detail": "Duplicate or invalid data."})
 
         upsert_device(user, device_id, device_platform or None, device_name or None, request)
-        # Send welcome email (non-blocking)
+        # Send welcome email (non-blocking) — a failure here must not block
+        # registration, but previously it vanished with zero trace (bare
+        # except: pass). Now logged + audited so a provider outage is
+        # actually visible instead of silently losing the email forever.
         try:
             if getattr(user, "email", None):
                 from apps.notifications.email_service import send_welcome_email
-                send_welcome_email(to_email=user.email)
-        except Exception:
-            pass
+                if not send_welcome_email(to_email=user.email):
+                    logger.warning("Welcome email failed to send for user_id=%s", user.id)
+                    AuditLog.log(actor=user, action="email.welcome.failed", meta={"user_id": str(user.id)})
+        except Exception as exc:
+            logger.warning("Welcome email raised for user_id=%s: %s", user.id, exc.__class__.__name__)
+            AuditLog.log(actor=user, action="email.welcome.failed", meta={"user_id": str(user.id), "error": exc.__class__.__name__})
 
         # Verification is suspended (KIS_PHONE_VERIFICATION_ENABLED=false): skip the
         # OTP step entirely and activate + log the account in immediately.
@@ -869,6 +979,10 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
             user.status = "active"
             user.is_active = True
             user.save(update_fields=["verification", "status", "is_active", "updated_at"])
+
+            if referral_code:
+                from apps.referrals.services import apply_referral_reward_if_pending
+                apply_referral_reward_if_pending(user)
 
             tokens = issue_tokens_for_user(user, device_id=device_id)
             return Response(
@@ -1525,14 +1639,46 @@ IS_AUTH_OR_RO = (permissions.IsAuthenticatedOrReadOnly,)
     resolve_handle=extend_schema(summary="Resolve @KIS handle to user"),
 )
 class UserViewSet(viewsets.ModelViewSet):
+    """
+    Previously: permission_classes = IsAuthenticatedOrReadOnly with no
+    object-level check at all, and UserSerializer built via exclude=(...)
+    (everything except password/is_superuser/is_staff/user_permissions/
+    groups). That meant anonymous requests could read every user's email,
+    full phone number, verification detail, and preferences; and any
+    authenticated user could PATCH/DELETE *any other* user's record —
+    including tier and status, which weren't read-only, making this a
+    free self-service tier upgrade / account-tampering path that bypassed
+    apps.billing entirely. Now: auth is required for everything, only the
+    owner or staff can write, and only the owner or staff ever see the
+    full UserSerializer — everyone else gets PublicUserSerializer.
+    """
     queryset = User.objects.select_related("profile").all()
     serializer_class = UserSerializer
     authentication_classes = JWT_AUTH
-    permission_classes = IS_AUTH_OR_RO
+    permission_classes = (IsSelfOrStaffForUserWrites,)
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["tier", "status"]
-    search_fields = ["email", "display_name", "username"]
+    # email deliberately excluded from search_fields — searching by name is
+    # the legitimate "find someone" feature this endpoint supports (see
+    # apps.accounts.tests_qa_full.ProfileDiscoverabilityTests.test_users_search);
+    # searching by email would let anyone probe whether a specific address
+    # is registered, an enumeration vector distinct from the field-exposure
+    # issue PublicUserSerializer already closes.
+    search_fields = ["display_name", "username"]
     ordering_fields = ["created_at", "trust_score"]
+
+    def get_serializer_class(self):
+        if self.action == "list" and not getattr(self.request.user, "is_staff", False):
+            return PublicUserSerializer
+        return UserSerializer
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if request.user.is_staff or instance.id == request.user.id:
+            serializer = UserSerializer(instance, context=self.get_serializer_context())
+        else:
+            serializer = PublicUserSerializer(instance, context=self.get_serializer_context())
+        return Response(serializer.data)
 
     @action(
         detail=False,
@@ -1710,10 +1856,18 @@ class UserViewSet(viewsets.ModelViewSet):
     retrieve=extend_schema(summary="Retrieve profile"),
 )
 class ProfileViewSet(viewsets.ModelViewSet):
+    """
+    Base list/retrieve/update/partial_update/destroy previously had
+    IS_AUTH_OR_RO (IsAuthenticatedOrReadOnly) with no object-level check —
+    any authenticated user could PATCH or DELETE another user's Profile.
+    The dedicated me/view/discover/set_open_to_work actions each already
+    define their own explicit, deliberate permission_classes and are
+    unaffected by this — see IsProfileOwnerOrStaffForWrites.
+    """
     queryset = Profile.objects.select_related("user").all()
     serializer_class = ProfileSerializer
     authentication_classes = JWT_AUTH
-    permission_classes = IS_AUTH_OR_RO
+    permission_classes = (IsProfileOwnerOrStaffForWrites,)
     parser_classes = (MultiPartParser, FormParser, JSONParser)
     filter_backends = [filters.SearchFilter]
     search_fields = ["headline", "bio", "industry"]
@@ -2085,9 +2239,14 @@ class ApiTokenViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Des
     retrieve=extend_schema(summary="Retrieve account tier"),
 )
 class AccountTierViewSet(viewsets.ModelViewSet):
+    """
+    Previously IS_AUTH_OR_RO — any authenticated user could write here,
+    even though AccountTier rows are shared platform-wide pricing/feature
+    definitions, not per-user data. See IsAdminOrReadOnly.
+    """
     serializer_class = AccountTierSerializer
     authentication_classes = JWT_AUTH
-    permission_classes = IS_AUTH_OR_RO
+    permission_classes = (IsAdminOrReadOnly,)
     filter_backends = [filters.SearchFilter]
     search_fields = ["name"]
 
@@ -2096,28 +2255,62 @@ class AccountTierViewSet(viewsets.ModelViewSet):
         return public_account_tiers_qs()
 
 @extend_schema_view(
-    list=extend_schema(summary="List subscriptions"),
-    retrieve=extend_schema(summary="Retrieve subscription"),
+    list=extend_schema(summary="List subscriptions (own records only, unless staff)"),
+    retrieve=extend_schema(summary="Retrieve subscription (own record only, unless staff)"),
 )
 class SubscriptionViewSet(viewsets.ModelViewSet):
-    queryset = Subscription.objects.select_related("user", "tier").all()
+    """
+    Read-only for normal users, scoped to their own subscription(s). Staff
+    get full CRUD for support/admin tooling. Subscription state itself must
+    only change through apps.billing's controlled upgrade/downgrade/cancel
+    services — this endpoint intentionally does not let a normal user
+    create, alter, or delete their own subscription row directly.
+    """
     serializer_class = SubscriptionSerializer
     authentication_classes = JWT_AUTH
-    permission_classes = IS_AUTH_OR_RO
+    permission_classes = (IsOwnerReadOnlyOrStaff,)
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["status", "tier"]
 
+    def get_queryset(self):
+        base = Subscription.objects.select_related("user", "tier")
+        user = self.request.user
+        if not user.is_authenticated:
+            return base.none()
+        if user.is_staff:
+            return base.all()
+        return base.filter(user=user)
+
+    def get_serializer_class(self):
+        if self.request.user.is_authenticated and self.request.user.is_staff:
+            return SubscriptionSerializer
+        return SubscriptionSelfSerializer
+
 @extend_schema_view(
-    list=extend_schema(summary="List sessions"),
-    retrieve=extend_schema(summary="Retrieve session"),
+    list=extend_schema(summary="List sessions (own records only, unless staff)"),
+    retrieve=extend_schema(summary="Retrieve session (own record only, unless staff)"),
 )
 class SessionViewSet(viewsets.ModelViewSet):
-    queryset = Session.objects.all()
+    """Same own-records-only posture as SubscriptionViewSet — see there for rationale."""
     serializer_class = SessionSerializer
     authentication_classes = JWT_AUTH
-    permission_classes = IS_AUTH_OR_RO
+    permission_classes = (IsOwnerReadOnlyOrStaff,)
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     ordering_fields = ["expires_at"]
+
+    def get_queryset(self):
+        base = Session.objects.all()
+        user = self.request.user
+        if not user.is_authenticated:
+            return base.none()
+        if user.is_staff:
+            return base
+        return base.filter(user=user)
+
+    def get_serializer_class(self):
+        if self.request.user.is_authenticated and self.request.user.is_staff:
+            return SessionSerializer
+        return SessionSelfSerializer
 
 @extend_schema_view(
     list=extend_schema(summary="List experiences"),
@@ -2990,20 +3183,30 @@ class RevokeAllSecondaryView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        now = timezone.now()
-        updated = Device.objects.filter(
-            user=request.user,
-            is_parent=False,
-            revoked_at__isnull=True,
-        ).update(
-            revoked_at=now,
-            revoke_reason="parent_revoked_all",
+        # Routed through the same canonical revoke_device_session() used by
+        # logout/single-device revoke — a bare bulk .update() previously
+        # skipped the token_version bump and E2EE key wipe that make
+        # revocation actually stick, leaving an already-issued access token
+        # valid until its natural expiry even after "revoking" it here.
+        secondary_devices = list(
+            Device.objects.filter(
+                user=request.user,
+                is_parent=False,
+                revoked_at__isnull=True,
+            )
         )
+        for device in secondary_devices:
+            revoke_device_session(request.user, device, reason="parent_revoked_all", request=request)
+        updated = len(secondary_devices)
 
         AuditLog.log(
             actor=request.user,
             action="device.revoke_all_secondary",
-            meta={"parent_device_id": requesting_device_id, "revoked_count": updated},
+            meta={
+                "parent_device_id": requesting_device_id,
+                "revoked_count": updated,
+                "revoked_device_ids": [d.device_id for d in secondary_devices],
+            },
         )
         return Response({"revoked_count": updated}, status=status.HTTP_200_OK)
 
@@ -3338,11 +3541,6 @@ class PasswordChangeView(APIView):
                 {"detail": "Both current_password and new_password are required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if len(new_pw) < 8:
-            return Response(
-                {"detail": "New password must be at least 8 characters."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
         user = request.user
         if not user.check_password(current):
@@ -3350,6 +3548,16 @@ class PasswordChangeView(APIView):
                 {"detail": "Current password is incorrect."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # Same validator chain as the OTP-based reset flow (apps.otp.views.
+        # PasswordResetView) — previously this only checked len >= 8, letting
+        # a user set a materially weaker password via "change" than via
+        # "forgot password" (10-char minimum, common-password, similarity,
+        # and numeric-only checks were all skipped here).
+        try:
+            validate_password(new_pw, user=user)
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
 
         user.set_password(new_pw)
         user.save(update_fields=["password"])

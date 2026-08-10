@@ -114,7 +114,9 @@ class HealthDashboardLandingPageApiTests(TestCase):
         create_response = self.client.post(self.landing_url, self._landing_payload(), format="json", secure=True)
         self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(HealthDashboardInstitutionLandingPage.objects.count(), 1)
-        self.assertTrue(create_response.data.get("institutionNameClickable"))
+        # Not published yet (the payload doesn't set isPublished) — a draft
+        # landing page isn't actually clickable/visible until published.
+        self.assertFalse(create_response.data.get("institutionNameClickable"))
 
         patch_response = self.client.patch(
             self.landing_url,
@@ -139,6 +141,14 @@ class HealthDashboardLandingPageApiTests(TestCase):
 
         create_response = self.client.post(self.landing_url, self._landing_payload(), format="json", secure=True)
         self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+
+        # hasLandingPage becomes true as soon as the row exists, but
+        # institutionNameClickable correctly requires it to be published
+        # too (an unpublished draft isn't visible to anyone but managers).
+        publish_response = self.client.patch(
+            self.landing_url, {"isPublished": True}, format="json", secure=True,
+        )
+        self.assertEqual(publish_response.status_code, status.HTTP_200_OK)
 
         after_response = self.client.get(self.list_url, secure=True)
         after_row = next(
@@ -168,6 +178,14 @@ class HealthDashboardLandingPageApiTests(TestCase):
         self.client.force_authenticate(self.owner)
         create_response = self.client.post(self.landing_url, self._landing_payload(), format="json", secure=True)
         self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        # An unpublished landing page correctly 404s for anonymous callers
+        # (see HealthDashboardLandingPageView.get) — publish it first so
+        # this test actually exercises "public user views an existing,
+        # live landing page" as intended.
+        publish_response = self.client.patch(
+            self.landing_url, {"isPublished": True}, format="json", secure=True,
+        )
+        self.assertEqual(publish_response.status_code, status.HTTP_200_OK)
 
         self.client.force_authenticate(user=None)
         get_response = self.client.get(self.landing_url, secure=True)

@@ -38,7 +38,10 @@ class MediaJobOwnershipTests(APITestCase):
         self.client.force_authenticate(self.owner)
 
     def test_processing_jobs_are_limited_to_asset_owner(self):
-        response = self.client.get("/api/v1/jobs/")
+        # /api/v1/jobs/ is an unrelated global-job-board endpoint (career
+        # listings) — ProcessingJobViewSet only lives under media/jobs/,
+        # with no bare-path alias (unlike MediaAssetViewSet's legacy-asset).
+        response = self.client.get("/api/v1/media/jobs/")
 
         self.assertEqual(response.status_code, 200)
         rows = response.data.get("results", response.data)

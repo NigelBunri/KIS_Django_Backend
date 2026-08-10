@@ -57,6 +57,8 @@ class WalletLedgerEntry(BaseEntity):
         ("purchase", "Purchase"),
         ("service_payout", "Service payout"),
         ("refund", "Refund"),
+        ("downgrade_credit", "Downgrade proration credit"),
+        ("subscription_reversal", "Subscription payment reversal (refund/chargeback)"),
     ]
 
     user = models.ForeignKey(

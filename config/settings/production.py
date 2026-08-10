@@ -28,11 +28,29 @@ if os.environ.get("ALLOW_ALL_HOSTS", "").strip().lower() in ("1", "true", "yes",
 if os.environ.get("OTP_DEBUG_LOG_CODES", "").strip().lower() in ("1", "true", "yes", "on"):
     raise ImproperlyConfigured("OTP_DEBUG_LOG_CODES must not be enabled in production.")
 
+if os.environ.get("OTP_OVERRIDE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
+    raise ImproperlyConfigured("OTP_OVERRIDE_ENABLED must not be enabled in production.")
+
+if os.environ.get("OTP_OVERRIDE_CODE", "").strip():
+    raise ImproperlyConfigured("OTP_OVERRIDE_CODE must not be set in production.")
+
 if os.environ.get("VERIFICATION_LIVE_PROVIDER_CALLS_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
     raise ImproperlyConfigured("Verification live provider calls must not be enabled in production.")
 
 if os.environ.get("VERIFICATION_PROVIDER_SANDBOX_NETWORK_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
     raise ImproperlyConfigured("Verification sandbox network calls must not be enabled in production.")
+
+# apps.chat.internal_signing already defaults to requiring a full HMAC
+# signature (not just the bare token) whenever DEBUG=False — this only
+# guards against an operator explicitly overriding that default back down
+# in production, the same footgun-prevention pattern as OTP_OVERRIDE_ENABLED
+# above.
+if os.environ.get("INTERNAL_SIGNATURE_REQUIRED", "").strip().lower() in ("0", "false", "no", "off"):
+    raise ImproperlyConfigured("INTERNAL_SIGNATURE_REQUIRED must not be disabled in production.")
+
+_nest_internal_token = os.environ.get("NEST_INTERNAL_TOKEN", "").strip()
+if _nest_internal_token and _is_weak_secret(_nest_internal_token):
+    raise ImproperlyConfigured("NEST_INTERNAL_TOKEN must be set to a strong value in production.")
 
 # Database — must be PostgreSQL in production; SQLite is not supported.
 _db_url = os.environ.get("DATABASE_URL", "").strip()
@@ -58,8 +76,16 @@ CACHES = {
     }
 }
 
-# Use real email provider settings (SendGrid, SES, etc.)
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+# Email: Resend (HTTP API) when RESEND_API_KEY is configured, otherwise the
+# previous SMTP path — no forced cutover. Deliberately not a hard
+# ImproperlyConfigured failure if neither is set: unlike DATABASE_URL/
+# REDIS_URL, a missing email provider degrades one notification channel,
+# not the whole app; verify_email_launch is the explicit opt-in guardrail
+# for confirming it's actually production-ready before relying on it.
+if RESEND_API_KEY:
+    EMAIL_BACKEND = "apps.notifications.resend_backend.ResendEmailBackend"
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 EMAIL_HOST = os.environ.get("EMAIL_HOST")
 EMAIL_PORT = os.environ.get("EMAIL_PORT", 587)
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER")
@@ -83,6 +109,11 @@ if _sentry_dsn:
         traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
         send_default_pii=False,
         environment="production",
+        # RENDER_GIT_COMMIT is auto-injected by Render at build and runtime
+        # (not something we set) — ties an error report to the exact commit
+        # that shipped it, instead of every deploy showing up as the same
+        # undifferentiated "production" bucket in Sentry.
+        release=os.environ.get("RENDER_GIT_COMMIT", "").strip() or None,
     )
 
 # Object storage — require an explicit remote provider in production to prevent
