@@ -1868,6 +1868,20 @@ class DirectPaymentIntentView(APIView):
 
 @method_decorator(csrf_exempt, name="dispatch")
 class DirectPaymentFlutterwaveWebhookView(APIView):
+    """
+    Flutterwave only supports one configured webhook URL per account, but
+    this codebase has two payment systems (DirectPaymentIntent for
+    commerce/booking/health payments, WalletTransaction for tier upgrades/
+    tips/deposits) historically split across two separate webhook views. If
+    the dashboard is (or ever becomes) pointed at THIS url while a real
+    WalletTransaction-based event arrives, reconcile_direct_payment_callback
+    correctly finds no matching DirectPaymentIntent and used to just drop
+    the event with a 404 -- silently leaving a genuinely successful payment
+    unreconciled and the user's account never upgraded. Falls back to the
+    same unified handling FlutterwaveWebhookView uses so a correctly-signed
+    event is never dropped based on which of the two URLs it happened to
+    land on.
+    """
     authentication_classes = []
     permission_classes = []
 
@@ -1880,7 +1894,9 @@ class DirectPaymentFlutterwaveWebhookView(APIView):
         if not ok and result == "missing_tx_ref":
             return Response({"detail": "tx_ref missing"}, status=status.HTTP_400_BAD_REQUEST)
         if not ok and result == "unmatched":
-            return Response({"detail": "unknown transaction"}, status=status.HTTP_404_NOT_FOUND)
+            # Signature already verified inside reconcile_direct_payment_callback
+            # before it returns "unmatched" -- safe to reuse the same payload.
+            return reconcile_wallet_flutterwave_event(payload=payload)
         return Response({"status": "ok", "result": result, "intent_id": str(intent.id) if intent else None})
 
 
