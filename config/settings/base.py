@@ -325,6 +325,7 @@ INSTALLED_APPS = [
     "apps.billing.apps.BillingConfig",
     "apps.verification.apps.VerificationConfig",
     "apps.referrals.apps.ReferralsConfig",
+    "apps.rewards.apps.RewardsConfig",
 
     # chats
     "apps.chat.apps.ChatConfig",
@@ -506,6 +507,14 @@ REST_FRAMEWORK = {
         # leaked, not per-end-user limiting (Nest already rate-limits the
         # RN-facing playback-url endpoint per user).
         "chat_voice_sign": _env_throttle_rate("THROTTLE_CHAT_VOICE_SIGN", dev_default="6000/min", prod_default="1200/min"),
+        # Public, unauthenticated payment-status check (the kingdomimpact
+        # ventures.org/payments/complete redirect landing page polls this
+        # after a Flutterwave checkout) — keyed by IP since there's no
+        # request.user, capped low enough to make tx_ref brute-forcing
+        # impractical (tx_ref is a 128-bit uuid4 hex, so this is defense in
+        # depth, not the primary protection) without blocking a real user
+        # refreshing the page a few times while a webhook is still pending.
+        "payment_status": _env_throttle_rate("THROTTLE_PAYMENT_STATUS", dev_default="6000/min", prod_default="30/min"),
         "broadcast_profile_create": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_CREATE", dev_default="6000/min", prod_default="60/min"),
         "broadcast_profile_manage": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_MANAGE", dev_default="6000/min", prod_default="300/min"),
         "broadcast_profile_attachment": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_ATTACHMENT", dev_default="6000/min", prod_default="300/min"),
@@ -623,6 +632,43 @@ CELERY_BEAT_SCHEDULE = {
     # meaningful revenue/security impact worth a tighter interval.
     "expire-subscriptions": {
         "task": "apps.billing.tasks.expire_subscriptions",
+        "schedule": 60 * 60,
+    },
+    # Reward/referral scheduled maintenance (Phase 11 of the billing/
+    # rewards project — apps/rewards/tasks.py, apps/referrals/tasks.py).
+    "expire-reward-ledger-entries": {
+        "task": "apps.rewards.tasks.expire_reward_ledger_entries",
+        # Matches the other sweeps' hourly cadence; a KIS Coin sitting
+        # unspent for up to an hour past its expiry has no economic-safety
+        # impact worth a tighter interval.
+        "schedule": 60 * 60,
+    },
+    "confirm-settled-referrals": {
+        "task": "apps.referrals.tasks.confirm_settled_referrals",
+        # REFERRAL_SETTLEMENT_WINDOW_DAYS (apps/referrals/services.py) is
+        # measured in days, so an hourly sweep is already far more granular
+        # than the window itself needs — this just bounds how long a
+        # referral sits QUALIFIED-but-past-window before settling.
+        "schedule": 60 * 60,
+    },
+    "reconcile-rewards-and-referrals": {
+        "task": "apps.rewards.tasks.reconcile_rewards_and_referrals_task",
+        # Read-only consistency check, not a corrective action — daily is
+        # frequent enough to catch drift without adding noise to whatever
+        # log/alerting pipeline watches this task's anomalies.
+        "schedule": 24 * 60 * 60,
+    },
+    # Phase 4 of the Education system production-hardening project: backstop
+    # for auto_complete_education_booking, which is otherwise only ever
+    # scheduled as a one-off apply_async(countdown=...) at the moment a
+    # booking enters AWAITING_SATISFACTION — see
+    # apps.broadcasts.tasks.sweep_stuck_education_bookings's own docstring
+    # for why a one-off schedule alone isn't enough. Hourly matches every
+    # other sweep's cadence; escrowed booking funds sitting locked for up
+    # to an extra hour past their 3-day deadline has no meaningful
+    # financial-safety impact worth a tighter interval.
+    "sweep-stuck-education-bookings": {
+        "task": "apps.broadcasts.tasks.sweep_stuck_education_bookings",
         "schedule": 60 * 60,
     },
 }

@@ -19,6 +19,7 @@ from rest_framework.decorators import action
 from rest_framework.filters import OrderingFilter
 from rest_framework.permissions import AllowAny, BasePermission, IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from django.core.exceptions import ValidationError
@@ -63,6 +64,7 @@ from .direct_payments import (
     create_direct_payment_intent,
     reconcile_direct_payment_callback,
     reconcile_stripe_direct_payment_event,
+    verify_flutterwave_transaction,
 )
 from .profitability_entitlements import get_profitability_entitlement_catalog
 from .profitability_analytics import get_profitability_command_center_summary
@@ -96,6 +98,20 @@ from .services import (
     cents_to_usd_compact,
     credits_to_cents,
     adjust_points,
+    redeem_promo_code,
+    PromoCodeNotFound,
+    PromoCodeNotActive,
+    PromoCodeExpired,
+    PromoCodeUsageLimitReached,
+    PromoCodeAlreadyRedeemed,
+    PromoCodeLegacyCashBonusBlocked,
+)
+from apps.rewards.services import (
+    calculate_redemption,
+    reserve_redemption,
+    confirm_redemption,
+    release_redemption,
+    InsufficientRewardBalance,
 )
 
 logger = logging.getLogger(__name__)
@@ -1227,17 +1243,62 @@ class WalletViewSet(viewsets.ViewSet):
                 status=status.HTTP_200_OK,
             )
 
+        # KIS Coins may only subsidize a real external-provider charge — not
+        # a payment already made from an internal balance (credits/wallet),
+        # which is handled by the branches above and returns before this
+        # point. apply_rewards is an intent flag only; the actual discount
+        # is always computed server-side by calculate_redemption, never
+        # trusted from the client.
+        apply_rewards = bool(request.data.get("apply_rewards"))
+        redemption_quote = None
+        if apply_rewards:
+            redemption_quote = calculate_redemption(request.user, tier.price_cents)
+
+        payable_cents = redemption_quote.payable_cents if redemption_quote else tier.price_cents
+
         tx_ref = f"kis_upgrade_{uuid.uuid4().hex}"
+        tx_meta = {"intent": "tier_upgrade", "tier_id": str(tier.id), "tier_name": tier.name}
+        if redemption_quote:
+            tx_meta.update({
+                "gross_amount_cents": tier.price_cents,
+                "coins_applied": redemption_quote.coins_to_spend,
+                "discount_cents": redemption_quote.discount_cents,
+            })
         transaction_obj = WalletTransaction.objects.create(
             user=request.user,
             provider="flutterwave",
             method="card",
-            amount_cents=tier.price_cents,
+            amount_cents=payable_cents,
             currency="USD",
             status="pending",
             tx_ref=tx_ref,
-            meta={"intent": "tier_upgrade", "tier_id": str(tier.id), "tier_name": tier.name},
+            meta=tx_meta,
         )
+
+        reservation = None
+        if redemption_quote and redemption_quote.coins_to_spend > 0:
+            try:
+                reservation = reserve_redemption(
+                    request.user,
+                    redemption_quote.coins_to_spend,
+                    reference_type="wallet_transaction",
+                    reference_id=transaction_obj.id,
+                    idempotency_key=f"redemption:{tx_ref}",
+                    description=f"Discount for {tier.name} upgrade",
+                    metadata={"tx_ref": tx_ref, "tier_id": str(tier.id)},
+                )
+            except InsufficientRewardBalance:
+                # Lost a race against a concurrent spend between the quote
+                # (above) and this reservation — nothing was charged yet,
+                # safe to discard and ask the client to retry.
+                transaction_obj.delete()
+                return Response(
+                    {"detail": "Insufficient KIS Coins balance for this discount. Please retry."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            if reservation:
+                transaction_obj.meta = {**transaction_obj.meta, "redemption_entry_id": str(reservation.id)}
+                transaction_obj.save(update_fields=["meta", "updated_at"])
 
         if mock:
             transaction_obj.status = "success"
@@ -1247,11 +1308,21 @@ class WalletViewSet(viewsets.ViewSet):
                 user=request.user,
                 tier=tier,
                 source="mock",
-                amount_cents=tier.price_cents,
+                amount_cents=payable_cents,
                 reference=tx_ref,
             )
+            if reservation:
+                confirm_redemption(reservation)
+            # Referral qualification deliberately does NOT fire for "mock" —
+            # only genuine external-provider success (QUALIFYING_PAYMENT_SOURCES)
+            # represents real revenue to reward a referral against.
             return Response(
-                {"tx_ref": tx_ref, "status": "success", "payment_url": None},
+                {
+                    "tx_ref": tx_ref, "status": "success", "payment_url": None,
+                    "payable_cents": payable_cents,
+                    "coins_applied": redemption_quote.coins_to_spend if redemption_quote else 0,
+                    "discount_cents": redemption_quote.discount_cents if redemption_quote else 0,
+                },
                 status=status.HTTP_200_OK,
             )
 
@@ -1259,7 +1330,7 @@ class WalletViewSet(viewsets.ViewSet):
             _ensure_payments_ready()
             payload = {
                 "tx_ref": tx_ref,
-                "amount": tier.price_cents / 100,
+                "amount": payable_cents / 100,
                 "currency": "USD",
                 "redirect_url": getattr(settings, "FLW_REDIRECT_URL", "https://kis.app/payments/complete"),
                 "customer": {
@@ -1279,13 +1350,20 @@ class WalletViewSet(viewsets.ViewSet):
             transaction_obj.raw_payload = response
             transaction_obj.save(update_fields=["payment_url", "raw_payload", "updated_at"])
             return Response(
-                {"tx_ref": tx_ref, "status": "pending", "payment_url": payment_url},
+                {
+                    "tx_ref": tx_ref, "status": "pending", "payment_url": payment_url,
+                    "payable_cents": payable_cents,
+                    "coins_applied": redemption_quote.coins_to_spend if redemption_quote else 0,
+                    "discount_cents": redemption_quote.discount_cents if redemption_quote else 0,
+                },
                 status=status.HTTP_200_OK,
             )
         except ValueError as exc:
             transaction_obj.status = "failed"
             transaction_obj.raw_payload = {"error": str(exc)}
             transaction_obj.save(update_fields=["status", "raw_payload", "updated_at"])
+            if reservation:
+                release_redemption(reservation, reason="payment_link_creation_failed")
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=["post"], url_path="redeem")
@@ -1293,49 +1371,27 @@ class WalletViewSet(viewsets.ViewSet):
         code = (request.data.get("code") or "").strip().upper()
         if not code:
             return Response({"detail": "Promo code required"}, status=status.HTTP_400_BAD_REQUEST)
-        promo = get_object_or_404(PromoCode, code=code, is_active=True)
-        if promo.ends_at and promo.ends_at < timezone.now():
-            return Response({"detail": "Promo expired"}, status=status.HTTP_400_BAD_REQUEST)
-        if promo.usage_limit and promo.used_count >= promo.usage_limit:
-            return Response({"detail": "Promo fully redeemed"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if PromoRedemption.objects.filter(user=request.user, promo=promo).exists():
-            return Response({"detail": "Promo already redeemed"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            result = redeem_promo_code(request.user, code)
+        except PromoCodeLegacyCashBonusBlocked as exc:
+            return Response(
+                {"detail": str(exc), "code": "legacy_financial_flow_disabled"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except (PromoCodeNotFound, PromoCodeNotActive) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except (PromoCodeExpired, PromoCodeUsageLimitReached, PromoCodeAlreadyRedeemed) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        cash_bonus_cents = int(promo.cash_bonus_cents or 0)
-        credit_bonus = int(promo.credit_bonus or 0)
-        cash_bonus_blocked = False
-        if cash_bonus_cents and not getattr(settings, "KIS_LEGACY_PROMO_CASH_BONUS_ENABLED", False):
-            cash_bonus_blocked = True
-            cash_bonus_cents = 0
-            if credit_bonus <= 0:
-                return Response(
-                    {
-                        "detail": "This promo grants legacy wallet value and is disabled.",
-                        "code": "legacy_financial_flow_disabled",
-                    },
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-
-        record_ledger(
-            user=request.user,
-            kind="promo",
-            amount_cents=cash_bonus_cents,
-            credits_delta=credit_bonus,
-            reference=f"promo:{promo.code}",
-            meta={"promo": promo.code, "legacy_cash_bonus_blocked": cash_bonus_blocked},
-        )
-        promo.used_count += 1
-        promo.save(update_fields=["used_count", "updated_at"])
-        PromoRedemption.objects.create(user=request.user, promo=promo)
         return Response(
             {
-                "code": promo.code,
-                "cash_bonus_cents": cash_bonus_cents,
-                "cash_bonus_usd": str(cents_to_usd(cash_bonus_cents)),
-                "cash_bonus_usd_compact": cents_to_usd_compact(cash_bonus_cents),
-                "credit_bonus": credit_bonus,
-                "legacy_cash_bonus_blocked": cash_bonus_blocked,
+                "code": result.promo.code,
+                "cash_bonus_cents": result.cash_bonus_cents,
+                "cash_bonus_usd": str(cents_to_usd(result.cash_bonus_cents)),
+                "cash_bonus_usd_compact": cents_to_usd_compact(result.cash_bonus_cents),
+                "credit_bonus": result.credit_bonus,
+                "legacy_cash_bonus_blocked": result.legacy_cash_bonus_blocked,
             }
         )
 
@@ -1453,6 +1509,201 @@ class PricingInsightsView(APIView):
         return Response(payload, status=status.HTTP_200_OK)
 
 
+def reconcile_wallet_flutterwave_event(*, payload: dict) -> Response:
+    """Processes a Flutterwave event (webhook delivery OR an independently
+    server-verified transaction — see PaymentStatusView) against
+    WalletTransaction-based flows (tier upgrades, tips, channel membership,
+    generic deposits). DirectPaymentIntent-based flows (commerce orders,
+    service/education bookings, health billing) are handled separately by
+    reconcile_direct_payment_callback — see the tx_ref-existence branch in
+    both FlutterwaveWebhookView.post and PaymentStatusView.get.
+
+    Extracted verbatim from FlutterwaveWebhookView.post (previously the
+    entire body of that view) so the exact same idempotent, row-locked
+    reconciliation logic runs whether the trigger is Flutterwave's webhook
+    or PaymentStatusView's fallback verify-with-Flutterwave-API path — one
+    implementation, not two, per this codebase's established convention."""
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    tx_ref = data.get("tx_ref")
+    status_flag = (data.get("status") or "").lower()
+
+    if not tx_ref:
+        return Response({"detail": "tx_ref missing"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if DirectPaymentIntent.objects.filter(tx_ref=tx_ref).exists():
+        # signature=FLW_WEBHOOK_SECRET: this function's own callers have
+        # already established trust by this point — either a real webhook
+        # signature check (FlutterwaveWebhookView) or an independent
+        # server-to-server verify call against Flutterwave's own API
+        # (PaymentStatusView) — so passing the correct secret here just
+        # satisfies reconcile_direct_payment_callback's own internal check
+        # rather than re-deriving trust a second time.
+        ok, result, _intent = reconcile_direct_payment_callback(
+            payload=payload, signature=getattr(settings, "FLW_WEBHOOK_SECRET", ""),
+        )
+        if not ok and result == "invalid_signature":
+            return Response({"detail": "invalid signature"}, status=status.HTTP_403_FORBIDDEN)
+        if not ok:
+            return Response({"detail": result}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"status": "ok", "result": result})
+
+    transaction_obj = WalletTransaction.objects.filter(tx_ref=tx_ref).first()
+    if not transaction_obj:
+        return Response({"detail": "unknown transaction"}, status=status.HTTP_404_NOT_FOUND)
+
+    transaction_obj.raw_payload = payload
+    if status_flag == "successful":
+        # Re-fetch under a row lock and re-check the status guard inside
+        # it — the previous plain read-then-write here had a real race
+        # window: two genuinely concurrent redeliveries of the same
+        # webhook event could both read status != "success" before
+        # either commits, and both call apply_tier_upgrade for the same
+        # payment. select_for_update() serializes them so the second
+        # one to arrive sees the first one's committed "success" status
+        # and correctly no-ops.
+        with transaction.atomic():
+            transaction_obj = WalletTransaction.objects.select_for_update().get(id=transaction_obj.id)
+            already_processed = transaction_obj.status == "success"
+            transaction_obj.raw_payload = payload
+            if not already_processed:
+                transaction_obj.status = "success"
+                transaction_obj.provider_ref = data.get("id", "")
+                transaction_obj.processed_at = timezone.now()
+            transaction_obj.save(
+                update_fields=["status", "provider_ref", "processed_at", "raw_payload", "updated_at"],
+            )
+            if already_processed:
+                return Response({"status": "ok", "note": "already processed"})
+
+        intent = (transaction_obj.meta or {}).get("intent")
+        if intent == "tier_upgrade":
+            tier_id = (transaction_obj.meta or {}).get("tier_id")
+            tier = AccountTier.objects.filter(id=tier_id).first()
+            if tier:
+                new_subscription = apply_tier_upgrade(
+                    user=transaction_obj.user,
+                    tier=tier,
+                    source="flutterwave",
+                    amount_cents=transaction_obj.amount_cents,
+                    reference=transaction_obj.tx_ref,
+                    meta={"provider": "flutterwave"},
+                )
+
+                redemption_entry_id = (transaction_obj.meta or {}).get("redemption_entry_id")
+                if redemption_entry_id:
+                    from apps.rewards.models import RewardLedgerEntry as _RewardLedgerEntry
+                    reservation = _RewardLedgerEntry.objects.filter(id=redemption_entry_id).first()
+                    if reservation:
+                        confirm_redemption(reservation)
+
+                # "flutterwave" is a genuine QUALIFYING_PAYMENT_SOURCES
+                # value — this is real external revenue, the only kind
+                # that should ever mature a referral reward. Deferred
+                # import: apps.referrals.services already imports from
+                # apps.billing.services (adjust_points), so a top-level
+                # import here would be circular — matches this
+                # codebase's established convention for exactly this
+                # situation (e.g. apps.otp.views importing
+                # apps.accounts.views locally).
+                from apps.referrals.services import qualify_referral
+                qualify_referral(
+                    transaction_obj.user,
+                    new_subscription,
+                    net_amount_cents=transaction_obj.amount_cents,
+                )
+        else:
+            record_ledger(
+                user=transaction_obj.user,
+                kind="deposit",
+                amount_cents=transaction_obj.amount_cents,
+                reference=transaction_obj.tx_ref,
+                meta={"provider": "flutterwave"},
+            )
+        # Activate channel membership if payment metadata indicates it
+        _meta = transaction_obj.meta or {}
+        if _meta.get("target_type") == "channel_membership":
+            _mem_id = _meta.get("target_id")
+            _user_id = _meta.get("user_id")
+            if _mem_id and _user_id:
+                try:
+                    from apps.broadcasts.models import ChannelMembership
+                    ChannelMembership.objects.filter(
+                        id=_mem_id, user_id=_user_id, status="pending_payment"
+                    ).update(status=ChannelMembership.Status.ACTIVE, payment_reference=str(tx_ref or ""))
+                except Exception as _exc:
+                    logger.warning("[FLW webhook] membership activation failed: %s", _exc)
+        # Send payment receipt email
+        try:
+            user_id = getattr(transaction_obj.user, "id", None) if transaction_obj.user else None
+            amount = transaction_obj.amount_cents
+            currency = str(data.get("currency") or "USD")
+            from django.contrib.auth import get_user_model as _get_user_model
+            _User = _get_user_model()
+            _user_obj = _User.objects.filter(id=str(user_id or "")).first() if user_id else None
+            if _user_obj and getattr(_user_obj, "email", None):
+                from apps.notifications.email_service import send_payment_receipt_email
+                if not send_payment_receipt_email(
+                    to_email=_user_obj.email,
+                    amount=str(amount or ""),
+                    currency=str(currency or "USD"),
+                    tx_ref=str(tx_ref or ""),
+                ):
+                    logger.warning("[FLW webhook] payment receipt email failed for tx_ref=%s", tx_ref)
+                    AuditLog.log(actor=_user_obj, action="email.payment_receipt.failed", meta={"tx_ref": str(tx_ref or "")})
+        except Exception as _exc:
+            logger.warning("[FLW webhook] payment receipt email raised: %s", _exc.__class__.__name__)
+    elif status_flag in ("failed", "cancelled"):
+        # Phase 6: this branch previously had none of the successful
+        # branch's protections — no row lock, no re-check against a
+        # status already committed by a concurrent/earlier delivery.
+        # Two concrete bugs that produced: (1) a late/out-of-order
+        # "failed" event arriving after a genuine "successful" one had
+        # already completed would still run this whole branch and
+        # incorrectly release_redemption() an already-REDEEMED
+        # reservation, clawing back coins from a completed upgrade —
+        # payment providers do not guarantee webhook delivery order;
+        # (2) two concurrent duplicate "failed" deliveries for the same
+        # tx_ref could both reach release_redemption() on the same
+        # PENDING entry, and the loser raised an unhandled ValueError
+        # instead of no-opping (also hardened at the source in
+        # apps.rewards.services.reverse_ledger_entry). Locking and
+        # re-checking status here mirrors the successful branch exactly.
+        with transaction.atomic():
+            transaction_obj = WalletTransaction.objects.select_for_update().get(id=transaction_obj.id)
+            transaction_obj.raw_payload = payload
+            if transaction_obj.status != "pending":
+                # Already "success" (a late failure event must never
+                # undo a completed payment) or already "failed"/
+                # "cancelled" (duplicate delivery) — nothing to do.
+                transaction_obj.save(update_fields=["raw_payload", "updated_at"])
+                return Response({"status": "ok", "note": "already processed"})
+
+            transaction_obj.status = "failed" if status_flag == "failed" else "cancelled"
+            meta = transaction_obj.meta or {}
+            if meta.get("intent") == "tier_upgrade":
+                retry_count = int(meta.get("retry_count", 0)) + 1
+                meta["retry_count"] = retry_count
+                if retry_count <= 3:
+                    meta["next_retry_at"] = (timezone.now() + timedelta(days=retry_count)).isoformat()
+                # Give any reserved coins back — the discount they were
+                # locked for never materialized. release_redemption is
+                # idempotent (see apps.rewards.services.reverse_ledger_entry);
+                # a genuinely abandoned checkout that never gets a
+                # failed/cancelled webhook at all (the user just closes
+                # the browser tab) is NOT covered here — that's the
+                # scheduled cleanup job's job (Phase 11), not this
+                # handler's.
+                redemption_entry_id = meta.get("redemption_entry_id")
+                if redemption_entry_id:
+                    from apps.rewards.models import RewardLedgerEntry as _RewardLedgerEntry
+                    reservation = _RewardLedgerEntry.objects.filter(id=redemption_entry_id).first()
+                    if reservation:
+                        release_redemption(reservation, reason=f"payment_{status_flag}")
+            transaction_obj.meta = meta
+            transaction_obj.save(update_fields=["status", "raw_payload", "meta", "updated_at"])
+    return Response({"status": "ok"})
+
+
 @method_decorator(csrf_exempt, name="dispatch")
 class FlutterwaveWebhookView(APIView):
     authentication_classes = []
@@ -1465,114 +1716,111 @@ class FlutterwaveWebhookView(APIView):
             return Response({"detail": "invalid signature"}, status=status.HTTP_403_FORBIDDEN)
 
         payload = request.data if isinstance(request.data, dict) else {}
-        data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        tx_ref = data.get("tx_ref")
-        status_flag = (data.get("status") or "").lower()
+        return reconcile_wallet_flutterwave_event(payload=payload)
 
+
+_WALLET_TX_STATUS_MAP = {"success": "paid", "failed": "failed", "cancelled": "cancelled", "pending": "pending"}
+_DIRECT_INTENT_STATUS_MAP = {
+    DirectPaymentIntent.STATUS_PAID: "paid",
+    DirectPaymentIntent.STATUS_FAILED: "failed",
+    DirectPaymentIntent.STATUS_CANCELLED: "cancelled",
+    DirectPaymentIntent.STATUS_PENDING: "pending",
+}
+
+
+def _describe_payment_status(*, intent: DirectPaymentIntent | None, wallet_tx: WalletTransaction | None) -> dict:
+    if intent:
+        return {
+            "found": True,
+            "status": _DIRECT_INTENT_STATUS_MAP.get(intent.status, "pending"),
+            "kind": intent.target_type,
+        }
+    meta = wallet_tx.meta or {}
+    kind = str(meta.get("intent") or meta.get("target_type") or "wallet_payment")
+    result = {
+        "found": True,
+        "status": _WALLET_TX_STATUS_MAP.get(wallet_tx.status, "pending"),
+        "kind": kind,
+    }
+    if kind == "tier_upgrade":
+        result["tier_name"] = str(meta.get("tier_name") or "")
+    return result
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PaymentStatusView(APIView):
+    """GET /api/v1/billing/payments/status/?tx_ref=...&transaction_id=...
+
+    Public (unauthenticated) endpoint for the payments/complete redirect
+    landing page (see FLW_REDIRECT_URL / kingdomimpactventures.org — a
+    plain marketing website, not the authenticated mobile app) to confirm
+    what actually happened to a checkout. Deliberately never derives the
+    verdict from the status/tx_ref/transaction_id query params the
+    Flutterwave redirect itself supplies — those are client-controlled URL
+    parameters a user could edit by hand, and trusting "status=successful"
+    from a redirect URL would let anyone grant themselves a free tier
+    upgrade. The verdict always comes from either our own DB (already
+    reconciled by a real webhook delivery) or a fresh, secret-key-
+    authenticated call to Flutterwave's own verify endpoint — see
+    apps.billing.direct_payments.verify_flutterwave_transaction.
+
+    This also self-heals the case that motivated it: a webhook that never
+    arrived (misconfigured endpoint, dropped delivery, provider outage)
+    left a real, successful payment stuck showing "pending" with the
+    user's tier never upgraded. Landing on this page (or its own retry)
+    now completes the same reconciliation the webhook would have.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "payment_status"
+
+    def get(self, request):
+        tx_ref = str(request.query_params.get("tx_ref") or "").strip()
+        transaction_id = str(request.query_params.get("transaction_id") or "").strip()
         if not tx_ref:
-            return Response({"detail": "tx_ref missing"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"found": False, "status": "unknown", "detail": "tx_ref is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if DirectPaymentIntent.objects.filter(tx_ref=tx_ref).exists():
-            ok, result, _intent = reconcile_direct_payment_callback(payload=payload, signature=signature or "")
-            if not ok and result == "invalid_signature":
-                return Response({"detail": "invalid signature"}, status=status.HTTP_403_FORBIDDEN)
-            if not ok:
-                return Response({"detail": result}, status=status.HTTP_400_BAD_REQUEST)
-            return Response({"status": "ok", "result": result})
+        intent = DirectPaymentIntent.objects.filter(tx_ref=tx_ref).first()
+        wallet_tx = None if intent else WalletTransaction.objects.filter(tx_ref=tx_ref).first()
+        if not intent and not wallet_tx:
+            return Response({"found": False, "status": "unknown"}, status=status.HTTP_404_NOT_FOUND)
 
-        transaction_obj = WalletTransaction.objects.filter(tx_ref=tx_ref).first()
-        if not transaction_obj:
-            return Response({"detail": "unknown transaction"}, status=status.HTTP_404_NOT_FOUND)
+        result = _describe_payment_status(intent=intent, wallet_tx=wallet_tx)
+        if result["status"] != "pending" or not transaction_id:
+            return Response(result, status=status.HTTP_200_OK)
 
-        transaction_obj.raw_payload = payload
-        if status_flag == "successful":
-            # Re-fetch under a row lock and re-check the status guard inside
-            # it — the previous plain read-then-write here had a real race
-            # window: two genuinely concurrent redeliveries of the same
-            # webhook event could both read status != "success" before
-            # either commits, and both call apply_tier_upgrade for the same
-            # payment. select_for_update() serializes them so the second
-            # one to arrive sees the first one's committed "success" status
-            # and correctly no-ops.
-            with transaction.atomic():
-                transaction_obj = WalletTransaction.objects.select_for_update().get(id=transaction_obj.id)
-                already_processed = transaction_obj.status == "success"
-                transaction_obj.raw_payload = payload
-                if not already_processed:
-                    transaction_obj.status = "success"
-                    transaction_obj.provider_ref = data.get("id", "")
-                    transaction_obj.processed_at = timezone.now()
-                transaction_obj.save(
-                    update_fields=["status", "provider_ref", "processed_at", "raw_payload", "updated_at"],
-                )
-                if already_processed:
-                    return Response({"status": "ok", "note": "already processed"})
+        # Still pending in our own DB — the webhook may simply not have
+        # landed yet. Verify directly with Flutterwave (server-to-server,
+        # our own secret key) rather than telling the page to just keep
+        # polling forever.
+        try:
+            verified = verify_flutterwave_transaction(transaction_id)
+        except Exception as exc:
+            logger.warning("PaymentStatusView: verify_flutterwave_transaction failed for tx_ref=%s: %s", tx_ref, exc)
+            return Response(result, status=status.HTTP_200_OK)
 
-            intent = (transaction_obj.meta or {}).get("intent")
-            if intent == "tier_upgrade":
-                tier_id = (transaction_obj.meta or {}).get("tier_id")
-                tier = AccountTier.objects.filter(id=tier_id).first()
-                if tier:
-                    apply_tier_upgrade(
-                        user=transaction_obj.user,
-                        tier=tier,
-                        source="flutterwave",
-                        amount_cents=transaction_obj.amount_cents,
-                        reference=transaction_obj.tx_ref,
-                        meta={"provider": "flutterwave"},
-                    )
+        if str(verified.get("tx_ref") or "") != tx_ref:
+            # The supplied transaction_id doesn't actually belong to this
+            # tx_ref — never let a mismatched id reconcile the wrong
+            # record. Report the pre-verification status, unchanged.
+            logger.warning(
+                "PaymentStatusView: transaction_id/tx_ref mismatch — expected tx_ref=%s got=%s",
+                tx_ref, verified.get("tx_ref"),
+            )
+            return Response(result, status=status.HTTP_200_OK)
+
+        verified_status = str(verified.get("status") or "").strip().lower()
+        if verified_status in {"successful", "success", "failed", "cancelled"}:
+            reconcile_wallet_flutterwave_event(payload={"data": verified})
+            if intent:
+                intent.refresh_from_db()
             else:
-                record_ledger(
-                    user=transaction_obj.user,
-                    kind="deposit",
-                    amount_cents=transaction_obj.amount_cents,
-                    reference=transaction_obj.tx_ref,
-                    meta={"provider": "flutterwave"},
-                )
-            # Activate channel membership if payment metadata indicates it
-            _meta = transaction_obj.meta or {}
-            if _meta.get("target_type") == "channel_membership":
-                _mem_id = _meta.get("target_id")
-                _user_id = _meta.get("user_id")
-                if _mem_id and _user_id:
-                    try:
-                        from apps.broadcasts.models import ChannelMembership
-                        ChannelMembership.objects.filter(
-                            id=_mem_id, user_id=_user_id, status="pending_payment"
-                        ).update(status=ChannelMembership.Status.ACTIVE, payment_reference=str(tx_ref or ""))
-                    except Exception as _exc:
-                        logger.warning("[FLW webhook] membership activation failed: %s", _exc)
-            # Send payment receipt email
-            try:
-                user_id = getattr(transaction_obj.user, "id", None) if transaction_obj.user else None
-                amount = transaction_obj.amount_cents
-                currency = str(data.get("currency") or "USD")
-                from django.contrib.auth import get_user_model as _get_user_model
-                _User = _get_user_model()
-                _user_obj = _User.objects.filter(id=str(user_id or "")).first() if user_id else None
-                if _user_obj and getattr(_user_obj, "email", None):
-                    from apps.notifications.email_service import send_payment_receipt_email
-                    if not send_payment_receipt_email(
-                        to_email=_user_obj.email,
-                        amount=str(amount or ""),
-                        currency=str(currency or "USD"),
-                        tx_ref=str(tx_ref or ""),
-                    ):
-                        logger.warning("[FLW webhook] payment receipt email failed for tx_ref=%s", tx_ref)
-                        AuditLog.log(actor=_user_obj, action="email.payment_receipt.failed", meta={"tx_ref": str(tx_ref or "")})
-            except Exception as _exc:
-                logger.warning("[FLW webhook] payment receipt email raised: %s", _exc.__class__.__name__)
-        elif status_flag in ("failed", "cancelled"):
-            transaction_obj.status = "failed" if status_flag == "failed" else "cancelled"
-            meta = transaction_obj.meta or {}
-            if meta.get("intent") == "tier_upgrade":
-                retry_count = int(meta.get("retry_count", 0)) + 1
-                meta["retry_count"] = retry_count
-                if retry_count <= 3:
-                    meta["next_retry_at"] = (timezone.now() + timedelta(days=retry_count)).isoformat()
-            transaction_obj.meta = meta
-            transaction_obj.save(update_fields=["status", "raw_payload", "meta", "updated_at"])
-        return Response({"status": "ok"})
+                wallet_tx.refresh_from_db()
+            result = _describe_payment_status(intent=intent, wallet_tx=wallet_tx)
+
+        return Response(result, status=status.HTTP_200_OK)
 
 
 class DirectPaymentIntentView(APIView):
@@ -1726,34 +1974,27 @@ class PromoCodeViewSet(viewsets.ModelViewSet):
         code_value = str(request.data.get("code", "")).strip().upper()
         if not code_value:
             return Response({"detail": "Provide a code."}, status=status.HTTP_400_BAD_REQUEST)
-        from django.utils import timezone as tz
+
         try:
-            promo = PromoCode.objects.get(code=code_value, is_active=True)
-        except PromoCode.DoesNotExist:
-            return Response({"detail": "Invalid or inactive code."}, status=status.HTTP_404_NOT_FOUND)
-        now = tz.now()
-        if promo.starts_at and promo.starts_at > now:
-            return Response({"detail": "Code is not yet active."}, status=status.HTTP_400_BAD_REQUEST)
-        if promo.ends_at and promo.ends_at < now:
-            return Response({"detail": "Code has expired."}, status=status.HTTP_400_BAD_REQUEST)
-        if promo.usage_limit is not None and promo.used_count >= promo.usage_limit:
-            return Response({"detail": "Code has reached its usage limit."}, status=status.HTTP_400_BAD_REQUEST)
-        _, created = PromoRedemption.objects.get_or_create(user=request.user, promo=promo)
-        if not created:
-            return Response({"detail": "You have already redeemed this code."}, status=status.HTTP_409_CONFLICT)
-        promo.used_count += 1
-        promo.save(update_fields=["used_count"])
-        # Apply credit bonus as loyalty points if applicable
-        if promo.credit_bonus:
-            try:
-                adjust_points(request.user, promo.credit_bonus, f"promo:{promo.code}")
-            except Exception:
-                pass
+            result = redeem_promo_code(request.user, code_value)
+        except (PromoCodeNotFound, PromoCodeNotActive) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except PromoCodeAlreadyRedeemed as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except PromoCodeLegacyCashBonusBlocked as exc:
+            return Response(
+                {"detail": str(exc), "code": "legacy_financial_flow_disabled"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except (PromoCodeExpired, PromoCodeUsageLimitReached) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         return Response({
             "detail": "Code redeemed successfully.",
-            "code": promo.code,
-            "credit_bonus": promo.credit_bonus,
-            "cash_bonus_cents": promo.cash_bonus_cents,
+            "code": result.promo.code,
+            "credit_bonus": result.credit_bonus,
+            "cash_bonus_cents": result.cash_bonus_cents,
+            "legacy_cash_bonus_blocked": result.legacy_cash_bonus_blocked,
         }, status=status.HTTP_200_OK)
 
 

@@ -14,7 +14,8 @@ from django.utils import timezone
 from apps.accounts.models import User, Subscription, AccountTier, AuditLog
 from apps.partners.services import ensure_partner_profiles_for_user
 from apps.commerce.models import LoyaltyPoint
-from .models import WalletAccount, CreditAccount, WalletLedgerEntry, WalletTransaction
+from apps.rewards.services import grant_promo_bonus
+from .models import WalletAccount, CreditAccount, WalletLedgerEntry, WalletTransaction, PromoCode, PromoRedemption
 
 logger = logging.getLogger(__name__)
 
@@ -438,8 +439,13 @@ def apply_tier_upgrade(
     reference: str = "",
     meta: dict | None = None,
     indefinite: bool = False,
-) -> None:
+) -> Subscription:
     """
+    Returns the newly-created active Subscription (added in Phase 5 so
+    callers on a real payment success path can pass it straight into
+    apps.referrals.services.qualify_referral without a redundant re-query —
+    existing callers that ignored the previous None return are unaffected).
+
     indefinite=True creates the Subscription with ends_at=None instead of
     the usual +30 days — for administrative grants (e.g. the KCAN
     super-admin bootstrap) that must not lapse on a schedule meant for paid
@@ -473,7 +479,7 @@ def apply_tier_upgrade(
         # `reference` is stored here (not just on the WalletLedgerEntry) so
         # reverse_tier_upgrade_payment() can find the Subscription a given
         # WalletTransaction paid for — previously no such link existed.
-        Subscription.objects.create(
+        new_subscription = Subscription.objects.create(
             user=user,
             tier=tier,
             status=Subscription.STATUS_ACTIVE,
@@ -497,6 +503,7 @@ def apply_tier_upgrade(
         },
     )
     ensure_partner_profiles_for_user(user, tier.name)
+    return new_subscription
 
 
 def finalize_expired_subscription(sub: Subscription) -> Subscription:
@@ -679,6 +686,31 @@ def reverse_tier_upgrade_payment(
             )
             return {"subscription_found": False}
 
+        # Reverse any KIS Coins discount that was applied to this payment
+        # (Phase 5) and any referral reward that matured from it — deferred
+        # imports since apps.rewards/apps.referrals both ultimately import
+        # from apps.billing.services (adjust_points), making a top-level
+        # import here circular; matches this codebase's established
+        # convention for exactly this situation. Both calls are no-ops if
+        # there was nothing to reverse (no redemption applied, or the
+        # referrer wasn't the one who referred this specific payer).
+        redemption_entry_id = locked_meta.get("redemption_entry_id")
+        if redemption_entry_id:
+            from apps.rewards.models import RewardLedgerEntry as _RewardLedgerEntry
+            from apps.rewards.services import reverse_ledger_entry as _reverse_ledger_entry
+            reservation = _RewardLedgerEntry.objects.filter(id=redemption_entry_id).first()
+            if reservation:
+                _reverse_ledger_entry(reservation, reason=f"{event_type}:{reason}")
+
+        from apps.referrals.models import Referral as _Referral
+        from apps.referrals.services import reverse_referral_reward as _reverse_referral_reward
+        referral = _Referral.objects.filter(
+            qualifying_subscription=sub,
+            status__in=(_Referral.STATUS_QUALIFIED, _Referral.STATUS_REWARDED),
+        ).first()
+        if referral:
+            _reverse_referral_reward(referral, reason=f"{event_type}:{reason}")
+
         was_current = sub.status == Subscription.STATUS_ACTIVE
         sub.status = Subscription.STATUS_REFUNDED
         sub.save(update_fields=["status", "updated_at"])
@@ -741,4 +773,139 @@ def adjust_points(user: User, points: int, reason: str) -> LoyaltyPoint:
         earned_at=timezone.now(),
         expires_at=None,
         reason=reason,
+    )
+
+
+class PromoCodeError(ValueError):
+    """Base for redeem_promo_code failures — the message is safe to surface
+    directly to the API caller."""
+
+
+class PromoCodeNotFound(PromoCodeError):
+    pass
+
+
+class PromoCodeNotActive(PromoCodeError):
+    pass
+
+
+class PromoCodeExpired(PromoCodeError):
+    pass
+
+
+class PromoCodeUsageLimitReached(PromoCodeError):
+    pass
+
+
+class PromoCodeAlreadyRedeemed(PromoCodeError):
+    pass
+
+
+class PromoCodeLegacyCashBonusBlocked(PromoCodeError):
+    pass
+
+
+@dataclass
+class PromoRedemptionResult:
+    promo: PromoCode
+    redemption: PromoRedemption
+    cash_bonus_cents: int
+    credit_bonus: int
+    legacy_cash_bonus_blocked: bool
+
+
+def redeem_promo_code(user: User, code: str) -> PromoRedemptionResult:
+    """
+    The single authoritative promo-redemption path — both
+    WalletViewSet.redeem and PromoCodeViewSet.redeem_code call this rather
+    than each maintaining their own logic (they previously diverged: one had
+    an unguarded TOCTOU race between the duplicate-check and the credit, the
+    other used a safer get_or_create for the redemption row but never
+    actually applied cash_bonus_cents despite returning it in the response
+    as if it had been).
+
+    Locks the PromoCode row for the duration of the check-and-redeem
+    sequence, serializing every concurrent redemption attempt against this
+    SAME code — not just the per-user duplicate (already enforced by
+    PromoRedemption's unique_together=("user","promo")), but also the
+    usage_limit/used_count counter, which a bare read-increment-write race
+    could otherwise let two concurrent redeemers both slip past.
+
+    cash_bonus_cents is gated behind KIS_LEGACY_PROMO_CASH_BONUS_ENABLED
+    (default off) exactly like every other legacy-financial-flow feature in
+    this codebase — a promo with a cash bonus but no credit_bonus is
+    rejected outright rather than silently redeemed for nothing.
+    """
+    normalized_code = (code or "").strip().upper()
+    if not normalized_code:
+        raise PromoCodeNotFound("Promo code required.")
+
+    with transaction.atomic():
+        promo = (
+            PromoCode.objects.select_for_update()
+            .filter(code=normalized_code, is_active=True)
+            .first()
+        )
+        if not promo:
+            raise PromoCodeNotFound("Invalid or inactive code.")
+
+        now = timezone.now()
+        if promo.starts_at and promo.starts_at > now:
+            raise PromoCodeNotActive("Code is not yet active.")
+        if promo.ends_at and promo.ends_at < now:
+            raise PromoCodeExpired("Code has expired.")
+        if promo.usage_limit is not None and promo.used_count >= promo.usage_limit:
+            raise PromoCodeUsageLimitReached("Code has reached its usage limit.")
+        if PromoRedemption.objects.filter(user=user, promo=promo).exists():
+            raise PromoCodeAlreadyRedeemed("You have already redeemed this code.")
+
+        cash_bonus_cents = int(promo.cash_bonus_cents or 0)
+        credit_bonus = int(promo.credit_bonus or 0)
+        legacy_cash_bonus_blocked = False
+        if cash_bonus_cents and not getattr(settings, "KIS_LEGACY_PROMO_CASH_BONUS_ENABLED", False):
+            legacy_cash_bonus_blocked = True
+            cash_bonus_cents = 0
+            if credit_bonus <= 0:
+                raise PromoCodeLegacyCashBonusBlocked(
+                    "This promo grants legacy wallet value and is disabled.",
+                )
+
+        if cash_bonus_cents:
+            record_ledger(
+                user=user,
+                kind="promo",
+                amount_cents=cash_bonus_cents,
+                reference=f"promo:{promo.code}",
+                meta={"promo": promo.code, "legacy_cash_bonus_blocked": legacy_cash_bonus_blocked},
+            )
+        if credit_bonus:
+            # Inside the same transaction as everything else here — unlike
+            # the old redeem_code, a failure here now rolls back the whole
+            # redemption (used_count, PromoRedemption row, cash bonus)
+            # instead of silently swallowing the error and leaving the code
+            # marked redeemed with nothing actually granted.
+            #
+            # Phase 5: writes to the new RewardLedgerEntry (KIS Coins) ledger
+            # rather than the legacy LoyaltyPoint model. The redemption
+            # ceiling engine (calculate_redemption/get_reward_balance) only
+            # reads RewardLedgerEntry — a promo credit_bonus that kept
+            # writing to LoyaltyPoint would be earned but never spendable
+            # anywhere in the new system, which defeats the point of a
+            # promo bonus. LoyaltyPoint is left untouched as historical
+            # data (already backfilled into RewardLedgerEntry in Phase 2);
+            # this is the last write path being migrated off it.
+            grant_promo_bonus(user, promo.code, credit_bonus)
+
+        promo.used_count += 1
+        promo.save(update_fields=["used_count", "updated_at"])
+        redemption = PromoRedemption.objects.create(
+            user=user, promo=promo, meta={"legacy_cash_bonus_blocked": legacy_cash_bonus_blocked},
+        )
+
+    return PromoRedemptionResult(
+        promo=promo,
+        redemption=redemption,
+        cash_bonus_cents=cash_bonus_cents,
+        credit_bonus=credit_bonus,
+        legacy_cash_bonus_blocked=legacy_cash_bonus_blocked,
     )

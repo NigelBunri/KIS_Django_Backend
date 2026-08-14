@@ -90,6 +90,29 @@ def _flutterwave_headers() -> dict[str, str]:
     }
 
 
+def verify_flutterwave_transaction(transaction_id: str) -> dict:
+    """Server-to-server verification against Flutterwave's own
+    GET /transactions/:id/verify endpoint — the only trustworthy source of
+    truth for what actually happened to a payment. Used as a fallback when
+    a webhook hasn't (yet) landed — see PaymentStatusView, which the public
+    payments/complete redirect page polls. Never construct a "successful"
+    outcome from a client-supplied status query param; this function's
+    return value, verified with our own secret key against Flutterwave
+    directly, is the only thing allowed to drive reconciliation from a
+    redirect landing page."""
+    if not str(transaction_id or "").strip():
+        raise ValueError("transaction_id is required.")
+    response = requests.get(
+        f"{FLW_BASE_URL}/transactions/{transaction_id}/verify",
+        headers=_flutterwave_headers(),
+        timeout=30,
+    )
+    data = response.json() if response.content else {}
+    if response.status_code >= 300:
+        raise ValueError(str(data.get("message") or "Unable to verify transaction with the payment provider."))
+    return data.get("data") or {}
+
+
 def _provider_links_enabled(provider: str) -> bool:
     if not getattr(settings, "KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED", False):
         return False
