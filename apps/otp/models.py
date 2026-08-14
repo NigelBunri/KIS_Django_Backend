@@ -4,7 +4,12 @@ from django.utils import timezone
 from datetime import timedelta
 
 class PhoneOTP(models.Model):
-    PURPOSE_CHOICES = (("register", "register"), ("login", "login"), ("reset", "reset"))
+    PURPOSE_CHOICES = (
+        ("register", "register"),
+        ("login", "login"),
+        ("reset", "reset"),
+        ("email_verify", "email_verify"),
+    )
     phone = models.CharField(max_length=20, db_index=True)
     purpose = models.CharField(max_length=16, choices=PURPOSE_CHOICES)
     code_hash = models.CharField(max_length=128)

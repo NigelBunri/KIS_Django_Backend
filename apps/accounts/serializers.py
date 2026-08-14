@@ -409,6 +409,7 @@ class ProfilePreferencesSerializer(serializers.ModelSerializer):
             "notification_preferences",
             "consent_preferences",
             "language_preference",
+            "lock_timeout_minutes",
             "created_at",
             "updated_at",
         ]
@@ -478,6 +479,7 @@ class ProfileShowcaseSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     profile = ProfileSerializer(read_only=True)
     verification_summary = serializers.SerializerMethodField()
+    has_pin = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -542,6 +544,13 @@ class UserSerializer(serializers.ModelSerializer):
         from apps.verification.services import verification_summary
 
         return verification_summary(VerificationSubjectType.USER, obj.id)
+
+    def get_has_pin(self, obj: User) -> bool:
+        # Boolean only — the PIN and its hash must never leave the backend.
+        try:
+            return bool(obj.profile_preferences.quicklock_pin_hash)
+        except ProfilePreferences.DoesNotExist:
+            return False
 
 
 class PublicUserSerializer(serializers.ModelSerializer):

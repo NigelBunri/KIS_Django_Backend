@@ -3,6 +3,7 @@ import hmac, secrets, string, logging
 from hashlib import sha256
 
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
@@ -78,13 +79,22 @@ def _find_user_by_phone(phone: str, country: str = "CM"):
     return User.objects.filter(q).order_by("created_at").first()
 
 
-def _find_otp(phone: str, purpose: str, country: str = "CM"):
-    """Robust OTP lookup that tries multiple phone format variants."""
+def _find_otp(phone: str, purpose: str, country: str = "CM", *, for_update: bool = False):
+    """Robust OTP lookup that tries multiple phone format variants.
+
+    `for_update=True` locks the matched row (caller must already be inside
+    `transaction.atomic()`) so a concurrent request presenting the same code
+    blocks until this one has consumed (deleted) it, instead of racing a
+    plain get-then-delete and letting both requests pass verification.
+    """
     phone_variants, _ = _build_phone_variants(phone, country)
     if not phone_variants:
         return None
+    qs = PhoneOTP.objects
+    if for_update:
+        qs = qs.select_for_update()
     return (
-        PhoneOTP.objects
+        qs
         .filter(phone__in=phone_variants, purpose=purpose)
         .order_by("-created_at")
         .first()
@@ -95,7 +105,7 @@ OTP_TTL_SECONDS = 5 * 60
 RESEND_COOLDOWN_SECONDS = 60
 MAX_ATTEMPTS = 5
 
-ALLOWED_PURPOSES = {"register", "login", "reset"}
+ALLOWED_PURPOSES = {"register", "login", "reset", "email_verify"}
 ALLOWED_CHANNELS = {"sms", "email", "whatsapp"}
 
 
@@ -376,6 +386,8 @@ class OtpInitiateView(APIView):
             return Response({"success": False, "message": "invalid purpose"}, status=400)
         if channel not in ALLOWED_CHANNELS:
             return Response({"success": False, "message": "invalid channel"}, status=400)
+        if purpose == "email_verify" and channel != "email":
+            return Response({"success": False, "message": "email_verify requires channel=email"}, status=400)
 
         # Channel availability checks
         if channel == "sms" and not sms_configured():
@@ -477,27 +489,38 @@ class OtpVerifyView(APIView):
         is_override = _override_otp_active(code)
 
         now = timezone.now()
-        # Use variant-aware OTP lookup so slight format differences don't block verification
-        otp = _find_otp(phone, purpose, country)
+        # Locked read-check-consume: without the row lock, two concurrent
+        # requests presenting the same valid code can both read the OTP
+        # before either deletes it, and both pass verification.
+        with transaction.atomic():
+            otp = _find_otp(phone, purpose, country, for_update=True)
 
-        if not is_override:
-            if not otp or otp.expires_at <= now:
-                return Response({"success": False, "message": "code expired or not found"}, status=400)
-            if otp.attempts >= MAX_ATTEMPTS:
-                return Response({"success": False, "message": "too many attempts"}, status=429)
+            if not is_override:
+                if not otp or otp.expires_at <= now:
+                    return Response({"success": False, "message": "code expired or not found"}, status=400)
+                if otp.attempts >= MAX_ATTEMPTS:
+                    return Response({"success": False, "message": "too many attempts"}, status=429)
 
-            # Hash must be computed against the phone key that was used when the code was generated
-            expected_hash = make_code_hash(otp.phone, purpose, code)
-            if not hmac.compare_digest(expected_hash, otp.code_hash):
-                otp.attempts += 1
-                otp.save(update_fields=["attempts"])
-                return Response({"success": False, "message": "invalid code"}, status=400)
+                # Hash must be computed against the phone key that was used when the code was generated
+                expected_hash = make_code_hash(otp.phone, purpose, code)
+                if not hmac.compare_digest(expected_hash, otp.code_hash):
+                    otp.attempts += 1
+                    otp.save(update_fields=["attempts"])
+                    return Response({"success": False, "message": "invalid code"}, status=400)
 
-        # ✅ Code verified — consume any pending OTP
-        if otp:
-            otp.delete()
+            # ✅ Code verified — consume any pending OTP
+            if otp:
+                otp.delete()
 
         if purpose == "reset":
+            return Response({"success": True, "verified": True}, status=200)
+
+        if purpose == "email_verify":
+            user = _find_user_by_phone(phone, country)
+            if not user:
+                return Response({"success": False, "message": "user not found"}, status=404)
+            user.email_verified = True
+            user.save(update_fields=["email_verified", "updated_at"])
             return Response({"success": True, "verified": True}, status=200)
 
         # Robust user lookup: tries E.164, digits-only, with-plus, and national-number variants
@@ -536,9 +559,10 @@ class OtpVerifyView(APIView):
         user.is_active = True
         user.save(update_fields=["verification", "status", "is_active", "updated_at"])
 
-        if purpose == "register":
-            from apps.referrals.services import apply_referral_reward_if_pending
-            apply_referral_reward_if_pending(user)
+        # Referral rewards are no longer granted at account activation — see
+        # apps.referrals.services.apply_referral_reward_if_pending's
+        # docstring. A referral created for this user stays PENDING until a
+        # real qualifying subscription payment triggers qualify_referral().
 
         # Issue auth tokens now that the account is verified
         from apps.accounts.views import issue_tokens_for_user, upsert_device
@@ -643,34 +667,44 @@ class PasswordResetView(APIView):
             return Response({"success": False, "message": "phone, code and new_password required"}, status=400)
 
         now = timezone.now()
-        otp = _find_otp(phone, "reset", country)
-        if not otp or otp.expires_at <= now:
-            return Response({"success": False, "message": "code expired or not found"}, status=400)
-        if otp.attempts >= MAX_ATTEMPTS:
-            return Response({"success": False, "message": "too many attempts"}, status=429)
+        with transaction.atomic():
+            otp = _find_otp(phone, "reset", country, for_update=True)
+            if not otp or otp.expires_at <= now:
+                return Response({"success": False, "message": "code expired or not found"}, status=400)
+            if otp.attempts >= MAX_ATTEMPTS:
+                return Response({"success": False, "message": "too many attempts"}, status=429)
 
-        # Hash against the phone key used when the OTP was stored, not the request's phone
-        expected_hash = make_code_hash(otp.phone, "reset", code)
-        if not hmac.compare_digest(expected_hash, otp.code_hash):
-            otp.attempts += 1
-            otp.save(update_fields=["attempts"])
-            return Response({"success": False, "message": "invalid code"}, status=400)
+            # Hash against the phone key used when the OTP was stored, not the request's phone
+            expected_hash = make_code_hash(otp.phone, "reset", code)
+            if not hmac.compare_digest(expected_hash, otp.code_hash):
+                otp.attempts += 1
+                otp.save(update_fields=["attempts"])
+                return Response({"success": False, "message": "invalid code"}, status=400)
 
-        user = _find_user_by_phone(phone, country)
-        if not user:
+            user = _find_user_by_phone(phone, country)
+            if not user:
+                otp.delete()
+                return Response({"success": True}, status=200)
+
+            try:
+                validate_password(new_password, user=user)
+            except DjangoValidationError as e:
+                return Response({"success": False, "message": e.messages}, status=400)
+
+            user.set_password(new_password)
+            if hasattr(user, "last_password_change_at"):
+                user.last_password_change_at = timezone.now()
+            user.save(update_fields=["password", "last_password_change_at", "updated_at"])
+
             otp.delete()
-            return Response({"success": True}, status=200)
 
-        try:
-            validate_password(new_password, user=user)
-        except DjangoValidationError as e:
-            return Response({"success": False, "message": e.messages}, status=400)
-
-        user.set_password(new_password)
-        if hasattr(user, "last_password_change_at"):
-            user.last_password_change_at = timezone.now()
-        user.save(update_fields=["password", "last_password_change_at", "updated_at"])
-
-        otp.delete()
+            # A password reset is unauthenticated proof-of-phone-ownership, not
+            # proof of which device is legitimate — stronger than a normal
+            # password change, so every device (not just "other" devices) is
+            # revoked, forcing re-authentication everywhere.
+            from apps.accounts.models import Device
+            from apps.accounts.views import revoke_device_session
+            for device in Device.objects.select_for_update().filter(user=user, revoked_at__isnull=True):
+                revoke_device_session(user, device, reason="password_reset", request=request)
 
         return Response({"success": True}, status=200)

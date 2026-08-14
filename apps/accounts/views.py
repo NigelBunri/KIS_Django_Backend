@@ -788,25 +788,36 @@ def promote_device_via_sim(
     other active parent (e.g. a stale record left behind by a deleted app on
     the original device_id).
     """
-    Device.objects.filter(
-        user=user, is_parent=True, revoked_at__isnull=True,
-    ).exclude(device_id=str(device_id)).update(is_parent=False)
+    normalized_device_id = str(device_id or "").strip()
+    with transaction.atomic():
+        # Lock any existing active parent row(s) first so a concurrent call
+        # (e.g. a duplicate login retry) can't demote-then-promote out of
+        # order with this one; the demote-before-promote sequencing below is
+        # what keeps the one-active-parent-per-user constraint satisfied.
+        list(
+            Device.objects.select_for_update()
+            .filter(user=user, is_parent=True, revoked_at__isnull=True)
+            .exclude(device_id=normalized_device_id)
+        )
+        Device.objects.filter(
+            user=user, is_parent=True, revoked_at__isnull=True,
+        ).exclude(device_id=normalized_device_id).update(is_parent=False)
 
-    device, _ = Device.objects.update_or_create(
-        user=user,
-        device_id=str(device_id),
-        defaults={
-            "platform": platform or "unknown",
-            "name": name or None,
-            "last_seen_at": timezone.now(),
-            "last_ip": request.META.get("REMOTE_ADDR") if request else None,
-            "user_agent": request.META.get("HTTP_USER_AGENT") if request else None,
-            "revoked_at": None,
-            "revoke_reason": "",
-            "is_parent": True,
-        },
-    )
-    return device
+        device, _ = Device.objects.update_or_create(
+            user=user,
+            device_id=normalized_device_id,
+            defaults={
+                "platform": platform or "unknown",
+                "name": name or None,
+                "last_seen_at": timezone.now(),
+                "last_ip": request.META.get("REMOTE_ADDR") if request else None,
+                "user_agent": request.META.get("HTTP_USER_AGENT") if request else None,
+                "revoked_at": None,
+                "revoke_reason": "",
+                "is_parent": True,
+            },
+        )
+        return device
 
 
 def upsert_device(
@@ -816,35 +827,54 @@ def upsert_device(
     name: Optional[str],
     request,
 ) -> Device:
-    existing = Device.objects.filter(user=user, device_id=str(device_id)).first()
-    token_version = (existing.token_version + 1) if existing and existing.revoked_at else (existing.token_version if existing else 1)
+    normalized_device_id = str(device_id or "").strip()
 
-    # Determine whether this device should become the parent device.
-    # A device is the parent if it's the very first active (non-revoked) device for this user.
+    def _write(*, promote: bool) -> Device:
+        with transaction.atomic():
+            existing = (
+                Device.objects.select_for_update()
+                .filter(user=user, device_id=normalized_device_id)
+                .first()
+            )
+            token_version = (
+                (existing.token_version + 1)
+                if existing and existing.revoked_at
+                else (existing.token_version if existing else 1)
+            )
+            defaults = {
+                "platform": platform or "unknown",
+                "name": name or None,
+                "last_seen_at": timezone.now(),
+                "last_ip": request.META.get("REMOTE_ADDR") if request else None,
+                "user_agent": request.META.get("HTTP_USER_AGENT") if request else None,
+                "token_version": token_version,
+                "revoked_at": None,
+                "revoke_reason": "",
+            }
+            if promote:
+                defaults["is_parent"] = True
+            device, _ = Device.objects.update_or_create(
+                user=user,
+                device_id=normalized_device_id,
+                defaults=defaults,
+            )
+            return device
+
+    # A device is the parent if it's the very first active (non-revoked)
+    # device for this user. This existence check and the write below are not
+    # under the same row lock (there's nothing to lock when zero rows exist
+    # yet), so two concurrent first-device upserts can both observe "no
+    # parent" — the DB-level accounts_device_one_active_parent_per_user
+    # constraint is the actual source of truth: if the promoting write loses
+    # the race, retry once as a non-promoting write instead of erroring.
     has_active_parent = Device.objects.filter(
         user=user, is_parent=True, revoked_at__isnull=True
-    ).exclude(device_id=str(device_id)).exists()
+    ).exclude(device_id=normalized_device_id).exists()
 
-    defaults = {
-        "platform": platform or "unknown",
-        "name": name or None,
-        "last_seen_at": timezone.now(),
-        "last_ip": request.META.get("REMOTE_ADDR") if request else None,
-        "user_agent": request.META.get("HTTP_USER_AGENT") if request else None,
-        "token_version": token_version,
-        "revoked_at": None,
-        "revoke_reason": "",
-    }
-    if not has_active_parent:
-        # No existing parent — promote this device.
-        defaults["is_parent"] = True
-
-    device, _ = Device.objects.update_or_create(
-        user=user,
-        device_id=str(device_id),
-        defaults=defaults,
-    )
-    return device
+    try:
+        return _write(promote=not has_active_parent)
+    except IntegrityError:
+        return _write(promote=False)
 
 
 def revoke_device_session(user: User, device: Device, *, reason: str, request=None) -> Device:
@@ -980,9 +1010,11 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
             user.is_active = True
             user.save(update_fields=["verification", "status", "is_active", "updated_at"])
 
-            if referral_code:
-                from apps.referrals.services import apply_referral_reward_if_pending
-                apply_referral_reward_if_pending(user)
+            # Referral rewards are no longer granted at account activation —
+            # see apps.referrals.services.apply_referral_reward_if_pending's
+            # docstring. The Referral row created by register_referral()
+            # (elsewhere in this view) stays PENDING until a real qualifying
+            # subscription payment triggers qualify_referral().
 
             tokens = issue_tokens_for_user(user, device_id=device_id)
             return Response(
@@ -1146,6 +1178,13 @@ class LoginView(APIView):
                     "is_active": user.is_active,
                     "device_id": device_id,
                     "two_factor_enabled": TwoFactor.objects.filter(user=user, type="totp", enabled=True).exists(),
+                    # Quick Lock PIN, without waiting for the next /users/me/ refresh.
+                    "has_pin": bool(
+                        ProfilePreferences.objects.filter(user=user)
+                        .exclude(quicklock_pin_hash__isnull=True)
+                        .exclude(quicklock_pin_hash="")
+                        .exists()
+                    ),
                 },
             },
             status=status.HTTP_200_OK,
@@ -2907,19 +2946,20 @@ def _send_push_to_device(user: User, device: Device, title: str, body: str, dedu
 
 
 def _send_recovery_email(user: User, recovery_code: str) -> None:
-    """Best-effort recovery email. Swallows all errors."""
+    """Best-effort recovery email. Swallows all errors — the caller (init
+    view) must not vary its response based on delivery success, to avoid
+    account enumeration."""
     try:
-        from apps.notifications.email_service import send_templated_email
+        from apps.notifications.email_service import send_device_recovery_email
         email = getattr(user, "email", None)
         if email:
-            send_templated_email(
-                to_email=email,
-                subject="KIS Account Recovery — your parent device recovery code",
-                template_name="device_recovery",
-                context={"recovery_code": recovery_code, "expires_minutes": 15},
+            send_device_recovery_email(
+                email,
+                recovery_code,
+                expires_minutes=_RECOVERY_TTL_SECONDS // 60,
             )
     except Exception:
-        pass
+        logger.exception("device recovery email failed for user_id=%s", getattr(user, "id", None))
 
 
 @extend_schema(
@@ -3012,7 +3052,11 @@ class DeviceQRLoginView(APIView):
         now = timezone.now()
 
         with transaction.atomic():
-            existing = Device.objects.filter(user=user, device_id=str(device_id)).first()
+            existing = (
+                Device.objects.select_for_update()
+                .filter(user=user, device_id=str(device_id))
+                .first()
+            )
             token_version = (
                 (existing.token_version + 1) if existing and existing.revoked_at
                 else (existing.token_version if existing else 1)
@@ -3296,8 +3340,13 @@ class ParentRecoveryInitView(APIView):
                 is_active=True,
             ).first()
 
-        # Always return the same message regardless of whether user exists.
-        if user:
+        # Always return the same message regardless of whether user exists —
+        # and, importantly, regardless of whether they have a verified email.
+        # Only a VERIFIED email is eligible to authorize replacing the
+        # primary device (see apps.otp purpose="email_verify"); an
+        # unverified email on file must never become authoritative here, so
+        # this silently no-ops for that user rather than sending anything.
+        if user and getattr(user, "email_verified", False) and user.email:
             import secrets as _secrets
             recovery_code = _secrets.token_urlsafe(24)
             cache_key = f"{_RECOVERY_CACHE_PREFIX}{recovery_code}"
@@ -3355,42 +3404,67 @@ class ParentRecoveryConfirmView(APIView):
         except User.DoesNotExist:
             return Response({"detail": "Invalid or expired recovery token."}, status=status.HTTP_401_UNAUTHORIZED)
 
-        # Consume the token so it cannot be reused.
+        # Consume the token so it cannot be reused. (cache get-then-delete is
+        # not itself atomic across all cache backends, but the downstream
+        # accounts_device_one_active_parent_per_user DB constraint is what
+        # actually prevents two concurrent confirmations from both
+        # succeeding as primary.)
         cache.delete(cache_key)
 
         now = timezone.now()
-        with transaction.atomic():
-            # Revoke the old parent(s).
-            Device.objects.filter(
-                user=user, is_parent=True, revoked_at__isnull=True
-            ).update(
-                revoked_at=now,
-                revoke_reason="parent_recovery",
-                is_parent=False,
-            )
+        try:
+            with transaction.atomic():
+                # Revoke the old parent(s) through the same path used by every
+                # other revocation (logout, single/bulk device revoke): bumps
+                # token_version and wipes E2EE keys, not just a bare
+                # revoked_at flag. Without this, a still-valid access token on
+                # the old (e.g. stolen) device kept working until its natural
+                # expiry even after "recovery".
+                old_parents = list(
+                    Device.objects.select_for_update().filter(
+                        user=user, is_parent=True, revoked_at__isnull=True
+                    ).exclude(device_id=str(device_id))
+                )
+                for old_parent in old_parents:
+                    old_parent.is_parent = False
+                    old_parent.save(update_fields=["is_parent", "updated_at"])
+                    revoke_device_session(user, old_parent, reason="parent_recovery", request=request)
 
-            existing = Device.objects.filter(user=user, device_id=str(device_id)).first()
-            token_version = (
-                (existing.token_version + 1) if existing and existing.revoked_at
-                else (existing.token_version if existing else 1)
-            )
-            device, _ = Device.objects.update_or_create(
-                user=user,
-                device_id=str(device_id),
-                defaults={
-                    "platform": platform,
-                    "name": device_name,
-                    "last_seen_at": now,
-                    "last_ip": request.META.get("REMOTE_ADDR"),
-                    "user_agent": request.META.get("HTTP_USER_AGENT"),
-                    "token_version": token_version,
-                    "revoked_at": None,
-                    "revoke_reason": "",
-                    "is_parent": True,
-                    "linked_via_qr": False,
-                    "trusted_until": now + datetime.timedelta(days=30),
-                    "parent_device": None,
-                },
+                existing = (
+                    Device.objects.select_for_update()
+                    .filter(user=user, device_id=str(device_id))
+                    .first()
+                )
+                token_version = (
+                    (existing.token_version + 1) if existing and existing.revoked_at
+                    else (existing.token_version if existing else 1)
+                )
+                device, _ = Device.objects.update_or_create(
+                    user=user,
+                    device_id=str(device_id),
+                    defaults={
+                        "platform": platform,
+                        "name": device_name,
+                        "last_seen_at": now,
+                        "last_ip": request.META.get("REMOTE_ADDR"),
+                        "user_agent": request.META.get("HTTP_USER_AGENT"),
+                        "token_version": token_version,
+                        "revoked_at": None,
+                        "revoke_reason": "",
+                        "is_parent": True,
+                        "linked_via_qr": False,
+                        "trusted_until": now + datetime.timedelta(days=30),
+                        "parent_device": None,
+                    },
+                )
+        except IntegrityError:
+            # Lost a race against a concurrent recovery/QR/login promoting a
+            # different device to parent first — the one-active-parent
+            # constraint caught it. Ask the client to retry with a fresh
+            # recovery token rather than surfacing a bare 500.
+            return Response(
+                {"detail": "Recovery could not complete — please retry."},
+                status=status.HTTP_409_CONFLICT,
             )
 
         tokens = issue_tokens_for_user(user, device_id=device_id)
@@ -3559,8 +3633,30 @@ class PasswordChangeView(APIView):
         except DjangoValidationError as exc:
             return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
 
-        user.set_password(new_pw)
-        user.save(update_fields=["password"])
+        current_device_id = str(request_device_id(request) or "").strip()
+
+        with transaction.atomic():
+            user.set_password(new_pw)
+            if hasattr(user, "last_password_change_at"):
+                user.last_password_change_at = timezone.now()
+            user.save(update_fields=["password", "last_password_change_at", "updated_at"])
+
+            # The device that just proved knowledge of the current password
+            # stays authenticated; every other active device is revoked so a
+            # changed password actually locks out anyone else already logged
+            # in (previously neither change nor reset touched other devices
+            # at all — tokens stayed valid up to their 90-day natural expiry).
+            other_devices = Device.objects.select_for_update().filter(
+                user=user, revoked_at__isnull=True
+            ).exclude(device_id=current_device_id)
+            for device in other_devices:
+                revoke_device_session(user, device, reason="password_change", request=request)
+
+        AuditLog.log(
+            actor=user,
+            action="user.password_changed",
+            meta=request_meta(request, device_id=current_device_id),
+        )
         return Response({"ok": True}, status=status.HTTP_200_OK)
 
 

@@ -461,6 +461,26 @@ class Device(BaseEntity):
             models.Index(fields=["user", "device_id"]),
             models.Index(fields=["user", "revoked_at"]),
         ]
+        constraints = [
+            # Prevents whitespace/case drift or a lost update from silently
+            # creating a second row for what should be the same device.
+            models.UniqueConstraint(
+                fields=["user", "device_id"],
+                name="accounts_device_user_device_id_uniq",
+            ),
+            # Single source of truth for "at most one active primary device
+            # per account" — enforced at the DB level so a race between two
+            # concurrent requests can't produce two active parents; the
+            # application catches the resulting IntegrityError and retries
+            # as a non-promoting write. Supported on Postgres and SQLite
+            # (both have supports_partial_indexes = True); not relied upon
+            # under MySQL/Oracle, which this project does not use.
+            models.UniqueConstraint(
+                fields=["user"],
+                condition=models.Q(is_parent=True, revoked_at__isnull=True),
+                name="accounts_device_one_active_parent_per_user",
+            ),
+        ]
 
 
 class E2EDeviceKey(BaseEntity):
@@ -597,17 +617,22 @@ class DeviceQRToken(models.Model):
             hashlib.sha256,
         ).hexdigest()
         now = timezone.now()
-        try:
-            qr_token = cls.objects.select_related('user', 'parent_device').get(
+        # Claim the token with a single atomic UPDATE ... WHERE used_at IS NULL
+        # rather than a separate get()-then-save(): two concurrent requests
+        # racing the same QR code can both pass a plain .get() before either
+        # commits, double-consuming a one-time token. Only one UPDATE can
+        # match the still-unused row; the loser gets rowcount 0.
+        with transaction.atomic():
+            updated = cls.objects.filter(
                 token_hash=token_hash,
                 used_at__isnull=True,
                 expires_at__gt=now,
+            ).update(used_at=now)
+            if not updated:
+                return None
+            return cls.objects.select_related('user', 'parent_device').get(
+                token_hash=token_hash,
             )
-        except cls.DoesNotExist:
-            return None
-        qr_token.used_at = now
-        qr_token.save(update_fields=['used_at'])
-        return qr_token
 
 
 class ApiToken(BaseEntity):
@@ -1080,6 +1105,7 @@ class ProfilePreferences(BaseEntity):
     language_preference = models.CharField(max_length=20, blank=True, default='')
     # NOTE: Run makemigrations after this change
     quicklock_pin_hash = models.CharField(max_length=128, blank=True, null=True)
+    lock_timeout_minutes = models.PositiveSmallIntegerField(default=5)
 
     class Meta:
         indexes = [models.Index(fields=["user"])]

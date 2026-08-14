@@ -7,7 +7,9 @@ cooperate correctly:
 
   Phase 1  — device-bound JWT auth (baseline, exercised throughout)
   Phase 3  — apply_tier_upgrade / real billing_period_days
-  Phase 4  — referral code capture + reward at registration
+  Phase 4  — referral code capture at registration (reward-granting itself
+             was later retired from this path — see the billing/rewards
+             project's pre-deployment hardening pass)
   Phase 5  — CELERY_TASK_ALWAYS_EAGER test wiring (sweep runs synchronously)
   Phase 6  — welcome-email failure is logged + audited, not silently lost
   Phase 7  — X-Internal-Auth bypass requires a real signed request
@@ -33,7 +35,6 @@ from apps.accounts.views import issue_tokens_for_user
 from apps.billing.tasks import expire_subscriptions
 from apps.chat.internal_signing import sign_internal_request
 from apps.referrals.models import Referral, ReferralCode
-from apps.referrals.services import REFERRAL_REWARD_POINTS
 from apps.commerce.models import LoyaltyPoint
 
 DEVICE_ID = "phase10-journey-device"
@@ -68,8 +69,13 @@ class FullUserJourneyAcrossPhasesTests(TestCase):
     def test_full_journey(self):
         # --- Step 1 (Phase 4): register a new user with the referral code.
         # Verification is suspended (the real production default), so the
-        # account activates and the referral reward fires in the same
-        # request.
+        # account activates immediately in the same request. Pre-deployment
+        # hardening pass (billing/rewards project): account activation no
+        # longer grants a referral reward — the referral stays PENDING
+        # until a real qualifying payment goes through the referral
+        # qualification engine (apps.referrals.services.qualify_referral,
+        # wired to the Flutterwave webhook, not exercised by this test
+        # since Step 2 below calls apply_tier_upgrade directly).
         with self.assertLogs("common.middleware", level="INFO") as request_logs:
             register_res = self.client.post("/api/v1/auth/register/", {
                 "phone_country_code": "+237", "phone_number": "699900002", "country": "CM",
@@ -83,11 +89,11 @@ class FullUserJourneyAcrossPhasesTests(TestCase):
         # Phase 9: the request actually produced a real access-log line.
         self.assertTrue(any("REQ END" in line and "/api/v1/auth/register/" in line for line in request_logs.output))
 
-        # Phase 4: referral reward granted to the referrer.
+        # Referral stays PENDING at registration — no reward granted yet.
         referral = Referral.objects.get(referred_user=new_user)
-        self.assertEqual(referral.status, Referral.STATUS_REWARDED)
+        self.assertEqual(referral.status, Referral.STATUS_PENDING)
         points = LoyaltyPoint.objects.filter(user=self.referrer).aggregate(total=Sum("points"))["total"]
-        self.assertEqual(points, REFERRAL_REWARD_POINTS)
+        self.assertIsNone(points)
 
         # Phase 6 note: UserCreateSerializer does not collect an `email`
         # field at registration (a known, separately-flagged gap — see

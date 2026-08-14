@@ -45,6 +45,13 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
         "<p>Your password reset code is: <strong>{code}</strong></p>"
         "<p>It expires in {ttl_minutes} minutes.</p>",
     ),
+    "device_recovery": (
+        "KIS Account Recovery — device transfer code",
+        "<h2>Account Recovery</h2>"
+        "<p>Your device recovery code is: <strong>{recovery_code}</strong></p>"
+        "<p>It expires in {expires_minutes} minutes. If you didn't request this, "
+        "ignore this email — your current primary device stays active.</p>",
+    ),
 }
 
 
@@ -114,6 +121,16 @@ def send_welcome_email(to_email: str) -> bool:
         title="Welcome to KIS!",
         body="Your account has been created. Start exploring today.",
         template_key="welcome",
+    )
+
+
+def send_device_recovery_email(to_email: str, recovery_code: str, expires_minutes: int = 15) -> bool:
+    return send_notification_email(
+        to_email=to_email,
+        title="KIS Account Recovery — device transfer code",
+        body=f"Your device recovery code is {recovery_code}. Expires in {expires_minutes} minutes.",
+        template_key="device_recovery",
+        context={"recovery_code": recovery_code, "expires_minutes": expires_minutes},
     )
 
 
