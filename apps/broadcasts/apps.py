@@ -6,3 +6,8 @@ class BroadcastsConfig(AppConfig):
     name = "apps.broadcasts"
     label = "broadcasts"
     verbose_name = "Broadcasts"
+
+    def ready(self):
+        from .media_hooks import register as register_media_hooks
+
+        register_media_hooks()

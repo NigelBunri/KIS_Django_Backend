@@ -131,6 +131,38 @@ def _status_audio_max_bytes() -> int:
     return int(getattr(settings, "STATUS_AUDIO_MAX_UPLOAD_BYTES", 15 * 1024 * 1024))
 
 
+def _education_image_allowed_content_types() -> set[str]:
+    configured = getattr(settings, "EDUCATION_IMAGE_ALLOWED_CONTENT_TYPES", "")
+    values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
+    return values or {"image/jpeg", "image/png", "image/webp"}
+
+
+def _education_image_max_bytes() -> int:
+    return int(getattr(settings, "EDUCATION_IMAGE_MAX_UPLOAD_BYTES", 8 * 1024 * 1024))
+
+
+def _education_material_allowed_content_types() -> set[str]:
+    configured = getattr(settings, "EDUCATION_MATERIAL_ALLOWED_CONTENT_TYPES", "")
+    values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
+    return values or {
+        "application/pdf",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
+        "audio/mp4",
+        "audio/mpeg",
+        "audio/aac",
+        "audio/wav",
+    }
+
+
+def _education_material_max_bytes() -> int:
+    return int(getattr(settings, "EDUCATION_MATERIAL_MAX_UPLOAD_BYTES", 100 * 1024 * 1024))
+
+
 @dataclass(frozen=True)
 class UploadContextConfig:
     allowed_content_types: Callable[[], set[str]]
@@ -209,6 +241,26 @@ UPLOAD_CONTEXTS: dict[str, UploadContextConfig] = {
         allowed_content_types=_status_audio_allowed_content_types,
         max_bytes=_status_audio_max_bytes,
         key_prefix="status/aud",
+    ),
+    # Education contexts. Like commerce, these are confirm-only (see
+    # _confirm_only_media_descriptor) with a separate, per-institution-
+    # authorized attach step — see apps/broadcasts/education_media.py.
+    # Institution ownership/staff-membership is validated BEFORE
+    # create_upload_intent() is even called (initiate_education_upload).
+    "education_institution_logo": UploadContextConfig(
+        allowed_content_types=_education_image_allowed_content_types,
+        max_bytes=_education_image_max_bytes,
+        key_prefix="education/logo",
+    ),
+    "education_module_cover_image": UploadContextConfig(
+        allowed_content_types=_education_image_allowed_content_types,
+        max_bytes=_education_image_max_bytes,
+        key_prefix="education/cover",
+    ),
+    "education_material": UploadContextConfig(
+        allowed_content_types=_education_material_allowed_content_types,
+        max_bytes=_education_material_max_bytes,
+        key_prefix="education/material",
     ),
 }
 
@@ -655,6 +707,9 @@ ATTACH_HANDLERS: dict[str, Callable[[MediaUploadIntent], dict]] = {
     "status_image": _confirm_only_media_descriptor,
     "status_video": _confirm_only_media_descriptor,
     "status_audio": _confirm_only_media_descriptor,
+    "education_institution_logo": _confirm_only_media_descriptor,
+    "education_module_cover_image": _confirm_only_media_descriptor,
+    "education_material": _confirm_only_media_descriptor,
 }
 
 

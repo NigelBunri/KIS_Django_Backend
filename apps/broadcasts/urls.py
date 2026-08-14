@@ -97,6 +97,7 @@ from .views import (
     BroadcastSubscribeView,
     EducationCourseBroadcastView,
     EducationHubView,
+    EducationUploadInitiateView,
     EducationInstitutionListView,
     EducationInstitutionDetailView,
     EducationInstitutionVerificationReviewView,
@@ -362,6 +363,11 @@ urlpatterns = [
         "broadcasts/education/courses/broadcast/",
         EducationCourseBroadcastView.as_view(),
         name="education-course-broadcast",
+    ),
+    path(
+        "broadcasts/education/uploads/initiate/",
+        EducationUploadInitiateView.as_view(),
+        name="education-upload-initiate",
     ),
     path(
         "broadcasts/education/institutions/",

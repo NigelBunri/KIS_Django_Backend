@@ -317,6 +317,7 @@ from apps.broadcasts.media_utils import (
     ensure_local_thumbnail,
     normalize_media_reference,
 )
+from apps.broadcasts import education_media
 from apps.billing.services import (
     cents_to_credits,
     cents_to_usd,
@@ -919,7 +920,14 @@ def _normalize_material_kind(value: object, default: str = EducationMaterialKind
     return default
 
 
-def _education_material_media_payload(data) -> tuple[str, str, str, str, dict]:
+def _education_material_media_payload(data, *, user=None, institution=None):
+    """Returns (resource_url, resource_name, resource_mime_type, storage_path,
+    metadata, intent). `intent` is the resolved MediaUploadIntent when the
+    client uploaded a real file (resource_attachment.media_id) — the caller
+    must call education_media.bind_education_media(intent=..., ...) once the
+    material row has been saved. `intent` is None for a plain resource_url
+    (education materials of kind=link are a pasted external URL, not an
+    upload — that field has always been, and remains, free text)."""
     resource_url = str(data.get("resource_url") or "").strip()
     resource_name = str(data.get("resource_name") or "").strip()
     resource_mime_type = str(data.get("resource_mime_type") or "").strip()
@@ -927,26 +935,47 @@ def _education_material_media_payload(data) -> tuple[str, str, str, str, dict]:
     metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
     metadata = dict(metadata)
     if resource_url.startswith(("file://", "content://", "data:")):
-        raise ValidationError({"resource_url": "Upload the material first and send the returned private media URL/reference, not a local file path."})
+        raise ValidationError({"resource_url": "Upload the material first and send the returned private media reference, not a local file path."})
     if storage_path:
         raise ValidationError({"storage_path": "Raw storage paths are not accepted for education materials."})
+
     attachment = data.get("resource_attachment") or data.get("attachment")
+    intent = None
     if isinstance(attachment, dict):
-        resource_url = str(attachment.get("url") or resource_url or "").strip()
-        resource_name = str(attachment.get("name") or resource_name or "").strip()
-        resource_mime_type = str(attachment.get("mime_type") or attachment.get("mimeType") or resource_mime_type or "").strip()
-        media_ref = str(attachment.get("id") or attachment.get("media_asset_id") or attachment.get("mediaAssetId") or attachment.get("safety_scan_id") or "").strip()
-        if media_ref:
-            metadata["private_media_ref"] = media_ref
-        safety = attachment.get("safety") if isinstance(attachment.get("safety"), dict) else {}
-        metadata["media_safety"] = {"status": attachment.get("scan_status") or safety.get("status") or "not_configured", "quarantined": bool(attachment.get("quarantined") or safety.get("quarantined")), "requires_review": bool(attachment.get("requires_review") or safety.get("requires_review")), "safety_scan_id": str(attachment.get("safety_scan_id") or ""), "context": "education_material"}
+        # A client-asserted `url`/`quarantined`/`scan_status` was previously
+        # trusted here at face value — a forged attachment dict could bind
+        # any URL (including another user's private object) onto a
+        # material with no server-side verification. media_id is now
+        # resolved against a real, owned, confirmed MediaUploadIntent
+        # instead; the object key and safety decision below are never
+        # client-supplied.
+        media_id = str(attachment.get("media_id") or attachment.get("mediaId") or "").strip()
+        if not media_id:
+            raise ValidationError({"resource_attachment": "resource_attachment.media_id is required — upload the file first via the education upload endpoints."})
+        if user is None:
+            raise ValidationError({"resource_attachment": "Material file uploads are not supported in this context."})
+        intent, decision = education_media.resolve_and_scan_education_media(
+            user=user, institution=institution, media_id=media_id,
+            expected_context=education_media.MATERIAL_CONTEXT,
+        )
+        resource_name = str(attachment.get("name") or intent.original_filename or resource_name or "").strip()
+        resource_mime_type = intent.content_type or resource_mime_type
+        metadata["private_media_ref"] = str(intent.id)
+        metadata["media_safety"] = {
+            "status": decision.status,
+            "quarantined": decision.quarantine,
+            "requires_review": decision.requires_review,
+            "safety_scan_id": "",
+            "context": "education_material",
+        }
+        if education_media.is_blocked(decision):
+            resource_url = ""
+            metadata["blocked_user_message"] = "This learning material is under safety review."
+        else:
+            resource_url = intent.object_key
     else:
         metadata.setdefault("media_safety", {"status": "metadata_only", "context": "education_material"})
-    safety = metadata.get("media_safety") if isinstance(metadata.get("media_safety"), dict) else {}
-    if safety.get("quarantined") or safety.get("blocked"):
-        resource_url = ""
-        metadata["blocked_user_message"] = "This learning material is under safety review."
-    return resource_url, resource_name, resource_mime_type, "", metadata
+    return resource_url, resource_name, resource_mime_type, "", metadata, intent
 
 
 def _normalize_event_type(value: object, default: str = EducationInstitutionEventType.EVENT) -> str:
@@ -1134,23 +1163,57 @@ def _normalize_education_decimal(value: object, field_name: str, *, allow_none: 
     return parsed.quantize(Decimal("0.01"))
 
 
-def _normalize_education_branding_payload(payload, existing: dict | None = None) -> dict:
+def _normalize_education_branding_payload(payload, existing: dict | None = None, *, user=None, institution=None):
+    """Returns (branding, intent). `intent` is set when the client uploaded
+    a real logo file (logo_attachment.media_id) — the caller must
+    bind_education_media() it once the institution row exists (for a
+    brand-new institution, that's right after .objects.create()). See
+    _education_cover_image_from_payload for why a plain logo_url/logoUrl/
+    etc string remains free text (never resolved server-side) while an
+    attachment object is."""
     branding = dict(existing or {})
     raw_branding = payload.get("branding") if hasattr(payload, "get") else None
     if isinstance(raw_branding, dict):
         branding.update(raw_branding)
+
+    intent = None
+    logo_resolved = False
+    logo_attachment = _first_payload_value(payload, "logo_attachment", "logoAttachment")
+    if not isinstance(logo_attachment, dict) and isinstance(raw_branding, dict):
+        logo_attachment = raw_branding.get("logo_attachment") or raw_branding.get("logoAttachment")
+    if isinstance(logo_attachment, dict):
+        media_id = str(logo_attachment.get("media_id") or logo_attachment.get("mediaId") or "").strip()
+        if media_id:
+            if user is None:
+                raise ValidationError({"logo_attachment": "Logo upload is not supported in this context."})
+            intent, decision = education_media.resolve_and_scan_education_media(
+                user=user, institution=institution, media_id=media_id,
+                expected_context=education_media.LOGO_CONTEXT,
+            )
+            if not education_media.is_blocked(decision):
+                branding["logo_url"] = intent.object_key
+                logo_resolved = True
+            else:
+                intent = None
 
     alias_map = {
         "logo_url": ("logo_url", "logoUrl", "logo", "avatar_url", "avatarUrl"),
         "image_url": ("image_url", "imageUrl", "institution_image_url", "institutionImageUrl"),
         "banner_image_url": ("banner_image_url", "bannerImageUrl", "cover_image_url", "coverImageUrl", "cover_url", "coverUrl"),
     }
+    # A server-resolved logo (from logo_attachment.media_id) is
+    # authoritative — a client cannot smuggle a second, unverified
+    # logo_url/logoUrl/etc string in the same request to override it.
     for target_key, aliases in alias_map.items():
+        if logo_resolved and target_key == "logo_url":
+            continue
         value = _first_payload_value(payload, *aliases)
         if value is not None:
             branding[target_key] = normalize_media_reference(str(value).strip())
 
     for target_key in alias_map:
+        if logo_resolved and target_key == "logo_url":
+            continue
         if branding.get(target_key):
             branding[target_key] = normalize_media_reference(branding[target_key])
 
@@ -1166,10 +1229,32 @@ def _normalize_education_branding_payload(payload, existing: dict | None = None)
         branding["imageUrl"] = branding["image_url"]
     if branding.get("banner_image_url"):
         branding["bannerImageUrl"] = branding["banner_image_url"]
-    return branding
+    return branding, intent
 
 
-def _education_cover_image_from_payload(payload) -> str:
+def _education_cover_image_from_payload(payload, *, user=None, institution=None):
+    """Returns (cover_image_url, intent). Mirrors
+    _education_material_media_payload's attachment-vs-free-text split: a
+    `cover_image_attachment: {media_id}` is resolved server-side against a
+    real, owned, confirmed upload (never a client-asserted url) — the
+    caller must bind_education_media() the returned intent once the target
+    row exists. A plain cover_image_url/imageUrl/etc string field remains
+    free text, exactly as before (many callers paste an external image
+    URL rather than uploading one)."""
+    attachment = _first_payload_value(payload, "cover_image_attachment", "coverImageAttachment")
+    if isinstance(attachment, dict):
+        media_id = str(attachment.get("media_id") or attachment.get("mediaId") or "").strip()
+        if media_id:
+            if user is None:
+                raise ValidationError({"cover_image_attachment": "Cover image upload is not supported in this context."})
+            intent, decision = education_media.resolve_and_scan_education_media(
+                user=user, institution=institution, media_id=media_id,
+                expected_context=education_media.COVER_IMAGE_CONTEXT,
+            )
+            if education_media.is_blocked(decision):
+                return "", None
+            return intent.object_key, intent
+
     value = _first_payload_value(
         payload,
         "cover_image_url",
@@ -1181,7 +1266,7 @@ def _education_cover_image_from_payload(payload) -> str:
         "image_url",
         "imageUrl",
     )
-    return normalize_media_reference(str(value or "").strip())
+    return normalize_media_reference(str(value or "").strip()), None
 
 
 def _education_cover_image_in_payload(payload) -> bool:
@@ -1196,6 +1281,8 @@ def _education_cover_image_in_payload(payload) -> bool:
             "coverUrl",
             "image_url",
             "imageUrl",
+            "cover_image_attachment",
+            "coverImageAttachment",
         )
     )
 
@@ -8990,6 +9077,35 @@ class LessonEnrollmentActionView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class EducationUploadInitiateView(APIView):
+    """POST /api/v1/broadcasts/education/uploads/initiate/
+
+    Education-specific entry point to the shared direct-to-S3 presigned
+    upload handshake (apps/media/upload_intent.py) — see
+    apps/broadcasts/education_media.py for why this needs its own initiate
+    view rather than reusing the generic one: institution-management
+    authorization (owner/manager/administrator membership) must be checked
+    against a specific institution BEFORE a presigned URL is ever issued.
+
+    Confirmation still goes through the existing, unmodified
+    POST /api/v1/media/uploads/<uuid:upload_id>/confirm/.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        body = request.data
+        result = education_media.initiate_education_upload(
+            user=request.user,
+            context=str(body.get("context") or "").strip(),
+            filename=body.get("filename"),
+            content_type=body.get("contentType") or body.get("content_type"),
+            size_bytes=body.get("sizeBytes") or body.get("size_bytes"),
+            institution_id=body.get("institutionId") or body.get("institution_id"),
+        )
+        return Response(result, status=status.HTTP_201_CREATED)
+
+
 class EducationInstitutionListView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -9022,6 +9138,7 @@ class EducationInstitutionListView(APIView):
             raise ValidationError({"name": "Institution name is required."})
 
         account_profile, _ = Profile.objects.get_or_create(user=request.user)
+        branding, logo_intent = _normalize_education_branding_payload(request.data, user=request.user, institution=None)
         institution = EducationInstitution.objects.create(
             owner=request.user,
             profile=account_profile,
@@ -9031,10 +9148,12 @@ class EducationInstitutionListView(APIView):
             membership_policy=_normalize_institution_membership_policy(request.data.get("membership_policy")),
             contact_email=str(request.data.get("contact_email") or "").strip(),
             contact_phone=str(request.data.get("contact_phone") or "").strip(),
-            branding=_normalize_education_branding_payload(request.data),
+            branding=branding,
             settings=request.data.get("settings") if isinstance(request.data.get("settings"), dict) else {},
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
+        if logo_intent is not None:
+            education_media.bind_education_media(intent=logo_intent, target_type="broadcasts.EducationInstitution", target_id=str(institution.id))
         EducationInstitutionMembership.objects.create(
             institution=institution,
             user=request.user,
@@ -9098,6 +9217,8 @@ class EducationInstitutionDetailView(APIView):
             for key in (
                 "logo_url",
                 "logoUrl",
+                "logo_attachment",
+                "logoAttachment",
                 "image_url",
                 "imageUrl",
                 "institution_image_url",
@@ -9108,7 +9229,11 @@ class EducationInstitutionDetailView(APIView):
                 "coverImageUrl",
             )
         ):
-            institution.branding = _normalize_education_branding_payload(request.data, existing=institution.branding or {})
+            institution.branding, logo_intent = _normalize_education_branding_payload(
+                request.data, existing=institution.branding or {}, user=request.user, institution=institution,
+            )
+            if logo_intent is not None:
+                education_media.bind_education_media(intent=logo_intent, target_type="broadcasts.EducationInstitution", target_id=str(institution.id))
         if isinstance(request.data.get("settings"), dict):
             institution.settings = request.data.get("settings")
         if isinstance(request.data.get("metadata"), dict):
@@ -9402,7 +9527,27 @@ class EducationInstitutionBookingActionView(APIView):
     def post(self, request, institution_id: str, booking_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
         _require_manage_institution_membership(request.user, institution)
-        booking = _get_institution_booking_or_404(institution, booking_id)
+        # select_for_update() here (not via the shared, read-only-callers-
+        # heavy _get_institution_booking_or_404) serializes this action
+        # against the satisfaction endpoint and the auto-completion Celery
+        # task below — both do their own check-then-release-funds on this
+        # same booking, and neither the check nor the wallet release/refund
+        # functions themselves (apps/billing/services.py) have any
+        # idempotency guard (no unique constraint on ledger reference), so
+        # an unlocked race here is a real double-payout/double-refund risk,
+        # not just a display glitch. Found during Phase 4 of the Education
+        # system production-hardening project.
+        # select_related is deliberately limited to non-nullable FKs here —
+        # Postgres rejects FOR UPDATE combined with select_related() on a
+        # nullable FK ("cannot be applied to the nullable side of an outer
+        # join"), the same restriction Phase 2 hit for broadcast.program/
+        # course/lesson/class_session/event. program/course/class_session/
+        # event/wallet_transaction/provider_credit_transaction are all
+        # null=True on this model.
+        booking = get_object_or_404(
+            EducationInstitutionBooking.objects.select_for_update().select_related("user"),
+            institution=institution, id=booking_id,
+        )
         action = str(request.data.get("action") or "").strip().lower()
         action_map = {
             "pending": EducationBookingStatus.PENDING,
@@ -9461,7 +9606,21 @@ class EducationInstitutionBookingSatisfactionView(APIView):
     @transaction.atomic
     def post(self, request, institution_id: str, booking_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
-        booking = _get_institution_booking_or_404(institution, booking_id)
+        # See EducationInstitutionBookingActionView.post for why this must
+        # be locked: this endpoint and the auto-completion Celery task both
+        # do their own check-then-release-funds on the same booking, and
+        # the underlying wallet release has no idempotency guard.
+        # select_related is deliberately limited to non-nullable FKs here —
+        # Postgres rejects FOR UPDATE combined with select_related() on a
+        # nullable FK ("cannot be applied to the nullable side of an outer
+        # join"), the same restriction Phase 2 hit for broadcast.program/
+        # course/lesson/class_session/event. program/course/class_session/
+        # event/wallet_transaction/provider_credit_transaction are all
+        # null=True on this model.
+        booking = get_object_or_404(
+            EducationInstitutionBooking.objects.select_for_update().select_related("user"),
+            institution=institution, id=booking_id,
+        )
         if booking.user_id != request.user.id:
             raise PermissionDenied("Only the learner who paid can mark a booking as satisfied.")
         if booking.status not in {
@@ -9708,16 +9867,19 @@ class EducationInstitutionProgramListView(APIView):
         title = str(request.data.get("title") or "").strip()
         if not title:
             raise ValidationError({"title": "Program title is required."})
+        cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
         program = EducationInstitutionProgram.objects.create(
             institution=institution,
             title=title,
             code=str(request.data.get("code") or "").strip(),
             summary=str(request.data.get("summary") or "").strip(),
             description=str(request.data.get("description") or "").strip(),
-            cover_image_url=_education_cover_image_from_payload(request.data),
+            cover_image_url=cover_url,
             status=_normalize_academic_status(request.data.get("status")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
+        if cover_intent is not None:
+            education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionProgram", target_id=str(program.id))
         serializer = EducationInstitutionProgramSerializer(program)
         return Response({"program": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -9751,7 +9913,10 @@ class EducationInstitutionProgramDetailView(APIView):
         if isinstance(description, str):
             program.description = description.strip()
         if _education_cover_image_in_payload(request.data):
-            program.cover_image_url = _education_cover_image_from_payload(request.data)
+            cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            program.cover_image_url = cover_url
+            if cover_intent is not None:
+                education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionProgram", target_id=str(program.id))
         if "status" in request.data:
             program.status = _normalize_academic_status(request.data.get("status"), program.status)
         if isinstance(request.data.get("metadata"), dict):
@@ -9794,6 +9959,7 @@ class EducationInstitutionCourseListView(APIView):
         program_id = request.data.get("program_id")
         if program_id:
             program = _get_institution_program_or_404(institution, str(program_id))
+        cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
         course = EducationInstitutionCourse.objects.create(
             institution=institution,
             program=program,
@@ -9801,13 +9967,15 @@ class EducationInstitutionCourseListView(APIView):
             code=str(request.data.get("code") or "").strip(),
             summary=str(request.data.get("summary") or "").strip(),
             description=str(request.data.get("description") or "").strip(),
-            cover_image_url=_education_cover_image_from_payload(request.data),
+            cover_image_url=cover_url,
             status=_normalize_academic_status(request.data.get("status")),
             duration_minutes=max(int(request.data.get("duration_minutes") or 0), 0),
             seat_limit=_to_optional_positive_int(request.data.get("seat_limit")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
             settings=request.data.get("settings") if isinstance(request.data.get("settings"), dict) else {},
         )
+        if cover_intent is not None:
+            education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionCourse", target_id=str(course.id))
         serializer = EducationInstitutionCourseSerializer(course)
         return Response({"course": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -9841,7 +10009,10 @@ class EducationInstitutionCourseDetailView(APIView):
         if isinstance(description, str):
             course.description = description.strip()
         if _education_cover_image_in_payload(request.data):
-            course.cover_image_url = _education_cover_image_from_payload(request.data)
+            cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            course.cover_image_url = cover_url
+            if cover_intent is not None:
+                education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionCourse", target_id=str(course.id))
         if "program_id" in request.data:
             program_id = request.data.get("program_id")
             course.program = _get_institution_program_or_404(institution, str(program_id)) if program_id else None
@@ -10088,19 +10259,22 @@ class EducationInstitutionLessonListView(APIView):
         if not course_id:
             raise ValidationError({"course_id": "Course is required."})
         course = _get_institution_course_or_404(institution, str(course_id))
+        cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
         lesson = EducationInstitutionLesson.objects.create(
             institution=institution,
             course=course,
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
             content=str(request.data.get("content") or "").strip(),
-            cover_image_url=_education_cover_image_from_payload(request.data),
+            cover_image_url=cover_url,
             lesson_order=max(int(request.data.get("lesson_order") or 0), 0),
             duration_minutes=max(int(request.data.get("duration_minutes") or 0), 0),
             is_preview=_to_bool(request.data.get("is_preview")),
             status=_normalize_academic_status(request.data.get("status")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
+        if cover_intent is not None:
+            education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionLesson", target_id=str(lesson.id))
         serializer = EducationInstitutionLessonSerializer(lesson)
         return Response({"lesson": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -10136,7 +10310,10 @@ class EducationInstitutionLessonDetailView(APIView):
         if isinstance(content, str):
             lesson.content = content.strip()
         if _education_cover_image_in_payload(request.data):
-            lesson.cover_image_url = _education_cover_image_from_payload(request.data)
+            cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            lesson.cover_image_url = cover_url
+            if cover_intent is not None:
+                education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionLesson", target_id=str(lesson.id))
         if "lesson_order" in request.data:
             lesson.lesson_order = max(int(request.data.get("lesson_order") or 0), 0)
         if "duration_minutes" in request.data:
@@ -10197,13 +10374,14 @@ class EducationInstitutionClassSessionListView(APIView):
         ends_at = _parse_dt(ends_at)
         if ends_at <= starts_at:
             raise ValidationError({"detail": "ends_at must be after starts_at."})
+        cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
         session = EducationInstitutionClassSession.objects.create(
             institution=institution,
             course=course,
             lesson=lesson,
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
-            cover_image_url=_education_cover_image_from_payload(request.data),
+            cover_image_url=cover_url,
             starts_at=starts_at,
             ends_at=ends_at,
             timezone_name=str(request.data.get("timezone_name") or "UTC").strip() or "UTC",
@@ -10214,6 +10392,8 @@ class EducationInstitutionClassSessionListView(APIView):
             status=_normalize_session_status(request.data.get("status")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
+        if cover_intent is not None:
+            education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionClassSession", target_id=str(session.id))
         serializer = EducationInstitutionClassSessionSerializer(session)
         return Response({"class_session": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -10241,7 +10421,10 @@ class EducationInstitutionClassSessionDetailView(APIView):
         if isinstance(summary, str):
             session.summary = summary.strip()
         if _education_cover_image_in_payload(request.data):
-            session.cover_image_url = _education_cover_image_from_payload(request.data)
+            cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            session.cover_image_url = cover_url
+            if cover_intent is not None:
+                education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionClassSession", target_id=str(session.id))
         if "course_id" in request.data:
             course_id = request.data.get("course_id")
             session.course = _get_institution_course_or_404(institution, str(course_id)) if course_id else None
@@ -10368,7 +10551,10 @@ class EducationInstitutionMaterialListView(APIView):
             class_sessions=class_sessions,
             assessments=assessments,
         )
-        resource_url, resource_name, resource_mime_type, storage_path, material_metadata = _education_material_media_payload(request.data)
+        resource_url, resource_name, resource_mime_type, storage_path, material_metadata, resource_intent = _education_material_media_payload(
+            request.data, user=request.user, institution=institution,
+        )
+        cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
         material = EducationInstitutionMaterial.objects.create(
             institution=institution,
             program=programs[0] if programs else None,
@@ -10378,7 +10564,7 @@ class EducationInstitutionMaterialListView(APIView):
             assessment=assessments[0] if assessments else None,
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
-            cover_image_url=_education_cover_image_from_payload(request.data),
+            cover_image_url=cover_url,
             kind=_normalize_material_kind(request.data.get("kind")),
             resource_url=resource_url,
             resource_name=resource_name,
@@ -10388,6 +10574,12 @@ class EducationInstitutionMaterialListView(APIView):
             status=_normalize_academic_status(request.data.get("status")),
             metadata=material_metadata,
         )
+        if resource_intent is not None:
+            education_media.bind_education_media(
+                intent=resource_intent, target_type="broadcasts.EducationInstitutionMaterial", target_id=str(material.id),
+            )
+        if cover_intent is not None:
+            education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionMaterial", target_id=str(material.id))
         _assign_material_link_sets(
             material,
             programs=programs,
@@ -10433,7 +10625,10 @@ class EducationInstitutionMaterialDetailView(APIView):
         if isinstance(summary, str):
             material.summary = summary.strip()
         if _education_cover_image_in_payload(request.data):
-            material.cover_image_url = _education_cover_image_from_payload(request.data)
+            cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            material.cover_image_url = cover_url
+            if cover_intent is not None:
+                education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionMaterial", target_id=str(material.id))
         programs = list(material.program_links.all()) or ([material.program] if material.program else [])
         courses = list(material.course_links.all()) or ([material.course] if material.course else [])
         lessons = list(material.lesson_links.all()) or ([material.lesson] if material.lesson else [])
@@ -10491,7 +10686,9 @@ class EducationInstitutionMaterialDetailView(APIView):
         if "kind" in request.data:
             material.kind = _normalize_material_kind(request.data.get("kind"), material.kind)
         if any(key in request.data for key in ("resource_url", "resource_name", "resource_mime_type", "storage_path", "resource_attachment", "attachment", "metadata")):
-            resource_url, resource_name, resource_mime_type, storage_path, material_metadata = _education_material_media_payload(request.data)
+            resource_url, resource_name, resource_mime_type, storage_path, material_metadata, resource_intent = _education_material_media_payload(
+                request.data, user=request.user, institution=institution,
+            )
             if "resource_url" in request.data or "resource_attachment" in request.data or "attachment" in request.data:
                 material.resource_url = resource_url
             if "resource_name" in request.data or "resource_attachment" in request.data or "attachment" in request.data:
@@ -10500,6 +10697,10 @@ class EducationInstitutionMaterialDetailView(APIView):
                 material.resource_mime_type = resource_mime_type
             material.storage_path = storage_path
             material.metadata = material_metadata
+            if resource_intent is not None:
+                education_media.bind_education_media(
+                    intent=resource_intent, target_type="broadcasts.EducationInstitutionMaterial", target_id=str(material.id),
+                )
         if "is_downloadable" in request.data:
             material.is_downloadable = _to_bool(request.data.get("is_downloadable"), default=material.is_downloadable)
         if "status" in request.data:
@@ -10577,6 +10778,7 @@ class EducationInstitutionEventListView(APIView):
             course,
             class_session,
         )
+        cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
         event = EducationInstitutionEvent.objects.create(
             institution=institution,
             program=program,
@@ -10586,7 +10788,7 @@ class EducationInstitutionEventListView(APIView):
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
             description=str(request.data.get("description") or "").strip(),
-            cover_image_url=_education_cover_image_from_payload(request.data),
+            cover_image_url=cover_url,
             starts_at=starts_at,
             ends_at=ends_at,
             timezone_name=str(request.data.get("timezone_name") or "UTC").strip() or "UTC",
@@ -10597,6 +10799,8 @@ class EducationInstitutionEventListView(APIView):
             status=_normalize_academic_status(request.data.get("status")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
+        if cover_intent is not None:
+            education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionEvent", target_id=str(event.id))
         serializer = EducationInstitutionEventSerializer(event)
         return Response({"event": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -10625,7 +10829,10 @@ class  EducationInstitutionEventDetailView(APIView):
             if isinstance(value, str):
                 setattr(event, field, value.strip())
         if _education_cover_image_in_payload(request.data):
-            event.cover_image_url = _education_cover_image_from_payload(request.data)
+            cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            event.cover_image_url = cover_url
+            if cover_intent is not None:
+                education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionEvent", target_id=str(event.id))
         if "program_id" in request.data:
             program_id = request.data.get("program_id")
             event.program = _get_institution_program_or_404(institution, str(program_id)) if program_id else None
@@ -10807,7 +11014,11 @@ class EducationInstitutionBroadcastListView(APIView):
         published_at = timezone.now()
         raw_price_amount = _education_price_amount_from_payload(request.data)
         manual_cover_image = _education_cover_image_in_payload(request.data)
-        cover_image_url = _education_cover_image_from_payload(request.data) if manual_cover_image else ""
+        cover_image_url, cover_intent = (
+            _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            if manual_cover_image
+            else ("", None)
+        )
         broadcast = EducationInstitutionBroadcast.objects.create(
             institution=institution,
             created_by=request.user,
@@ -10838,6 +11049,8 @@ class EducationInstitutionBroadcastListView(APIView):
                 "manual_cover_image": manual_cover_image,
             },
         )
+        if cover_intent is not None:
+            education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionBroadcast", target_id=str(broadcast.id))
         _sync_education_broadcast_item(broadcast)
         serializer = EducationInstitutionBroadcastSerializer(
             _get_institution_broadcast_or_404(institution, str(broadcast.id)),
@@ -10945,7 +11158,10 @@ class EducationInstitutionBroadcastDetailView(APIView):
             if field in request.data:
                 setattr(broadcast, field, str(request.data.get(field) or "").strip())
         if _education_cover_image_in_payload(request.data):
-            broadcast.cover_image_url = _education_cover_image_from_payload(request.data)
+            cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            broadcast.cover_image_url = cover_url
+            if cover_intent is not None:
+                education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionBroadcast", target_id=str(broadcast.id))
             metadata = dict(broadcast.metadata) if isinstance(broadcast.metadata, dict) else {}
             metadata["manual_cover_image"] = True
             broadcast.metadata = metadata
@@ -11052,7 +11268,16 @@ class EducationInstitutionBroadcastEnrollmentListView(APIView):
     @transaction.atomic
     def post(self, request, institution_id: str, broadcast_id: str):
         institution = _get_public_education_institution_or_404(institution_id)
-        broadcast = _get_institution_broadcast_or_404(institution, broadcast_id)
+        # Locked directly here (not via the shared _get_institution_broadcast_
+        # or_404 helper, which many read-only call sites also use) to
+        # serialize concurrent enrollment attempts against this broadcast —
+        # see EducationContentEnrollmentView.post for the concurrency bug
+        # this closes (seat_limit overselling + an unhandled IntegrityError
+        # crash on duplicate-user-enrollment).
+        broadcast = get_object_or_404(
+            EducationInstitutionBroadcast.objects.select_for_update(),
+            id=broadcast_id, institution=institution,
+        )
         if broadcast.status != EducationBroadcastStatus.PUBLISHED:
             raise PermissionDenied("Only published broadcasts accept enrollments.")
         _ensure_broadcast_membership_ready(institution, request.user)
@@ -11097,7 +11322,18 @@ class EducationInstitutionBroadcastBookingListView(APIView):
     @transaction.atomic
     def post(self, request, institution_id: str, broadcast_id: str):
         institution = _get_public_education_institution_or_404(institution_id)
-        broadcast = _get_institution_broadcast_or_404(institution, broadcast_id)
+        # Locked directly here (not via the shared _get_institution_broadcast_
+        # or_404 helper, which many read-only call sites also use) to
+        # serialize concurrent booking attempts against this broadcast — the
+        # same seat_limit-overselling + unhandled-IntegrityError-on-duplicate-
+        # user-booking race that Phase 2 closed for enrollment
+        # (EducationInstitutionBroadcastEnrollmentListView.post) was never
+        # closed here, even though this view runs the identical
+        # check-then-create pattern against unique_together=("broadcast","user").
+        broadcast = get_object_or_404(
+            EducationInstitutionBroadcast.objects.select_for_update(),
+            id=broadcast_id, institution=institution,
+        )
         if broadcast.status != EducationBroadcastStatus.PUBLISHED:
             raise PermissionDenied("Only published broadcasts accept bookings.")
         if not broadcast.booking_enabled:
@@ -11871,8 +12107,18 @@ class EducationContentEnrollmentView(APIView):
 
     @transaction.atomic
     def post(self, request, content_id: str):
+        # select_for_update() on the broadcast row serializes concurrent
+        # enrollment attempts against the SAME broadcast — without it, two
+        # concurrent requests can both pass the seat_limit check below
+        # before either commits (overselling a capacity-limited broadcast),
+        # and two concurrent requests from the same user can both pass the
+        # "no existing enrollment" check and both attempt .create(), with
+        # the loser crashing on the unique_together=("broadcast","user")
+        # constraint instead of being handled gracefully. Found via a real
+        # TransactionTestCase + threading concurrency test (Phase 2 of the
+        # Education system production-hardening project).
         broadcast = get_object_or_404(
-            EducationInstitutionBroadcast.objects.select_related("institution"),
+            EducationInstitutionBroadcast.objects.select_related("institution").select_for_update(),
             id=content_id,
             status=EducationBroadcastStatus.PUBLISHED,
         )
@@ -12010,6 +12256,7 @@ class EducationInstitutionAssessmentListView(APIView):
         ends_at = _parse_dt(request.data.get("ends_at")) if request.data.get("ends_at") else None
         if starts_at and ends_at and ends_at <= starts_at:
             raise ValidationError({"detail": "ends_at must be after starts_at."})
+        cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
         assessment = EducationInstitutionAssessment.objects.create(
             institution=institution,
             course=course,
@@ -12018,7 +12265,7 @@ class EducationInstitutionAssessmentListView(APIView):
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
             instructions=str(request.data.get("instructions") or "").strip(),
-            cover_image_url=_education_cover_image_from_payload(request.data),
+            cover_image_url=cover_url,
             assessment_type=_normalize_assessment_type(request.data.get("assessment_type")),
             status=_normalize_academic_status(request.data.get("status")),
             starts_at=starts_at,
@@ -12029,6 +12276,8 @@ class EducationInstitutionAssessmentListView(APIView):
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
             settings=request.data.get("settings") if isinstance(request.data.get("settings"), dict) else {},
         )
+        if cover_intent is not None:
+            education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionAssessment", target_id=str(assessment.id))
         serializer = EducationInstitutionAssessmentSerializer(assessment)
         return Response({"assessment": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -12057,7 +12306,10 @@ class EducationInstitutionAssessmentDetailView(APIView):
             if isinstance(value, str):
                 setattr(assessment, field, value.strip())
         if _education_cover_image_in_payload(request.data):
-            assessment.cover_image_url = _education_cover_image_from_payload(request.data)
+            cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            assessment.cover_image_url = cover_url
+            if cover_intent is not None:
+                education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionAssessment", target_id=str(assessment.id))
         if "course_id" in request.data:
             cid = request.data.get("course_id")
             assessment.course = _get_institution_course_or_404(institution, str(cid)) if cid else None

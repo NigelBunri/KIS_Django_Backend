@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import uuid
 from io import StringIO
 from datetime import timedelta
@@ -9,12 +10,13 @@ from django.contrib.auth import get_user_model
 from django.contrib import admin
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from apps.accounts.models import Profile
 from apps.billing.direct_payments import reconcile_direct_payment_callback
 from apps.billing.models import DirectPaymentIntent
+from apps.media.models import MediaSafetyScan, MediaUploadIntent
 from apps.broadcasts.models import (
     BroadcastChannel,
     BroadcastChannelRole,
@@ -38,11 +40,14 @@ from apps.broadcasts.models import (
     BroadcastSourceType,
     BroadcastVideo,
     UserContentPlaylist,
+    EducationEnrollmentStatus,
     EducationInstitution,
     EducationInstitutionBroadcast,
     EducationInstitutionCourse,
     EducationInstitutionEnrollment,
+    EducationInstitutionMaterial,
     EducationInstitutionMembership,
+    EducationInstitutionMembershipPolicy,
     EducationInstitutionMembershipRole,
     EducationInstitutionMembershipStatus,
     EducationInstitutionEvent,
@@ -75,7 +80,7 @@ from apps.chat.models import BaseConversationRole, Conversation, ConversationMem
 from apps.communities.models import Community, CommunityMembership, CommunityRole
 from apps.partners.models import Partner, PartnerJoinConfig, PartnerMembership, PartnerMembershipStatus
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APITestCase, APITransactionTestCase
 
 
 class FeedEntryStoreTests(SimpleTestCase):
@@ -2880,8 +2885,36 @@ class EducationCourseraCoreTests(APITestCase):
         )
         self.assertEqual(storage_response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_education_material_preserves_safe_private_media_reference_without_exposing_storage_path(self):
+    @patch("apps.media.storage_backends.S3MediaStorage._client")
+    def test_education_material_preserves_safe_private_media_reference_without_exposing_storage_path(self, mock_client):
+        # Phase 3 (direct-to-S3): resource_attachment now carries a
+        # media_id resolved against a real, owned, confirmed
+        # MediaUploadIntent — not a client-asserted url/scan_status, which
+        # a forged request could previously set to anything (see git
+        # history for the pre-Phase-3 version of this test).
+        from apps.media.tests import _mock_s3_client
+
+        client = _mock_s3_client()
+        client.head_object.return_value = {"ContentLength": 1000, "ContentType": "application/pdf"}
+        mock_client.return_value = client
+
         self.client.force_authenticate(self.owner)
+        initiate = self.client.post(
+            '/api/v1/broadcasts/education/uploads/initiate/',
+            {
+                'institutionId': str(self.institution.id),
+                'context': 'education_material',
+                'filename': 'workbook.pdf',
+                'contentType': 'application/pdf',
+                'sizeBytes': 1000,
+            },
+            format='json',
+        )
+        self.assertEqual(initiate.status_code, status.HTTP_201_CREATED, initiate.data)
+        confirm = self.client.post(f"/api/v1/media/uploads/{initiate.data['uploadId']}/confirm/", {}, format='json')
+        self.assertEqual(confirm.status_code, status.HTTP_200_OK, confirm.data)
+        media_id = confirm.data['mediaId']
+
         url = f'/api/v1/broadcasts/education/institutions/{self.institution.id}/materials/'
         response = self.client.post(
             url,
@@ -2889,22 +2922,847 @@ class EducationCourseraCoreTests(APITestCase):
                 'title': 'Workbook',
                 'kind': 'document',
                 'course_ids': [str(self.course.id)],
-                'resource_attachment': {
-                    'url': 'https://media.example.com/private-signed/workbook.pdf',
-                    'name': 'workbook.pdf',
-                    'mime_type': 'application/pdf',
-                    'safety_scan_id': 'scan-education-1',
-                    'scan_status': 'allowed',
-                    'quarantined': False,
-                    'requires_review': False,
-                },
+                'resource_attachment': {'media_id': media_id, 'name': 'workbook.pdf'},
             },
             format='json',
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         material = response.data['material']
-        self.assertEqual(material['private_media_ref'], 'scan-education-1')
-        self.assertEqual(material['media_safety_status'], 'allowed')
-        self.assertFalse(material['media_review_required'])
+        self.assertEqual(material['private_media_ref'], media_id)
         self.assertEqual(material['storage_path'], '')
-        self.assertEqual(material['safe_resource_url'], 'https://media.example.com/private-signed/workbook.pdf')
+        self.assertTrue(material['safe_resource_url'])
+        self.assertNotIn('https://media.example.com', material['safe_resource_url'])
+        intent = MediaUploadIntent.objects.get(id=media_id)
+        self.assertIsNotNone(intent.attached_at)
+
+
+# ---------------------------------------------------------------------
+# Phase 2 (Education system production-hardening project): concurrency
+# safety for enrollment, proven with real threads + APITransactionTestCase
+# (TestCase wraps everything in one rolled-back transaction, which would
+# mask the exact race these tests exist to catch).
+# ---------------------------------------------------------------------
+
+class EducationEnrollmentConcurrencyTests(APITransactionTestCase):
+    # Scoped to just the apps these tests touch. Without this,
+    # TransactionTestCase's post-test flush TRUNCATEs every table in the
+    # database in one statement and fails with "cannot truncate a table
+    # referenced in a foreign key constraint" — apps.broadcasts.
+    # education_models' tables (e.g. broadcasts_liveclassroom) still
+    # physically exist in the database from a past migration but are no
+    # longer imported by apps/broadcasts/models.py (Django's actual app
+    # registry), so Django's flush doesn't know to include them in the
+    # TRUNCATE list even though Postgres still enforces their FK to
+    # accounts_user — a pre-existing inconsistency unrelated to this
+    # phase's own changes, not something this test should have to resolve.
+    available_apps = ['apps.accounts', 'apps.broadcasts']
+
+    def _make_institution_and_broadcast(self, *, seat_limit=None, phone_prefix='55589'):
+        User = get_user_model()
+        owner = User.objects.create_user(
+            phone=f'{phone_prefix}00001', username=f'edu_conc_owner_{phone_prefix}', password='secret', country='NG',
+        )
+        institution = EducationInstitution.objects.create(
+            owner=owner,
+            name='Concurrency Test Academy',
+            membership_policy=EducationInstitutionMembershipPolicy.OPEN,
+        )
+        broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=institution,
+            created_by=owner,
+            broadcast_kind='course',
+            title='Race Condition 101',
+            summary='A free, unlimited-or-limited-seat broadcast for concurrency testing.',
+            description='Detail text.',
+            booking_enabled=False,
+            status='published',
+            seat_limit=seat_limit,
+        )
+        return owner, institution, broadcast
+
+    def test_concurrent_enrollments_never_oversell_a_seat_limited_broadcast(self):
+        User = get_user_model()
+        _, _, broadcast = self._make_institution_and_broadcast(seat_limit=3, phone_prefix='55591')
+        learners = [
+            User.objects.create_user(
+                phone=f'555910{i:03d}', username=f'edu_conc_learner_{i}', password='secret', country='NG',
+            )
+            for i in range(8)
+        ]
+        results = []
+        lock = threading.Lock()
+
+        def worker(user):
+            from rest_framework.test import APIClient
+            client = APIClient()
+            client.force_authenticate(user)
+            try:
+                response = client.post(
+                    f'/api/v1/education/contents/{broadcast.id}/enroll/', {}, format='json',
+                )
+                with lock:
+                    results.append(response.status_code)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=worker, args=(learner,)) for learner in learners]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # No thread should ever crash with an unhandled server error.
+        self.assertTrue(all(code < 500 for code in results), results)
+        self.assertEqual(len(results), 8)
+
+        enrolled_count = EducationInstitutionEnrollment.objects.filter(
+            broadcast=broadcast, status=EducationEnrollmentStatus.ENROLLED,
+        ).count()
+        waitlisted_count = EducationInstitutionEnrollment.objects.filter(
+            broadcast=broadcast, status=EducationEnrollmentStatus.WAITLISTED,
+        ).count()
+        self.assertLessEqual(enrolled_count, 3, 'seat_limit=3 must never be oversold under concurrency')
+        self.assertEqual(enrolled_count + waitlisted_count, 8, 'every learner must end up enrolled or waitlisted, never lost')
+
+    def test_concurrent_duplicate_enrollment_attempts_from_the_same_user_never_crash(self):
+        User = get_user_model()
+        _, _, broadcast = self._make_institution_and_broadcast(seat_limit=None, phone_prefix='55592')
+        learner = User.objects.create_user(
+            phone='5559200002', username='edu_conc_dup_learner', password='secret', country='NG',
+        )
+        results = []
+        lock = threading.Lock()
+
+        def worker():
+            from rest_framework.test import APIClient
+            client = APIClient()
+            client.force_authenticate(learner)
+            try:
+                response = client.post(
+                    f'/api/v1/education/contents/{broadcast.id}/enroll/', {}, format='json',
+                )
+                with lock:
+                    results.append(response.status_code)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertTrue(all(code == 200 for code in results), results)
+        self.assertEqual(
+            EducationInstitutionEnrollment.objects.filter(broadcast=broadcast, user=learner).count(), 1,
+            'the unique_together=(broadcast,user) constraint must result in exactly one row, never an unhandled IntegrityError',
+        )
+
+
+# ---------------------------------------------------------------------
+# Phase 2 (Education system production-hardening project): cross-user /
+# cross-institution IDOR audit. Every test here authenticates as a user
+# who owns Institution A, then attempts to read/write Institution B's
+# resources by substituting IDs — proving server-side authorization holds
+# regardless of what a client supplies, not just that the mobile UI hides
+# the option.
+# ---------------------------------------------------------------------
+
+class EducationInstitutionIDORTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner_a = User.objects.create_user(
+            phone='5559300001', username='edu_idor_owner_a', password='secret', country='NG',
+        )
+        self.owner_b = User.objects.create_user(
+            phone='5559300002', username='edu_idor_owner_b', password='secret', country='NG',
+        )
+        self.institution_a = EducationInstitution.objects.create(owner=self.owner_a, name='Institution A')
+        self.institution_b = EducationInstitution.objects.create(owner=self.owner_b, name='Institution B')
+        self.material_a = EducationInstitutionMaterial.objects.create(
+            institution=self.institution_a,
+            title='Institution A private material',
+            kind='document',
+        )
+
+    def test_owner_b_cannot_patch_institution_a_via_direct_id_substitution(self):
+        self.client.force_authenticate(self.owner_b)
+        response = self.client.patch(
+            f'/api/v1/broadcasts/education/institutions/{self.institution_a.id}/',
+            {'name': 'Hijacked by B'}, format='json',
+        )
+        self.assertIn(response.status_code, (403, 404))
+        self.institution_a.refresh_from_db()
+        self.assertEqual(self.institution_a.name, 'Institution A')
+
+    def test_owner_b_cannot_delete_institution_a(self):
+        self.client.force_authenticate(self.owner_b)
+        response = self.client.delete(f'/api/v1/broadcasts/education/institutions/{self.institution_a.id}/')
+        self.assertIn(response.status_code, (403, 404))
+        self.assertTrue(EducationInstitution.objects.filter(id=self.institution_a.id).exists())
+
+    def test_owner_b_cannot_read_institution_a_material_via_own_institution_url(self):
+        """Institution B is legitimately B's own — the material_id belongs
+        to A. The lookup must fail because the material doesn't belong to
+        the institution named in the URL, not silently succeed."""
+        self.client.force_authenticate(self.owner_b)
+        response = self.client.get(
+            f'/api/v1/broadcasts/education/institutions/{self.institution_b.id}/materials/{self.material_a.id}/',
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_owner_b_cannot_read_institution_a_material_via_institution_a_url(self):
+        """The outer boundary: B isn't a member of A at all, so B must be
+        rejected before the material lookup even happens."""
+        self.client.force_authenticate(self.owner_b)
+        response = self.client.get(
+            f'/api/v1/broadcasts/education/institutions/{self.institution_a.id}/materials/{self.material_a.id}/',
+        )
+        self.assertIn(response.status_code, (403, 404))
+
+    def test_owner_b_cannot_delete_institution_a_material(self):
+        self.client.force_authenticate(self.owner_b)
+        response = self.client.delete(
+            f'/api/v1/broadcasts/education/institutions/{self.institution_b.id}/materials/{self.material_a.id}/',
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(EducationInstitutionMaterial.objects.filter(id=self.material_a.id).exists())
+
+    def test_anonymous_user_cannot_access_institution_admin_endpoints(self):
+        response = self.client.get(f'/api/v1/broadcasts/education/institutions/{self.institution_a.id}/dashboard/')
+        self.assertEqual(response.status_code, 401)
+
+
+class EducationEnrollmentAndReviewIDORTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5559400001', username='edu_idor_owner', password='secret', country='NG',
+        )
+        self.learner_a = User.objects.create_user(
+            phone='5559400002', username='edu_idor_learner_a', password='secret', country='NG',
+        )
+        self.learner_b = User.objects.create_user(
+            phone='5559400003', username='edu_idor_learner_b', password='secret', country='NG',
+        )
+        self.institution = EducationInstitution.objects.create(owner=self.owner, name='Shared Institution')
+        self.course = EducationInstitutionCourse.objects.create(
+            institution=self.institution, title='Course', status='published',
+        )
+        self.broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=self.institution,
+            created_by=self.owner,
+            broadcast_kind='course',
+            course=self.course,
+            title='Course',
+            summary='Summary',
+            description='Description',
+            status='published',
+        )
+
+    def test_a_cancelled_enrollment_cannot_post_a_review(self):
+        """Re-verifies the existing enrollment-gated review rule
+        (test_non_enrolled_learner_cannot_post_review already proves the
+        never-enrolled case) against the adversarial case: an enrollment
+        that existed and was cancelled must not still count as access."""
+        EducationInstitutionEnrollment.objects.create(
+            institution=self.institution,
+            broadcast=self.broadcast,
+            course=self.course,
+            user=self.learner_a,
+            status=EducationEnrollmentStatus.CANCELLED,
+        )
+        self.client.force_authenticate(self.learner_a)
+        response = self.client.post(
+            f'/api/v1/education/contents/{self.broadcast.id}/reviews/',
+            {'rating': 5, 'comment': 'Should not be allowed.'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(
+            EducationCourseReview.objects.filter(broadcast=self.broadcast, user=self.learner_a).exists()
+        )
+
+    def test_learner_b_cannot_mark_progress_on_a_content_item_without_being_enrolled(self):
+        self.client.force_authenticate(self.learner_b)
+        # A syntactically well-formed but arbitrary item_id — the request
+        # must be rejected because learner_b has no ENROLLED/COMPLETED
+        # enrollment at all, regardless of whether the item_id resolves.
+        response = self.client.post(
+            f'/api/v1/education/contents/{self.broadcast.id}/items/lesson-{uuid.uuid4()}/action/',
+            {'action': 'mark_attended'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 404)
+
+
+# ---------------------------------------------------------------------
+# Phase 3 (Education system production-hardening project): direct-to-S3
+# upload authorization, cross-institution IDOR, and content-safety gating
+# for the education_institution_logo / education_module_cover_image /
+# education_material upload contexts (apps/broadcasts/education_media.py).
+# ---------------------------------------------------------------------
+
+INITIATE_URL = '/api/v1/broadcasts/education/uploads/initiate/'
+
+
+def _media_confirm_url(upload_id):
+    return f'/api/v1/media/uploads/{upload_id}/confirm/'
+
+
+@patch("apps.media.storage_backends.S3MediaStorage._client")
+class EducationUploadIntentTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5559500001', username='edu_upload_owner', password='secret', country='NG',
+        )
+        self.staff_member = User.objects.create_user(
+            phone='5559500002', username='edu_upload_staff', password='secret', country='NG',
+        )
+        self.outsider = User.objects.create_user(
+            phone='5559500003', username='edu_upload_outsider', password='secret', country='NG',
+        )
+        self.institution = EducationInstitution.objects.create(owner=self.owner, name='Upload Academy')
+        self.other_institution = EducationInstitution.objects.create(owner=self.outsider, name='Other Academy')
+        self.course = EducationInstitutionCourse.objects.create(
+            institution=self.institution, title='Course', status='published',
+        )
+        self.other_course = EducationInstitutionCourse.objects.create(
+            institution=self.other_institution, title='Other Course', status='published',
+        )
+        EducationInstitutionMembership.objects.create(
+            institution=self.institution,
+            user=self.staff_member,
+            role=EducationInstitutionMembershipRole.MANAGER,
+            status=EducationInstitutionMembershipStatus.ACTIVE,
+        )
+
+    def _initiate_and_confirm(self, mock_client, *, user, context, institution_id=None,
+                               content_type='image/jpeg', size_bytes=1000, filename=None):
+        from apps.media.tests import _mock_s3_client
+
+        client = _mock_s3_client()
+        client.head_object.return_value = {"ContentLength": size_bytes, "ContentType": content_type}
+        mock_client.return_value = client
+        self.client.force_authenticate(user)
+        if filename is None:
+            filename = 'upload.pdf' if content_type == 'application/pdf' else 'upload.jpg'
+        body = {
+            'context': context,
+            'filename': filename,
+            'contentType': content_type,
+            'sizeBytes': size_bytes,
+        }
+        if institution_id is not None:
+            body['institutionId'] = institution_id
+        return self.client.post(INITIATE_URL, body, format='json')
+
+    def test_institution_owner_can_initiate_for_material(self, mock_client):
+        response = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_material',
+            institution_id=str(self.institution.id), content_type='application/pdf',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertIn('uploadId', response.data)
+
+    def test_institution_manager_can_initiate(self, mock_client):
+        response = self._initiate_and_confirm(
+            mock_client, user=self.staff_member, context='education_module_cover_image',
+            institution_id=str(self.institution.id),
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_non_member_cannot_initiate_for_institution(self, mock_client):
+        response = self._initiate_and_confirm(
+            mock_client, user=self.outsider, context='education_material',
+            institution_id=str(self.institution.id), content_type='application/pdf',
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_logo_upload_allowed_without_institution_id_for_brand_new_institution(self, mock_client):
+        response = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_institution_logo',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_cover_image_upload_requires_institution_id(self, mock_client):
+        response = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_module_cover_image',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_material_upload_requires_institution_id(self, mock_client):
+        response = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_material', content_type='application/pdf',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_oversized_material_upload_rejected(self, mock_client):
+        response = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_material',
+            institution_id=str(self.institution.id), content_type='application/pdf',
+            size_bytes=500 * 1024 * 1024,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unsupported_content_type_rejected(self, mock_client):
+        response = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_module_cover_image',
+            institution_id=str(self.institution.id), content_type='application/x-msdownload',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_media_confirmed_for_one_institution_cannot_attach_to_another(self, mock_client):
+        initiate = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_material',
+            institution_id=str(self.institution.id), content_type='application/pdf',
+        )
+        self.assertEqual(initiate.status_code, status.HTTP_201_CREATED, initiate.data)
+        confirm = self.client.post(_media_confirm_url(initiate.data['uploadId']), {}, format='json')
+        self.assertEqual(confirm.status_code, status.HTTP_200_OK, confirm.data)
+        media_id = confirm.data['mediaId']
+
+        # The owner also owns other_institution's... no — outsider owns it.
+        # Make the owner a manager of other_institution to isolate the
+        # "wrong institution" check from the "wrong user" check.
+        EducationInstitutionMembership.objects.create(
+            institution=self.other_institution,
+            user=self.owner,
+            role=EducationInstitutionMembershipRole.MANAGER,
+            status=EducationInstitutionMembershipStatus.ACTIVE,
+        )
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.other_institution.id}/materials/',
+            {'title': 'Cross-institution material', 'course_ids': [str(self.other_course.id)], 'resource_attachment': {'media_id': media_id}},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_media_confirmed_by_one_user_cannot_be_used_by_another(self, mock_client):
+        initiate = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_material',
+            institution_id=str(self.institution.id), content_type='application/pdf',
+        )
+        confirm = self.client.post(_media_confirm_url(initiate.data['uploadId']), {}, format='json')
+        media_id = confirm.data['mediaId']
+
+        self.client.force_authenticate(self.staff_member)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/materials/',
+            {'title': 'Stolen media', 'course_ids': [str(self.course.id)], 'resource_attachment': {'media_id': media_id}},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_a_forged_attachment_without_media_id_is_rejected(self, mock_client):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/materials/',
+            {
+                'title': 'Forged',
+                'resource_attachment': {
+                    'url': 'https://evil.example.com/anything.pdf',
+                    'quarantined': False,
+                    'scan_status': 'allowed',
+                },
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_settings(MEDIA_SAFETY_ENABLED=True, MEDIA_EXPLICIT_SCAN_REQUIRED=True, MEDIA_SAFETY_PROVIDER='stub')
+    def test_quarantined_material_upload_is_blanked_not_hard_rejected(self, mock_client):
+        # Production defaults (stub provider, no live provider calls) mark
+        # every upload pending_review/quarantine=True — the material must
+        # still be CREATED (soft-quarantine, matching the pre-Phase-3
+        # behavior of _education_material_media_payload), just with a blank
+        # resource_url and a blocked_user_message, never a hard 400.
+        initiate = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_material',
+            institution_id=str(self.institution.id), content_type='application/pdf',
+        )
+        confirm = self.client.post(_media_confirm_url(initiate.data['uploadId']), {}, format='json')
+        media_id = confirm.data['mediaId']
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/materials/',
+            {'title': 'Under review', 'course_ids': [str(self.course.id)], 'resource_attachment': {'media_id': media_id}},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        material = response.data['material']
+        self.assertEqual(material['safe_resource_url'], '')
+        scan = MediaSafetyScan.objects.get(upload_id=media_id)
+        self.assertEqual(scan.context, 'education')
+        self.assertTrue(scan.quarantine)
+
+    def test_confirmed_material_media_binds_and_cannot_be_reused(self, mock_client):
+        initiate = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_material',
+            institution_id=str(self.institution.id), content_type='application/pdf',
+        )
+        confirm = self.client.post(_media_confirm_url(initiate.data['uploadId']), {}, format='json')
+        media_id = confirm.data['mediaId']
+
+        first = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/materials/',
+            {'title': 'First use', 'course_ids': [str(self.course.id)], 'resource_attachment': {'media_id': media_id}},
+            format='json',
+        )
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+        intent = MediaUploadIntent.objects.get(id=media_id)
+        self.assertIsNotNone(intent.attached_at)
+
+        second = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/materials/',
+            {'title': 'Second use', 'course_ids': [str(self.course.id)], 'resource_attachment': {'media_id': media_id}},
+            format='json',
+        )
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_institution_logo_resolves_media_id_and_ignores_smuggled_url_override(self, mock_client):
+        initiate = self._initiate_and_confirm(
+            mock_client, user=self.owner, context='education_institution_logo',
+            institution_id=str(self.institution.id),
+        )
+        confirm = self.client.post(_media_confirm_url(initiate.data['uploadId']), {}, format='json')
+        media_id = confirm.data['mediaId']
+
+        self.client.force_authenticate(self.owner)
+        response = self.client.patch(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/',
+            {
+                'logo_attachment': {'media_id': media_id},
+                'logo_url': 'https://evil.example.com/fake-logo.png',
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        branding = response.data['institution']['branding']
+        self.assertNotIn('evil.example.com', branding.get('logo_url', ''))
+        intent = MediaUploadIntent.objects.get(id=media_id)
+        self.assertIsNotNone(intent.attached_at)
+
+
+# ---------------------------------------------------------------------
+# Phase 4 (Education system production-hardening project): concurrency
+# safety for booking creation (seat_limit overselling) and escrow release
+# (double-payout), proven with real threads + APITransactionTestCase —
+# same rationale as EducationEnrollmentConcurrencyTests (Phase 2): a
+# rolled-back-transaction TestCase would mask the exact races these tests
+# exist to catch.
+# ---------------------------------------------------------------------
+
+class EducationBookingConcurrencySafetyTests(APITransactionTestCase):
+    # See EducationEnrollmentConcurrencyTests for why this is required.
+    available_apps = ['apps.accounts', 'apps.broadcasts', 'apps.billing']
+
+    def _make_institution_and_broadcast(self, *, seat_limit=None, booking_enabled=True,
+                                         price_amount='10.00', phone_prefix='55594'):
+        User = get_user_model()
+        owner = User.objects.create_user(
+            phone=f'{phone_prefix}00001', username=f'edu_booking_conc_owner_{phone_prefix}',
+            password='secret', country='NG',
+        )
+        institution = EducationInstitution.objects.create(
+            owner=owner,
+            name='Booking Concurrency Academy',
+            membership_policy=EducationInstitutionMembershipPolicy.OPEN,
+        )
+        broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=institution,
+            created_by=owner,
+            broadcast_kind='course',
+            title='Booking Race Condition 101',
+            summary='A booking-enabled broadcast for concurrency testing.',
+            description='Detail text.',
+            booking_enabled=booking_enabled,
+            price_amount=price_amount,
+            price_currency='USD',
+            status='published',
+            seat_limit=seat_limit,
+        )
+        return owner, institution, broadcast
+
+    def test_concurrent_bookings_never_oversell_a_seat_limited_broadcast(self):
+        User = get_user_model()
+        _, _, broadcast = self._make_institution_and_broadcast(seat_limit=3, phone_prefix='55595')
+        learners = [
+            User.objects.create_user(
+                phone=f'555950{i:03d}', username=f'edu_booking_conc_learner_{i}', password='secret', country='NG',
+            )
+            for i in range(8)
+        ]
+        results = []
+        lock = threading.Lock()
+
+        def worker(user):
+            from rest_framework.test import APIClient
+            client = APIClient()
+            client.force_authenticate(user)
+            try:
+                response = client.post(
+                    f'/api/v1/broadcasts/education/institutions/{broadcast.institution_id}/broadcasts/{broadcast.id}/bookings/',
+                    {}, format='json',
+                )
+                with lock:
+                    results.append(response.status_code)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=worker, args=(learner,)) for learner in learners]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertTrue(all(code < 500 for code in results), results)
+        self.assertEqual(len(results), 8)
+
+        from apps.broadcasts.models import EducationBookingStatus, EducationInstitutionBooking
+
+        confirmed_count = EducationInstitutionBooking.objects.filter(
+            broadcast=broadcast, status=EducationBookingStatus.CONFIRMED,
+        ).count()
+        pending_or_waitlisted_count = EducationInstitutionBooking.objects.filter(
+            broadcast=broadcast, status__in=[EducationBookingStatus.PENDING, EducationBookingStatus.WAITLISTED],
+        ).count()
+        self.assertLessEqual(confirmed_count, 3, 'seat_limit=3 must never be oversold under concurrency')
+        self.assertEqual(
+            confirmed_count + pending_or_waitlisted_count, 8,
+            'every learner must end up with a booking row (confirmed, pending, or waitlisted), never lost',
+        )
+
+    def test_concurrent_duplicate_booking_attempts_from_the_same_user_never_crash(self):
+        User = get_user_model()
+        _, _, broadcast = self._make_institution_and_broadcast(seat_limit=None, phone_prefix='55596')
+        learner = User.objects.create_user(
+            phone='5559600002', username='edu_booking_conc_dup_learner', password='secret', country='NG',
+        )
+        results = []
+        lock = threading.Lock()
+
+        def worker():
+            from rest_framework.test import APIClient
+            client = APIClient()
+            client.force_authenticate(learner)
+            try:
+                response = client.post(
+                    f'/api/v1/broadcasts/education/institutions/{broadcast.institution_id}/broadcasts/{broadcast.id}/bookings/',
+                    {}, format='json',
+                )
+                with lock:
+                    results.append(response.status_code)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertTrue(all(code in (200, 201) for code in results), results)
+
+        from apps.broadcasts.models import EducationInstitutionBooking
+
+        self.assertEqual(
+            EducationInstitutionBooking.objects.filter(broadcast=broadcast, user=learner).count(), 1,
+            'the unique_together=(broadcast,user) constraint must result in exactly one row, never an unhandled IntegrityError',
+        )
+
+    @override_settings(KIS_LEGACY_EDUCATION_WALLET_CHECKOUT_ENABLED=True)
+    def test_concurrent_satisfaction_confirmations_never_double_release_escrowed_funds(self):
+        from datetime import timedelta
+
+        from apps.billing.models import WalletTransaction
+        from apps.billing.services import get_wallet_account, lock_wallet_funds_for_booking
+        from apps.broadcasts.models import EducationBookingStatus, EducationInstitutionBooking
+
+        User = get_user_model()
+        _, institution, broadcast = self._make_institution_and_broadcast(phone_prefix='55597')
+        learner = User.objects.create_user(
+            phone='5559700002', username='edu_booking_conc_payer', password='secret', country='NG',
+        )
+        EducationInstitutionMembership.objects.create(
+            institution=institution,
+            user=learner,
+            role=EducationInstitutionMembershipRole.STUDENT,
+            status=EducationInstitutionMembershipStatus.ACTIVE,
+        )
+        wallet = get_wallet_account(learner)
+        wallet.balance_cents = 10_000
+        wallet.save(update_fields=['balance_cents', 'updated_at'])
+        _, wallet_tx = lock_wallet_funds_for_booking(
+            user=learner, amount_cents=1_000, reference='test-education-booking-lock',
+        )
+        booking = EducationInstitutionBooking.objects.create(
+            institution=institution,
+            broadcast=broadcast,
+            user=learner,
+            status=EducationBookingStatus.AWAITING_SATISFACTION,
+            amount_cents=1_000,
+            currency='USD',
+            wallet_transaction=wallet_tx,
+            confirmed_at=timezone.now(),
+            provider_completed_at=timezone.now(),
+            satisfaction_deadline=timezone.now() + timedelta(days=3),
+        )
+        results = []
+        lock = threading.Lock()
+
+        def worker():
+            from rest_framework.test import APIClient
+            client = APIClient()
+            client.force_authenticate(learner)
+            try:
+                response = client.post(
+                    f'/api/v1/broadcasts/education/institutions/{institution.id}/bookings/{booking.id}/satisfy/',
+                    {}, format='json',
+                )
+                with lock:
+                    results.append(response.status_code)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Exactly one request wins the lock and completes the booking; the
+        # rest correctly see it's no longer CONFIRMED/AWAITING_SATISFACTION
+        # once serialized behind the winner and get a 400 — never a 500,
+        # and never two winners double-releasing the escrow.
+        self.assertTrue(all(code in (200, 400) for code in results), results)
+        self.assertEqual(results.count(200), 1, results)
+        booking.refresh_from_db()
+        self.assertEqual(booking.status, EducationBookingStatus.COMPLETED)
+        self.assertEqual(
+            WalletTransaction.objects.filter(tx_ref=f'education-booking-payout-{booking.id}').count(), 1,
+            'exactly one payout transaction must be created, never a double payout',
+        )
+        wallet.refresh_from_db()
+        self.assertEqual(
+            wallet.locked_cents, 0,
+            'locked escrow funds must be released exactly once — a race here would over-release and corrupt the payer\'s wallet',
+        )
+
+
+# ---------------------------------------------------------------------
+# Phase 5 (Education system production-hardening project): final
+# integration-seam IDOR sweep. EducationInstitutionBookingActionView and
+# EducationInstitutionBookingSatisfactionView gained a new select_for_update()
+# fetch in Phase 4 (to close the escrow double-release race) but had no
+# direct authorization test coverage of their own before this phase —
+# every previous booking test exercised the happy path. These tests close
+# that specific gap rather than re-proving what Phases 2-4 already covered.
+# ---------------------------------------------------------------------
+
+class EducationBookingActionIDORTests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5559800001', username='edu_booking_idor_owner', password='secret', country='NG',
+        )
+        self.payer = User.objects.create_user(
+            phone='5559800002', username='edu_booking_idor_payer', password='secret', country='NG',
+        )
+        self.stranger = User.objects.create_user(
+            phone='5559800003', username='edu_booking_idor_stranger', password='secret', country='NG',
+        )
+        self.other_owner = User.objects.create_user(
+            phone='5559800004', username='edu_booking_idor_other_owner', password='secret', country='NG',
+        )
+        self.institution = EducationInstitution.objects.create(owner=self.owner, name='IDOR Booking Academy')
+        self.other_institution = EducationInstitution.objects.create(owner=self.other_owner, name='Other Academy')
+        self.broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=self.institution,
+            created_by=self.owner,
+            broadcast_kind='course',
+            title='IDOR Booking Course',
+            summary='Summary',
+            description='Description',
+            booking_enabled=True,
+            price_amount='5.00',
+            price_currency='USD',
+            status='published',
+        )
+        EducationInstitutionMembership.objects.create(
+            institution=self.institution,
+            user=self.payer,
+            role=EducationInstitutionMembershipRole.STUDENT,
+            status=EducationInstitutionMembershipStatus.ACTIVE,
+        )
+        from apps.broadcasts.models import EducationBookingStatus, EducationInstitutionBooking
+
+        self.booking = EducationInstitutionBooking.objects.create(
+            institution=self.institution,
+            broadcast=self.broadcast,
+            user=self.payer,
+            status=EducationBookingStatus.CONFIRMED,
+            amount_cents=500,
+            currency='USD',
+            confirmed_at=timezone.now(),
+        )
+
+    def test_stranger_cannot_call_booking_action_view(self):
+        self.client.force_authenticate(self.stranger)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/bookings/{self.booking.id}/action/',
+            {'action': 'confirm'},
+            format='json',
+        )
+        self.assertIn(response.status_code, (403, 404))
+        self.booking.refresh_from_db()
+        from apps.broadcasts.models import EducationBookingStatus
+
+        self.assertEqual(self.booking.status, EducationBookingStatus.CONFIRMED, 'a non-manager must never be able to mutate a booking')
+
+    def test_payer_cannot_call_booking_action_view(self):
+        # The action view is institution-management-only (complete/cancel/
+        # confirm/etc as the provider) — the payer's own action is the
+        # separate satisfaction endpoint, not this one.
+        self.client.force_authenticate(self.payer)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/bookings/{self.booking.id}/action/',
+            {'action': 'cancel'},
+            format='json',
+        )
+        self.assertIn(response.status_code, (403, 404))
+
+    def test_other_institution_manager_cannot_call_booking_action_view_via_id_substitution(self):
+        self.client.force_authenticate(self.other_owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.other_institution.id}/bookings/{self.booking.id}/action/',
+            {'action': 'confirm'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 404, 'a booking scoped to institution A must not resolve under institution B')
+
+    def test_stranger_cannot_confirm_satisfaction_for_someone_elses_booking(self):
+        self.client.force_authenticate(self.stranger)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/bookings/{self.booking.id}/satisfy/',
+            {},
+            format='json',
+        )
+        self.assertIn(response.status_code, (403, 404))
+        self.booking.refresh_from_db()
+        from apps.broadcasts.models import EducationBookingStatus
+
+        self.assertEqual(self.booking.status, EducationBookingStatus.CONFIRMED)
+
+    def test_institution_manager_cannot_confirm_satisfaction_on_the_payers_behalf(self):
+        # Satisfaction confirmation is deliberately payer-only — an
+        # institution owner marking their own booking "satisfied" would
+        # defeat the whole point of the payer-controlled escrow release.
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{self.institution.id}/bookings/{self.booking.id}/satisfy/',
+            {},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)

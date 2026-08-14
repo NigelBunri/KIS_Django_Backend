@@ -307,3 +307,36 @@ register_purpose("status_audio", _PurposeSpec(
     context="status", moderation_context="status", retention_days=None,
     target_types=("statuses.StatusItem",), allow_attach=False, visibility_class="restricted",
 ))
+
+# Education (Phase 3 of the Education System cleanup project). Like status
+# and complaint attachments, these bind at CREATE/UPDATE time on the owning
+# record (see apps.broadcasts.education_media), not via a later generic
+# attach call — allow_attach=False. target_types lists every model these
+# purposes can end up bound to (institution branding logo; program/course/
+# lesson/class-session/material/assessment/event cover images; material
+# resource attachments) purely for documentation — actual authorization is
+# institution-membership-based (owner/manager/administrator), not a single
+# fixed FK, mirroring commerce's Shop-owner-or-staff pattern.
+register_purpose("education_institution_logo", _PurposeSpec(
+    context="education", moderation_context="education", retention_days=None,
+    target_types=("broadcasts.EducationInstitution",), allow_attach=False,
+    visibility_class="public_catalog",
+))
+register_purpose("education_module_cover_image", _PurposeSpec(
+    context="education", moderation_context="education", retention_days=None,
+    target_types=(
+        "broadcasts.EducationInstitutionProgram",
+        "broadcasts.EducationInstitutionCourse",
+        "broadcasts.EducationInstitutionLesson",
+        "broadcasts.EducationInstitutionClassSession",
+        "broadcasts.EducationInstitutionMaterial",
+        "broadcasts.EducationInstitutionAssessment",
+        "broadcasts.EducationInstitutionEvent",
+    ),
+    allow_attach=False, visibility_class="public_catalog",
+))
+register_purpose("education_material", _PurposeSpec(
+    context="education", moderation_context="education", retention_days=None,
+    target_types=("broadcasts.EducationInstitutionMaterial",), allow_attach=False,
+    visibility_class="restricted",
+))

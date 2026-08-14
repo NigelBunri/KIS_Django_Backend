@@ -1,4 +1,5 @@
 from celery import shared_task
+from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
@@ -11,19 +12,39 @@ from apps.commerce.constants import KIS_COIN_CODE
 def auto_complete_education_booking(booking_id: str):
     from .models import EducationBookingStatus, EducationInstitutionBooking
 
-    try:
-        booking = EducationInstitutionBooking.objects.select_related(
-            "institution",
-            "user",
-            "provider_credit_transaction",
-        ).get(id=booking_id)
-    except EducationInstitutionBooking.DoesNotExist:
-        return {"status": "missing"}
+    # select_for_update() + transaction.atomic() so this can never race the
+    # payer's own satisfaction confirmation (EducationInstitutionBooking
+    # SatisfactionView) or an institution's manual completion/cancellation
+    # (EducationInstitutionBookingActionView) — both do the same check-then-
+    # release/refund-funds pattern on this booking, and CELERY_TASK_ACKS_LATE
+    # (config/settings/base.py) means this task itself can be redelivered
+    # and re-run after a worker crash mid-task. release_locked_booking_funds/
+    # refund_locked_booking_funds (apps/billing/services.py) have no
+    # idempotency guard of their own, so the lock here is the only thing
+    # preventing a double payout. Found during Phase 4 of the Education
+    # system production-hardening project.
+    with transaction.atomic():
+        try:
+            # select_related limited to institution/user (both non-nullable
+            # FKs) — Postgres rejects FOR UPDATE combined with
+            # select_related() on a nullable FK, and provider_credit_
+            # transaction is null=True on this model.
+            booking = EducationInstitutionBooking.objects.select_for_update().select_related(
+                "institution",
+                "user",
+            ).get(id=booking_id)
+        except EducationInstitutionBooking.DoesNotExist:
+            return {"status": "missing"}
 
-    if booking.status != EducationBookingStatus.AWAITING_SATISFACTION:
-        return {"status": "skipped", "current_status": booking.status}
-    if booking.satisfaction_deadline and booking.satisfaction_deadline > timezone.now():
-        return {"status": "waiting"}
+        if booking.status != EducationBookingStatus.AWAITING_SATISFACTION:
+            return {"status": "skipped", "current_status": booking.status}
+        if booking.satisfaction_deadline and booking.satisfaction_deadline > timezone.now():
+            return {"status": "waiting"}
+        return _complete_awaiting_booking(booking)
+
+
+def _complete_awaiting_booking(booking):
+    from .models import EducationBookingStatus
 
     try:
         metadata = dict(booking.metadata) if isinstance(booking.metadata, dict) else {}
@@ -72,3 +93,41 @@ def auto_complete_education_booking(booking_id: str):
         return {"status": "completed"}
     except (ValueError, ValidationError) as exc:
         return {"status": "failed", "error": str(exc)}
+
+
+@shared_task
+def sweep_stuck_education_bookings(limit: int = 500):
+    """Periodic backstop for auto_complete_education_booking: that task is
+    scheduled per-booking via apply_async(countdown=...) at the moment a
+    provider marks a booking AWAITING_SATISFACTION — a one-off delayed
+    task, unlike every other Education/media/billing sweep, which all run
+    on a recurring beat schedule. A one-off task is lost for good if the
+    broker drops it (e.g. a Redis restart without persistence) or if the
+    countdown was scheduled before a deploy that changed the task's import
+    path — with no periodic reconciliation, an escrowed booking would stay
+    locked indefinitely with no code path ever revisiting it. This sweep
+    finds every AWAITING_SATISFACTION booking already past its
+    satisfaction_deadline and drives it through the same locked
+    _complete_awaiting_booking() the per-booking task uses, so a lost
+    one-off schedule self-heals within one sweep interval instead of
+    silently stranding a payer's funds forever. Found during Phase 4 of the
+    Education system production-hardening project — see
+    CELERY_BEAT_SCHEDULE in config/settings/base.py for the schedule."""
+    from .models import EducationBookingStatus, EducationInstitutionBooking
+
+    stuck_ids = list(
+        EducationInstitutionBooking.objects.filter(
+            status=EducationBookingStatus.AWAITING_SATISFACTION,
+            satisfaction_deadline__lte=timezone.now(),
+        )
+        .order_by("satisfaction_deadline")
+        .values_list("id", flat=True)[:limit]
+    )
+    results = {"status": "completed", "failed": 0, "swept": 0}
+    for booking_id in stuck_ids:
+        outcome = auto_complete_education_booking(str(booking_id))
+        if outcome.get("status") == "completed":
+            results["swept"] += 1
+        elif outcome.get("status") == "failed":
+            results["failed"] += 1
+    return results
