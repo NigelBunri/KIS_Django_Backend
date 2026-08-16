@@ -2408,6 +2408,15 @@ def _build_education_discovery_payload(user: User, request) -> dict[str, Any]:
     )
     search = str(request.query_params.get("q") or "").strip().lower()
     kind_filter = str(request.query_params.get("type") or "").strip().lower()
+    institution_id_filter = str(
+        request.query_params.get("institution_id") or request.query_params.get("institutionId") or ""
+    ).strip()
+    if institution_id_filter:
+        # "See all courses from this institution" - tapping an institution
+        # card in the spotlights section. Narrows before the [:80] cap
+        # below, so a single institution's full catalog is returned even
+        # when the global feed itself would otherwise be truncated.
+        qs = qs.filter(institution_id=institution_id_filter)
     if kind_filter:
         if kind_filter in {"program", "course", "lesson", "workshop"}:
             filtered = []

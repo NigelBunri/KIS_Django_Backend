@@ -2800,6 +2800,44 @@ class EducationCourseraCoreTests(APITestCase):
         self.assertIn('trustSummary', item)
         self.assertEqual(item['safetySummary']['status'], 'allowed')
 
+    def test_discovery_institution_id_filter_returns_only_that_institutions_courses(self):
+        other_institution = EducationInstitution.objects.create(
+            owner=self.owner,
+            name='Other Academy',
+            description='A different institution entirely.',
+        )
+        other_course = EducationInstitutionCourse.objects.create(
+            institution=other_institution,
+            title='Unrelated Course',
+            status='published',
+        )
+        other_broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=other_institution,
+            created_by=self.owner,
+            broadcast_kind='course',
+            course=other_course,
+            title='Unrelated Course',
+            summary='Should not show up when filtering by self.institution.',
+            status='published',
+        )
+
+        self.client.force_authenticate(self.learner)
+        response = self.client.get(
+            '/api/v1/education/discovery/',
+            {'institution_id': str(self.institution.id)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        all_ids = [
+            item['id']
+            for section in response.data['sections']
+            for item in section['items']
+        ]
+        self.assertIn(str(self.broadcast.id), all_ids)
+        self.assertNotIn(str(other_broadcast.id), all_ids)
+        for section in response.data['sections']:
+            for item in section['items']:
+                self.assertEqual(item['partnerId'], str(self.institution.id))
+
     def test_enrolled_learner_can_create_review_and_question(self):
         EducationInstitutionEnrollment.objects.create(
             institution=self.institution,
