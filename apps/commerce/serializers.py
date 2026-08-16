@@ -2713,7 +2713,11 @@ class MarketplaceOrderItemCreateSerializer(serializers.Serializer):
     product_id = serializers.UUIDField()
     variant_id = serializers.CharField(required=False, allow_blank=True)
     quantity = serializers.IntegerField(min_value=1, default=1)
-    unit_price_cents = serializers.IntegerField(min_value=1)
+    # Accepted for backward compatibility with existing clients but never
+    # trusted - services._normalize_marketplace_items always re-derives the
+    # authoritative price from Product/ProductVariant at order time, so this
+    # is optional and purely advisory (e.g. for optimistic UI).
+    unit_price_cents = serializers.IntegerField(min_value=1, required=False)
     selected_attributes = serializers.JSONField(required=False)
     custom_description = serializers.CharField(required=False, allow_blank=True)
 

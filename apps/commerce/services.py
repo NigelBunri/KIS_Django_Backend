@@ -24,6 +24,7 @@ from .models import (
     ProductAuthenticityCheck,
     Order,
     Product,
+    ProductVariant,
     Shop,
     ShopRole,
     ShopTeamMember,
@@ -288,7 +289,14 @@ def place_marketplace_order(*, buyer, shop_id, items, metadata=None):
 
 
 def _normalize_marketplace_items(items, shop):
-    """Ensure items are tied to the provided shop and collect needed metadata."""
+    """Ensure items are tied to the provided shop and price them
+    authoritatively from Product/ProductVariant. Any client-supplied price
+    (unit_price_cents/unit_price/price/amount) is ignored for the actual
+    charge - a modified client could otherwise set any unit_price_cents it
+    liked and have that value flow straight into MarketplaceOrder.total_amount
+    and the resulting payment intent. The server always re-derives the
+    current catalog price at order time; the client may only choose which
+    product/variant/quantity to buy."""
     product_ids = {str(item.get('product_id')) for item in items if item.get('product_id')}
     if not product_ids:
         raise ValidationError('Each marketplace order item must reference a product_id.')
@@ -296,6 +304,13 @@ def _normalize_marketplace_items(items, shop):
     if products.count() != len(product_ids):
         raise ValidationError('One or more products are invalid or not part of this shop.')
     product_map = {str(product.id): product for product in products}
+
+    variant_ids = {str(item.get('variant_id')) for item in items if item.get('variant_id')}
+    variant_map = {}
+    if variant_ids:
+        variants = ProductVariant.objects.filter(id__in=variant_ids, product_id__in=product_ids, is_active=True)
+        variant_map = {str(variant.id): variant for variant in variants}
+
     normalized_items = []
     seen = set()
     for entry in items:
@@ -307,10 +322,15 @@ def _normalize_marketplace_items(items, shop):
         product = product_map.get(product_id)
         if not product:
             raise ValidationError(f'Product {product_id} is invalid or unavailable in this shop.')
+        variant = None
+        if variant_id:
+            variant = variant_map.get(variant_id)
+            if not variant or str(variant.product_id) != product_id:
+                raise ValidationError(f'Variant {variant_id} is invalid for product {product_id}.')
         quantity = max(1, int(entry.get('quantity') or 1))
-        unit_price_cents = _ensure_unit_price_cents(entry)
+        unit_price_cents = _catalog_unit_price_cents(product, variant)
         if unit_price_cents <= 0:
-            raise ValidationError('Each marketplace order item must have a positive price.')
+            raise ValidationError(f'Product {product_id} does not have a valid price and cannot be ordered.')
         normalized_items.append({
             'product': product,
             'variant_id': variant_id,
@@ -326,16 +346,17 @@ def _calculate_items_total_cents(normalized_items):
     return sum(item['quantity'] * item['unit_price_cents'] for item in normalized_items)
 
 
-def _ensure_unit_price_cents(entry):
-    """Round and convert the incoming price to whole cents."""
-    raw_cents = entry.get('unit_price_cents')
-    if raw_cents is not None:
-        try:
-            return int(Decimal(raw_cents).to_integral_value(rounding=ROUND_HALF_UP))
-        except Exception:
-            return 0
-    raw_price = entry.get('unit_price') or entry.get('price') or entry.get('amount') or 0
-    return _decimal_price_to_cents(raw_price)
+def _catalog_unit_price_cents(product, variant=None):
+    """The single source of truth for what a product/variant costs at order
+    time. A variant's own price overrides the product's; a variant price of
+    0 is treated as "no override" (matches ProductVariant.price defaulting
+    to 0 for variants that don't set their own price), falling back to the
+    product's sale_price if set, else its base price."""
+    if variant is not None and variant.price and variant.price > 0:
+        return _decimal_price_to_cents(variant.price)
+    if product.sale_price is not None and product.sale_price > 0:
+        return _decimal_price_to_cents(product.sale_price)
+    return _decimal_price_to_cents(product.price)
 
 
 def _order_total_cents(order):

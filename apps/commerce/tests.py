@@ -661,6 +661,16 @@ class MarketplaceOrderSettlementTests(TestCase):
         self.assertEqual(provider_wallet.balance_cents, 1_000)
 
     def test_marketplace_satisfaction_uses_locked_buyer_transaction_amount(self):
+        # unit_price_cents is intentionally NOT the point of this test (that's
+        # covered by test_marketplace_satisfaction_credits_provider_exact_cents
+        # above) - this asserts that settlement credits whatever was actually
+        # locked from the buyer's wallet (buyer_debit_transaction.amount_cents)
+        # rather than re-deriving the total a second time at settlement.
+        # Since _normalize_marketplace_items now always re-derives price from
+        # the catalog (Product.price/sale_price), a client-supplied
+        # unit_price_cents can no longer diverge from the locked amount - so
+        # this uses the real product price ($10.00 = 1_000 cents, per setUp)
+        # instead of a fabricated mismatched value.
         buyer_wallet = get_wallet_account(self.buyer)
         buyer_wallet.balance_cents = 2_000_000
         buyer_wallet.save(update_fields=['balance_cents'])
@@ -672,7 +682,6 @@ class MarketplaceOrderSettlementTests(TestCase):
                 {
                     'product_id': str(self.product.id),
                     'quantity': 1,
-                    'unit_price_cents': 1_000_000,
                 }
             ],
             metadata={'payment_method': 'wallet'},
@@ -683,7 +692,7 @@ class MarketplaceOrderSettlementTests(TestCase):
         buyer_wallet.refresh_from_db()
         provider_wallet.refresh_from_db()
 
-        self.assertEqual(buyer_wallet.locked_cents, 1_000_000)
+        self.assertEqual(buyer_wallet.locked_cents, 1_000)
 
         satisfy_marketplace_order(order)
 
@@ -693,9 +702,9 @@ class MarketplaceOrderSettlementTests(TestCase):
 
         self.assertEqual(order.status, MarketplaceOrderStatus.SATISFIED)
         self.assertIsNotNone(order.provider_credit_transaction)
-        self.assertEqual(order.provider_credit_transaction.amount_cents, 1_000_000)
+        self.assertEqual(order.provider_credit_transaction.amount_cents, 1_000)
         self.assertEqual(buyer_wallet.locked_cents, 0)
-        self.assertEqual(provider_wallet.balance_cents, 1_000_000)
+        self.assertEqual(provider_wallet.balance_cents, 1_000)
 
 
 @override_settings(FLW_WEBHOOK_SECRET='test-webhook-secret')

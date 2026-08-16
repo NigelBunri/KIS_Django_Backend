@@ -2748,6 +2748,33 @@ class MarketplaceOrderViewSet(
         metadata.setdefault('source', 'product_details')
         if validated.get('payment_method'):
             metadata['payment_method'] = validated.get('payment_method')
+
+        # A dropped connection or automatic client retry during checkout
+        # must not create two separate orders (and two separate payment
+        # intents) for the same cart. Mirrors OrderViewSet.pay's existing
+        # "retry returns the same pending intent" pattern, but at order
+        # creation: a client-supplied key scopes the dedupe to one buyer +
+        # shop, reusing the metadata JSON field rather than a migration.
+        idempotency_key = str(
+            request.headers.get('X-Idempotency-Key')
+            or request.data.get('idempotency_key')
+            or ''
+        ).strip()
+        if idempotency_key:
+            existing = (
+                MarketplaceOrder.objects.filter(
+                    buyer=request.user,
+                    shop_id=validated['shop_id'],
+                    metadata__idempotency_key=idempotency_key,
+                )
+                .order_by('-created_at')
+                .first()
+            )
+            if existing:
+                output = MarketplaceOrderSerializer(existing, context={'request': request})
+                return Response(output.data, status=status.HTTP_200_OK)
+            metadata['idempotency_key'] = idempotency_key
+
         try:
             order = place_marketplace_order(
                 buyer=request.user,
