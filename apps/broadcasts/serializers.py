@@ -1,4 +1,5 @@
 from decimal import Decimal
+from urllib.parse import quote
 
 from django.urls import reverse
 from rest_framework import serializers
@@ -6,6 +7,8 @@ from rest_framework import serializers
 from apps.broadcasts.media_utils import build_media_url, ensure_local_thumbnail
 from apps.broadcasts.health_engine_policy import is_service_medium_allowed
 from apps.core.money import parse_decimal_amount
+from apps.media.models import MediaAsset
+from apps.media.signing import sign_media_asset_token
 from common.media_urls import absolutize_backend_media
 
 from .models import (
@@ -628,8 +631,38 @@ def _attach_education_detail_summary(payload: dict, summary: dict) -> dict:
     return payload
 
 
+def _resolve_education_media_display_url(value: str, request=None) -> str:
+    """`value` is either a client-pasted external URL (pass through as
+    before) or one of our own S3 object keys stored verbatim by
+    _education_cover_image_from_payload/_education_material_media_payload
+    (e.g. "private/education/cover/<user>/<uuid>.jpg"). The latter case was
+    previously string-joined onto the API host via absolutize_backend_media
+    alone, producing a URL with no matching Django route to a private,
+    unsigned bucket key that always 404ed. Resolve it through the same
+    MediaAsset-keyed signed-download proxy MediaAssetViewSet.sign/.download
+    already use for every other private upload, instead of exposing the raw
+    key."""
+    text = str(value or "").strip()
+    if not text or text.startswith(("http://", "https://", "//")):
+        return absolutize_backend_media(text, request)
+    asset = MediaAsset.objects.filter(bucket_key=text).order_by("-created_at").first()
+    if asset is None:
+        # No matching MediaAsset (e.g. a pre-migration row) - fall back to
+        # the old behavior rather than crashing; still broken, but no worse
+        # than before.
+        return absolutize_backend_media(text, request)
+    token = sign_media_asset_token(asset)
+    path = f"/api/v1/assets/{asset.id}/download/?token={quote(token)}"
+    if request is not None:
+        try:
+            return request.build_absolute_uri(path)
+        except Exception:
+            pass
+    return absolutize_backend_media(path, request)
+
+
 def _attach_education_cover_image(payload: dict, cover_image_url: str, context: dict | None = None) -> dict:
-    absolute_url = absolutize_backend_media(cover_image_url, (context or {}).get("request"))
+    absolute_url = _resolve_education_media_display_url(cover_image_url, (context or {}).get("request"))
     payload["cover_image_url"] = absolute_url
     payload["cover_url"] = absolute_url
     payload["coverUrl"] = absolute_url
@@ -1518,7 +1551,8 @@ class EducationInstitutionMaterialSerializer(serializers.ModelSerializer):
         safety = self._media_safety(obj)
         if safety.get("quarantined") or safety.get("blocked"):
             return ""
-        return getattr(obj, "resource_url", "") or ""
+        raw_url = getattr(obj, "resource_url", "") or ""
+        return _resolve_education_media_display_url(raw_url, self.context.get("request"))
 
     def get_private_media_ref(self, obj):
         metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
