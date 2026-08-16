@@ -580,6 +580,7 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
         booking.save(update_fields=list(dict.fromkeys(booking_update_fields)))
     elif intent.target_type == DirectPaymentIntent.TARGET_EDUCATION_BOOKING:
         from apps.broadcasts.models import EducationBookingStatus
+        from apps.broadcasts.views import _grant_education_enrollment_for_confirmed_booking
 
         target.status = EducationBookingStatus.CONFIRMED
         target.payment_method = intent.provider
@@ -587,6 +588,10 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
         target.confirmed_at = target.confirmed_at or timezone.now()
         target.metadata = {**(target.metadata or {}), **paid_metadata}
         target.save(update_fields=["status", "payment_method", "currency", "confirmed_at", "metadata", "updated_at"])
+        # Course content (has_learning_access) only unlocks once the
+        # enrollment record itself is ENROLLED, not merely because the
+        # booking is CONFIRMED - see EducationContentEnrollmentView.post.
+        _grant_education_enrollment_for_confirmed_booking(target)
     elif intent.target_type == DirectPaymentIntent.TARGET_HEALTH_BILLING_SESSION:
         from apps.health_ops.models import PaymentBillingStatus
 

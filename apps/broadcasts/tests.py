@@ -40,10 +40,14 @@ from apps.broadcasts.models import (
     BroadcastSourceType,
     BroadcastVideo,
     UserContentPlaylist,
+    EducationCourseModuleItemType,
     EducationEnrollmentStatus,
     EducationInstitution,
+    EducationInstitutionBooking,
     EducationInstitutionBroadcast,
     EducationInstitutionCourse,
+    EducationInstitutionCourseModule,
+    EducationInstitutionCourseModuleItem,
     EducationInstitutionEnrollment,
     EducationInstitutionMaterial,
     EducationInstitutionMembership,
@@ -2866,6 +2870,121 @@ class EducationCourseraCoreTests(APITestCase):
         self.assertEqual(intent.target_type, DirectPaymentIntent.TARGET_EDUCATION_BOOKING)
         self.assertEqual(booking['direct_payment_intent_id'], booking['payment_intent_id'])
         self.assertIn('payment_reference', booking)
+
+    def _create_module_material_item(self):
+        module = EducationInstitutionCourseModule.objects.create(
+            institution=self.institution,
+            course=self.course,
+            title='Module One',
+            status='published',
+        )
+        material = EducationInstitutionMaterial.objects.create(
+            institution=self.institution,
+            course=self.course,
+            title='Secret Workbook',
+            kind='document',
+            resource_url='https://cdn.example.com/private/secret-workbook.pdf',
+            status='published',
+        )
+        EducationInstitutionCourseModuleItem.objects.create(
+            institution=self.institution,
+            course=self.course,
+            module=module,
+            item_type=EducationCourseModuleItemType.MATERIAL,
+            material=material,
+        )
+        return module, material
+
+    @override_settings(FLW_WEBHOOK_SECRET="test-webhook-secret")
+    def test_paid_course_hides_material_content_until_payment_confirmed(self):
+        # Regression test: EducationContentEnrollmentView used to grant
+        # ENROLLED (and therefore has_learning_access) the instant a
+        # payment intent was created, before the buyer had actually paid -
+        # see the paired backend fix that made this test pass. Module/item
+        # *titles* must stay visible throughout (so a shopper can see what
+        # the course covers) - only the actual content (resource_url etc.)
+        # must stay hidden until the booking is confirmed.
+        EducationInstitutionMembership.objects.create(
+            institution=self.institution,
+            user=self.learner,
+            role=EducationInstitutionMembershipRole.STUDENT,
+            status=EducationInstitutionMembershipStatus.ACTIVE,
+            decided_by=self.owner,
+            decided_at=timezone.now(),
+        )
+        module, material = self._create_module_material_item()
+        self.client.force_authenticate(self.learner)
+
+        enroll_response = self.client.post(
+            f'/api/v1/education/contents/{self.broadcast.id}/enroll/',
+            {},
+            format='json',
+        )
+        self.assertEqual(enroll_response.status_code, status.HTTP_200_OK, enroll_response.data)
+        self.assertEqual(enroll_response.data['enrollment']['status'], 'pending')
+
+        enrollment = EducationInstitutionEnrollment.objects.get(
+            broadcast=self.broadcast, user=self.learner,
+        )
+        self.assertEqual(enrollment.status, EducationEnrollmentStatus.PENDING)
+
+        # The enrollment response itself must not leak the first item's
+        # content even though it's not returned as part of "courseOutline".
+        progress = enroll_response.data.get('progress') or {}
+        current_item = progress.get('currentItem') or {}
+        if current_item:
+            self.assertEqual((current_item.get('content') or {}).get('resource_url'), '')
+
+        detail_response = self.client.get(f'/api/v1/education/contents/{self.broadcast.id}/')
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK, detail_response.data)
+        self.assertFalse(detail_response.data['content']['viewerState'].get('has_learning_access'))
+        outline = detail_response.data['content']['courseOutline']
+        module_titles = [row['title'] for row in outline]
+        self.assertIn('Module One', module_titles)
+        found_item = next(
+            item
+            for row in outline
+            for item in row['items']
+            if item['title'] == 'Secret Workbook'
+        )
+        self.assertEqual(found_item['content'].get('resource_url'), '')
+        self.assertFalse(found_item['content'].get('is_downloadable'))
+
+        item_action_response = self.client.post(
+            f'/api/v1/education/contents/{self.broadcast.id}/items/{found_item["id"]}/action/',
+            {'action': 'mark_attended'},
+            format='json',
+        )
+        self.assertEqual(item_action_response.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Now simulate the payment webhook confirming the booking.
+        from apps.broadcasts.models import EducationBookingStatus
+
+        booking = EducationInstitutionBooking.objects.get(broadcast=self.broadcast, user=self.learner)
+        intent = DirectPaymentIntent.objects.get(id=enroll_response.data['booking']['payment_intent_id'])
+        ok, result, _intent = reconcile_direct_payment_callback(
+            payload={'data': {'tx_ref': intent.tx_ref, 'status': 'successful', 'id': 'flw-test-ref'}},
+            signature='test-webhook-secret',
+        )
+        self.assertTrue(ok, result)
+
+        booking.refresh_from_db()
+        self.assertEqual(booking.status, EducationBookingStatus.CONFIRMED)
+        enrollment.refresh_from_db()
+        self.assertEqual(enrollment.status, EducationEnrollmentStatus.ENROLLED)
+
+        unlocked_response = self.client.get(f'/api/v1/education/contents/{self.broadcast.id}/')
+        self.assertTrue(unlocked_response.data['content']['viewerState'].get('has_learning_access'))
+        unlocked_material = next(
+            item
+            for row in unlocked_response.data['content']['courseOutline']
+            for item in row['items']
+            if item['title'] == 'Secret Workbook'
+        )
+        self.assertEqual(
+            unlocked_material['content'].get('resource_url'),
+            material.resource_url,
+        )
 
     def test_education_material_rejects_local_file_paths_and_raw_storage_paths(self):
         self.client.force_authenticate(self.owner)

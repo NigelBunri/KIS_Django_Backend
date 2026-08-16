@@ -3067,6 +3067,52 @@ def _require_learning_access_for_content(user: User, broadcast: EducationInstitu
     return enrollment
 
 
+def _grant_education_enrollment_for_confirmed_booking(booking: "EducationInstitutionBooking") -> None:
+    """Unlocks course content for a learner whose booking payment has just
+    been confirmed - webhook success (apps.billing.direct_payments._mark_target_paid),
+    an institution admin manually confirming a booking
+    (EducationInstitutionBookingActionView, action=confirm), or a
+    synchronous zero-amount/wallet payment
+    (EducationInstitutionBroadcastBookingPaymentView.post).
+
+    Must never be called before the booking is actually CONFIRMED - that's
+    exactly the gate this exists to enforce. EducationContentEnrollmentView.post
+    used to grant ENROLLED immediately upon successfully creating a payment
+    intent (i.e. before the buyer had paid anything), which meant
+    has_learning_access - and therefore every lesson/material resource_url -
+    was unlocked the instant someone hit "Enroll" on a paid course, whether
+    or not they ever completed checkout.
+
+    Booking and enrollment have no direct FK between them (bookings key off
+    broadcast+program/course/class_session/event+user, same as enrollments)
+    - resolved by broadcast+user, matching every other lookup in this file."""
+    broadcast = booking.broadcast
+    if broadcast is None:
+        return
+    enrollment = broadcast.enrollments.filter(user_id=booking.user_id).first()
+    already_enrolled_count = broadcast.enrollments.filter(
+        status=EducationEnrollmentStatus.ENROLLED,
+    ).exclude(id=enrollment.id if enrollment else None).count()
+    seat_limit_reached = bool(broadcast.seat_limit and already_enrolled_count >= broadcast.seat_limit)
+    target_status = EducationEnrollmentStatus.WAITLISTED if seat_limit_reached else EducationEnrollmentStatus.ENROLLED
+    if enrollment is None:
+        broadcast.enrollments.create(
+            institution=booking.institution,
+            broadcast=broadcast,
+            program=broadcast.program,
+            course=broadcast.course,
+            lesson=broadcast.lesson,
+            class_session=broadcast.class_session,
+            event=broadcast.event,
+            user_id=booking.user_id,
+            status=target_status,
+            metadata={"created_from": "education_booking_payment_confirmed"},
+        )
+    elif enrollment.status in {EducationEnrollmentStatus.PENDING, EducationEnrollmentStatus.WAITLISTED}:
+        enrollment.status = target_status
+        enrollment.save(update_fields=["status", "updated_at"])
+
+
 def _build_education_hub_payload(user: User, request) -> dict[str, Any]:
     institutions = list(_education_institution_qs_for_user(user))
     institution_ids = [row.id for row in institutions]
@@ -9595,6 +9641,11 @@ class EducationInstitutionBookingActionView(APIView):
         metadata["last_action_at"] = timezone.now().isoformat()
         booking.metadata = metadata
         booking.save(update_fields=["status", "confirmed_at", "metadata", "updated_at"])
+        if booking.status == EducationBookingStatus.CONFIRMED:
+            # An institution admin manually confirming a booking (e.g. an
+            # offline/manual payment) unlocks content the same way a
+            # webhook-confirmed online payment does.
+            _grant_education_enrollment_for_confirmed_booking(booking)
         return Response(
             {"booking": EducationInstitutionBookingSerializer(booking).data},
             status=status.HTTP_200_OK,
@@ -11390,6 +11441,7 @@ class EducationInstitutionBroadcastBookingPaymentView(APIView):
             booking.status = EducationBookingStatus.CONFIRMED
             booking.confirmed_at = timezone.now()
             booking.save(update_fields=["status", "confirmed_at", "updated_at"])
+            _grant_education_enrollment_for_confirmed_booking(booking)
             return Response({"booking": EducationInstitutionBookingSerializer(booking).data}, status=status.HTTP_200_OK)
 
         method = str(
@@ -11445,6 +11497,7 @@ class EducationInstitutionBroadcastBookingPaymentView(APIView):
                     "updated_at",
                 ]
             )
+            _grant_education_enrollment_for_confirmed_booking(booking)
             return Response(
                 {
                     "booking": EducationInstitutionBookingSerializer(booking).data,
@@ -12150,15 +12203,26 @@ class EducationContentEnrollmentView(APIView):
             booking.refresh_from_db()
             if response.status_code >= 400:
                 return response
+            # A 2xx here only means a payment intent was created (or, for
+            # zero-amount/wallet bookings, that payment cleared
+            # synchronously) - NOT that the buyer has actually paid.
+            # Content only unlocks once booking.status is CONFIRMED: either
+            # right now (synchronous paths) or later via the payment
+            # webhook (apps.billing.direct_payments._mark_target_paid ->
+            # _grant_education_enrollment_for_confirmed_booking) or an
+            # institution admin manually confirming the booking. Granting
+            # ENROLLED unconditionally here was the bug - it unlocked every
+            # lesson/material resource_url the instant someone hit
+            # "Enroll", whether or not checkout was ever completed.
             enrollment = broadcast.enrollments.filter(user=request.user).first()
-            if not enrollment:
-                enrollment_status = EducationEnrollmentStatus.ENROLLED
-                if (
-                    broadcast.seat_limit
-                    and broadcast.enrollments.filter(status=EducationEnrollmentStatus.ENROLLED).count()
-                    >= broadcast.seat_limit
-                ):
-                    enrollment_status = EducationEnrollmentStatus.WAITLISTED
+            if booking.status == EducationBookingStatus.CONFIRMED:
+                if not enrollment or enrollment.status in {
+                    EducationEnrollmentStatus.PENDING,
+                    EducationEnrollmentStatus.WAITLISTED,
+                }:
+                    _grant_education_enrollment_for_confirmed_booking(booking)
+                    enrollment = broadcast.enrollments.filter(user=request.user).first()
+            elif not enrollment:
                 enrollment = EducationInstitutionEnrollment.objects.create(
                     institution=institution,
                     broadcast=broadcast,
@@ -12168,10 +12232,22 @@ class EducationContentEnrollmentView(APIView):
                     class_session=broadcast.class_session,
                     event=broadcast.event,
                     user=request.user,
-                    status=enrollment_status,
+                    status=EducationEnrollmentStatus.PENDING,
                     metadata={"created_from": "education_discovery_paid"},
                 )
-            outline = _build_public_learning_outline(broadcast, request)
+            has_learning_access = bool(
+                enrollment
+                and enrollment.status in {EducationEnrollmentStatus.ENROLLED, EducationEnrollmentStatus.COMPLETED}
+            )
+            # _build_learning_progress_payload's currentItem/nextItem embed
+            # the full outline item (including content.resource_url) - must
+            # sanitize BEFORE building progress, or a PENDING (unpaid)
+            # enrollment would still get the first lesson's material URL
+            # handed to it directly in this very response.
+            outline = _sanitize_learning_outline_for_public_viewer(
+                _build_public_learning_outline(broadcast, request),
+                has_learning_access=has_learning_access,
+            )
             progress_payload = _build_learning_progress_payload(broadcast, outline, enrollment)
             return Response(
                 {
