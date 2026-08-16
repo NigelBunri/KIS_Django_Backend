@@ -181,6 +181,90 @@ def _can_access_patient_record(user, patient, required_scope: str = models.Healt
     return False, "", None
 
 
+def _accessible_patient_ids(user):
+    """Patient ids the given user may access, or None to mean "unrestricted"
+    (superuser). Mirrors _can_access_patient_record's three access paths
+    (owner / org staff / active delegate grant) at queryset scale, so it can
+    back get_queryset() on every PHI-bearing ViewSet. This is the sole source
+    of truth for PHI scoping - a client-supplied institution/patient/org query
+    param may only narrow an already-scoped queryset via filterset_fields, it
+    must never be able to widen it."""
+    if getattr(user, "is_superuser", False):
+        return None
+    if not getattr(user, "is_authenticated", False):
+        return models.PatientMasterRecord.objects.none().values_list("id", flat=True)
+    user_id = str(getattr(user, "id", "") or "")
+    org_ids = _user_org_ids(user)
+    granted_patient_ids = (
+        models.HealthDataAccessGrant.objects.filter(
+            granted_to=user,
+            status=models.HealthDataAccessGrant.STATUS_ACTIVE,
+        )
+        .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
+        .values_list("patient_id", flat=True)
+    )
+    accessible = Q(primary_contact__user_id=user_id) | Q(id__in=granted_patient_ids)
+    if org_ids:
+        accessible |= Q(organization_id__in=org_ids)
+    return models.PatientMasterRecord.objects.filter(accessible).values_list("id", flat=True)
+
+
+class PatientScopedQuerySetMixin:
+    """Scopes a ViewSet's queryset to patients the requesting user may access.
+
+    Set `patient_lookup` to the field path from this model to
+    PatientMasterRecord (e.g. "patient" or "session__patient"). retrieve/
+    update/destroy of an out-of-scope object correctly 404 via DRF's
+    get_object(), since it filters through get_queryset() first.
+    """
+
+    patient_lookup = "patient"
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        allowed_patient_ids = _accessible_patient_ids(self.request.user)
+        if allowed_patient_ids is None:
+            return queryset
+        return queryset.filter(**{f"{self.patient_lookup}__in": allowed_patient_ids})
+
+    def _assert_write_access(self, patient):
+        """Guard against IDOR on create/update: a client-supplied `patient`
+        (or `session`) foreign key must resolve to a patient this user can
+        actually access, regardless of what the request body says."""
+        if patient is None:
+            return
+        allowed, _reason, _grant = _can_access_patient_record(
+            self.request.user,
+            patient,
+            required_scope=models.HealthDataAccessGrant.SCOPE_RECORDS,
+        )
+        if not allowed:
+            raise PermissionDenied("You do not have access to this patient's records.")
+
+
+class OrgScopedQuerySetMixin:
+    """Scopes a ViewSet's queryset to HealthcareOrganizations the requesting
+    user staffs (via _user_org_ids). Set org_lookup to the field path from
+    this model to HealthcareOrganization (e.g. "organization" or
+    "staff_profile__profile__organization")."""
+
+    org_lookup = "organization"
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        org_ids = _user_org_ids(self.request.user)
+        if org_ids is None:
+            return queryset
+        return queryset.filter(**{f"{self.org_lookup}__in": org_ids})
+
+    def _assert_org_write_access(self, organization_id):
+        if organization_id is None:
+            return
+        org_ids = _user_org_ids(self.request.user)
+        if org_ids is not None and organization_id not in org_ids:
+            raise PermissionDenied("You cannot act on records outside your organization.")
+
+
 def _log_patient_access(actor, patient, action: str, reason: str, grant=None, metadata=None):
     payload = {
         "patient_id": str(patient.id),
@@ -262,6 +346,11 @@ class CanManageRolesPermission(IsAuthenticated):
 
 
 class CanAccessComplianceData(BasePermission):
+    """Authentication alone is not sufficient here - each compliance
+    ViewSet additionally scopes its queryset to the caller's own org(s) via
+    _user_org_ids(), and write actions re-check org membership on the
+    specific object before acting on it."""
+
     def has_permission(self, request, view):
         return bool(request.user and request.user.is_authenticated)
 
@@ -1000,19 +1089,44 @@ class ComplianceAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_fields = ["severity", "action", "target_type"]
     ordering_fields = ["created_at"]
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        user = self.request.user
+        if getattr(user, "is_superuser", False):
+            return queryset
+        # Audit log targets are polymorphic (target_type/target_id), so we
+        # can't join to a single org/patient FK generically. Scope to the
+        # caller's own actions plus any patient-targeted entries for
+        # patients they can access - this closes the platform-wide read
+        # (any authenticated user could previously page through every
+        # patient-access log) without needing bespoke resolution for every
+        # possible target_type.
+        own_patient_ids = {str(pid) for pid in _accessible_patient_ids(user) or []}
+        return queryset.filter(
+            Q(actor=user) | (Q(target_type="PatientMasterRecord") & Q(target_id__in=own_patient_ids))
+        )
+
 
 @extend_schema(tags=["Compliance"])
-class CredentialVerificationViewSet(viewsets.ModelViewSet):
-    queryset = models.CredentialVerification.objects.select_related("staff_profile", "verified_by").all()
+class CredentialVerificationViewSet(OrgScopedQuerySetMixin, viewsets.ModelViewSet):
+    queryset = models.CredentialVerification.objects.select_related("staff_profile", "staff_profile__profile", "verified_by").all()
     serializer_class = serializers.CredentialVerificationSerializer
     permission_classes = [CanAccessComplianceData]
     filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = ["staff_profile", "status"]
     ordering_fields = ["expires_at"]
+    org_lookup = "staff_profile__profile__organization"
+
+    def perform_create(self, serializer):
+        staff_profile = serializer.validated_data.get("staff_profile")
+        if staff_profile is not None:
+            self._assert_org_write_access(staff_profile.profile.organization_id)
+        serializer.save()
 
     @action(detail=True, methods=["post"])
     def verify(self, request, pk=None):
         credential = self.get_object()
+        self._assert_org_write_access(credential.staff_profile.profile.organization_id)
         credential.mark_verified(request.user)
         models.ComplianceAuditLog.log(
             actor=request.user,
@@ -1029,7 +1143,7 @@ class CredentialVerificationViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Compliance"])
-class RegulatoryReportViewSet(viewsets.ModelViewSet):
+class RegulatoryReportViewSet(OrgScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.RegulatoryReport.objects.select_related("profile", "organization").all()
     serializer_class = serializers.RegulatoryReportSerializer
     permission_classes = [CanAccessComplianceData]
@@ -1037,9 +1151,15 @@ class RegulatoryReportViewSet(viewsets.ModelViewSet):
     filterset_fields = ["profile", "organization", "report_type", "status"]
     ordering_fields = ["period_start"]
 
+    def perform_create(self, serializer):
+        organization = serializer.validated_data.get("organization")
+        self._assert_org_write_access(organization.id if organization else None)
+        serializer.save()
+
     @action(detail=True, methods=["post"])
     def submit(self, request, pk=None):
         report = self.get_object()
+        self._assert_org_write_access(report.organization_id)
         report.submit()
         models.ComplianceAuditLog.log(
             actor=request.user,
@@ -1057,7 +1177,7 @@ class RegulatoryReportViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Compliance"])
-class ComplianceDocumentViewSet(viewsets.ModelViewSet):
+class ComplianceDocumentViewSet(OrgScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.ComplianceDocument.objects.select_related("profile", "organization", "signed_by").all()
     serializer_class = serializers.ComplianceDocumentSerializer
     permission_classes = [CanAccessComplianceData]
@@ -1065,9 +1185,15 @@ class ComplianceDocumentViewSet(viewsets.ModelViewSet):
     filterset_fields = ["profile", "organization", "status", "is_signed"]
     ordering_fields = ["created_at"]
 
+    def perform_create(self, serializer):
+        organization = serializer.validated_data.get("organization")
+        self._assert_org_write_access(organization.id if organization else None)
+        serializer.save()
+
     @action(detail=True, methods=["post"])
     def sign(self, request, pk=None):
         document = self.get_object()
+        self._assert_org_write_access(document.organization_id)
         document.mark_signed(request.user)
         models.ComplianceAuditLog.log(
             actor=request.user,
@@ -1084,13 +1210,17 @@ class ComplianceDocumentViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Compliance"])
-class DataAccessConsentViewSet(viewsets.ModelViewSet):
+class DataAccessConsentViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.DataAccessConsent.objects.select_related("patient").all()
     serializer_class = serializers.DataAccessConsentSerializer
     permission_classes = [CanAccessComplianceData]
     filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = ["patient", "granted_to", "status"]
     ordering_fields = ["created_at"]
+
+    def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
+        serializer.save()
 
     @action(detail=True, methods=["post"])
     def revoke(self, request, pk=None):
@@ -1192,6 +1322,13 @@ class PatientMasterRecordViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     filterset_fields = ["tenant_id", "mrn", "status", "organization"]
     search_fields = ["first_name", "last_name", "mrn"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        allowed_patient_ids = _accessible_patient_ids(self.request.user)
+        if allowed_patient_ids is None:
+            return queryset
+        return queryset.filter(id__in=allowed_patient_ids)
 
     def get_serializer_class(self):
         if self.action in ("retrieve",):
@@ -1580,15 +1717,19 @@ class PatientMasterRecordViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Patients"])
-class FamilyProfileViewSet(viewsets.ModelViewSet):
+class FamilyProfileViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.PatientFamilyProfile.objects.select_related("patient").all()
     serializer_class = serializers.FamilyProfileSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["patient", "relationship"]
 
+    def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
+        serializer.save()
+
 
 @extend_schema(tags=["Patients"])
-class ConsentRecordViewSet(viewsets.ModelViewSet):
+class ConsentRecordViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.ConsentRecord.objects.select_related("patient").all()
     serializer_class = serializers.ConsentRecordSerializer
     permission_classes = [IsAuthenticated]
@@ -1596,6 +1737,7 @@ class ConsentRecordViewSet(viewsets.ModelViewSet):
     search_fields = ["purpose"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         granted_by = serializer.validated_data.get("granted_by")
         if granted_by is None and getattr(self.request.user, "is_authenticated", False):
             serializer.save(granted_by=self.request.user)
@@ -1604,28 +1746,33 @@ class ConsentRecordViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Patients"])
-class EncounterViewSet(viewsets.ModelViewSet):
+class EncounterViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.EncounterNote.objects.select_related("patient", "organization", "clinician").all()
     serializer_class = serializers.EncounterSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["patient", "organization", "encounter_type"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         encounter = serializer.save(clinician=self.request.user)
         if not encounter:
             return
 
 
 @extend_schema(tags=["Patients"])
-class AppointmentViewSet(viewsets.ModelViewSet):
+class AppointmentViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.Appointment.objects.select_related("patient", "profile").all()
     serializer_class = serializers.AppointmentSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["patient", "profile", "status"]
 
+    def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
+        serializer.save()
+
 
 @extend_schema(tags=["Patients"])
-class MedicationOrderViewSet(viewsets.ModelViewSet):
+class MedicationOrderViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.MedicationOrder.objects.select_related("patient", "clinician", "profile").all()
     serializer_class = serializers.MedicationOrderSerializer
     permission_classes = [IsAuthenticated]
@@ -1634,6 +1781,7 @@ class MedicationOrderViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         patient = serializer.validated_data.get("patient")
+        self._assert_write_access(patient)
         order = serializer.save(clinician=self.request.user)
         order.fhir_resource = {
             "resourceType": "MedicationRequest",
@@ -1651,7 +1799,7 @@ class MedicationOrderViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Patients"])
-class AllergyRecordViewSet(viewsets.ModelViewSet):
+class AllergyRecordViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.AllergyRecord.objects.select_related("patient").all()
     serializer_class = serializers.AllergyRecordSerializer
     permission_classes = [IsAuthenticated]
@@ -1659,13 +1807,14 @@ class AllergyRecordViewSet(viewsets.ModelViewSet):
     search_fields = ["agent"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         allergy = serializer.save()
         if not allergy:
             return
 
 
 @extend_schema(tags=["Patients"])
-class VitalSignViewSet(viewsets.ModelViewSet):
+class VitalSignViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.VitalSign.objects.select_related("patient", "profile", "clinician").all()
     serializer_class = serializers.VitalSignSerializer
     permission_classes = [IsAuthenticated]
@@ -1673,13 +1822,14 @@ class VitalSignViewSet(viewsets.ModelViewSet):
     search_fields = ["notes"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         vital = serializer.save(clinician=self.request.user)
         if not vital:
             return
 
 
 @extend_schema(tags=["Patients"])
-class ProblemRecordViewSet(viewsets.ModelViewSet):
+class ProblemRecordViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.ProblemRecord.objects.select_related("patient", "profile", "diagnosed_by").all()
     serializer_class = serializers.ProblemRecordSerializer
     permission_classes = [IsAuthenticated]
@@ -1687,11 +1837,12 @@ class ProblemRecordViewSet(viewsets.ModelViewSet):
     search_fields = ["title", "code", "notes"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         serializer.save(diagnosed_by=self.request.user)
 
 
 @extend_schema(tags=["Patients"])
-class ImmunizationRecordViewSet(viewsets.ModelViewSet):
+class ImmunizationRecordViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.ImmunizationRecord.objects.select_related("patient", "profile", "administered_by").all()
     serializer_class = serializers.ImmunizationRecordSerializer
     permission_classes = [IsAuthenticated]
@@ -1699,11 +1850,12 @@ class ImmunizationRecordViewSet(viewsets.ModelViewSet):
     search_fields = ["vaccine_name", "manufacturer", "lot_number"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         serializer.save(administered_by=self.request.user)
 
 
 @extend_schema(tags=["Patients"])
-class ProcedureRecordViewSet(viewsets.ModelViewSet):
+class ProcedureRecordViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.ProcedureRecord.objects.select_related("patient", "profile", "performed_by").all()
     serializer_class = serializers.ProcedureRecordSerializer
     permission_classes = [IsAuthenticated]
@@ -1711,11 +1863,12 @@ class ProcedureRecordViewSet(viewsets.ModelViewSet):
     search_fields = ["procedure_name", "location", "notes"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         serializer.save(performed_by=self.request.user)
 
 
 @extend_schema(tags=["Patients"])
-class HealthDocumentViewSet(viewsets.ModelViewSet):
+class HealthDocumentViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.HealthDocument.objects.select_related("patient", "profile", "uploaded_by").all()
     serializer_class = serializers.HealthDocumentSerializer
     permission_classes = [IsAuthenticated]
@@ -1723,11 +1876,12 @@ class HealthDocumentViewSet(viewsets.ModelViewSet):
     search_fields = ["title", "source_label", "notes", "file_url"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         serializer.save(uploaded_by=self.request.user)
 
 
 @extend_schema(tags=["Patients"])
-class HealthRecordExchangeLogViewSet(viewsets.ReadOnlyModelViewSet):
+class HealthRecordExchangeLogViewSet(PatientScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
     queryset = models.HealthRecordExchangeLog.objects.select_related("patient", "actor").all()
     serializer_class = serializers.HealthRecordExchangeLogSerializer
     permission_classes = [IsAuthenticated]
@@ -1735,7 +1889,7 @@ class HealthRecordExchangeLogViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 @extend_schema(tags=["Patients"])
-class WellnessMetricViewSet(viewsets.ModelViewSet):
+class WellnessMetricViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.WellnessMetric.objects.select_related("patient", "profile", "recorded_by").all()
     serializer_class = serializers.WellnessMetricSerializer
     permission_classes = [IsAuthenticated]
@@ -1743,11 +1897,12 @@ class WellnessMetricViewSet(viewsets.ModelViewSet):
     search_fields = ["source_label"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         serializer.save(recorded_by=self.request.user)
 
 
 @extend_schema(tags=["Clinical"])
-class ClinicalTaskViewSet(viewsets.ModelViewSet):
+class ClinicalTaskViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.ClinicalTask.objects.select_related("patient", "assigned_to", "created_by").all()
     serializer_class = serializers.ClinicalTaskSerializer
     permission_classes = [IsAuthenticated]
@@ -1755,6 +1910,7 @@ class ClinicalTaskViewSet(viewsets.ModelViewSet):
     search_fields = ["title", "description"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         task = serializer.save(created_by=self.request.user)
         if task.assigned_to_id:
             notification_services.create_notification(
@@ -1791,13 +1947,14 @@ class ClinicalTaskViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Clinical"])
-class EmergencyEscalationViewSet(viewsets.ModelViewSet):
+class EmergencyEscalationViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.EmergencyEscalation.objects.select_related("patient", "reported_by").all()
     serializer_class = serializers.EmergencyEscalationSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["patient", "severity", "status"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         escalation = serializer.save(reported_by=self.request.user)
         notified_users = []
         if escalation.patient and escalation.patient.organization_id:
@@ -1841,13 +1998,14 @@ class EmergencyEscalationViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Clinical"])
-class TriageRecordViewSet(viewsets.ModelViewSet):
+class TriageRecordViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.TriageRecord.objects.select_related("patient", "created_by").all()
     serializer_class = serializers.TriageRecordSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["patient", "acuity_level"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         record = serializer.save(created_by=self.request.user)
         new_level = record.acuity_level
         _record_clinical_event(
@@ -1860,13 +2018,14 @@ class TriageRecordViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Clinical"])
-class ReferralRouteViewSet(viewsets.ModelViewSet):
+class ReferralRouteViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.ReferralRoute.objects.select_related("patient", "from_organization", "to_organization").all()
     serializer_class = serializers.ReferralRouteSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["patient", "from_organization", "to_organization", "status"]
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         referral = serializer.save(created_by=self.request.user)
         _record_clinical_event(
             patient=referral.patient,
@@ -1878,7 +2037,7 @@ class ReferralRouteViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Clinical"])
-class ClinicalEventLogViewSet(viewsets.ReadOnlyModelViewSet):
+class ClinicalEventLogViewSet(PatientScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
     queryset = models.ClinicalEventLog.objects.select_related("patient", "triggered_by").all()
     serializer_class = serializers.ClinicalEventLogSerializer
     permission_classes = [IsAuthenticated]
@@ -1893,26 +2052,49 @@ class CommandCenterOverview(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        pending_tasks = models.ClinicalTask.objects.filter(
+        # Never trust a client-supplied institution/organization id here - the
+        # frontend doesn't even send one today, and even if it did, scope must
+        # be derived from the authenticated user's own org memberships.
+        org_ids = _user_org_ids(request.user)
+
+        task_qs = models.ClinicalTask.objects.filter(
             status__in=[models.ClinicalTask.STATUS_PENDING, models.ClinicalTask.STATUS_IN_PROGRESS]
-        ).count()
-        active_escalations = models.EmergencyEscalation.objects.exclude(status=models.EmergencyEscalation.STATUS_RESOLVED).count()
-        open_referrals = models.ReferralRoute.objects.filter(status=models.ReferralRoute.STATUS_PENDING).count()
-        latest_events = models.ClinicalEventLog.objects.order_by("-created_at")[:5]
-        latest_triage = models.TriageRecord.objects.order_by("-created_at")[:3]
+        )
+        escalation_qs = models.EmergencyEscalation.objects.exclude(status=models.EmergencyEscalation.STATUS_RESOLVED)
+        referral_qs = models.ReferralRoute.objects.filter(status=models.ReferralRoute.STATUS_PENDING)
+        events_qs = models.ClinicalEventLog.objects.order_by("-created_at")
+        triage_qs = models.TriageRecord.objects.order_by("-created_at")
+
+        if org_ids is not None:
+            if org_ids:
+                task_qs = task_qs.filter(patient__organization_id__in=org_ids)
+                escalation_qs = escalation_qs.filter(patient__organization_id__in=org_ids)
+                referral_qs = referral_qs.filter(patient__organization_id__in=org_ids)
+                events_qs = events_qs.filter(patient__organization_id__in=org_ids)
+                triage_qs = triage_qs.filter(patient__organization_id__in=org_ids)
+            else:
+                # Authenticated but not staff at any org: scope to the
+                # caller's own patient record(s) only, never platform-wide.
+                own_patient_ids = _accessible_patient_ids(request.user)
+                task_qs = task_qs.filter(patient_id__in=own_patient_ids)
+                escalation_qs = escalation_qs.filter(patient_id__in=own_patient_ids)
+                referral_qs = referral_qs.filter(patient_id__in=own_patient_ids)
+                events_qs = events_qs.filter(patient_id__in=own_patient_ids)
+                triage_qs = triage_qs.filter(patient_id__in=own_patient_ids)
+
         return Response(
             {
-                "pending_tasks": pending_tasks,
-                "active_escalations": active_escalations,
-                "open_referrals": open_referrals,
-                "recent_events": serializers.ClinicalEventLogSerializer(latest_events, many=True).data,
-                "recent_triage": serializers.TriageRecordSerializer(latest_triage, many=True).data,
+                "pending_tasks": task_qs.count(),
+                "active_escalations": escalation_qs.count(),
+                "open_referrals": referral_qs.count(),
+                "recent_events": serializers.ClinicalEventLogSerializer(events_qs[:5], many=True).data,
+                "recent_triage": serializers.TriageRecordSerializer(triage_qs[:3], many=True).data,
             }
         )
 
 
 @extend_schema(tags=["Telemedicine"])
-class TelemedicineSessionViewSet(viewsets.ModelViewSet):
+class TelemedicineSessionViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.TelemedicineSession.objects.select_related("patient", "clinician", "profile", "appointment").all()
     serializer_class = serializers.TelemedicineSessionSerializer
     permission_classes = [IsAuthenticated]
@@ -1920,6 +2102,7 @@ class TelemedicineSessionViewSet(viewsets.ModelViewSet):
     reminder_window_hours = 24
 
     def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
         clinician = serializer.validated_data.get("clinician")
         if clinician is None and getattr(self.request.user, "is_authenticated", False):
             clinician = self.request.user
@@ -1969,21 +2152,30 @@ class TelemedicineSessionViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Telemedicine"])
-class TelemedicineDeviceViewSet(viewsets.ModelViewSet):
-    queryset = models.TelemedicineDevice.objects.select_related("session").all()
+class TelemedicineDeviceViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
+    queryset = models.TelemedicineDevice.objects.select_related("session", "session__patient").all()
     serializer_class = serializers.TelemedicineDeviceSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["session", "device_type"]
+    patient_lookup = "session__patient"
+
+    def perform_create(self, serializer):
+        session = serializer.validated_data.get("session")
+        self._assert_write_access(session.patient if session else None)
+        serializer.save()
 
 
 @extend_schema(tags=["Telemedicine"])
-class VoiceDictationViewSet(viewsets.ModelViewSet):
-    queryset = models.VoiceDictation.objects.select_related("session", "clinician").all()
+class VoiceDictationViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
+    queryset = models.VoiceDictation.objects.select_related("session", "session__patient", "clinician").all()
     serializer_class = serializers.VoiceDictationSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["session", "clinician"]
+    patient_lookup = "session__patient"
 
     def perform_create(self, serializer):
+        session = serializer.validated_data.get("session")
+        self._assert_write_access(session.patient if session else None)
         dictation = serializer.save()
         transcript = (
             dictation.audio_metadata.get("transcription")
@@ -2012,29 +2204,41 @@ class InventoryItemViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema(tags=["Medical Resources"])
-class DiagnosticOrderViewSet(viewsets.ModelViewSet):
+class DiagnosticOrderViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.DiagnosticOrder.objects.select_related("patient", "profile", "requested_by").all()
     serializer_class = serializers.DiagnosticOrderSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["patient", "profile", "status"]
     search_fields = ["test_name"]
 
+    def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
+        serializer.save()
+
 
 @extend_schema(tags=["Medical Resources"])
-class ImagingStudyViewSet(viewsets.ModelViewSet):
+class ImagingStudyViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.ImagingStudy.objects.select_related("patient", "profile").all()
     serializer_class = serializers.ImagingStudySerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["patient", "profile", "status", "modality"]
     search_fields = ["body_region"]
 
+    def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
+        serializer.save()
+
 
 @extend_schema(tags=["Medical Resources"])
-class MedicationAdherenceReminderViewSet(viewsets.ModelViewSet):
+class MedicationAdherenceReminderViewSet(PatientScopedQuerySetMixin, viewsets.ModelViewSet):
     queryset = models.MedicationAdherenceReminder.objects.select_related("patient", "medication_order").all()
     serializer_class = serializers.MedicationAdherenceReminderSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ["patient", "status", "channel"]
+
+    def perform_create(self, serializer):
+        self._assert_write_access(serializer.validated_data.get("patient"))
+        serializer.save()
 
     @action(detail=True, methods=["post"])
     def mark_sent(self, request, pk=None):

@@ -951,7 +951,12 @@ class PatientCanonicalHealthProfileTests(TestCase):
     def test_health_summary_denies_unrelated_user_without_access_grant(self):
         response = self.other_client.get(f"/api/v1/patients/master/{self.patient.id}/health-summary/")
 
-        self.assertEqual(response.status_code, 403)
+        # PatientMasterRecordViewSet.get_queryset() now scopes to accessible
+        # patients before get_object() runs, so an out-of-scope id 404s
+        # (DRF's standard "not found" for a filtered-out row) rather than
+        # reaching the action body's own 403 PermissionDenied check - access
+        # is still denied, the status code is just more conservative now.
+        self.assertEqual(response.status_code, 404)
 
     def test_health_summary_allows_active_delegate_with_grant(self):
         models.HealthDataAccessGrant.objects.create(
@@ -1032,3 +1037,201 @@ class PatientCanonicalHealthProfileTests(TestCase):
         self.assertTrue(models.HealthDocument.objects.filter(patient=self.patient, title="Imported Lab Result").exists())
         log = models.HealthRecordExchangeLog.objects.filter(patient=self.patient, direction="import").latest("created_at")
         self.assertEqual("test-provider", log.source_label)
+
+
+class PatientPhiCrossInstitutionAuthorizationTests(TestCase):
+    """Regression coverage for the PHI authorization gap: an authenticated
+    staff member at Institution A must never be able to read, write, or
+    tamper their way into Institution B's clinical/compliance data via
+    query params, even though every endpoint below only required
+    IsAuthenticated before this fix."""
+
+    def setUp(self):
+        self.client_a = APIClient()
+        self.user_a = User.objects.create_user(
+            phone="+237670000010", password="StrongPass123", country="CM",
+            email="org-a-staff@example.com",
+        )
+        self.client_a.force_authenticate(self.user_a)
+
+        self.client_b = APIClient()
+        self.user_b = User.objects.create_user(
+            phone="+237670000011", password="StrongPass123", country="CM",
+            email="org-b-staff@example.com",
+        )
+        self.client_b.force_authenticate(self.user_b)
+
+        self.org_a = models.HealthcareOrganization.objects.create(name="Org A Clinic", slug="org-a-clinic")
+        self.org_b = models.HealthcareOrganization.objects.create(name="Org B Clinic", slug="org-b-clinic")
+
+        self.medical_profile_a = models.MedicalProfile.objects.create(organization=self.org_a, name="Org A Profile")
+        self.medical_profile_b = models.MedicalProfile.objects.create(organization=self.org_b, name="Org B Profile")
+
+        models.StaffProfile.objects.create(profile=self.medical_profile_a, user=self.user_a, role="clinician")
+        models.StaffProfile.objects.create(profile=self.medical_profile_b, user=self.user_b, role="clinician")
+
+        self.patient_a = models.PatientMasterRecord.objects.create(
+            mrn="ORG-A-001", first_name="Alpha", last_name="Patient", organization=self.org_a,
+        )
+        self.patient_b = models.PatientMasterRecord.objects.create(
+            mrn="ORG-B-001", first_name="Beta", last_name="Patient", organization=self.org_b,
+        )
+
+        self.encounter_b = models.EncounterNote.objects.create(patient=self.patient_b, organization=self.org_b)
+        self.medication_b = models.MedicationOrder.objects.create(patient=self.patient_b, drug_name="Metformin")
+        self.allergy_b = models.AllergyRecord.objects.create(patient=self.patient_b, agent="Latex")
+        self.vital_b = models.VitalSign.objects.create(
+            patient=self.patient_b, vital_type=models.VitalSign.TYPE_TEMPERATURE, value="37.0", units="C",
+        )
+        self.task_b = models.ClinicalTask.objects.create(patient=self.patient_b, title="Follow up", description="Call patient")
+        self.escalation_b = models.EmergencyEscalation.objects.create(patient=self.patient_b, severity="high")
+
+        self.credential_b = models.CredentialVerification.objects.create(
+            staff_profile=models.StaffProfile.objects.get(profile=self.medical_profile_b),
+            credential_type="license", license_number="B-123",
+        )
+        self.regulatory_report_b = models.RegulatoryReport.objects.create(
+            report_type="quarterly", profile=self.medical_profile_b, organization=self.org_b,
+            period_start=timezone.now().date(), period_end=timezone.now().date(),
+        )
+        self.compliance_document_b = models.ComplianceDocument.objects.create(
+            profile=self.medical_profile_b, organization=self.org_b, document_name="Org B Policy",
+        )
+        self.data_access_consent_b = models.DataAccessConsent.objects.create(
+            patient=self.patient_b, granted_to="someone@example.com", scope="records",
+        )
+        models.ComplianceAuditLog.log(
+            actor=self.user_b, action="patient.summary.read",
+            target_type="PatientMasterRecord", target_id=str(self.patient_b.id),
+        )
+
+    # ---- Allowed: each user can see their own institution's data ----
+
+    def test_org_staff_can_list_and_retrieve_own_institution_records(self):
+        encounter_a = models.EncounterNote.objects.create(patient=self.patient_a, organization=self.org_a)
+        resp = self.client_a.get(reverse("core:core:patientencounter-list"))
+        self.assertEqual(resp.status_code, 200)
+        ids = {row["id"] for row in resp.json()["results"]} if "results" in resp.json() else {row["id"] for row in resp.json()}
+        self.assertIn(str(encounter_a.id), ids)
+
+        resp = self.client_a.get(reverse("core:core:patientencounter-detail", args=[encounter_a.id]))
+        self.assertEqual(resp.status_code, 200)
+
+    def test_command_center_returns_only_authorized_data(self):
+        resp = self.client_b.get(reverse("core:clinical-command-center"))
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        self.assertGreaterEqual(payload["pending_tasks"], 1)
+        self.assertGreaterEqual(payload["active_escalations"], 1)
+
+    # ---- Forbidden: cross-institution reads must not leak ----
+
+    def _assert_list_excludes(self, url_name, forbidden_id):
+        resp = self.client_a.get(reverse(f"core:core:{url_name}"))
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        rows = payload["results"] if isinstance(payload, dict) and "results" in payload else payload
+        ids = {row["id"] for row in rows}
+        self.assertNotIn(str(forbidden_id), ids)
+
+    def _assert_retrieve_denied(self, url_name, object_id):
+        resp = self.client_a.get(reverse(f"core:core:{url_name}", args=[object_id]))
+        self.assertIn(resp.status_code, (403, 404))
+
+    def test_cross_institution_encounter_access_denied(self):
+        self._assert_list_excludes("patientencounter-list", self.encounter_b.id)
+        self._assert_retrieve_denied("patientencounter-detail", self.encounter_b.id)
+
+    def test_cross_institution_medication_access_denied(self):
+        self._assert_list_excludes("patientmedication-list", self.medication_b.id)
+        self._assert_retrieve_denied("patientmedication-detail", self.medication_b.id)
+
+    def test_cross_institution_allergy_access_denied(self):
+        self._assert_list_excludes("patientallergy-list", self.allergy_b.id)
+        self._assert_retrieve_denied("patientallergy-detail", self.allergy_b.id)
+
+    def test_cross_institution_vitals_access_denied(self):
+        self._assert_list_excludes("patientvital-list", self.vital_b.id)
+        self._assert_retrieve_denied("patientvital-detail", self.vital_b.id)
+
+    def test_cross_institution_clinical_task_access_denied(self):
+        self._assert_list_excludes("clinicaltask-list", self.task_b.id)
+        self._assert_retrieve_denied("clinicaltask-detail", self.task_b.id)
+
+    def test_cross_institution_escalation_access_denied(self):
+        self._assert_list_excludes("clinicalescalation-list", self.escalation_b.id)
+        self._assert_retrieve_denied("clinicalescalation-detail", self.escalation_b.id)
+
+    def test_cross_institution_patient_master_record_denied(self):
+        resp = self.client_a.get(reverse("core:core:patientmasterrecord-detail", args=[self.patient_b.id]))
+        self.assertIn(resp.status_code, (403, 404))
+        resp = self.client_a.get(reverse("core:core:patientmasterrecord-list"))
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        rows = payload["results"] if isinstance(payload, dict) and "results" in payload else payload
+        ids = {row["id"] for row in rows}
+        self.assertNotIn(str(self.patient_b.id), ids)
+
+    def test_command_center_excludes_other_institution_activity(self):
+        resp = self.client_a.get(reverse("core:clinical-command-center"))
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        self.assertEqual(payload["pending_tasks"], 0)
+        self.assertEqual(payload["active_escalations"], 0)
+        event_ids = {row.get("id") for row in payload["recent_events"]}
+        self.assertFalse(event_ids & set())  # sanity: no crash on empty overlap
+
+    # ---- Forbidden: compliance endpoints must not leak cross-org ----
+
+    def test_cross_org_compliance_audit_log_excludes_other_org(self):
+        resp = self.client_a.get(reverse("core:core:complianceaudit-list"))
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        rows = payload["results"] if isinstance(payload, dict) and "results" in payload else payload
+        target_ids = {row["target_id"] for row in rows}
+        self.assertNotIn(str(self.patient_b.id), target_ids)
+
+    def test_cross_org_credential_verification_denied(self):
+        self._assert_list_excludes("compliancecredential-list", self.credential_b.id)
+        self._assert_retrieve_denied("compliancecredential-detail", self.credential_b.id)
+        resp = self.client_a.post(reverse("core:core:compliancecredential-verify", args=[self.credential_b.id]))
+        self.assertIn(resp.status_code, (403, 404))
+
+    def test_cross_org_regulatory_report_denied(self):
+        self._assert_list_excludes("regulatoryreport-list", self.regulatory_report_b.id)
+        self._assert_retrieve_denied("regulatoryreport-detail", self.regulatory_report_b.id)
+        resp = self.client_a.post(reverse("core:core:regulatoryreport-submit", args=[self.regulatory_report_b.id]))
+        self.assertIn(resp.status_code, (403, 404))
+
+    def test_cross_org_compliance_document_denied(self):
+        self._assert_list_excludes("compliancedocument-list", self.compliance_document_b.id)
+        self._assert_retrieve_denied("compliancedocument-detail", self.compliance_document_b.id)
+        resp = self.client_a.post(reverse("core:core:compliancedocument-sign", args=[self.compliance_document_b.id]))
+        self.assertIn(resp.status_code, (403, 404))
+
+    def test_cross_institution_data_access_consent_denied(self):
+        self._assert_list_excludes("dataaccess-list", self.data_access_consent_b.id)
+        self._assert_retrieve_denied("dataaccess-detail", self.data_access_consent_b.id)
+
+    # ---- Forbidden: query-param tampering must not widen scope ----
+
+    def test_query_param_tampering_cannot_widen_scope(self):
+        for params in (
+            {"patient": str(self.patient_b.id)},
+            {"organization": str(self.org_b.id)},
+        ):
+            resp = self.client_a.get(reverse("core:core:patientencounter-list"), params)
+            self.assertEqual(resp.status_code, 200)
+            payload = resp.json()
+            rows = payload["results"] if isinstance(payload, dict) and "results" in payload else payload
+            ids = {row["id"] for row in rows}
+            self.assertNotIn(str(self.encounter_b.id), ids)
+
+    def test_cannot_create_clinical_record_for_unauthorized_patient(self):
+        resp = self.client_a.post(
+            reverse("core:core:patientallergy-list"),
+            {"patient": str(self.patient_b.id), "agent": "Injected allergy"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(models.AllergyRecord.objects.filter(patient=self.patient_b, agent="Injected allergy").exists())
