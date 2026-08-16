@@ -227,6 +227,7 @@ from apps.broadcasts.health_engine_policy import (
     should_drop_service_after_medium_cleanup,
 )
 from apps.broadcasts.serializers import (
+    _resolve_education_media_display_url,
     BroadcastChannelDetailSerializer,
     BroadcastChannelSummarySerializer,
     BroadcastChannelSubscriptionSerializer,
@@ -2264,8 +2265,8 @@ def _build_public_institution_summary(institution: EducationInstitution, request
         "description": institution.description,
         "institutionType": institution.institution_type,
         "membershipPolicy": institution.membership_policy,
-        "logoUrl": build_absolute_url(request, logo_url) if logo_url else "",
-        "imageUrl": build_absolute_url(request, image_url) if image_url else "",
+        "logoUrl": _resolve_education_media_display_url(logo_url, request) if logo_url else "",
+        "imageUrl": _resolve_education_media_display_url(image_url, request) if image_url else "",
         "verificationSummary": verification_summary,
         "trustSummary": {
             "verified": bool(verification_summary.get("is_verified") or verification_summary.get("verified")),

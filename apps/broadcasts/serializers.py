@@ -1,5 +1,4 @@
 from decimal import Decimal
-from urllib.parse import quote
 
 from django.urls import reverse
 from rest_framework import serializers
@@ -7,8 +6,6 @@ from rest_framework import serializers
 from apps.broadcasts.media_utils import build_media_url, ensure_local_thumbnail
 from apps.broadcasts.health_engine_policy import is_service_medium_allowed
 from apps.core.money import parse_decimal_amount
-from apps.media.models import MediaAsset
-from apps.media.signing import sign_media_asset_token
 from common.media_urls import absolutize_backend_media
 
 from .models import (
@@ -632,33 +629,32 @@ def _attach_education_detail_summary(payload: dict, summary: dict) -> dict:
 
 
 def _resolve_education_media_display_url(value: str, request=None) -> str:
-    """`value` is either a client-pasted external URL (pass through as
-    before) or one of our own S3 object keys stored verbatim by
-    _education_cover_image_from_payload/_education_material_media_payload
-    (e.g. "private/education/cover/<user>/<uuid>.jpg"). The latter case was
-    previously string-joined onto the API host via absolutize_backend_media
-    alone, producing a URL with no matching Django route to a private,
-    unsigned bucket key that always 404ed. Resolve it through the same
-    MediaAsset-keyed signed-download proxy MediaAssetViewSet.sign/.download
-    already use for every other private upload, instead of exposing the raw
-    key."""
+    """`value` here is one of three shapes: a client-pasted external URL, an
+    already-relative path from a legacy/pasted same-host URL that
+    normalize_media_reference (strip_backend_origin) stripped down to e.g.
+    "/media/institutions/institution.jpg", or one of our own S3 object keys
+    stored verbatim by _education_cover_image_from_payload/
+    _education_material_media_payload - always "private/<key_prefix>/<user>/
+    <uuid>.<ext>" (see apps.media.upload_intent._generate_object_key), never
+    leading-slash. Only that third shape was ever broken: string-joined onto
+    the API host via absolutize_backend_media alone, producing a URL with no
+    matching Django route to a private, unsigned bucket key that always
+    404ed. build_media_url is the same resolver every other broadcasts media
+    field already uses for that shape specifically (and, via
+    default_storage.url(), the exact mechanism ProfileSerializer's
+    avatar_file/cover_file rely on for private S3 objects — S3MediaStorage.url()
+    returns a real presigned GET automatically); everything else keeps using
+    absolutize_backend_media exactly as before."""
     text = str(value or "").strip()
-    if not text or text.startswith(("http://", "https://", "//")):
+    if not text.startswith("private/"):
         return absolutize_backend_media(text, request)
-    asset = MediaAsset.objects.filter(bucket_key=text).order_by("-created_at").first()
-    if asset is None:
-        # No matching MediaAsset (e.g. a pre-migration row) - fall back to
-        # the old behavior rather than crashing; still broken, but no worse
-        # than before.
+    try:
+        return build_media_url(request, text)
+    except Exception:
+        # Storage couldn't resolve this key (e.g. a stale/pre-migration
+        # value) - fall back rather than crashing; still broken, but no
+        # worse than before.
         return absolutize_backend_media(text, request)
-    token = sign_media_asset_token(asset)
-    path = f"/api/v1/assets/{asset.id}/download/?token={quote(token)}"
-    if request is not None:
-        try:
-            return request.build_absolute_uri(path)
-        except Exception:
-            pass
-    return absolutize_backend_media(path, request)
 
 
 def _attach_education_cover_image(payload: dict, cover_image_url: str, context: dict | None = None) -> dict:
@@ -1017,12 +1013,12 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
     def get_logo_url(self, obj: EducationInstitution) -> str:
         branding = obj.branding or {}
         value = branding.get("logo_url") or branding.get("logoUrl") or branding.get("image_url") or branding.get("imageUrl") or ""
-        return absolutize_backend_media(value, request=self.context.get("request"))
+        return _resolve_education_media_display_url(value, self.context.get("request"))
 
     def get_image_url(self, obj: EducationInstitution) -> str:
         branding = obj.branding or {}
         value = branding.get("image_url") or branding.get("imageUrl") or branding.get("logo_url") or branding.get("logoUrl") or ""
-        return absolutize_backend_media(value, request=self.context.get("request"))
+        return _resolve_education_media_display_url(value, self.context.get("request"))
 
     def get_banner_image_url(self, obj: EducationInstitution) -> str:
         branding = obj.branding or {}
@@ -1033,7 +1029,7 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
             or branding.get("coverImageUrl")
             or ""
         )
-        return absolutize_backend_media(value, request=self.context.get("request"))
+        return _resolve_education_media_display_url(value, self.context.get("request"))
 
     def get_logoUrl(self, obj: EducationInstitution) -> str:
         return self.get_logo_url(obj)
@@ -1059,7 +1055,7 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
             "coverImageUrl",
         ):
             if branding.get(key):
-                branding[key] = absolutize_backend_media(branding.get(key), request=request)
+                branding[key] = _resolve_education_media_display_url(branding.get(key), request)
         payload["branding"] = branding
         return _attach_education_detail_summary(
             payload,
