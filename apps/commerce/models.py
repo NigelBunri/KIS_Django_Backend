@@ -91,7 +91,7 @@ class Shop(BaseEntity):
     description = models.TextField(blank=True)
     employee_slots = models.PositiveIntegerField(default=1)
     branding = JSONField(default=dict, blank=True)
-    image_file = models.ImageField(upload_to='commerce/shops/', null=True, blank=True)
+    image_file = models.ImageField(upload_to='commerce/shops/', max_length=1024, null=True, blank=True)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE, db_index=True)
     is_verified = models.BooleanField(default=False)
     verification_status = models.CharField(max_length=20, default='UNVERIFIED')  # PENDING | VERIFIED | REJECTED
@@ -303,7 +303,7 @@ class ShopService(BaseEntity):
     published_at = models.DateTimeField(null=True, blank=True)
     paused_at = models.DateTimeField(null=True, blank=True)
     other_shops_discount = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
-    image_file = models.ImageField(upload_to='commerce/services/', null=True, blank=True)
+    image_file = models.ImageField(upload_to='commerce/services/', max_length=1024, null=True, blank=True)
     image_url = models.URLField(max_length=512, blank=True)
     rating_avg = models.FloatField(default=0.0)
     rating_count = models.IntegerField(default=0)
@@ -618,7 +618,7 @@ class ServiceBookingComplaint(BaseEntity):
 
 class ShopServiceImage(BaseEntity):
     service = models.ForeignKey(ShopService, on_delete=models.CASCADE, related_name='images')
-    image_file = models.ImageField(upload_to='commerce/service-images/', null=True, blank=True)
+    image_file = models.ImageField(upload_to='commerce/service-images/', max_length=1024, null=True, blank=True)
     order = models.IntegerField(default=0)
 
     class Meta:
@@ -666,7 +666,7 @@ class Product(BaseEntity):
     slug = models.SlugField(max_length=255, unique=True)
 
     # Media
-    main_image = models.ImageField(upload_to='commerce/products/main/', null=True, blank=True)
+    main_image = models.ImageField(upload_to='commerce/products/main/', max_length=1024, null=True, blank=True)
     description = models.TextField(blank=True)
 
     # Pricing
@@ -749,7 +749,7 @@ class Product(BaseEntity):
 
 class ProductImage(BaseEntity):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='gallery_images')
-    image_file = models.ImageField(upload_to='commerce/products/gallery/')
+    image_file = models.ImageField(upload_to='commerce/products/gallery/', max_length=1024)
     alt_text = models.CharField(max_length=255, blank=True)
     sort_order = models.PositiveIntegerField(default=0)
     is_active = models.BooleanField(default=True)
@@ -899,7 +899,7 @@ class MarketplaceComplaint(BaseEntity):
     order = models.ForeignKey(MarketplaceOrder, on_delete=models.CASCADE, related_name='complaints')
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='marketplace_complaints')
     text = models.TextField()
-    attachment = models.FileField(upload_to='commerce/marketplace/complaints/', null=True, blank=True)
+    attachment = models.FileField(upload_to='commerce/marketplace/complaints/', max_length=1024, null=True, blank=True)
     status = models.CharField(max_length=32, choices=MarketplaceComplaintStatus.choices, default=MarketplaceComplaintStatus.PENDING)
 
     class Meta:

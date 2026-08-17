@@ -955,6 +955,7 @@ class ProductSerializer(serializers.ModelSerializer):
             'image_url',
             'is_broadcasted',
             'broadcast_item_id',
+            'currency',
             'currency_display',
             'seller_trust',
             'review_summary',
@@ -1563,7 +1564,6 @@ class ShopServiceSerializer(serializers.ModelSerializer):
         required=False,
         allow_empty=True,
     )
-    currency = serializers.CharField(write_only=True, required=False, allow_blank=True)
     is_broadcasted = serializers.SerializerMethodField()
     broadcast_item_id = serializers.SerializerMethodField()
     packages = serializers.JSONField(required=False, default=list)
@@ -1614,7 +1614,6 @@ class ShopServiceSerializer(serializers.ModelSerializer):
             else data.copy() if isinstance(data, dict)
             else dict(data)
         )
-        mutable_data.pop('currency', None)
         if normalized_slug:
             mutable_data['slug'] = normalized_slug
         slug_candidate = str(mutable_data.get('slug') or mutable_data.get('name') or '').strip()
@@ -2608,7 +2607,7 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         )
-        read_only_fields = ('id', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'status', 'currency', 'created_at', 'updated_at')
 
     def get_buyer_info(self, obj):
         user = getattr(obj, 'buyer', None)

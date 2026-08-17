@@ -1022,7 +1022,19 @@ def _normalize_education_broadcast_status(
 def _to_optional_positive_int(value: object | None) -> int | None:
     if value in ("", None):
         return None
-    return max(int(value), 0)
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        raise ValidationError({"detail": f"Expected a whole number, got {value!r}."})
+
+
+def _to_bounded_int(value: object | None, default: int, minimum: int) -> int:
+    if value in ("", None):
+        value = default
+    try:
+        return max(int(value), minimum)
+    except (TypeError, ValueError):
+        raise ValidationError({"detail": f"Expected a whole number, got {value!r}."})
 
 
 def _normalize_staff_assignment_role(
@@ -10030,7 +10042,7 @@ class EducationInstitutionCourseListView(APIView):
             description=str(request.data.get("description") or "").strip(),
             cover_image_url=cover_url,
             status=_normalize_academic_status(request.data.get("status")),
-            duration_minutes=max(int(request.data.get("duration_minutes") or 0), 0),
+            duration_minutes=_to_bounded_int(request.data.get("duration_minutes"), 0, 0),
             seat_limit=_to_optional_positive_int(request.data.get("seat_limit")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
             settings=request.data.get("settings") if isinstance(request.data.get("settings"), dict) else {},
@@ -10080,7 +10092,7 @@ class EducationInstitutionCourseDetailView(APIView):
         if "status" in request.data:
             course.status = _normalize_academic_status(request.data.get("status"), course.status)
         if "duration_minutes" in request.data:
-            course.duration_minutes = max(int(request.data.get("duration_minutes") or 0), 0)
+            course.duration_minutes = _to_bounded_int(request.data.get("duration_minutes"), 0, 0)
         if "seat_limit" in request.data:
             course.seat_limit = _to_optional_positive_int(request.data.get("seat_limit"))
         if isinstance(request.data.get("metadata"), dict):
@@ -10128,7 +10140,7 @@ class EducationInstitutionCourseModuleListView(APIView):
             course=course,
             title=title,
             summary=str(request.data.get("summary") or "").strip(),
-            module_order=max(int(request.data.get("module_order") or 0), 0),
+            module_order=_to_bounded_int(request.data.get("module_order"), 0, 0),
             is_preview=_to_bool(request.data.get("is_preview")),
             status=_normalize_academic_status(request.data.get("status")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
@@ -10165,7 +10177,7 @@ class EducationInstitutionCourseModuleDetailView(APIView):
         if isinstance(summary, str):
             module.summary = summary.strip()
         if "module_order" in request.data:
-            module.module_order = max(int(request.data.get("module_order") or 0), 0)
+            module.module_order = _to_bounded_int(request.data.get("module_order"), 0, 0)
         if "is_preview" in request.data:
             module.is_preview = _to_bool(request.data.get("is_preview"))
         if "status" in request.data:
@@ -10217,10 +10229,10 @@ class EducationInstitutionCourseModuleItemListView(APIView):
             course=course,
             module=module,
             item_type=binding["item_type"],
-            item_order=max(int(request.data.get("item_order") or 0), 0),
+            item_order=_to_bounded_int(request.data.get("item_order"), 0, 0),
             title_override=str(request.data.get("title_override") or "").strip(),
             summary_override=str(request.data.get("summary_override") or "").strip(),
-            estimated_minutes=max(int(request.data.get("estimated_minutes") or 0), 0),
+            estimated_minutes=_to_bounded_int(request.data.get("estimated_minutes"), 0, 0),
             lesson=binding["lesson"],
             material=binding["material"],
             class_session=binding["class_session"],
@@ -10268,7 +10280,7 @@ class EducationInstitutionCourseModuleItemDetailView(APIView):
         item.event = binding["event"]
         item.broadcast = binding["broadcast"]
         if "item_order" in request.data:
-            item.item_order = max(int(request.data.get("item_order") or 0), 0)
+            item.item_order = _to_bounded_int(request.data.get("item_order"), 0, 0)
         title_override = request.data.get("title_override")
         if isinstance(title_override, str):
             item.title_override = title_override.strip()
@@ -10276,7 +10288,7 @@ class EducationInstitutionCourseModuleItemDetailView(APIView):
         if isinstance(summary_override, str):
             item.summary_override = summary_override.strip()
         if "estimated_minutes" in request.data:
-            item.estimated_minutes = max(int(request.data.get("estimated_minutes") or 0), 0)
+            item.estimated_minutes = _to_bounded_int(request.data.get("estimated_minutes"), 0, 0)
         if isinstance(request.data.get("metadata"), dict):
             item.metadata = request.data.get("metadata")
         item.save()
@@ -10328,8 +10340,8 @@ class EducationInstitutionLessonListView(APIView):
             summary=str(request.data.get("summary") or "").strip(),
             content=str(request.data.get("content") or "").strip(),
             cover_image_url=cover_url,
-            lesson_order=max(int(request.data.get("lesson_order") or 0), 0),
-            duration_minutes=max(int(request.data.get("duration_minutes") or 0), 0),
+            lesson_order=_to_bounded_int(request.data.get("lesson_order"), 0, 0),
+            duration_minutes=_to_bounded_int(request.data.get("duration_minutes"), 0, 0),
             is_preview=_to_bool(request.data.get("is_preview")),
             status=_normalize_academic_status(request.data.get("status")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
@@ -10376,9 +10388,9 @@ class EducationInstitutionLessonDetailView(APIView):
             if cover_intent is not None:
                 education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionLesson", target_id=str(lesson.id))
         if "lesson_order" in request.data:
-            lesson.lesson_order = max(int(request.data.get("lesson_order") or 0), 0)
+            lesson.lesson_order = _to_bounded_int(request.data.get("lesson_order"), 0, 0)
         if "duration_minutes" in request.data:
-            lesson.duration_minutes = max(int(request.data.get("duration_minutes") or 0), 0)
+            lesson.duration_minutes = _to_bounded_int(request.data.get("duration_minutes"), 0, 0)
         if "is_preview" in request.data:
             lesson.is_preview = _to_bool(request.data.get("is_preview"))
         if "status" in request.data:
@@ -11404,7 +11416,7 @@ class EducationInstitutionBroadcastBookingListView(APIView):
         if existing:
             return Response({"booking": EducationInstitutionBookingSerializer(existing).data}, status=status.HTTP_200_OK)
 
-        seat_count = max(int(request.data.get("seat_count") or 1), 1)
+        seat_count = _to_bounded_int(request.data.get("seat_count"), 1, 1)
         amount_cents = 0
         if broadcast.price_amount is not None:
             amount_cents = int(round(float(broadcast.price_amount) * 100)) * seat_count
@@ -12356,9 +12368,9 @@ class EducationInstitutionAssessmentListView(APIView):
             status=_normalize_academic_status(request.data.get("status")),
             starts_at=starts_at,
             ends_at=ends_at,
-            duration_minutes=max(int(request.data.get("duration_minutes") or 0), 0),
-            max_attempts=max(int(request.data.get("max_attempts") or 1), 1),
-            passing_score_percent=max(int(request.data.get("passing_score_percent") or 0), 0),
+            duration_minutes=_to_bounded_int(request.data.get("duration_minutes"), 0, 0),
+            max_attempts=_to_bounded_int(request.data.get("max_attempts"), 1, 1),
+            passing_score_percent=_to_bounded_int(request.data.get("passing_score_percent"), 0, 0),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
             settings=request.data.get("settings") if isinstance(request.data.get("settings"), dict) else {},
         )
@@ -12422,11 +12434,11 @@ class EducationInstitutionAssessmentDetailView(APIView):
         if assessment.starts_at and assessment.ends_at and assessment.ends_at <= assessment.starts_at:
             raise ValidationError({"detail": "ends_at must be after starts_at."})
         if "duration_minutes" in request.data:
-            assessment.duration_minutes = max(int(request.data.get("duration_minutes") or 0), 0)
+            assessment.duration_minutes = _to_bounded_int(request.data.get("duration_minutes"), 0, 0)
         if "max_attempts" in request.data:
-            assessment.max_attempts = max(int(request.data.get("max_attempts") or 1), 1)
+            assessment.max_attempts = _to_bounded_int(request.data.get("max_attempts"), 1, 1)
         if "passing_score_percent" in request.data:
-            assessment.passing_score_percent = max(int(request.data.get("passing_score_percent") or 0), 0)
+            assessment.passing_score_percent = _to_bounded_int(request.data.get("passing_score_percent"), 0, 0)
         if isinstance(request.data.get("metadata"), dict):
             assessment.metadata = request.data.get("metadata")
         if isinstance(request.data.get("settings"), dict):
@@ -12467,7 +12479,7 @@ class EducationInstitutionAssessmentQuestionListView(APIView):
             assessment=assessment,
             prompt=prompt,
             question_type=_normalize_assessment_question_type(request.data.get("question_type")),
-            question_order=max(int(request.data.get("question_order") or 0), 0),
+            question_order=_to_bounded_int(request.data.get("question_order"), 0, 0),
             points=_normalize_education_decimal(request.data.get("points") or 1, "points", allow_none=False),
             is_required=_to_bool(request.data.get("is_required"), default=True),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
@@ -12499,7 +12511,7 @@ class EducationInstitutionAssessmentQuestionDetailView(APIView):
         if "question_type" in request.data:
             question.question_type = _normalize_assessment_question_type(request.data.get("question_type"), question.question_type)
         if "question_order" in request.data:
-            question.question_order = max(int(request.data.get("question_order") or 0), 0)
+            question.question_order = _to_bounded_int(request.data.get("question_order"), 0, 0)
         if "points" in request.data:
             question.points = _normalize_education_decimal(
                 request.data.get("points"),
@@ -12547,7 +12559,7 @@ class EducationInstitutionAssessmentOptionListView(APIView):
         option = EducationInstitutionAssessmentOption.objects.create(
             question=question,
             option_text=option_text,
-            option_order=max(int(request.data.get("option_order") or 0), 0),
+            option_order=_to_bounded_int(request.data.get("option_order"), 0, 0),
             is_correct=_to_bool(request.data.get("is_correct")),
             explanation=str(request.data.get("explanation") or "").strip(),
         )
@@ -12577,7 +12589,7 @@ class EducationInstitutionAssessmentOptionDetailView(APIView):
         if isinstance(option_text, str) and option_text.strip():
             option.option_text = option_text.strip()
         if "option_order" in request.data:
-            option.option_order = max(int(request.data.get("option_order") or 0), 0)
+            option.option_order = _to_bounded_int(request.data.get("option_order"), 0, 0)
         if "is_correct" in request.data:
             option.is_correct = _to_bool(request.data.get("is_correct"))
         if "explanation" in request.data:
@@ -18929,7 +18941,10 @@ class ChannelLiveStreamTipView(APIView):
 
     def post(self, request, stream_id):
         live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
-        amount_cents = int(request.data.get("amount_cents") or 0)
+        try:
+            amount_cents = int(request.data.get("amount_cents") or 0)
+        except (TypeError, ValueError):
+            raise ValidationError({"amount_cents": "Must be a whole number of cents."})
         if amount_cents < 100:
             raise ValidationError({"amount_cents": "Minimum tip is 1.00."})
         tip = ChannelLiveStreamTip.objects.create(

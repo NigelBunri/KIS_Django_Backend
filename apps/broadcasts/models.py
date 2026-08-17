@@ -1402,7 +1402,7 @@ class EducationInstitutionProgram(models.Model):
     code = models.CharField(max_length=64, blank=True, default="")
     summary = models.TextField(blank=True, default="")
     description = models.TextField(blank=True, default="")
-    cover_image_url = models.URLField(blank=True, default="")
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
     status = models.CharField(
         max_length=16,
         choices=EducationAcademicRecordStatus.choices,
@@ -1526,7 +1526,7 @@ class EducationInstitutionCourse(models.Model):
     code = models.CharField(max_length=64, blank=True, default="")
     summary = models.TextField(blank=True, default="")
     description = models.TextField(blank=True, default="")
-    cover_image_url = models.URLField(blank=True, default="")
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
     status = models.CharField(
         max_length=16,
         choices=EducationAcademicRecordStatus.choices,
@@ -1604,7 +1604,7 @@ class EducationInstitutionLesson(models.Model):
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
     content = models.TextField(blank=True, default="")
-    cover_image_url = models.URLField(blank=True, default="")
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
     lesson_order = models.PositiveIntegerField(default=0)
     duration_minutes = models.PositiveIntegerField(default=0)
     is_preview = models.BooleanField(default=False)
@@ -1737,7 +1737,7 @@ class EducationInstitutionClassSession(models.Model):
     )
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
-    cover_image_url = models.URLField(blank=True, default="")
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
     starts_at = models.DateTimeField()
     ends_at = models.DateTimeField()
     timezone_name = models.CharField(max_length=64, blank=True, default="UTC")
@@ -1840,13 +1840,13 @@ class EducationInstitutionMaterial(models.Model):
     )
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
-    cover_image_url = models.URLField(blank=True, default="")
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
     kind = models.CharField(
         max_length=16,
         choices=EducationMaterialKind.choices,
         default=EducationMaterialKind.DOCUMENT,
     )
-    resource_url = models.URLField(blank=True, default="")
+    resource_url = models.URLField(max_length=2048, blank=True, default="")
     resource_name = models.CharField(max_length=255, blank=True, default="")
     resource_mime_type = models.CharField(max_length=128, blank=True, default="")
     storage_path = models.CharField(max_length=512, blank=True, default="")
@@ -1907,7 +1907,7 @@ class EducationInstitutionAssessment(models.Model):
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
     instructions = models.TextField(blank=True, default="")
-    cover_image_url = models.URLField(blank=True, default="")
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
     assessment_type = models.CharField(
         max_length=16,
         choices=EducationAssessmentType.choices,
@@ -2137,7 +2137,7 @@ class EducationInstitutionEvent(models.Model):
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
     description = models.TextField(blank=True, default="")
-    cover_image_url = models.URLField(blank=True, default="")
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
     starts_at = models.DateTimeField()
     ends_at = models.DateTimeField()
     timezone_name = models.CharField(max_length=64, blank=True, default="UTC")
@@ -2235,7 +2235,7 @@ class EducationInstitutionBroadcast(models.Model):
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True, default="")
     description = models.TextField(blank=True, default="")
-    cover_image_url = models.URLField(blank=True, default="")
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
     starts_at = models.DateTimeField(null=True, blank=True)
     ends_at = models.DateTimeField(null=True, blank=True)
     timezone_name = models.CharField(max_length=64, blank=True, default="UTC")

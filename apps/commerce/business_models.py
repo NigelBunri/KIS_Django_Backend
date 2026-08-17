@@ -15,6 +15,15 @@ from apps.health_ops.models import TimeStampedUUIDModel
 from apps.accounts.models import User
 
 
+# Must match CURRENCIES in KIS/src/screens/business/CreateCampaignScreen.tsx —
+# these models track real-world fiat amounts (unlike the KIS-coin-only
+# marketplace), so a fixed but broader currency list applies here.
+SUPPORTED_FIAT_CURRENCIES = (
+    "USD", "GBP", "EUR", "NGN", "GHS", "KES", "ZAR", "CAD", "AUD",
+)
+CURRENCY_CHOICES = [(code, code) for code in SUPPORTED_FIAT_CURRENCIES]
+
+
 # ---------------------------------------------------------------------------
 # Crowdfunding
 # ---------------------------------------------------------------------------
@@ -41,7 +50,7 @@ class CrowdfundCampaign(TimeStampedUUIDModel):
     description = models.TextField()
     target_amount = models.DecimalField(max_digits=15, decimal_places=2)
     raised_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
-    currency = models.CharField(max_length=3, default="USD")
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default="USD")
     deadline = models.DateField(null=True, blank=True)
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.DRAFT
@@ -101,7 +110,7 @@ class SavingsGroup(TimeStampedUUIDModel):
         max_length=20, choices=Type.choices, default=Type.SUSU
     )
     contribution_amount = models.DecimalField(max_digits=12, decimal_places=2)
-    currency = models.CharField(max_length=3, default="USD")
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default="USD")
     cycle_days = models.IntegerField(default=30)
     max_members = models.IntegerField(default=12)
     current_round = models.IntegerField(default=1)
@@ -162,7 +171,7 @@ class JobListing(TimeStampedUUIDModel):
     )
     salary_min = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     salary_max = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    currency = models.CharField(max_length=3, default="USD")
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default="USD")
     required_skills = JSONField(default=list)
     deadline = models.DateField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
@@ -264,7 +273,7 @@ class CoWorkingSpace(TimeStampedUUIDModel):
     price_per_day = models.DecimalField(
         max_digits=8, decimal_places=2, null=True, blank=True
     )
-    currency = models.CharField(max_length=3, default="USD")
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default="USD")
     contact_email = models.EmailField(blank=True)
     website = models.URLField(blank=True)
     cover_url = models.URLField(blank=True)

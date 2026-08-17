@@ -402,7 +402,13 @@ class PregnancyTrackerViewSet(ModelViewSet):
                 {"detail": "current_week is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        tracker.current_week = int(week)
+        try:
+            tracker.current_week = int(week)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "current_week must be a whole number."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         tracker.save(update_fields=["current_week", "updated_at"])
         return Response(PregnancyTrackerSerializer(tracker).data)
 

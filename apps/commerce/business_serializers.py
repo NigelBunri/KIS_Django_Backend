@@ -70,7 +70,14 @@ class CrowdfundCampaignSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "creator", "raised_amount", "created_at", "updated_at"]
+        read_only_fields = [
+            "id",
+            "creator",
+            "raised_amount",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
 
     def get_progress_percent(self, obj):
         if obj.target_amount and obj.target_amount > 0:
