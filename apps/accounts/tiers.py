@@ -115,6 +115,37 @@ def get_feature_limit(user, key: str, default=None):
     return value
 
 
+def get_platform_commission_pct(user) -> float:
+    """
+    The platform marketplace commission rate for `user` (the seller/
+    provider — an Education institution owner, Market shop owner, Health
+    institution owner, or Broadcast channel owner), scaled by their
+    account tier via settings.PLATFORM_COMMISSION_BY_TIER. This is a
+    separate, per-transaction marketplace fee — entirely independent of
+    AccountTier/Subscription pricing. Falls back to the flat
+    settings.PLATFORM_COMMISSION_PCT when the user's tier can't be
+    resolved or has no configured rate. Used identically across Education,
+    Market, Health, and Broadcast settlement — one shared rate table, not
+    a per-domain duplicate.
+    """
+    from django.conf import settings
+
+    flat_default = float(getattr(settings, "PLATFORM_COMMISSION_PCT", 10))
+    by_tier = getattr(settings, "PLATFORM_COMMISSION_BY_TIER", None) or {}
+    if not user:
+        return flat_default
+    tier = get_user_tier(user)
+    if not tier:
+        return flat_default
+    rate = by_tier.get(_normalize_tier_name(tier.name))
+    if rate is None:
+        return flat_default
+    try:
+        return float(rate)
+    except (TypeError, ValueError):
+        return flat_default
+
+
 def normalize_limit_value(value, default=None):
     """
     Normalize feature limits to:

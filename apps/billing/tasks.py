@@ -1,6 +1,6 @@
 # billing/tasks.py
 from celery import shared_task
-from .services import sweep_expired_subscriptions
+from .services import sweep_expired_subscriptions, sweep_stale_pending_wallet_transactions
 
 
 @shared_task
@@ -11,3 +11,12 @@ def expire_subscriptions():
     Beat; apps/billing/management/commands/reconcile_subscriptions.py wraps
     the same function for manual/cron use where Beat isn't configured."""
     return sweep_expired_subscriptions()
+
+
+@shared_task
+def expire_stale_pending_wallet_transactions():
+    """Periodic sweep for WalletTransaction rows stuck in "pending" past
+    WALLET_TRANSACTION_STALE_PENDING_TIMEOUT (an abandoned/cancelled
+    checkout) — see apps.billing.services.sweep_stale_pending_wallet_transactions.
+    Schedule via Celery Beat, same as expire_subscriptions."""
+    return sweep_stale_pending_wallet_transactions()

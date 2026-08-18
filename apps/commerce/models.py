@@ -75,6 +75,15 @@ class BaseEntity(models.Model):
         abstract = True
 
 
+class ShopPayoutAccountStatus(models.TextChoices):
+    """Mirrors EducationInstitutionPayoutAccountStatus (apps/broadcasts/
+    models.py) — kept as a separate per-app definition (not a shared
+    cross-app import) to avoid any import-order risk between apps."""
+    NOT_CONNECTED = "not_connected", "Not connected"
+    PENDING = "pending", "Pending"
+    ACTIVE = "active", "Active"
+
+
 class Shop(BaseEntity):
     STATUS_DRAFT = 'draft'
     STATUS_ACTIVE = 'active'
@@ -103,6 +112,20 @@ class Shop(BaseEntity):
     analytics = JSONField(default=dict, blank=True)
     trust_badges = JSONField(default=list, blank=True)  # e.g., ['kyc','authenticity','secure-pay']
     membership_public = models.BooleanField(default=False)
+    # Flutterwave subaccount for direct-to-shop payout splitting — buyer
+    # payment settles straight to the shop's own bank account at the
+    # provider level instead of sitting in KIS's balance. Only the
+    # provider-issued subaccount id and display-safe fields are stored;
+    # the raw bank account number is never persisted (see
+    # ShopPayoutAccountConnectView, apps/commerce/views.py).
+    flutterwave_subaccount_id = models.CharField(max_length=128, blank=True, default="")
+    payout_account_status = models.CharField(
+        max_length=16,
+        choices=ShopPayoutAccountStatus.choices,
+        default=ShopPayoutAccountStatus.NOT_CONNECTED,
+    )
+    payout_account_name = models.CharField(max_length=255, blank=True, default="")
+    payout_bank_last4 = models.CharField(max_length=8, blank=True, default="")
 
     class Meta:
         indexes = [models.Index(fields=['slug'])]

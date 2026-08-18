@@ -112,6 +112,7 @@ TIER_PRESETS: list[dict[str, Any]] = [
             "support": "priority",
             "admin_tools": True,
             "analytics_basic": True,
+            "team_seats": 3,
             "shops_limit": 2,
             "products_per_shop_limit": 60,
             "market_profiles": 1,

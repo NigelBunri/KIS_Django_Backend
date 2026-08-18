@@ -127,6 +127,121 @@ def _provider_links_enabled(provider: str) -> bool:
     return False
 
 
+def _payout_owner_for_intent(intent: DirectPaymentIntent):
+    """Resolves the seller/provider whose connected payout account (if
+    ACTIVE) this payment should split to, and who owns the commission-rate
+    tier — one model instance per DirectPaymentIntent target type, each
+    exposing the same flutterwave_subaccount_id/payout_account_status/
+    owner shape. Returns None if the target has no connected, active
+    payout account (or isn't a target type that supports one)."""
+    if intent.target_type == DirectPaymentIntent.TARGET_EDUCATION_BOOKING:
+        from apps.broadcasts.models import EducationInstitutionBooking, EducationInstitutionPayoutAccountStatus
+
+        booking = (
+            EducationInstitutionBooking.objects.select_related("institution")
+            .filter(id=intent.target_id)
+            .first()
+        )
+        if not booking or not booking.course_id:
+            return None
+        entity = booking.institution
+        active_status = EducationInstitutionPayoutAccountStatus.ACTIVE
+    elif intent.target_type == DirectPaymentIntent.TARGET_MARKETPLACE_ORDER:
+        from apps.commerce.models import MarketplaceOrder, ShopPayoutAccountStatus
+
+        order = MarketplaceOrder.objects.select_related("shop").filter(id=intent.target_id).first()
+        if not order:
+            return None
+        entity = order.shop
+        active_status = ShopPayoutAccountStatus.ACTIVE
+    elif intent.target_type == DirectPaymentIntent.TARGET_SERVICE_BOOKING_PAYMENT:
+        from apps.commerce.models import ServiceBookingPayment, ShopPayoutAccountStatus
+
+        payment = (
+            ServiceBookingPayment.objects.select_related("booking__shop")
+            .filter(id=intent.target_id)
+            .first()
+        )
+        if not payment:
+            return None
+        entity = payment.booking.shop
+        active_status = ShopPayoutAccountStatus.ACTIVE
+    elif intent.target_type == DirectPaymentIntent.TARGET_HEALTH_BILLING_SESSION:
+        from apps.health_ops.models import HealthInstitutionPayoutAccountStatus, PaymentBillingSession
+
+        session = (
+            PaymentBillingSession.objects.select_related("institution")
+            .filter(id=intent.target_id)
+            .first()
+        )
+        if not session:
+            return None
+        entity = session.institution
+        active_status = HealthInstitutionPayoutAccountStatus.ACTIVE
+    elif intent.target_type == DirectPaymentIntent.TARGET_CHANNEL_MEMBERSHIP:
+        from apps.broadcasts.models import BroadcastChannel, BroadcastChannelPayoutAccountStatus, ChannelMembership
+
+        membership = (
+            ChannelMembership.objects.select_related("tier__channel")
+            .filter(id=intent.target_id)
+            .first()
+        )
+        if not membership or membership.tier.channel.owner_type != BroadcastChannel.OwnerType.USER:
+            return None
+        entity = membership.tier.channel
+        active_status = BroadcastChannelPayoutAccountStatus.ACTIVE
+    else:
+        return None
+
+    if entity.payout_account_status != active_status or not entity.flutterwave_subaccount_id:
+        return None
+    return entity
+
+
+def _payout_entity_owner(entity) -> Any:
+    """BroadcastChannel exposes its owner as `owner_user`, not `owner`
+    (it's polymorphically owned, unlike Shop/HealthInstitution/
+    EducationInstitution) — normalize here so callers can treat every
+    payout entity uniformly."""
+    return getattr(entity, "owner", None) or getattr(entity, "owner_user", None)
+
+
+def _split_subaccounts_for_intent(intent: DirectPaymentIntent) -> list[dict] | None:
+    """Flutterwave native split: when this payment's seller/provider has
+    an ACTIVE connected subaccount, settlement is split automatically at
+    the provider level — their bank account receives its share directly,
+    no internal transfer/payout code needed on our side. Covers Education
+    course bookings, Market orders/service bookings, and Health billing
+    sessions (Broadcast tips/memberships are wired separately once they
+    route through DirectPaymentIntent — see apps/broadcasts/views.py).
+    `transaction_charge` is the percentage kept by the platform's own
+    (main) account; the remainder settles to the subaccount — confirmed
+    against Flutterwave's v3 Split Payments docs (developer.flutterwave.com/
+    v3.0/docs/split-payments), which give `transaction_charge_type:
+    "percentage"` as "you (the platform) want to get a percentage of the
+    settlement amount". That same doc's examples give `transaction_charge`
+    as a decimal FRACTION of the percentage (0.09 for a 9% commission, 0.2
+    for 20%), not the whole-number percentage — get_platform_commission_pct
+    returns whole numbers (10, 7, 5 — see settings.PLATFORM_COMMISSION_BY_TIER)
+    since that's the convention every other caller of it uses (e.g.
+    apps.billing.services.release_locked_booking_funds_split divides by 100
+    itself), so it's converted to a fraction here, at this API boundary,
+    rather than changing what the shared helper returns everywhere else."""
+    entity = _payout_owner_for_intent(intent)
+    if entity is None:
+        return None
+    from apps.accounts.tiers import get_platform_commission_pct
+
+    commission_pct = get_platform_commission_pct(_payout_entity_owner(entity))
+    return [
+        {
+            "id": entity.flutterwave_subaccount_id,
+            "transaction_charge_type": "percentage",
+            "transaction_charge": round(commission_pct / 100, 4),
+        }
+    ]
+
+
 def _create_flutterwave_payment_link(intent: DirectPaymentIntent) -> tuple[str, dict]:
     user = intent.user
     amount = (Decimal(int(intent.amount_cents or 0)) / Decimal("100")).quantize(Decimal("0.01"))
@@ -150,6 +265,9 @@ def _create_flutterwave_payment_link(intent: DirectPaymentIntent) -> tuple[str, 
             "target_id": str(intent.target_id),
         },
     }
+    subaccounts = _split_subaccounts_for_intent(intent)
+    if subaccounts:
+        payload["subaccounts"] = subaccounts
     response = requests.post(f"{FLW_BASE_URL}/payments", json=payload, headers=_flutterwave_headers(), timeout=30)
     data = response.json() if response.content else {}
     if response.status_code >= 300:
@@ -285,6 +403,11 @@ def _target_owner_and_amount(target_type: str, target_id: uuid.UUID | str) -> tu
         session = PaymentBillingSession.objects.select_related("user").get(id=target_uuid)
         amount = int((Decimal(int(session.payable_amount_micro or 0)) / Decimal(KISC_MICRO_PER_USD_CENT)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         return session.user, amount, "Health billing payment", session
+    if target_type == DirectPaymentIntent.TARGET_CHANNEL_MEMBERSHIP:
+        from apps.broadcasts.models import ChannelMembership
+
+        membership = ChannelMembership.objects.select_related("user", "tier").get(id=target_uuid)
+        return membership.user, int(membership.tier.price_cents or 0), "Channel membership payment", membership
     raise ValueError("Unsupported payment target type")
 
 
@@ -401,6 +524,13 @@ def _attach_intent_to_target(intent: DirectPaymentIntent, target: Any | None = N
         target.status = PaymentBillingStatus.PAYMENT_PENDING
         target.metadata = {**(target.metadata or {}), **metadata, "currency": "USD"}
         target.save(update_fields=["payment_provider", "payment_reference", "status", "metadata", "updated_at"])
+    elif intent.target_type == DirectPaymentIntent.TARGET_CHANNEL_MEMBERSHIP:
+        # ChannelMembership has no updated_at field, unlike the other
+        # targets above — only update the fields it actually has.
+        target.payment_reference = intent.tx_ref
+        target.status = "pending_payment"
+        target.metadata = {**(target.metadata or {}), **metadata}
+        target.save(update_fields=["payment_reference", "status", "metadata"])
 
 
 def reconcile_direct_payment_callback(*, payload: dict, signature: str = "") -> tuple[bool, str, DirectPaymentIntent | None]:
@@ -552,7 +682,7 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
         if "status" in update_fields:
             _schedule_marketplace_order_auto_satisfaction(target.id)
     elif intent.target_type == DirectPaymentIntent.TARGET_SERVICE_BOOKING_PAYMENT:
-        from apps.commerce.models import ServiceBooking
+        from apps.commerce.models import ServiceBooking, ServiceBookingReceipt
 
         target.payment_status = target.STATUS_PAID
         target.payment_method = intent.provider
@@ -565,10 +695,11 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
         booking.metadata = {**(booking.metadata or {}), **paid_metadata}
         booking.payment_tx_ref = intent.tx_ref
         booking_update_fields = ["metadata", "payment_tx_ref", "updated_at"]
+        is_remaining_payment = str((intent.metadata or {}).get("source") or "").strip().lower() == "service_booking_remaining"
         if booking.status in {ServiceBooking.STATUS_PENDING, "payment_pending", "provider_payment_pending"}:
             booking.status = ServiceBooking.STATUS_CONFIRMED
             booking_update_fields.append("status")
-        if str((intent.metadata or {}).get("source") or "").strip().lower() == "service_booking_remaining":
+        if is_remaining_payment:
             booking.deposit_cents = int(booking.price_cents or 0)
             booking.balance_cents = 0
             booking.metadata = {
@@ -578,15 +709,46 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
             }
             booking_update_fields.extend(["deposit_cents", "balance_cents"])
         booking.save(update_fields=list(dict.fromkeys(booking_update_fields)))
+        # The legacy wallet-lock path already records a ServiceBookingReceipt
+        # at booking-creation time (apps.commerce.views._record_booking_receipt);
+        # the default USD/direct-payment path never did, so paid bookings on
+        # that path had no receipt at all. Record one here, at the moment
+        # payment is actually confirmed.
+        if target.amount_cents and not ServiceBookingReceipt.objects.filter(
+            booking=booking, transaction_reference=intent.tx_ref
+        ).exists():
+            ServiceBookingReceipt.objects.create(
+                booking=booking,
+                amount_cents=int(target.amount_cents or 0),
+                currency="USD",
+                transaction_reference=intent.tx_ref,
+                phase=ServiceBookingReceipt.PHASE_REMAINING if is_remaining_payment else ServiceBookingReceipt.PHASE_DEPOSIT,
+            )
     elif intent.target_type == DirectPaymentIntent.TARGET_EDUCATION_BOOKING:
         from apps.broadcasts.models import EducationBookingStatus
         from apps.broadcasts.views import _grant_education_enrollment_for_confirmed_booking
+        from .documents import ensure_direct_payment_intent_receipt_documents
 
         target.status = EducationBookingStatus.CONFIRMED
         target.payment_method = intent.provider
         target.currency = "USD"
         target.confirmed_at = target.confirmed_at or timezone.now()
-        target.metadata = {**(target.metadata or {}), **paid_metadata}
+        try:
+            receipt_html_rel, receipt_pdf_rel = ensure_direct_payment_intent_receipt_documents(
+                intent, kind_label="Course enrollment"
+            )
+        except Exception:
+            # A receipt-storage failure must never block the actual
+            # payment confirmation/enrollment grant below — log it and
+            # leave the receipt paths unset; a future read can retry.
+            logger.exception("Receipt generation failed for education booking intent_id=%s", intent.id)
+            receipt_html_rel, receipt_pdf_rel = None, None
+        target.metadata = {
+            **(target.metadata or {}),
+            **paid_metadata,
+            "receipt_html_path": receipt_html_rel,
+            "receipt_pdf_path": receipt_pdf_rel,
+        }
         target.save(update_fields=["status", "payment_method", "currency", "confirmed_at", "metadata", "updated_at"])
         # Course content (has_learning_access) only unlocks once the
         # enrollment record itself is ENROLLED, not merely because the
@@ -594,7 +756,20 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
         _grant_education_enrollment_for_confirmed_booking(target)
     elif intent.target_type == DirectPaymentIntent.TARGET_HEALTH_BILLING_SESSION:
         from apps.health_ops.models import PaymentBillingStatus
+        from .documents import ensure_direct_payment_intent_receipt_documents
 
+        try:
+            receipt_html_rel, receipt_pdf_rel = ensure_direct_payment_intent_receipt_documents(
+                intent, kind_label="Health billing session"
+            )
+        except Exception:
+            logger.exception("Receipt generation failed for health billing session intent_id=%s", intent.id)
+            receipt_html_rel, receipt_pdf_rel = None, None
+        paid_metadata = {
+            **paid_metadata,
+            "receipt_html_path": receipt_html_rel,
+            "receipt_pdf_path": receipt_pdf_rel,
+        }
         target.status = PaymentBillingStatus.PAID
         target.payment_provider = intent.provider
         target.payment_reference = intent.tx_ref

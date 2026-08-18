@@ -177,6 +177,15 @@ class ContentBlockType(models.TextChoices):
     INTERACTIVE = "interactive", "Interactive"
 
 
+class HealthInstitutionPayoutAccountStatus(models.TextChoices):
+    """Mirrors EducationInstitutionPayoutAccountStatus (apps/broadcasts/
+    models.py) — kept as a separate per-app definition (not a shared
+    cross-app import) to avoid any import-order risk between apps."""
+    NOT_CONNECTED = "not_connected", "Not connected"
+    PENDING = "pending", "Pending"
+    ACTIVE = "active", "Active"
+
+
 class HealthInstitution(TimeStampedUUIDModel):
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name="health_ops_owned_institutions")
     name = models.CharField(max_length=255)
@@ -185,6 +194,20 @@ class HealthInstitution(TimeStampedUUIDModel):
     timezone = models.CharField(max_length=64, default="UTC")
     settings = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
+    # Flutterwave subaccount for direct-to-institution payout splitting —
+    # patient payment settles straight to the institution's own bank
+    # account at the provider level instead of sitting in KIS's balance.
+    # Only the provider-issued subaccount id and display-safe fields are
+    # stored; the raw bank account number is never persisted (see
+    # HealthInstitutionPayoutAccountConnectView, apps/health_ops/views.py).
+    flutterwave_subaccount_id = models.CharField(max_length=128, blank=True, default="")
+    payout_account_status = models.CharField(
+        max_length=16,
+        choices=HealthInstitutionPayoutAccountStatus.choices,
+        default=HealthInstitutionPayoutAccountStatus.NOT_CONNECTED,
+    )
+    payout_account_name = models.CharField(max_length=255, blank=True, default="")
+    payout_bank_last4 = models.CharField(max_length=8, blank=True, default="")
 
     class Meta:
         db_table = "health_ops_institution"

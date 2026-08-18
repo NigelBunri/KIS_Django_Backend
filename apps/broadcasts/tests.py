@@ -13,7 +13,8 @@ from django.core.management import call_command
 from django.db import IntegrityError, connection, transaction
 from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
-from apps.accounts.models import Profile
+from apps.accounts.models import AccountTier, Profile, Subscription
+from apps.accounts.tiers import ensure_default_account_tiers
 from apps.billing.direct_payments import reconcile_direct_payment_callback
 from apps.billing.models import DirectPaymentIntent
 from apps.media.models import MediaSafetyScan, MediaUploadIntent
@@ -426,6 +427,16 @@ class BroadcastChannelApiTests(APITestCase):
             password='secret',
             country='NG',
         )
+        # Channel creation is tier-gated (Free tier's channels_create limit
+        # is 0 — see apps/accounts/tier_presets.py). Give the viewer a
+        # Business subscription (channels_create=5) so tests exercising
+        # channel creation reflect a real paying user with enough headroom
+        # to create more than one channel, rather than the untiered
+        # default or a limit of exactly 1.
+        ensure_default_account_tiers()
+        business_tier = AccountTier.objects.filter(name__iexact="Business").first()
+        if business_tier:
+            Subscription.objects.create(user=self.viewer, tier=business_tier, status="active")
         self.channel = BroadcastChannel.objects.create(
             owner_type=BroadcastChannel.OwnerType.USER,
             owner_id=self.owner.id,
@@ -605,6 +616,47 @@ class BroadcastChannelApiTests(APITestCase):
             format='json',
         )
         self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_free_tier_user_cannot_create_broadcast_channel(self):
+        # Free tier's channels_create limit is 0 (apps/accounts/tier_presets.py)
+        # — this must be enforced server-side, not just hidden in the UI.
+        free_user = get_user_model().objects.create_user(
+            phone='5557200099', username='api_channel_free_user', password='secret', country='NG',
+        )
+        self.client.force_authenticate(user=free_user)
+        response = self.client.post(
+            '/api/v1/broadcasts/channels/',
+            {'handle': 'free-tier-channel', 'display_name': 'Free Tier Channel'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertFalse(BroadcastChannel.objects.filter(handle='free-tier-channel').exists())
+
+    def test_pro_tier_user_blocked_after_reaching_channel_limit(self):
+        # Pro tier's channels_create limit is 1 (apps/accounts/tier_presets.py).
+        ensure_default_account_tiers()
+        pro_tier = AccountTier.objects.filter(name__iexact="Pro").first()
+        pro_user = get_user_model().objects.create_user(
+            phone='5557200098', username='api_channel_pro_user', password='secret', country='NG',
+        )
+        if pro_tier:
+            Subscription.objects.create(user=pro_user, tier=pro_tier, status="active")
+        self.client.force_authenticate(user=pro_user)
+
+        first = self.client.post(
+            '/api/v1/broadcasts/channels/',
+            {'handle': 'pro-first-channel', 'display_name': 'First Channel'},
+            format='json',
+        )
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+
+        second = self.client.post(
+            '/api/v1/broadcasts/channels/',
+            {'handle': 'pro-second-channel', 'display_name': 'Second Channel'},
+            format='json',
+        )
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST, second.data)
+        self.assertFalse(BroadcastChannel.objects.filter(handle='pro-second-channel').exists())
 
     def test_non_manager_cannot_edit_channel_or_content(self):
         content = ChannelContent.objects.create(

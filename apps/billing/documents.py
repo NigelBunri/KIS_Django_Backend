@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import io
+import logging
 import os
 import math
 import random
 from datetime import datetime
 from typing import Tuple, Optional
 
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 from apps.commerce.models import ServiceBooking, ServiceBookingReceipt
 
@@ -24,33 +30,41 @@ import html as html_module
 # -----------------------------
 # Storage helpers (unchanged)
 # -----------------------------
-def _receipt_storage_root() -> str:
-    media_root = getattr(settings, "MEDIA_ROOT", "media")
-    path = os.path.join(media_root, "billing", "receipts")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
 def _relative_path(filename: str) -> str:
-    return os.path.join("billing", "receipts", filename)
-
-
-def _booking_receipt_storage_root() -> str:
-    media_root = getattr(settings, "MEDIA_ROOT", "media")
-    path = os.path.join(media_root, "billing", "booking-receipts")
-    os.makedirs(path, exist_ok=True)
-    return path
+    return f"billing/receipts/{filename}"
 
 
 def _booking_relative_path(filename: str) -> str:
-    return os.path.join("billing", "booking-receipts", filename)
+    return f"billing/booking-receipts/{filename}"
 
 
-def _build_media_url(request, relative_path: str) -> str:
-    media_url = getattr(settings, "MEDIA_URL", "/media/")
-    media_url = media_url if media_url.endswith("/") else f"{media_url}/"
-    relative = relative_path.lstrip("/")
-    return request.build_absolute_uri(f"{media_url}{relative}")
+def _save_text(relative_path: str, text: str) -> None:
+    default_storage.save(relative_path, ContentFile(text.encode("utf-8")))
+
+
+def _save_pdf(relative_path: str, render_fn, *args) -> None:
+    """Renders a reportlab PDF into an in-memory buffer (rather than a
+    local-disk path) and persists it through default_storage — the same
+    configured backend (AWS S3 in production) every other upload in this
+    app uses, so the URL this returns is always actually reachable
+    regardless of DEBUG/local-container-disk lifetime."""
+    buffer = io.BytesIO()
+    render_fn(*args, buffer)
+    default_storage.save(relative_path, ContentFile(buffer.getvalue()))
+
+
+def build_media_url(request, relative_path: str) -> str:
+    """`request` is only actually needed to make a local-storage relative
+    URL absolute — the production backend (S3) already returns a full
+    absolute (signed) URL from default_storage.url(), so this works fine
+    called with request=None from contexts with no request object (e.g. a
+    serializer with no request in its context, a webhook handler)."""
+    url = default_storage.url(relative_path)
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if request is not None:
+        return request.build_absolute_uri(url)
+    return url
 
 
 def _public_currency_label(value: object | None) -> str:
@@ -1053,21 +1067,16 @@ def _render_booking_receipt_html(booking, receipt: Optional[ServiceBookingReceip
 # Plug into your existing API
 # -----------------------------
 def ensure_receipt_documents(tx) -> Tuple[str, str]:
-    storage_root = _receipt_storage_root()
-    html_name = f"{tx.tx_ref}.html"
-    pdf_name = f"{tx.tx_ref}.pdf"
-    html_path = os.path.join(storage_root, html_name)
-    pdf_path = os.path.join(storage_root, pdf_name)
+    html_rel = _relative_path(f"{tx.tx_ref}.html")
+    pdf_rel = _relative_path(f"{tx.tx_ref}.pdf")
 
-    # keep your HTML if you want (optional)
-    if not os.path.exists(html_path):
-        with open(html_path, "w", encoding="utf-8") as handle:
-            handle.write(_render_receipt_html(tx))
+    if not default_storage.exists(html_rel):
+        _save_text(html_rel, _render_receipt_html(tx))
 
-    if not os.path.exists(pdf_path):
-        render_receipt_pdf(tx, pdf_path)
+    if not default_storage.exists(pdf_rel):
+        _save_pdf(pdf_rel, render_receipt_pdf, tx)
 
-    return _relative_path(html_name), _relative_path(pdf_name)
+    return html_rel, pdf_rel
 
 
 def ensure_booking_receipt_documents(
@@ -1075,54 +1084,46 @@ def ensure_booking_receipt_documents(
     receipt: Optional[ServiceBookingReceipt] = None,
     force: bool = False,
 ) -> Tuple[str, str]:
-    storage_root = _booking_receipt_storage_root()
     suffix = f"-{receipt.phase}-{receipt.id}" if receipt else ""
     base_name = f"booking-{booking.id}{suffix}"
-    html_name = f"{base_name}.html"
-    pdf_name = f"{base_name}.pdf"
-    html_path = os.path.join(storage_root, html_name)
-    pdf_path = os.path.join(storage_root, pdf_name)
+    html_rel = _booking_relative_path(f"{base_name}.html")
+    pdf_rel = _booking_relative_path(f"{base_name}.pdf")
 
     if force:
-        for target in (html_path, pdf_path):
-            if os.path.exists(target):
-                os.remove(target)
+        for target in (html_rel, pdf_rel):
+            if default_storage.exists(target):
+                default_storage.delete(target)
 
-    if not os.path.exists(html_path):
-        with open(html_path, "w", encoding="utf-8") as handle:
-            handle.write(_render_booking_receipt_html(booking, receipt))
-    if not os.path.exists(pdf_path):
-        render_booking_receipt_pdf(booking, receipt, pdf_path)
+    if not default_storage.exists(html_rel):
+        _save_text(html_rel, _render_booking_receipt_html(booking, receipt))
+    if not default_storage.exists(pdf_rel):
+        _save_pdf(pdf_rel, render_booking_receipt_pdf, booking, receipt)
 
-    return _booking_relative_path(html_name), _booking_relative_path(pdf_name)
+    return html_rel, pdf_rel
 
 
 def ensure_invoice_documents(sub) -> Tuple[str, str]:
-    storage_root = _receipt_storage_root()
     base_name = f"invoice_{sub.id}"
-    html_name = f"{base_name}.html"
-    pdf_name = f"{base_name}.pdf"
-    html_path = os.path.join(storage_root, html_name)
-    pdf_path = os.path.join(storage_root, pdf_name)
+    html_rel = _relative_path(f"{base_name}.html")
+    pdf_rel = _relative_path(f"{base_name}.pdf")
 
-    if not os.path.exists(html_path):
-        with open(html_path, "w", encoding="utf-8") as handle:
-            handle.write(f"<html><body><h2>KIS Invoice</h2><p>{sub.id}</p></body></html>")
+    if not default_storage.exists(html_rel):
+        _save_text(html_rel, f"<html><body><h2>KIS Invoice</h2><p>{sub.id}</p></body></html>")
 
-    if not os.path.exists(pdf_path):
-        render_invoice_pdf(sub, pdf_path)
+    if not default_storage.exists(pdf_rel):
+        _save_pdf(pdf_rel, render_invoice_pdf, sub)
 
-    return _relative_path(html_name), _relative_path(pdf_name)
+    return html_rel, pdf_rel
 
 
 def build_receipt_urls(request, tx) -> Tuple[str, str]:
     html_rel, pdf_rel = ensure_receipt_documents(tx)
-    return _build_media_url(request, html_rel), _build_media_url(request, pdf_rel)
+    return build_media_url(request, html_rel), build_media_url(request, pdf_rel)
 
 
 def build_invoice_urls(request, sub) -> Tuple[str, str]:
     html_rel, pdf_rel = ensure_invoice_documents(sub)
-    return _build_media_url(request, html_rel), _build_media_url(request, pdf_rel)
+    return build_media_url(request, html_rel), build_media_url(request, pdf_rel)
 
 
 def build_booking_receipt_urls(
@@ -1132,4 +1133,44 @@ def build_booking_receipt_urls(
     force: bool = False,
 ) -> Tuple[str, str]:
     html_rel, pdf_rel = ensure_booking_receipt_documents(booking, receipt, force=force)
-    return _build_media_url(request, html_rel), _build_media_url(request, pdf_rel)
+    return build_media_url(request, html_rel), build_media_url(request, pdf_rel)
+
+
+class _DirectPaymentIntentReceiptAdapter:
+    """Read-only view over a DirectPaymentIntent exposing the same
+    attribute shape _render_receipt_html/render_receipt_pdf already read
+    off a WalletTransaction (tx_ref/status/amount_cents/currency/provider/
+    method/created_at/meta) — lets Education and Health payments (which
+    have no dedicated receipt model of their own, unlike WalletTransaction
+    or ServiceBookingReceipt) reuse the exact same receipt template/layout
+    without duplicating it."""
+
+    def __init__(self, intent, kind_label: str):
+        self.tx_ref = intent.tx_ref
+        self.status = "success" if intent.status == intent.STATUS_PAID else intent.status
+        self.amount_cents = intent.amount_cents
+        self.currency = intent.currency
+        self.provider = intent.provider
+        self.method = kind_label
+        self.created_at = intent.created_at
+        self.meta = intent.metadata or {}
+
+
+def ensure_direct_payment_intent_receipt_documents(intent, *, kind_label: str) -> Tuple[str, str]:
+    adapter = _DirectPaymentIntentReceiptAdapter(intent, kind_label)
+    html_rel = _relative_path(f"{intent.tx_ref}.html")
+    pdf_rel = _relative_path(f"{intent.tx_ref}.pdf")
+
+    if not default_storage.exists(html_rel):
+        _save_text(html_rel, _render_receipt_html(adapter))
+    if not default_storage.exists(pdf_rel):
+        _save_pdf(pdf_rel, render_receipt_pdf, adapter)
+
+    return html_rel, pdf_rel
+
+
+def build_direct_payment_intent_receipt_urls(request, intent, *, kind_label: str) -> Tuple[str, str]:
+    if intent.status != intent.STATUS_PAID:
+        return None, None
+    html_rel, pdf_rel = ensure_direct_payment_intent_receipt_documents(intent, kind_label=kind_label)
+    return build_media_url(request, html_rel), build_media_url(request, pdf_rel)

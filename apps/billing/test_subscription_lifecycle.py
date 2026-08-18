@@ -364,6 +364,10 @@ class SweepExpiredSubscriptionsTests(TestCase):
 @override_settings(SECURE_SSL_REDIRECT=False)
 class ReverseTierUpgradePaymentTests(TestCase):
     def setUp(self):
+        # reverse_tier_upgrade_payment reverts the user to a real
+        # AccountTier named exactly "Free" — it must exist in the DB for
+        # the revert (and this test's assertions about it) to do anything.
+        _make_tier("Free", 0, 0)
         self.user = _make_user("+237699700001")
         self.tier = _make_tier("Reversal Pro", 1000, 1)
         apply_tier_upgrade(
@@ -446,6 +450,9 @@ class ReverseTierUpgradePaymentTests(TestCase):
 @override_settings(SECURE_SSL_REDIRECT=False)
 class SelfServiceRefundReversalIntegrationTests(TestCase):
     def setUp(self):
+        # See ReverseTierUpgradePaymentTests.setUp: reverse_tier_upgrade_payment
+        # reverts to a real AccountTier named exactly "Free".
+        _make_tier("Free", 0, 0)
         self.user = _make_user("+237699710001")
         self.tier = _make_tier("Refund Integration Pro", 1000, 1)
         apply_tier_upgrade(
@@ -498,6 +505,9 @@ class SelfServiceRefundReversalIntegrationTests(TestCase):
 @override_settings(SECURE_SSL_REDIRECT=False)
 class AdminReversePaymentActionTests(TestCase):
     def setUp(self):
+        # See ReverseTierUpgradePaymentTests.setUp: reverse_tier_upgrade_payment
+        # reverts to a real AccountTier named exactly "Free".
+        _make_tier("Free", 0, 0)
         self.staff = _make_user("+237699720001")
         self.staff.is_staff = True
         self.staff.save(update_fields=["is_staff"])

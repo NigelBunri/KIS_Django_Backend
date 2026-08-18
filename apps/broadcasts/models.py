@@ -84,6 +84,15 @@ class BroadcastFeedProfile(models.Model):
         db_table = "broadcast_feed_profile"
 
 
+class BroadcastChannelPayoutAccountStatus(models.TextChoices):
+    """Mirrors EducationInstitutionPayoutAccountStatus below — kept as a
+    separate definition per model rather than a shared import, matching
+    the same per-model convention used for Shop/HealthInstitution."""
+    NOT_CONNECTED = "not_connected", "Not connected"
+    PENDING = "pending", "Pending"
+    ACTIVE = "active", "Active"
+
+
 class BroadcastChannel(models.Model):
     class OwnerType(models.TextChoices):
         USER = "user", "User"
@@ -133,6 +142,21 @@ class BroadcastChannel(models.Model):
     is_deleted = models.BooleanField(default=False, db_index=True)
     subscriber_count = models.PositiveIntegerField(default=0)
     content_count = models.PositiveIntegerField(default=0)
+    # Flutterwave subaccount for direct-to-creator payout splitting on
+    # tips/memberships/PPV — only meaningful for owner_type=USER channels
+    # (institution-owned channels already settle via their owning Shop/
+    # HealthInstitution/EducationInstitution's own payout account). Only
+    # the provider-issued subaccount id and display-safe fields are
+    # stored; the raw bank account number is never persisted (see
+    # ChannelPayoutAccountConnectView, apps/broadcasts/views.py).
+    flutterwave_subaccount_id = models.CharField(max_length=128, blank=True, default="")
+    payout_account_status = models.CharField(
+        max_length=16,
+        choices=BroadcastChannelPayoutAccountStatus.choices,
+        default=BroadcastChannelPayoutAccountStatus.NOT_CONNECTED,
+    )
+    payout_account_name = models.CharField(max_length=255, blank=True, default="")
+    payout_bank_last4 = models.CharField(max_length=8, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1157,6 +1181,12 @@ class EducationInstitutionMembershipStatus(models.TextChoices):
     REMOVED = "removed", "Removed"
 
 
+class EducationInstitutionPayoutAccountStatus(models.TextChoices):
+    NOT_CONNECTED = "not_connected", "Not connected"
+    PENDING = "pending", "Pending"
+    ACTIVE = "active", "Active"
+
+
 class EducationInstitution(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     owner = models.ForeignKey(
@@ -1189,6 +1219,18 @@ class EducationInstitution(models.Model):
     settings = models.JSONField(default=dict, blank=True)
     metadata = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(default=True)
+    # Flutterwave subaccount for paid-course payout splitting. Only the
+    # provider-issued subaccount id and display-safe fields are stored —
+    # the raw bank account number is never persisted (see
+    # EducationInstitutionPayoutAccountConnectView, apps/broadcasts/views.py).
+    flutterwave_subaccount_id = models.CharField(max_length=128, blank=True, default="")
+    payout_account_status = models.CharField(
+        max_length=16,
+        choices=EducationInstitutionPayoutAccountStatus.choices,
+        default=EducationInstitutionPayoutAccountStatus.NOT_CONNECTED,
+    )
+    payout_account_name = models.CharField(max_length=255, blank=True, default="")
+    payout_bank_last4 = models.CharField(max_length=8, blank=True, default="")
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1282,6 +1324,17 @@ class EducationAcademicRecordStatus(models.TextChoices):
     DRAFT = "draft", "Draft"
     PUBLISHED = "published", "Published"
     ARCHIVED = "archived", "Archived"
+
+
+class EducationCourseVisibility(models.TextChoices):
+    PUBLIC = "public", "Public"
+    PRIVATE = "private", "Private"
+
+
+class EducationCourseAccessRequestStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    APPROVED = "approved", "Approved"
+    REJECTED = "rejected", "Rejected"
 
 
 class EducationClassSessionStatus(models.TextChoices):
@@ -1534,6 +1587,19 @@ class EducationInstitutionCourse(models.Model):
     )
     duration_minutes = models.PositiveIntegerField(default=0)
     seat_limit = models.PositiveIntegerField(null=True, blank=True)
+    # Pricing: null/0 means free — matches the exact convention already
+    # used for EducationInstitutionBroadcast.price_amount. This is the
+    # source of truth; any course-kind broadcast pointing at this course
+    # has its own price fields kept in sync (see _sync_course_pricing_to_broadcasts).
+    price_amount = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+    )
+    price_currency = models.CharField(max_length=8, blank=True, default=KIS_COIN_CODE)
+    visibility = models.CharField(
+        max_length=16,
+        choices=EducationCourseVisibility.choices,
+        default=EducationCourseVisibility.PUBLIC,
+    )
     metadata = models.JSONField(default=dict, blank=True)
     settings = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
@@ -1546,10 +1612,59 @@ class EducationInstitutionCourse(models.Model):
             models.Index(fields=["institution", "status"]),
             models.Index(fields=["institution", "code"]),
             models.Index(fields=["program", "status"]),
+            models.Index(fields=["institution", "visibility"]),
         ]
 
     def __str__(self):
         return self.title
+
+    @property
+    def is_free(self) -> bool:
+        return not self.price_amount or self.price_amount <= 0
+
+
+class EducationInstitutionCourseAccessRequest(models.Model):
+    """Request-to-access workflow for private courses — same shape as
+    EducationInstitutionMembership, one level down (per-course instead of
+    per-institution). See _ensure_course_access_ready in views.py."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    course = models.ForeignKey(
+        EducationInstitutionCourse,
+        on_delete=models.CASCADE,
+        related_name="access_requests",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="education_course_access_requests",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=EducationCourseAccessRequestStatus.choices,
+        default=EducationCourseAccessRequestStatus.PENDING,
+    )
+    decided_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="decided_education_course_access_requests",
+        null=True,
+        blank=True,
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_course_access_request"
+        unique_together = [("course", "user")]
+        indexes = [
+            models.Index(fields=["course", "status"]),
+            models.Index(fields=["user", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.course_id}:{self.user_id}:{self.status}"
 
 
 class EducationInstitutionCourseModule(models.Model):

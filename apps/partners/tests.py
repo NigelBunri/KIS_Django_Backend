@@ -6,7 +6,8 @@ from django.test import TestCase
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from apps.accounts.models import User
+from apps.accounts.models import AccountTier, Subscription, User
+from apps.accounts.tiers import ensure_default_account_tiers
 from apps.channels.models import Channel
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
 from apps.partners.models import (
@@ -49,6 +50,15 @@ class PartnerApiTests(TestCase):
         self.owner = self._create_user("owner", "+237670000001")
         self.member = self._create_user("member", "+237670000002")
         self.manager = self._create_user("manager", "+237670000003")
+        # Real partner org owners are always on the Partner/Partner Pro tier
+        # (PartnerViewSet.create gates partner_accounts to those tiers) —
+        # give the test owner a matching active subscription so team-seat
+        # enforcement in redeem_invite behaves like production, instead of
+        # the untiered-user default.
+        ensure_default_account_tiers()
+        partner_tier = AccountTier.objects.filter(name__iexact="Partner").first()
+        if partner_tier:
+            Subscription.objects.create(user=self.owner, tier=partner_tier, status="active")
 
     def _create_user(self, username: str, phone: str) -> User:
         suffix = phone[-4:]

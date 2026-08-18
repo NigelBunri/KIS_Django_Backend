@@ -131,12 +131,14 @@ class DirectPaymentIntent(BaseEntity):
     TARGET_SERVICE_BOOKING_PAYMENT = "service_booking_payment"
     TARGET_EDUCATION_BOOKING = "education_booking"
     TARGET_HEALTH_BILLING_SESSION = "health_billing_session"
+    TARGET_CHANNEL_MEMBERSHIP = "channel_membership"
 
     TARGET_CHOICES = [
         (TARGET_MARKETPLACE_ORDER, "Marketplace order"),
         (TARGET_SERVICE_BOOKING_PAYMENT, "Service booking payment"),
         (TARGET_EDUCATION_BOOKING, "Education booking"),
         (TARGET_HEALTH_BILLING_SESSION, "Health billing session"),
+        (TARGET_CHANNEL_MEMBERSHIP, "Channel membership"),
     ]
 
     user = models.ForeignKey(

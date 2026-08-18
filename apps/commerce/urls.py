@@ -53,4 +53,9 @@ urlpatterns = [
         views.ShopMembersByShopView.as_view(),
         name='shop-members',
     ),
+    path(
+        'shops/<uuid:shop_id>/payout-account/connect/',
+        views.ShopPayoutAccountConnectView.as_view(),
+        name='shop-payout-account-connect',
+    ),
 ]

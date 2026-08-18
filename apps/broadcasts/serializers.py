@@ -55,6 +55,7 @@ from .models import (
     EducationInstitutionStaffAssignment,
     EducationInstitutionProgram,
     EducationInstitutionCourse,
+    EducationInstitutionCourseAccessRequest,
     EducationInstitutionCourseModule,
     EducationInstitutionCourseModuleItem,
     EducationInstitutionLesson,
@@ -896,6 +897,35 @@ class EducationInstitutionMembershipSerializer(serializers.ModelSerializer):
         return getattr(user, "display_name", "") or getattr(user, "username", "") or ""
 
 
+class EducationInstitutionCourseAccessRequestSerializer(serializers.ModelSerializer):
+    user_id = serializers.UUIDField(source="user.id", read_only=True)
+    display_name = serializers.SerializerMethodField()
+    phone = serializers.CharField(source="user.phone", read_only=True)
+    email = serializers.EmailField(source="user.email", read_only=True, allow_null=True)
+    course_id = serializers.UUIDField(source="course.id", read_only=True)
+    course_title = serializers.CharField(source="course.title", read_only=True)
+
+    class Meta:
+        model = EducationInstitutionCourseAccessRequest
+        fields = [
+            "id",
+            "course_id",
+            "course_title",
+            "user_id",
+            "display_name",
+            "phone",
+            "email",
+            "status",
+            "created_at",
+            "updated_at",
+            "decided_at",
+        ]
+
+    def get_display_name(self, obj: EducationInstitutionCourseAccessRequest):
+        user = getattr(obj, "user", None)
+        return getattr(user, "display_name", "") or getattr(user, "username", "") or ""
+
+
 class EducationInstitutionSerializer(serializers.ModelSerializer):
     memberships = EducationInstitutionMembershipSerializer(many=True, read_only=True)
     owner = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -942,8 +972,16 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
             "can_manage",
             "verification_summary",
             "memberships",
+            "payout_account_status",
+            "payout_account_name",
+            "payout_bank_last4",
             "created_at",
             "updated_at",
+        ]
+        read_only_fields = [
+            "payout_account_status",
+            "payout_account_name",
+            "payout_bank_last4",
         ]
 
     def get_active_member_count(self, obj: EducationInstitution) -> int:
@@ -1172,6 +1210,7 @@ class EducationInstitutionStaffAssignmentSerializer(serializers.ModelSerializer)
 
 class EducationInstitutionCourseSerializer(serializers.ModelSerializer):
     program_id = serializers.UUIDField(source="program.id", read_only=True)
+    is_free = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = EducationInstitutionCourse
@@ -1186,6 +1225,10 @@ class EducationInstitutionCourseSerializer(serializers.ModelSerializer):
             "status",
             "duration_minutes",
             "seat_limit",
+            "price_amount",
+            "price_currency",
+            "is_free",
+            "visibility",
             "metadata",
             "settings",
             "created_at",
@@ -2052,6 +2095,8 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
     direct_payment_intent_id = serializers.SerializerMethodField()
     payment_reference = serializers.SerializerMethodField()
     payment_url = serializers.SerializerMethodField()
+    receipt_url = serializers.SerializerMethodField()
+    receipt_pdf_url = serializers.SerializerMethodField()
 
     class Meta:
         model = EducationInstitutionBooking
@@ -2077,6 +2122,8 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
             "direct_payment_intent_id",
             "payment_reference",
             "payment_url",
+            "receipt_url",
+            "receipt_pdf_url",
             "wallet_transaction_id",
             "provider_credit_transaction_id",
             "booked_item_id",
@@ -2136,6 +2183,24 @@ class EducationInstitutionBookingSerializer(serializers.ModelSerializer):
     def get_payment_url(self, obj):
         metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
         return str(metadata.get("payment_url") or "") or None
+
+    def _receipt_path_url(self, obj, key: str):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        relative_path = metadata.get(key)
+        if not relative_path:
+            return None
+        from apps.billing.documents import build_media_url
+
+        try:
+            return build_media_url(self.context.get("request"), relative_path)
+        except Exception:
+            return None
+
+    def get_receipt_url(self, obj):
+        return self._receipt_path_url(obj, "receipt_html_path")
+
+    def get_receipt_pdf_url(self, obj):
+        return self._receipt_path_url(obj, "receipt_pdf_path")
 
     def _target(self, obj: EducationInstitutionBooking):
         targets = (

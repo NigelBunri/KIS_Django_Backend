@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
+from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
 from apps.media import upload_intent
 from apps.media.models import MediaSafetyScan, MediaUploadIntent
 from apps.media.safety import MediaSafetyDecision, scan_upload_for_explicit_content
@@ -109,6 +110,12 @@ def initiate_education_upload(
     upload_intent.validate_initiate_payload(
         context=context, filename=filename, content_type=content_type, size_bytes=size_bytes,
     )
+    features = get_user_tier_features(user)
+    limit_mb = normalize_limit_value(features.get("media_storage_mb"), default=None)
+    if limit_mb is not None:
+        limit_bytes = int(limit_mb) * 1024 * 1024
+        if int(size_bytes) > limit_bytes:
+            raise ValidationError({"detail": "Media file exceeds your tier storage limit."})
     intent = upload_intent.create_upload_intent(
         user=user,
         context=context,

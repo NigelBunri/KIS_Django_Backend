@@ -52,7 +52,7 @@ from apps.communities.models import (
 )
 from apps.accounts.models import Profile, User
 from apps.accounts.feature_gate import require_feature
-from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
+from apps.accounts.tiers import get_platform_commission_pct, get_user_tier_features, normalize_limit_value
 from apps.commerce.constants import KIS_COIN_CODE
 from apps.commerce.models import Product, ShopService, ShopTeamMember, ServiceBooking
 from apps.core.money import parse_decimal_amount
@@ -90,6 +90,7 @@ from apps.broadcasts.media_pipeline import (
 )
 from apps.broadcasts.models import (
     BroadcastChannel,
+    BroadcastChannelPayoutAccountStatus,
     BroadcastChannelRole,
     BroadcastChannelSubscription,
     BroadcastFeature,
@@ -144,12 +145,16 @@ from apps.broadcasts.models import (
     EducationAssessmentType,
     EducationClassSessionMode,
     EducationClassSessionStatus,
+    EducationCourseAccessRequestStatus,
     EducationCourseQuestion,
     EducationCourseQuestionStatus,
     EducationCourseReview,
     EducationCourseReviewStatus,
+    EducationCourseVisibility,
     EducationInstitution,
     EducationInstitutionAssessment,
+    EducationInstitutionCourseAccessRequest,
+    EducationInstitutionPayoutAccountStatus,
     EducationInstitutionAssessmentOption,
     EducationInstitutionAssessmentQuestion,
     EducationInstitutionAssessmentResponse,
@@ -263,6 +268,7 @@ from apps.broadcasts.serializers import (
     EducationCourseQuestionSerializer,
     EducationCourseReviewSerializer,
     EducationInstitutionCourseSerializer,
+    EducationInstitutionCourseAccessRequestSerializer,
     EducationInstitutionCourseModuleSerializer,
     EducationInstitutionCourseModuleItemSerializer,
     EducationInstitutionEnrollmentSerializer,
@@ -329,9 +335,10 @@ from apps.billing.services import (
     lock_wallet_funds_for_booking,
     record_ledger,
     release_locked_booking_funds,
+    release_locked_booking_funds_split,
     refund_locked_booking_funds,
 )
-from apps.billing.direct_payments import create_direct_payment_intent
+from apps.billing.direct_payments import create_direct_payment_intent, FLW_BASE_URL
 from apps.billing.models import DirectPaymentIntent, WalletTransaction
 from apps.bible.certificates import build_certificate_pdf, build_certificate_url, ensure_certificate_file
 from apps.feed_personalization import get_affinity_profile, log_feed_interaction, rank_feed_items
@@ -900,6 +907,13 @@ def _normalize_academic_status(value: object, default: str = EducationAcademicRe
     return default
 
 
+def _normalize_course_visibility(value: object, default: str = EducationCourseVisibility.PUBLIC) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in EducationCourseVisibility.values:
+        return raw
+    return default
+
+
 def _normalize_session_status(value: object, default: str = EducationClassSessionStatus.SCHEDULED) -> str:
     raw = str(value or "").strip().lower()
     if raw in EducationClassSessionStatus.values:
@@ -1354,6 +1368,20 @@ def _sync_education_source_broadcasts(*entities: object) -> None:
             _sync_education_broadcast_item(broadcast)
 
 
+def _sync_course_pricing_to_broadcasts(course: "EducationInstitutionCourse") -> None:
+    """Course.price_amount/price_currency/visibility are the source of
+    truth the creator edits; any course-kind broadcast pointing at this
+    course (the entity that actually makes it discoverable/enrollable —
+    see EducationContentEnrollmentView) has its own price fields kept in
+    lockstep here so the existing booking/payment machinery, which reads
+    price off the broadcast, needs no changes at all."""
+    for broadcast in course.broadcasts.all():
+        broadcast.price_amount = course.price_amount
+        broadcast.price_currency = course.price_currency
+        broadcast.booking_enabled = bool(course.price_amount and course.price_amount > 0)
+        broadcast.save(update_fields=["price_amount", "price_currency", "booking_enabled", "updated_at"])
+
+
 def _education_booking_provider_user(booking: EducationInstitutionBooking) -> User:
     return booking.institution.owner
 
@@ -1384,19 +1412,34 @@ def _complete_education_booking(
     if booking.amount_cents > 0 and not booking.provider_credit_transaction_id:
         provider_user = _education_booking_provider_user(booking)
         reference = f"education-booking-payout-{booking.id}"
-        release_locked_booking_funds(
-            payer=booking.user,
-            provider=provider_user,
-            amount_cents=int(booking.amount_cents or 0),
-            reference=reference,
-            meta={
-                "booking_id": str(booking.id),
-                "broadcast_id": str(booking.broadcast_id),
-                "institution_id": str(booking.institution_id),
-                "source": "education_booking_payout",
-                "auto_release": auto_release,
-            },
-        )
+        release_meta = {
+            "booking_id": str(booking.id),
+            "broadcast_id": str(booking.broadcast_id),
+            "institution_id": str(booking.institution_id),
+            "source": "education_booking_payout",
+            "auto_release": auto_release,
+        }
+        if booking.course_id:
+            # Course purchase: split platform commission vs. institution
+            # payout on this (legacy) wallet rail — the production
+            # Flutterwave rail settles its split at the provider level
+            # instead (see _education_course_split_subaccounts).
+            release_locked_booking_funds_split(
+                payer=booking.user,
+                provider=provider_user,
+                amount_cents=int(booking.amount_cents or 0),
+                commission_pct=get_platform_commission_pct(provider_user),
+                reference=reference,
+                meta=release_meta,
+            )
+        else:
+            release_locked_booking_funds(
+                payer=booking.user,
+                provider=provider_user,
+                amount_cents=int(booking.amount_cents or 0),
+                reference=reference,
+                meta=release_meta,
+            )
         provider_tx = WalletTransaction.objects.create(
             user=provider_user,
             provider="internal",
@@ -2102,6 +2145,43 @@ def _ensure_broadcast_membership_ready(
     return membership
 
 
+def _ensure_course_access_ready(
+    course: EducationInstitutionCourse,
+    user: User,
+) -> EducationInstitutionCourseAccessRequest | None:
+    """Gate for EducationCourseVisibility.PRIVATE courses — mirrors
+    _ensure_broadcast_membership_ready one level down (per-course instead
+    of per-institution). Auto-creates a PENDING access request on first
+    touch and blocks until an institution manager approves it via
+    EducationInstitutionCourseAccessRequestActionView. No-op for public
+    courses. This is checked independently of (and before) payment —
+    a private+paid course requires both an APPROVED request and a
+    CONFIRMED booking."""
+    if course.visibility != EducationCourseVisibility.PRIVATE:
+        return None
+    access_request, _created = EducationInstitutionCourseAccessRequest.objects.get_or_create(
+        course=course,
+        user=user,
+        defaults={"status": EducationCourseAccessRequestStatus.PENDING},
+    )
+    if access_request.status != EducationCourseAccessRequestStatus.APPROVED:
+        if access_request.status == EducationCourseAccessRequestStatus.REJECTED:
+            raise PermissionDenied("Your access request for this course was denied.")
+        raise PermissionDenied("Access request submitted. Approval is required before access.")
+    return access_request
+
+
+def _get_course_access_request_status(course: EducationInstitutionCourse | None, user: User) -> str | None:
+    """Read-only counterpart to _ensure_course_access_ready, safe to call
+    from GET/display code paths — never creates a row, only reports one.
+    Returns None for public courses (or no course), otherwise one of
+    'not_requested' | 'pending' | 'approved' | 'rejected'."""
+    if course is None or course.visibility != EducationCourseVisibility.PRIVATE:
+        return None
+    access_request = course.access_requests.filter(user=user).first()
+    return access_request.status if access_request else "not_requested"
+
+
 def _education_flutterwave_headers() -> dict[str, str]:
     secret = getattr(settings, "FLW_SECRET_KEY", "")
     return {
@@ -2151,10 +2231,12 @@ def _build_broadcast_viewer_state(
     booking = broadcast.bookings.filter(user=user).first()
     enrollment_status = enrollment.status if enrollment else None
     booking_status = booking.status if booking else None
+    access_request_status = _get_course_access_request_status(broadcast.course, user)
+    course_access_ok = access_request_status in (None, EducationCourseAccessRequestStatus.APPROVED)
     has_learning_access = enrollment_status in {
         EducationEnrollmentStatus.ENROLLED,
         EducationEnrollmentStatus.COMPLETED,
-    }
+    } and course_access_ok
     return {
         "membership": {
             "status": membership.status,
@@ -2170,8 +2252,11 @@ def _build_broadcast_viewer_state(
         "can_apply_membership": not membership
         and broadcast.institution.membership_policy
         != EducationInstitutionMembershipPolicy.CLOSED,
-        "can_enroll": enrollment is None,
-        "can_book": bool(broadcast.booking_enabled) and booking is None,
+        "can_enroll": enrollment is None and course_access_ok,
+        "can_book": bool(broadcast.booking_enabled) and booking is None and course_access_ok,
+        "visibility": broadcast.course.visibility if broadcast.course_id else EducationCourseVisibility.PUBLIC,
+        "access_request_status": access_request_status,
+        "can_request_access": access_request_status == "not_requested",
     }
 
 
@@ -2908,7 +2993,10 @@ def _build_public_education_content_detail(
         .filter(user=request.user, status__in=[EducationEnrollmentStatus.ENROLLED, EducationEnrollmentStatus.COMPLETED])
         .first()
     )
-    has_learning_access = enrollment is not None
+    # Reuse viewer_state's has_learning_access rather than recomputing from
+    # enrollment alone — it additionally requires an APPROVED course access
+    # request for private courses (see _build_broadcast_viewer_state).
+    has_learning_access = viewer_state["has_learning_access"]
     course_outline = _sanitize_learning_outline_for_public_viewer(
         course_outline,
         has_learning_access=has_learning_access,
@@ -3202,6 +3290,10 @@ def _build_education_institution_dashboard_payload(institution: EducationInstitu
         ).count(),
         "pending_application_count": institution.memberships.filter(
             status=EducationInstitutionMembershipStatus.PENDING
+        ).count(),
+        "pending_course_access_request_count": EducationInstitutionCourseAccessRequest.objects.filter(
+            course__institution=institution,
+            status=EducationCourseAccessRequestStatus.PENDING,
         ).count(),
     }
     recent_courses = EducationInstitutionCourseSerializer(
@@ -9325,6 +9417,98 @@ class EducationInstitutionDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class EducationInstitutionPayoutAccountConnectView(APIView):
+    """Connects the institution's Flutterwave subaccount for paid-course
+    settlement splitting. Only the platform's own FLW_SECRET_KEY is ever
+    used (see _education_flutterwave_headers) — the institution never
+    provides or stores a provider secret key, matching Flutterwave's
+    Subaccounts API (https://developer.flutterwave.com/docs/subaccounts):
+    creating a subaccount on our platform account returns a subaccount id
+    that later payment links can reference in their `subaccounts` split
+    array. Only that id (and display-safe fields) are persisted; the raw
+    bank account number submitted here is never stored."""
+
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, institution_id: str):
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+        if not getattr(settings, "FLW_SECRET_KEY", None):
+            raise ValidationError({"detail": "Payment provider is not configured."})
+
+        account_bank = str(request.data.get("account_bank") or "").strip()
+        account_number = str(request.data.get("account_number") or "").strip()
+        business_name = str(request.data.get("business_name") or institution.name).strip()
+        country = str(request.data.get("country") or "NG").strip().upper()
+        if not account_bank or not account_number:
+            raise ValidationError({"detail": "Bank and account number are required."})
+
+        institution.payout_account_status = EducationInstitutionPayoutAccountStatus.PENDING
+        institution.save(update_fields=["payout_account_status", "updated_at"])
+
+        try:
+            response = requests.post(
+                f"{FLW_BASE_URL}/subaccounts",
+                json={
+                    "account_bank": account_bank,
+                    "account_number": account_number,
+                    "business_name": business_name,
+                    "business_email": institution.contact_email or request.user.email or "",
+                    "country": country,
+                    "split_type": "percentage",
+                    # Flutterwave's own share of each split transaction;
+                    # the platform's cut is applied per-transaction via the
+                    # `subaccounts[].transaction_charge` on the payment
+                    # link itself (see _create_flutterwave_payment_link),
+                    # not here, so this default doesn't double-charge.
+                    "split_value": 0,
+                },
+                headers=_education_flutterwave_headers(),
+                timeout=30,
+            )
+            payload = response.json() if response.content else {}
+        except (requests.RequestException, ValueError) as exc:
+            institution.payout_account_status = EducationInstitutionPayoutAccountStatus.NOT_CONNECTED
+            institution.save(update_fields=["payout_account_status", "updated_at"])
+            raise ValidationError({"detail": f"Could not reach the payment provider: {exc}"})
+
+        if response.status_code >= 400 or payload.get("status") != "success":
+            institution.payout_account_status = EducationInstitutionPayoutAccountStatus.NOT_CONNECTED
+            institution.save(update_fields=["payout_account_status", "updated_at"])
+            message = payload.get("message") or "Unable to connect payout account."
+            raise ValidationError({"detail": message})
+
+        data = payload.get("data") or {}
+        subaccount_id = str(data.get("subaccount_id") or data.get("id") or "")
+        if not subaccount_id:
+            institution.payout_account_status = EducationInstitutionPayoutAccountStatus.NOT_CONNECTED
+            institution.save(update_fields=["payout_account_status", "updated_at"])
+            raise ValidationError({"detail": "Payment provider did not return a subaccount id."})
+
+        institution.flutterwave_subaccount_id = subaccount_id
+        institution.payout_account_status = EducationInstitutionPayoutAccountStatus.ACTIVE
+        institution.payout_account_name = business_name
+        institution.payout_bank_last4 = account_number[-4:] if len(account_number) >= 4 else account_number
+        institution.save(
+            update_fields=[
+                "flutterwave_subaccount_id",
+                "payout_account_status",
+                "payout_account_name",
+                "payout_bank_last4",
+                "updated_at",
+            ]
+        )
+        return Response(
+            {
+                "payout_account_status": institution.payout_account_status,
+                "payout_account_name": institution.payout_account_name,
+                "payout_bank_last4": institution.payout_bank_last4,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class EducationInstitutionVerificationStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -9499,6 +9683,27 @@ class EducationInstitutionEnrollmentListView(APIView):
         ).order_by("-created_at")
         serializer = EducationInstitutionEnrollmentSerializer(qs, many=True)
         return Response({"enrollments": serializer.data}, status=status.HTTP_200_OK)
+
+
+class EducationInstitutionCourseAccessRequestListView(APIView):
+    """Institution-wide view across every course's access requests, for
+    the institution dashboard's pending-approvals surface — the
+    per-course EducationCourseAccessRequestListView is for a single
+    course's own management screen."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, institution_id: str):
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+        qs = EducationInstitutionCourseAccessRequest.objects.filter(
+            course__institution=institution,
+        ).select_related("user", "course").order_by("-created_at")
+        status_filter = str(request.query_params.get("status") or "").strip().lower()
+        if status_filter in EducationCourseAccessRequestStatus.values:
+            qs = qs.filter(status=status_filter)
+        serializer = EducationInstitutionCourseAccessRequestSerializer(qs, many=True)
+        return Response({"access_requests": serializer.data}, status=status.HTTP_200_OK)
 
 
 class EducationInstitutionEnrollmentDetailView(APIView):
@@ -9736,6 +9941,75 @@ class EducationInstitutionMembershipActionView(APIView):
         membership.save(update_fields=["status", "decided_by", "decided_at", "updated_at"])
         serializer = EducationInstitutionMembershipSerializer(membership)
         return Response({"membership": serializer.data}, status=status.HTTP_200_OK)
+
+
+def _get_course_or_404_public(course_id: str) -> EducationInstitutionCourse:
+    """Unlike _get_institution_course_or_404, this doesn't require the
+    caller to already belong to the institution — a learner requesting
+    access to a private course they don't belong to yet must still be
+    able to look the course up to request access at all."""
+    return get_object_or_404(
+        EducationInstitutionCourse.objects.select_related("institution"),
+        id=course_id,
+    )
+
+
+class EducationCourseAccessRequestListView(APIView):
+    """Request-to-access workflow for private courses — same shape as
+    EducationInstitutionMembershipListView, one level down. GET: managers
+    see every request for the course, everyone else sees only their own.
+    POST: self-apply (idempotent — returns the existing request if one
+    already exists, exactly like the membership self-apply branch)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, course_id: str):
+        course = _get_course_or_404_public(course_id)
+        membership = _get_institution_membership(request.user, course.institution)
+        is_manager = bool(membership and membership.role in _education_manage_roles())
+        qs = course.access_requests.select_related("user").order_by("-created_at")
+        if not is_manager:
+            qs = qs.filter(user=request.user)
+        serializer = EducationInstitutionCourseAccessRequestSerializer(qs, many=True)
+        return Response({"access_requests": serializer.data}, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def post(self, request, course_id: str):
+        course = _get_course_or_404_public(course_id)
+        existing = course.access_requests.filter(user=request.user).first()
+        if existing:
+            serializer = EducationInstitutionCourseAccessRequestSerializer(existing)
+            return Response({"access_request": serializer.data}, status=status.HTTP_200_OK)
+        access_request = EducationInstitutionCourseAccessRequest.objects.create(
+            course=course,
+            user=request.user,
+            status=EducationCourseAccessRequestStatus.PENDING,
+        )
+        serializer = EducationInstitutionCourseAccessRequestSerializer(access_request)
+        return Response({"access_request": serializer.data}, status=status.HTTP_201_CREATED)
+
+
+class EducationCourseAccessRequestActionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, course_id: str, request_id: str):
+        course = _get_course_or_404_public(course_id)
+        _require_manage_institution_membership(request.user, course.institution)
+        access_request = get_object_or_404(course.access_requests, id=request_id)
+        action = str(request.data.get("action") or "").strip().lower()
+        if action not in {"approve", "reject"}:
+            raise ValidationError({"action": "Unsupported action."})
+        access_request.status = (
+            EducationCourseAccessRequestStatus.APPROVED
+            if action == "approve"
+            else EducationCourseAccessRequestStatus.REJECTED
+        )
+        access_request.decided_by = request.user
+        access_request.decided_at = timezone.now()
+        access_request.save(update_fields=["status", "decided_by", "decided_at", "updated_at"])
+        serializer = EducationInstitutionCourseAccessRequestSerializer(access_request)
+        return Response({"access_request": serializer.data}, status=status.HTTP_200_OK)
 
 
 class EducationInstitutionStaffAssignmentListView(APIView):
@@ -10033,6 +10307,7 @@ class EducationInstitutionCourseListView(APIView):
         if program_id:
             program = _get_institution_program_or_404(institution, str(program_id))
         cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+        raw_price_amount = request.data.get("price_amount")
         course = EducationInstitutionCourse.objects.create(
             institution=institution,
             program=program,
@@ -10044,6 +10319,9 @@ class EducationInstitutionCourseListView(APIView):
             status=_normalize_academic_status(request.data.get("status")),
             duration_minutes=_to_bounded_int(request.data.get("duration_minutes"), 0, 0),
             seat_limit=_to_optional_positive_int(request.data.get("seat_limit")),
+            price_amount=_normalize_education_decimal(raw_price_amount, "price_amount"),
+            price_currency=KIS_COIN_CODE,
+            visibility=_normalize_course_visibility(request.data.get("visibility")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
             settings=request.data.get("settings") if isinstance(request.data.get("settings"), dict) else {},
         )
@@ -10095,12 +10373,18 @@ class EducationInstitutionCourseDetailView(APIView):
             course.duration_minutes = _to_bounded_int(request.data.get("duration_minutes"), 0, 0)
         if "seat_limit" in request.data:
             course.seat_limit = _to_optional_positive_int(request.data.get("seat_limit"))
+        if "price_amount" in request.data:
+            course.price_amount = _normalize_education_decimal(request.data.get("price_amount"), "price_amount")
+            course.price_currency = KIS_COIN_CODE
+        if "visibility" in request.data:
+            course.visibility = _normalize_course_visibility(request.data.get("visibility"), course.visibility)
         if isinstance(request.data.get("metadata"), dict):
             course.metadata = request.data.get("metadata")
         if isinstance(request.data.get("settings"), dict):
             course.settings = request.data.get("settings")
         course.save()
         _sync_education_source_broadcasts(course)
+        _sync_course_pricing_to_broadcasts(course)
         serializer = EducationInstitutionCourseSerializer(course)
         return Response({"course": serializer.data}, status=status.HTTP_200_OK)
 
@@ -11354,6 +11638,8 @@ class EducationInstitutionBroadcastEnrollmentListView(APIView):
         if broadcast.status != EducationBroadcastStatus.PUBLISHED:
             raise PermissionDenied("Only published broadcasts accept enrollments.")
         _ensure_broadcast_membership_ready(institution, request.user)
+        if broadcast.course_id:
+            _ensure_course_access_ready(broadcast.course, request.user)
         existing = broadcast.enrollments.filter(user=request.user).first()
         if existing:
             return Response({"enrollment": EducationInstitutionEnrollmentSerializer(existing).data}, status=status.HTTP_200_OK)
@@ -11412,6 +11698,8 @@ class EducationInstitutionBroadcastBookingListView(APIView):
         if not broadcast.booking_enabled:
             raise ValidationError({"detail": "Booking is not enabled for this broadcast."})
         _ensure_broadcast_membership_ready(institution, request.user)
+        if broadcast.course_id:
+            _ensure_course_access_ready(broadcast.course, request.user)
         existing = broadcast.bookings.filter(user=request.user).first()
         if existing:
             return Response({"booking": EducationInstitutionBookingSerializer(existing).data}, status=status.HTTP_200_OK)
@@ -12177,6 +12465,48 @@ class EducationContentItemActionView(APIView):
         )
 
 
+class EducationContentAccessRequestView(APIView):
+    """content_id (broadcast)-keyed alias of EducationCourseAccessRequestListView's
+    self-apply branch — every other learner-facing endpoint in this file is
+    keyed off content_id, not course_id, so the "Request Access" button on
+    a course card/detail sheet can reuse the same id it already has instead
+    of needing a separate course_id round trip."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, content_id: str):
+        broadcast = get_object_or_404(
+            EducationInstitutionBroadcast.objects.select_related("course"),
+            id=content_id,
+        )
+        if not broadcast.course_id:
+            return Response({"access_request": None}, status=status.HTTP_200_OK)
+        existing = broadcast.course.access_requests.filter(user=request.user).first()
+        serializer = EducationInstitutionCourseAccessRequestSerializer(existing) if existing else None
+        return Response({"access_request": serializer.data if serializer else None}, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def post(self, request, content_id: str):
+        broadcast = get_object_or_404(
+            EducationInstitutionBroadcast.objects.select_related("course"),
+            id=content_id,
+        )
+        if not broadcast.course_id:
+            raise ValidationError({"detail": "This content has no course to request access to."})
+        course = broadcast.course
+        existing = course.access_requests.filter(user=request.user).first()
+        if existing:
+            serializer = EducationInstitutionCourseAccessRequestSerializer(existing)
+            return Response({"access_request": serializer.data}, status=status.HTTP_200_OK)
+        access_request = EducationInstitutionCourseAccessRequest.objects.create(
+            course=course,
+            user=request.user,
+            status=EducationCourseAccessRequestStatus.PENDING,
+        )
+        serializer = EducationInstitutionCourseAccessRequestSerializer(access_request)
+        return Response({"access_request": serializer.data}, status=status.HTTP_201_CREATED)
+
+
 class EducationContentEnrollmentView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -12199,6 +12529,8 @@ class EducationContentEnrollmentView(APIView):
         )
         institution = broadcast.institution
         _ensure_broadcast_membership_ready(institution, request.user)
+        if broadcast.course_id:
+            _ensure_course_access_ready(broadcast.course, request.user)
 
         if broadcast.booking_enabled and broadcast.price_amount not in (None, 0, "0", "0.00"):
             booking = broadcast.bookings.filter(user=request.user).first()
@@ -13607,6 +13939,76 @@ def _user_can_manage_channel(user, channel: BroadcastChannel) -> bool:
     }
 
 
+class ChannelPayoutAccountConnectView(APIView):
+    """Connects the channel's Flutterwave subaccount for direct-to-creator
+    settlement splitting on tips/memberships/PPV — mirrors
+    EducationInstitutionPayoutAccountConnectView above, using the shared
+    apps.billing.payout_accounts helper. Only meaningful for
+    owner_type=USER channels; institution-owned channels settle via their
+    owning Shop/HealthInstitution/EducationInstitution's own payout
+    account instead."""
+
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, channel_id: str):
+        from apps.billing.payout_accounts import create_flutterwave_subaccount
+
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You do not have permission to manage this channel.")
+        if channel.owner_type != BroadcastChannel.OwnerType.USER:
+            raise ValidationError(
+                {"detail": "This channel settles through its owning organization's payout account instead."}
+            )
+
+        account_bank = str(request.data.get("account_bank") or "").strip()
+        account_number = str(request.data.get("account_number") or "").strip()
+        business_name = str(request.data.get("business_name") or channel.display_name).strip()
+        country = str(request.data.get("country") or "NG").strip().upper()
+        if not account_bank or not account_number:
+            raise ValidationError({"detail": "Bank and account number are required."})
+
+        channel.payout_account_status = BroadcastChannelPayoutAccountStatus.PENDING
+        channel.save(update_fields=["payout_account_status", "updated_at"])
+
+        owner_email = channel.owner_user.email if channel.owner_user else ""
+        try:
+            subaccount_id = create_flutterwave_subaccount(
+                account_bank=account_bank,
+                account_number=account_number,
+                business_name=business_name,
+                business_email=owner_email or "",
+                country=country,
+            )
+        except ValidationError:
+            channel.payout_account_status = BroadcastChannelPayoutAccountStatus.NOT_CONNECTED
+            channel.save(update_fields=["payout_account_status", "updated_at"])
+            raise
+
+        channel.flutterwave_subaccount_id = subaccount_id
+        channel.payout_account_status = BroadcastChannelPayoutAccountStatus.ACTIVE
+        channel.payout_account_name = business_name
+        channel.payout_bank_last4 = account_number[-4:] if len(account_number) >= 4 else account_number
+        channel.save(
+            update_fields=[
+                "flutterwave_subaccount_id",
+                "payout_account_status",
+                "payout_account_name",
+                "payout_bank_last4",
+                "updated_at",
+            ]
+        )
+        return Response(
+            {
+                "payout_account_status": channel.payout_account_status,
+                "payout_account_name": channel.payout_account_name,
+                "payout_bank_last4": channel.payout_bank_last4,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 def _user_can_edit_content(user, content: ChannelContent) -> bool:
     return _user_channel_role(user, content.channel) in {
         "staff",
@@ -14242,6 +14644,22 @@ class BroadcastChannelListCreateView(APIView):
         owner_type = str(request.data.get("owner_type") or BroadcastChannel.OwnerType.USER).strip().lower()
         if owner_type != BroadcastChannel.OwnerType.USER:
             raise ValidationError({"owner_type": "Organization channel creation will be connected in a later phase."})
+        channel_limit = _resolve_profile_limit(
+            request.user,
+            "channels_create",
+            legacy_required_tier="pro",
+            permission_message="Creating a broadcast channel requires Pro tier or higher.",
+        )
+        if channel_limit is not None:
+            existing_channel_count = BroadcastChannel.objects.filter(
+                owner_type=BroadcastChannel.OwnerType.USER,
+                owner_user=request.user,
+                is_deleted=False,
+            ).count()
+            if existing_channel_count >= channel_limit:
+                raise ValidationError(
+                    {"detail": f"Your current plan allows up to {channel_limit} broadcast channel{'s' if channel_limit != 1 else ''}. Upgrade to create more."}
+                )
         handle = _safe_channel_handle_from_value(request.data.get("handle"))
         if not handle:
             raise ValidationError({"handle": "A public channel handle is required."})

@@ -100,6 +100,8 @@ from .views import (
     EducationUploadInitiateView,
     EducationInstitutionListView,
     EducationInstitutionDetailView,
+    ChannelPayoutAccountConnectView,
+    EducationInstitutionPayoutAccountConnectView,
     EducationInstitutionVerificationReviewView,
     EducationInstitutionVerificationStartView,
     EducationInstitutionVerificationStatusView,
@@ -149,6 +151,10 @@ from .views import (
     EducationContentItemActionView,
     EducationProgressView,
     EducationContentEnrollmentView,
+    EducationContentAccessRequestView,
+    EducationCourseAccessRequestListView,
+    EducationCourseAccessRequestActionView,
+    EducationInstitutionCourseAccessRequestListView,
     EducationInstitutionAssessmentListView,
     EducationInstitutionAssessmentDetailView,
     EducationInstitutionAssessmentQuestionListView,
@@ -247,6 +253,7 @@ urlpatterns = [
     path("broadcasts/channels/<uuid:channel_id>/contents/", BroadcastChannelContentListCreateView.as_view(), name="broadcast-channel-contents"),
     path("broadcasts/channels/<uuid:channel_id>/playlists/", BroadcastPlaylistListCreateView.as_view(), name="broadcast-channel-playlists"),
     path("broadcasts/channels/<uuid:channel_id>/live-streams/", ChannelLiveStreamListCreateView.as_view(), name="broadcast-channel-live-streams"),
+    path("broadcasts/channels/<uuid:channel_id>/payout-account/connect/", ChannelPayoutAccountConnectView.as_view(), name="broadcast-channel-payout-account-connect"),
     path("broadcasts/channel-contents/my-reactions/", ChannelContentMyReactionsView.as_view(), name="broadcast-channel-content-my-reactions"),
     path("broadcasts/channel-contents/<uuid:content_id>/", ChannelContentDetailView.as_view(), name="broadcast-channel-content-detail"),
     path("broadcasts/channel-contents/<uuid:content_id>/publish/", ChannelContentPublishView.as_view(), name="broadcast-channel-content-publish"),
@@ -385,6 +392,11 @@ urlpatterns = [
         name="education-institution-detail",
     ),
     path(
+        "broadcasts/education/institutions/<uuid:institution_id>/payout-account/connect/",
+        EducationInstitutionPayoutAccountConnectView.as_view(),
+        name="education-institution-payout-account-connect",
+    ),
+    path(
         "broadcasts/education/institutions/<uuid:institution_id>/verification-status/",
         EducationInstitutionVerificationStatusView.as_view(),
         name="education-institution-verification-status",
@@ -413,6 +425,11 @@ urlpatterns = [
         "broadcasts/education/institutions/<uuid:institution_id>/enrollments/",
         EducationInstitutionEnrollmentListView.as_view(),
         name="education-institution-enrollments",
+    ),
+    path(
+        "broadcasts/education/institutions/<uuid:institution_id>/course-access-requests/",
+        EducationInstitutionCourseAccessRequestListView.as_view(),
+        name="education-institution-course-access-requests",
     ),
     path(
         "broadcasts/education/institutions/<uuid:institution_id>/enrollments/<uuid:enrollment_id>/",
@@ -628,6 +645,21 @@ urlpatterns = [
         "education/contents/<uuid:content_id>/enroll/",
         EducationContentEnrollmentView.as_view(),
         name="education-content-enroll",
+    ),
+    path(
+        "education/contents/<uuid:content_id>/access-request/",
+        EducationContentAccessRequestView.as_view(),
+        name="education-content-access-request",
+    ),
+    path(
+        "broadcasts/education/courses/<uuid:course_id>/access-requests/",
+        EducationCourseAccessRequestListView.as_view(),
+        name="education-course-access-requests",
+    ),
+    path(
+        "broadcasts/education/courses/<uuid:course_id>/access-requests/<uuid:request_id>/action/",
+        EducationCourseAccessRequestActionView.as_view(),
+        name="education-course-access-request-action",
     ),
     path(
         "broadcasts/education/institutions/<uuid:institution_id>/assessments/",

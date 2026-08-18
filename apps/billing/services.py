@@ -236,6 +236,56 @@ def release_locked_booking_funds(
     )
 
 
+def release_locked_booking_funds_split(
+    *,
+    payer: User,
+    provider: User,
+    amount_cents: int,
+    commission_pct: float,
+    reference: str,
+    meta: Optional[dict] = None,
+) -> None:
+    """Commission-aware sibling of release_locked_booking_funds, used for
+    Education course purchases on the legacy wallet-payment rail (the
+    production path — direct Flutterwave/Stripe checkout — settles its
+    split at the payment-provider level instead, via the connected
+    subaccount; see _education_course_split_subaccounts in
+    apps/billing/direct_payments.py). Only the provider's share is ever
+    credited via record_ledger; if settings.EDUCATION_PLATFORM_USER_ID
+    isn't configured, the commission amount is simply never credited to
+    anyone (it is still correctly debited from the payer's escrow) rather
+    than inventing a platform account here — acceptable since this rail
+    is feature-flagged off by default."""
+    if amount_cents <= 0:
+        raise ValueError("Release amount must be greater than zero.")
+    payer_wallet = get_wallet_account(payer)
+    if payer_wallet.locked_cents < amount_cents:
+        raise ValueError("Insufficient locked funds.")
+    commission_cents = int(round(amount_cents * max(0.0, min(100.0, commission_pct)) / 100))
+    provider_cents = amount_cents - commission_cents
+    payer_wallet.locked_cents -= amount_cents
+    payer_wallet.save(update_fields=["locked_cents", "updated_at"])
+    split_meta = {**(meta or {}), "commission_cents": commission_cents, "commission_pct": commission_pct}
+    record_ledger(
+        user=provider,
+        kind="service_payout",
+        amount_cents=provider_cents,
+        reference=reference,
+        meta=split_meta,
+    )
+    platform_user_id = getattr(settings, "EDUCATION_PLATFORM_USER_ID", "") or ""
+    if commission_cents > 0 and platform_user_id:
+        platform_user = User.objects.filter(id=platform_user_id).first()
+        if platform_user:
+            record_ledger(
+                user=platform_user,
+                kind="platform_commission",
+                amount_cents=commission_cents,
+                reference=reference,
+                meta=split_meta,
+            )
+
+
 def refund_locked_booking_funds(
     *,
     payer: User,
@@ -612,6 +662,62 @@ def sweep_expired_subscriptions(limit: int = 500) -> dict:
             finalized += 1
         except Exception:
             logger.exception("finalize_expired_subscription failed for subscription_id=%s", sub.id)
+            errors += 1
+    return {"candidates": len(candidates), "finalized": finalized, "errors": errors}
+
+
+WALLET_TRANSACTION_STALE_PENDING_TIMEOUT = timedelta(hours=2)
+
+
+def finalize_stale_pending_wallet_transaction(
+    tx: WalletTransaction,
+    *,
+    timeout: timedelta = WALLET_TRANSACTION_STALE_PENDING_TIMEOUT,
+) -> WalletTransaction:
+    """
+    A WalletTransaction is created with status="pending" the instant a tier
+    upgrade checkout starts (WalletViewSet.upgrade) — before the user has
+    actually paid. If they cancel or abandon checkout, the Flutterwave/
+    Stripe webhook that would flip it to "success" never arrives, so
+    without this the row stays "pending" forever: it keeps appearing in
+    billing history indefinitely, indistinguishable from an in-progress
+    payment.
+
+    Called from the request-time lazy check (WalletViewSet.transactions/
+    billing_history) and the scheduled Celery sweep
+    (sweep_stale_pending_wallet_transactions), same pattern as
+    finalize_expired_subscription/sweep_expired_subscriptions above.
+
+    Idempotent: only acts on a still-pending row older than `timeout`.
+    """
+    if tx.status != "pending":
+        return tx
+    if tx.created_at > timezone.now() - timeout:
+        return tx
+    tx.status = "cancelled"
+    tx.processed_at = timezone.now()
+    tx.save(update_fields=["status", "processed_at", "updated_at"])
+    return tx
+
+
+def sweep_stale_pending_wallet_transactions(limit: int = 500) -> dict:
+    """Scheduled-sweep counterpart to the request-time lazy check — see
+    finalize_stale_pending_wallet_transaction for what/why."""
+    cutoff = timezone.now() - WALLET_TRANSACTION_STALE_PENDING_TIMEOUT
+    candidates = list(
+        WalletTransaction.objects.filter(
+            status="pending",
+            created_at__lte=cutoff,
+        ).order_by("created_at")[:limit]
+    )
+    finalized = 0
+    errors = 0
+    for tx in candidates:
+        try:
+            finalize_stale_pending_wallet_transaction(tx)
+            finalized += 1
+        except Exception:
+            logger.exception("finalize_stale_pending_wallet_transaction failed for transaction_id=%s", tx.id)
             errors += 1
     return {"candidates": len(candidates), "finalized": finalized, "errors": errors}
 

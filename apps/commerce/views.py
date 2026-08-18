@@ -33,6 +33,7 @@ from .category_catalog import ensure_catalog_categories
 from .documents import render_marketplace_receipt_pdf
 from .models import (
     Shop,
+    ShopPayoutAccountStatus,
     ShopVerificationRequest,
     Product,
     ProductAuthenticityCheck,
@@ -806,6 +807,68 @@ class ShopViewSet(viewsets.ModelViewSet):
         shop = self.get_object()
         ShopFollow.objects.get_or_create(user=request.user, shop=shop)
         return Response({'joined': True}, status=status.HTTP_200_OK)
+
+
+class ShopPayoutAccountConnectView(APIView):
+    """Connects the shop's Flutterwave subaccount for direct-to-shop
+    settlement splitting — mirrors
+    EducationInstitutionPayoutAccountConnectView (apps/broadcasts/views.py)
+    exactly, using the shared apps.billing.payout_accounts helper."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, shop_id: str):
+        from apps.billing.payout_accounts import create_flutterwave_subaccount
+
+        shop = get_object_or_404(Shop, id=shop_id)
+        if shop.owner_id != request.user.id and not request.user.is_staff:
+            raise PermissionDenied("Only the shop owner can connect a payout account.")
+
+        account_bank = str(request.data.get("account_bank") or "").strip()
+        account_number = str(request.data.get("account_number") or "").strip()
+        business_name = str(request.data.get("business_name") or shop.name).strip()
+        country = str(request.data.get("country") or "NG").strip().upper()
+        if not account_bank or not account_number:
+            raise ValidationError({"detail": "Bank and account number are required."})
+
+        shop.payout_account_status = ShopPayoutAccountStatus.PENDING
+        shop.save(update_fields=["payout_account_status", "updated_at"])
+
+        try:
+            subaccount_id = create_flutterwave_subaccount(
+                account_bank=account_bank,
+                account_number=account_number,
+                business_name=business_name,
+                business_email=shop.owner.email or "",
+                country=country,
+            )
+        except ValidationError:
+            shop.payout_account_status = ShopPayoutAccountStatus.NOT_CONNECTED
+            shop.save(update_fields=["payout_account_status", "updated_at"])
+            raise
+
+        shop.flutterwave_subaccount_id = subaccount_id
+        shop.payout_account_status = ShopPayoutAccountStatus.ACTIVE
+        shop.payout_account_name = business_name
+        shop.payout_bank_last4 = account_number[-4:] if len(account_number) >= 4 else account_number
+        shop.save(
+            update_fields=[
+                "flutterwave_subaccount_id",
+                "payout_account_status",
+                "payout_account_name",
+                "payout_bank_last4",
+                "updated_at",
+            ]
+        )
+        return Response(
+            {
+                "payout_account_status": shop.payout_account_status,
+                "payout_account_name": shop.payout_account_name,
+                "payout_bank_last4": shop.payout_bank_last4,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class CommerceDiscoveryView(APIView):
@@ -2463,7 +2526,13 @@ class ServiceBookingViewSet(
             receipt_id=request.query_params.get("receipt_id"),
             phase=request.query_params.get("phase"),
         )
-        html_url, pdf_url = build_booking_receipt_urls(request, booking, receipt)
+        if receipt:
+            html_url, pdf_url = build_booking_receipt_urls(request, booking, receipt)
+        else:
+            # No ServiceBookingReceipt exists yet — payment hasn't completed
+            # for this booking, so there is nothing real to link to. Do not
+            # synthesize a receipt document for an unpaid booking.
+            html_url, pdf_url = None, None
         response = {"receipt_url": html_url, "receipt_pdf_url": pdf_url}
         if receipt:
             response.update({
@@ -2482,7 +2551,10 @@ class ServiceBookingViewSet(
         receipt_id = request.data.get("receipt_id") or request.query_params.get("receipt_id")
         phase = request.data.get("phase") or request.query_params.get("phase")
         receipt = self._select_booking_receipt(booking, receipt_id=receipt_id, phase=phase)
-        html_url, pdf_url = build_booking_receipt_urls(request, booking, receipt, force=True)
+        if receipt:
+            html_url, pdf_url = build_booking_receipt_urls(request, booking, receipt, force=True)
+        else:
+            html_url, pdf_url = None, None
         response = {"receipt_url": html_url, "receipt_pdf_url": pdf_url}
         if receipt:
             response.update({
@@ -2673,20 +2745,27 @@ class ServiceBookingPaymentSatisfyView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         escrow = getattr(booking, "escrow", None)
-        amount = escrow.amount_cents if escrow else booking.deposit_cents or 0
         if escrow and escrow.status == ServiceBookingEscrow.STATUS_RELEASED:
             pass
-        elif amount > 0:
+        elif escrow:
+            # Legacy wallet-lock rail: funds were locked in the payer's
+            # wallet at booking time and must be explicitly released now.
             try:
                 release_locked_booking_funds(
                     payer=booking.user,
                     provider=booking.shop.owner,
-                    amount_cents=_wallet_amount(amount),
+                    amount_cents=_wallet_amount(escrow.amount_cents),
                     reference=payment.transaction_reference,
                     meta={"booking_id": str(booking.id)},
                 )
             except ValueError as exc:
                 raise ValidationError({"detail": str(exc)})
+        # else: default USD/direct-payment path (no escrow ever created) —
+        # settlement already happened at the Flutterwave webhook, either
+        # via the shop's connected subaccount split or, if none is
+        # connected, directly into KIS's own account. There is no wallet
+        # lock to release here; attempting one used to raise
+        # "Insufficient locked funds." for every booking on this path.
         now = timezone.now()
         payment.payment_status = ServiceBookingPayment.STATUS_SATISFIED
         payment.satisfied_at = now
@@ -2826,6 +2905,17 @@ class MarketplaceOrderViewSet(
     @action(detail=True, methods=['get'])
     def receipt(self, request, pk=None):
         order = self.get_object()
+        paid_statuses = {
+            MarketplaceOrderStatus.AWAITING_SATISFACTION,
+            MarketplaceOrderStatus.SATISFIED,
+            MarketplaceOrderStatus.COMPLETED,
+        }
+        is_paid = order.status in paid_statuses or (order.metadata or {}).get('payment_status') == 'paid'
+        if not is_paid:
+            return Response(
+                {'detail': 'A receipt is only available once payment for this order is complete.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         buffer = render_marketplace_receipt_pdf(order)
         return FileResponse(buffer, as_attachment=True, filename=f'marketplace_receipt_{order.id}.pdf')
 

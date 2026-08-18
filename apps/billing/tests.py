@@ -837,6 +837,11 @@ class WalletSubscriptionLifecycleApiTests(TestCase):
             name="Phase5 Business Pro",
             defaults={"price_cents": 4000, "rank": 3},
         )
+        # WalletViewSet.subscription_cancel (immediate=True) reverts the
+        # user to a real AccountTier named exactly "Free" — it must exist
+        # for that revert (and this test's assertion about it) to do
+        # anything, independent of this class's "Phase5 Free" fixture.
+        AccountTier.objects.get_or_create(name="Free", defaults={"price_cents": 0, "rank": 0})
 
     def _make_active_subscription(self, tier: AccountTier) -> Subscription:
         Subscription.objects.filter(user=self.user, status="active").update(status="superseded")
@@ -1289,3 +1294,30 @@ class WalletHistoryManagementApiTests(TestCase):
         self.assertEqual(transactions_res.status_code, status.HTTP_200_OK)
         ids = {str(item.get("id")) for item in transactions_res.data.get("results", [])}
         self.assertNotIn(str(tx.id), ids)
+
+
+class FlutterwaveSplitCommissionTests(TestCase):
+    """
+    Flutterwave's v3 Split Payments API takes `transaction_charge` as a
+    decimal FRACTION of the percentage (0.09 for a 9% commission) when
+    transaction_charge_type is "percentage" — see
+    developer.flutterwave.com/v3.0/docs/split-payments. Every other caller
+    of get_platform_commission_pct treats its return value as a whole
+    number (10 == 10%), so the Flutterwave payload builder must convert at
+    that API boundary. This regression-tests that conversion directly,
+    without needing a full DirectPaymentIntent/Shop/subaccount fixture.
+    """
+
+    def test_transaction_charge_is_a_decimal_fraction_not_a_whole_number(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch as _patch
+        from apps.billing.direct_payments import _split_subaccounts_for_intent
+
+        fake_entity = SimpleNamespace(flutterwave_subaccount_id="RS_TEST123", owner=None, owner_user=None)
+        with _patch("apps.billing.direct_payments._payout_owner_for_intent", return_value=fake_entity), \
+             _patch("apps.accounts.tiers.get_platform_commission_pct", return_value=10.0):
+            subaccounts = _split_subaccounts_for_intent(intent=object())
+
+        self.assertEqual(len(subaccounts), 1)
+        self.assertEqual(subaccounts[0]["transaction_charge_type"], "percentage")
+        self.assertEqual(subaccounts[0]["transaction_charge"], 0.1)

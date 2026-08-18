@@ -92,6 +92,7 @@ from .services import (
     upgrade_with_credits,
     apply_tier_upgrade,
     finalize_expired_subscription,
+    finalize_stale_pending_wallet_transaction,
     reverse_tier_upgrade_payment,
     cents_to_credits,
     cents_to_usd,
@@ -588,6 +589,7 @@ class WalletViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["get"], url_path="transactions")
     def transactions(self, request):
         entries = WalletTransaction.objects.filter(user=request.user, is_deleted=False).order_by("-created_at")[:100]
+        entries = [finalize_stale_pending_wallet_transaction(tx) for tx in entries]
         serializer = WalletTransactionSerializer(entries, many=True, context={"request": request})
         return Response({"results": serializer.data}, status=status.HTTP_200_OK)
 
@@ -619,6 +621,7 @@ class WalletViewSet(viewsets.ViewSet):
         ledger = WalletLedgerEntry.objects.filter(user=request.user, is_deleted=False).order_by("-created_at")[:50]
         ledger_data = WalletLedgerEntrySerializer(ledger, many=True, context={"request": request}).data
         transactions = WalletTransaction.objects.filter(user=request.user, is_deleted=False).order_by("-created_at")[:50]
+        transactions = [finalize_stale_pending_wallet_transaction(tx) for tx in transactions]
         sub = _current_subscription(request.user)
         if sub:
             sub = finalize_expired_subscription(sub)

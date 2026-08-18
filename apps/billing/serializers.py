@@ -497,7 +497,7 @@ class WalletLedgerEntrySerializer(serializers.ModelSerializer):
                     tx_ref=tx_ref,
                     is_deleted=False,
                 ).first()
-                if tx:
+                if tx and tx.status == "success":
                     try:
                         urls = build_receipt_urls(request, tx)
                     except Exception:
@@ -584,7 +584,17 @@ class WalletTransactionSerializer(serializers.ModelSerializer):
         cache = self._receipt_cache
         key = obj.id
         if key not in cache:
-            cache[key] = build_receipt_urls(request, obj)
+            if obj.status == "success":
+                try:
+                    cache[key] = build_receipt_urls(request, obj)
+                except Exception:
+                    # A transient storage failure must never break the
+                    # whole billing-history response — the receipt just
+                    # isn't available on this request; it'll retry the
+                    # next time this is read.
+                    cache[key] = (None, None)
+            else:
+                cache[key] = (None, None)
         return cache[key]
 
     def get_receipt_url(self, obj: WalletTransaction) -> str | None:

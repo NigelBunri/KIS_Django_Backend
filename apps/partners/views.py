@@ -2776,6 +2776,19 @@ class PartnerViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Not allowed to create invites.")
         serializer = PartnerInviteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        requested_role = str(serializer.validated_data.get("membership_role") or "member").strip().lower()
+        if requested_role != "subscriber" and partner.owner_id:
+            owner_features = get_user_tier_features(partner.owner)
+            seat_limit = normalize_limit_value(owner_features.get("team_seats"), default=0)
+            if seat_limit is not None:
+                existing_seat_count = PartnerMembership.objects.filter(
+                    partner=partner, status=PartnerMembershipStatus.MEMBER
+                ).count()
+                if existing_seat_count >= seat_limit:
+                    raise PermissionDenied(
+                        f"This partner organization has reached its team seat limit ({seat_limit}). "
+                        "Upgrade your plan to invite more team members."
+                    )
         invite = serializer.save(partner=partner, created_by=request.user)
         log_partner_audit(
             partner=partner,
@@ -2849,6 +2862,18 @@ class PartnerViewSet(viewsets.ModelViewSet):
                 if normalized_role == "subscriber"
                 else PartnerMembershipStatus.MEMBER
             )
+            if status_value == PartnerMembershipStatus.MEMBER and partner.owner_id:
+                owner_features = get_user_tier_features(partner.owner)
+                seat_limit = normalize_limit_value(owner_features.get("team_seats"), default=0)
+                if seat_limit is not None:
+                    existing_seat_count = PartnerMembership.objects.filter(
+                        partner=partner, status=PartnerMembershipStatus.MEMBER
+                    ).exclude(user_id=request.user.id).count()
+                    if existing_seat_count >= seat_limit:
+                        raise PermissionDenied(
+                            f"This partner organization has reached its team seat limit ({seat_limit}). "
+                            "Ask the owner to upgrade their plan to add more team members."
+                        )
             self._activate_partner_membership(
                 partner=partner,
                 user=request.user,

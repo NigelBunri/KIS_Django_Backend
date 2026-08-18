@@ -13,7 +13,8 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework import status
 
-from .models import User, Device
+from .models import AccountTier, Subscription, User, Device
+from .tiers import ensure_default_account_tiers
 from .views import issue_tokens_for_user
 
 # ──────────────────────────────────────────────
@@ -140,6 +141,13 @@ class BroadcastPlatformTests(TestCase):
         self.viewer = make_verified_user("+237672000002", display_name="Viewer")
         self.client_creator = auth_client(self.creator)
         self.client_viewer = auth_client(self.viewer, device_id=DEVICE_B)
+        # Broadcast channel creation is tier-gated (Free tier's
+        # channels_create limit is 0 — apps/accounts/tier_presets.py); give
+        # the creator a Pro subscription to match this test's premise.
+        ensure_default_account_tiers()
+        pro_tier = AccountTier.objects.filter(name__iexact="Pro").first()
+        if pro_tier:
+            Subscription.objects.create(user=self.creator, tier=pro_tier, status="active")
 
     # KIS-QA-014 Feeds
     def test_broadcast_feed_accessible(self):

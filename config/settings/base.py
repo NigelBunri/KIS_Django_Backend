@@ -2,6 +2,7 @@
 Base settings. Intended to be imported by local.py and production.py.
 Contains production-safe defaults and advanced configuration patterns.
 """
+import json
 import os
 from pathlib import Path
 from datetime import timedelta
@@ -160,6 +161,51 @@ FLW_WEBHOOK_SECRET = os.environ.get("FLW_WEBHOOK_SECRET", "")
 FLW_REDIRECT_URL = os.environ.get("FLW_REDIRECT_URL", "https://kis.app/payments/complete")
 KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED = _env_bool("KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED", False)
 PAYMENTS_MOCK = os.environ.get("PAYMENTS_MOCK", "False").lower() in ("1", "true", "yes")
+
+# Platform commission taken on paid marketplace transactions — Education
+# course purchases, Market orders/service bookings, Health billing
+# sessions, and Broadcast tips/memberships/PPV — before the remainder
+# settles to the seller/provider's connected Flutterwave subaccount (or,
+# on the legacy wallet rail, before crediting their wallet). This is
+# entirely separate from subscription/tier pricing — it is a
+# per-transaction marketplace fee, not part of any AccountTier price.
+#
+# Scaled by the seller/provider's own account tier (not per-shop/per-
+# institution) so the rate stays reasonable across tiers: higher tiers
+# already fund the platform via a larger subscription, so they keep a
+# larger share of what they sell. Capped at 10% (Free/Pro) so KIS stays a
+# realistic place to sell at every tier. Overridable via env as a JSON
+# object, e.g. PLATFORM_COMMISSION_BY_TIER='{"free": 10}'.
+# PLATFORM_COMMISSION_PCT remains the fallback rate used when the
+# owner's tier can't be resolved (e.g. no active subscription record).
+PLATFORM_COMMISSION_PCT = float(
+    os.environ.get("PLATFORM_COMMISSION_PCT", "10")
+)
+_PLATFORM_COMMISSION_BY_TIER_DEFAULT = {
+    "free": 10,
+    "pro": 10,
+    "business": 7,
+    "business pro": 7,
+    "partner": 5,
+    "partner pro": 5,
+}
+try:
+    PLATFORM_COMMISSION_BY_TIER = {
+        str(k).strip().lower(): float(v)
+        for k, v in json.loads(
+            os.environ.get("PLATFORM_COMMISSION_BY_TIER", "")
+            or json.dumps(_PLATFORM_COMMISSION_BY_TIER_DEFAULT)
+        ).items()
+    }
+except (ValueError, TypeError, AttributeError):
+    PLATFORM_COMMISSION_BY_TIER = dict(_PLATFORM_COMMISSION_BY_TIER_DEFAULT)
+# Optional: a system User id to credit with the platform's commission on
+# the legacy wallet-payment rail (apps/billing/services.py:
+# release_locked_booking_funds_split). Not required — the production
+# payment path settles its split at the Flutterwave provider level via
+# the institution's connected subaccount instead (see
+# _education_course_split_subaccounts in apps/billing/direct_payments.py).
+EDUCATION_PLATFORM_USER_ID = os.environ.get("EDUCATION_PLATFORM_USER_ID", "")
 
 # Financial safety defaults. Keep these disabled unless a controlled legacy
 # migration or local-only test explicitly needs the old stored-value behavior.
@@ -632,6 +678,17 @@ CELERY_BEAT_SCHEDULE = {
     # meaningful revenue/security impact worth a tighter interval.
     "expire-subscriptions": {
         "task": "apps.billing.tasks.expire_subscriptions",
+        "schedule": 60 * 60,
+    },
+    # Stale pending WalletTransaction sweep (apps/billing/tasks.py,
+    # apps/billing/services.py sweep_stale_pending_wallet_transactions). A
+    # tier-upgrade checkout creates the transaction row as "pending" before
+    # the user has actually paid; if they cancel/abandon, nothing ever
+    # transitions it, so it stayed "pending" forever and kept showing up in
+    # billing history with a broken receipt link. Same hourly cadence as
+    # the other sweeps.
+    "expire-stale-pending-wallet-transactions": {
+        "task": "apps.billing.tasks.expire_stale_pending_wallet_transactions",
         "schedule": 60 * 60,
     },
     # Reward/referral scheduled maintenance (Phase 11 of the billing/

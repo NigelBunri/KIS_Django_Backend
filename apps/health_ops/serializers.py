@@ -1379,6 +1379,8 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
     payment_intent_id = serializers.SerializerMethodField()
     direct_payment_intent_id = serializers.SerializerMethodField()
     payment_url = serializers.SerializerMethodField()
+    receipt_url = serializers.SerializerMethodField()
+    receipt_pdf_url = serializers.SerializerMethodField()
     next_action = serializers.SerializerMethodField()
 
     class Meta:
@@ -1413,6 +1415,8 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
             "payment_intent_id",
             "direct_payment_intent_id",
             "payment_url",
+            "receipt_url",
+            "receipt_pdf_url",
             "next_action",
             "payment_reference",
             "invoice_number",
@@ -1492,6 +1496,24 @@ class PaymentBillingSessionSerializer(serializers.ModelSerializer):
     def get_payment_url(self, obj):
         metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
         return str(metadata.get("payment_url") or "") or None
+
+    def _receipt_path_url(self, obj, key: str):
+        metadata = obj.metadata if isinstance(obj.metadata, dict) else {}
+        relative_path = metadata.get(key)
+        if not relative_path:
+            return None
+        from apps.billing.documents import build_media_url
+
+        try:
+            return build_media_url(self.context.get("request"), relative_path)
+        except Exception:
+            return None
+
+    def get_receipt_url(self, obj):
+        return self._receipt_path_url(obj, "receipt_html_path")
+
+    def get_receipt_pdf_url(self, obj):
+        return self._receipt_path_url(obj, "receipt_pdf_path")
 
     def get_currency_label(self, obj):
         metadata = obj.metadata if isinstance(obj.metadata, dict) else {}

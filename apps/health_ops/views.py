@@ -62,6 +62,7 @@ from .models import (
     HealthCarePlan,
     HealthInstitution,
     HealthInstitutionMembership,
+    HealthInstitutionPayoutAccountStatus,
     HomeLogisticsSession,
     HomeLogisticsStatus,
     HealthService,
@@ -1476,6 +1477,68 @@ class HealthInstitutionDetailView(APIView):
         if error_response:
             return error_response
         return Response({"institution": HealthInstitutionSerializer(institution, context={"request": request}).data}, status=status.HTTP_200_OK)
+
+
+class HealthInstitutionPayoutAccountConnectView(APIView):
+    """Connects the institution's Flutterwave subaccount for direct-to-
+    institution settlement splitting — mirrors
+    EducationInstitutionPayoutAccountConnectView (apps/broadcasts/views.py)
+    exactly, using the shared apps.billing.payout_accounts helper."""
+
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, institution_id: str):
+        from apps.billing.payout_accounts import create_flutterwave_subaccount
+
+        institution = get_object_or_404(HealthInstitution, id=institution_id)
+        if not _can_manage_institution(request.user, institution):
+            raise PermissionDenied("You do not have permission to manage this institution.")
+
+        account_bank = str(request.data.get("account_bank") or "").strip()
+        account_number = str(request.data.get("account_number") or "").strip()
+        business_name = str(request.data.get("business_name") or institution.name).strip()
+        country = str(request.data.get("country") or "NG").strip().upper()
+        if not account_bank or not account_number:
+            raise ValidationError({"detail": "Bank and account number are required."})
+
+        institution.payout_account_status = HealthInstitutionPayoutAccountStatus.PENDING
+        institution.save(update_fields=["payout_account_status", "updated_at"])
+
+        try:
+            subaccount_id = create_flutterwave_subaccount(
+                account_bank=account_bank,
+                account_number=account_number,
+                business_name=business_name,
+                business_email=institution.owner.email or "",
+                country=country,
+            )
+        except ValidationError:
+            institution.payout_account_status = HealthInstitutionPayoutAccountStatus.NOT_CONNECTED
+            institution.save(update_fields=["payout_account_status", "updated_at"])
+            raise
+
+        institution.flutterwave_subaccount_id = subaccount_id
+        institution.payout_account_status = HealthInstitutionPayoutAccountStatus.ACTIVE
+        institution.payout_account_name = business_name
+        institution.payout_bank_last4 = account_number[-4:] if len(account_number) >= 4 else account_number
+        institution.save(
+            update_fields=[
+                "flutterwave_subaccount_id",
+                "payout_account_status",
+                "payout_account_name",
+                "payout_bank_last4",
+                "updated_at",
+            ]
+        )
+        return Response(
+            {
+                "payout_account_status": institution.payout_account_status,
+                "payout_account_name": institution.payout_account_name,
+                "payout_bank_last4": institution.payout_bank_last4,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class HealthCareSummaryView(APIView):
