@@ -1,5 +1,6 @@
 from rest_framework import serializers
 
+from apps.websites.forms import validate_field_schema
 from apps.websites.models import KIS_CONTENT_TARGET_TYPES, SECTION_TYPES, Website, WebsitePage
 
 
@@ -26,6 +27,9 @@ class WebsitePageSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         f"kis_content section has an invalid target_type: {data.get('target_type')!r}."
                     )
+            if entry["type"] == "form":
+                fields = (entry.get("data") or {}).get("fields") or []
+                validate_field_schema(fields)
         return value
 
 

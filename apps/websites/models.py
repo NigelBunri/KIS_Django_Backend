@@ -205,3 +205,36 @@ KIS_CONTENT_TARGET_TYPES = (
     "event",
     "testimonial",
 )
+
+# Closed vocabulary for a `form` section's data.fields[].type — deliberately
+# small (three plain HTML input shapes), not an open-ended schema.
+FORM_FIELD_TYPES = ("text", "email", "textarea")
+
+
+class WebsiteFormSubmission(BaseEntity):
+    """A visitor's submission of a `form` section on a published page.
+    `section_id` is the section's own `id` within WebsitePage.sections —
+    not a FK, since sections aren't a separate table (see WebsitePage.
+    sections docstring) — so a submission stays attributable even if the
+    owner later edits that section's fields. `spam_score` is a 0-1
+    heuristic (apps.websites.forms.score_submission) computed at
+    submit-time and never re-evaluated; nothing here is ever auto-deleted
+    purely from an authorial signal alone, since removing a page/website
+    should still cascade correctly for privacy/retention purposes."""
+
+    website = models.ForeignKey(Website, on_delete=models.CASCADE, related_name="form_submissions")
+    page = models.ForeignKey(WebsitePage, on_delete=models.CASCADE, related_name="form_submissions")
+    section_id = models.CharField(max_length=64)
+    data = models.JSONField(default=dict, blank=True)
+    spam_score = models.FloatField(default=0.0)
+
+    class Meta:
+        db_table = "website_form_submission"
+        indexes = [
+            models.Index(fields=["website", "created_at"]),
+            models.Index(fields=["page", "section_id"]),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Submission on {self.page_id}/{self.section_id} at {self.created_at:%Y-%m-%d %H:%M}"

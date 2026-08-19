@@ -573,6 +573,7 @@ REST_FRAMEWORK = {
         "broadcast_profile_create": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_CREATE", dev_default="6000/min", prod_default="60/min"),
         "broadcast_profile_manage": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_MANAGE", dev_default="6000/min", prod_default="300/min"),
         "broadcast_profile_attachment": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_ATTACHMENT", dev_default="6000/min", prod_default="300/min"),
+        "website_form_submit": _env_throttle_rate("THROTTLE_WEBSITE_FORM_SUBMIT", dev_default="6000/min", prod_default="20/min"),
     },
 }
 

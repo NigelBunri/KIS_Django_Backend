@@ -6,14 +6,17 @@ from rest_framework import status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from apps.core.public_web import public_web_base_url, public_web_enabled, safe_public_description
+from apps.notifications.email_service import send_website_form_notification_email
 from apps.websites import adapters
 from apps.websites.branding import validate_branding
+from apps.websites.forms import HONEYPOT_KEY, score_submission, validate_submission_data
 from apps.websites.kis_content_resolvers import resolve_kis_content_section
-from apps.websites.models import Website, WebsiteOwnerType, WebsitePage, WebsiteStatus
-from apps.websites.owner_resolution import resolve_owner_object, user_can_manage_website
+from apps.websites.models import Website, WebsiteFormSubmission, WebsiteOwnerType, WebsitePage, WebsiteStatus
+from apps.websites.owner_resolution import resolve_owner_object, resolve_owner_user, user_can_manage_website
 from apps.websites.permissions import (
     check_kis_content_sections_quota,
     check_pages_quota,
@@ -155,6 +158,94 @@ class WebsitePublicSitemapPlanView(APIView):
             "robots": "index,follow" if indexing else "noindex,nofollow",
             "sites": sites,
         })
+
+
+def _notify_owner_of_form_submission(website: Website, page: WebsitePage, section_data: dict, cleaned: dict):
+    owner_instance = resolve_owner_object(website.owner_type, website.owner_id)
+    owner_user = resolve_owner_user(website.owner_type, owner_instance)
+    to_email = getattr(owner_user, "email", "") if owner_user else ""
+    if not to_email:
+        return
+    field_labels = {f.get("key"): f.get("label") or f.get("key") for f in (section_data.get("fields") or [])}
+    labeled = {field_labels.get(k, k): v for k, v in cleaned.items()}
+    send_website_form_notification_email(
+        to_email=to_email,
+        website_name=website.name or website.slug,
+        page_title=page.title,
+        form_title=section_data.get("title") or "Website",
+        fields=labeled,
+    )
+
+
+class WebsitePublicFormSubmitView(APIView):
+    """AllowAny + IP-throttled — a visitor submitting a `form` section on a
+    published page never authenticates. Honeypot hits are accepted with a
+    fake success and never persisted or notified, so a bot gets no signal
+    it was caught; everything else is scored (apps.websites.forms.
+    score_submission) and stored either way so the owner can still see
+    borderline submissions rather than having them silently vanish."""
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "website_form_submit"
+
+    def post(self, request, website_slug, page_slug, section_id):
+        _require_public_web_enabled()
+        website = get_object_or_404(Website, slug=website_slug)
+        if website.status != WebsiteStatus.PUBLISHED:
+            raise Http404("Website not found.")
+        lookup_slug = "" if page_slug == "home" else page_slug
+        page = get_object_or_404(WebsitePage, website=website, slug=lookup_slug)
+        if page.status != WebsiteStatus.PUBLISHED:
+            raise Http404("Page not found.")
+
+        section = next(
+            (s for s in (page.sections or []) if isinstance(s, dict) and s.get("id") == section_id), None,
+        )
+        if not section or section.get("type") != "form":
+            raise Http404("Form not found.")
+
+        submitted = request.data if isinstance(request.data, dict) else {}
+        if submitted.get(HONEYPOT_KEY):
+            return Response({"success": True}, status=status.HTTP_201_CREATED)
+
+        section_data = section.get("data") or {}
+        cleaned = validate_submission_data(section_data, submitted)
+        spam_score = score_submission(submitted)
+
+        submission = WebsiteFormSubmission.objects.create(
+            website=website, page=page, section_id=section_id, data=cleaned, spam_score=spam_score,
+        )
+
+        if spam_score < 0.5:
+            _notify_owner_of_form_submission(website, page, section_data, cleaned)
+
+        return Response({"success": True, "id": str(submission.id)}, status=status.HTTP_201_CREATED)
+
+
+class WebsiteFormResponsesView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, website_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_manage_permission(request.user, website)
+        page_id = request.query_params.get("page_id")
+        submissions = website.form_submissions.select_related("page").order_by("-created_at")
+        if page_id:
+            submissions = submissions.filter(page_id=page_id)
+        submissions = submissions[:500]
+        return Response([
+            {
+                "id": str(s.id),
+                "page_id": str(s.page_id),
+                "page_title": s.page.title,
+                "section_id": s.section_id,
+                "data": s.data,
+                "spam_score": s.spam_score,
+                "created_at": s.created_at.isoformat(),
+            }
+            for s in submissions
+        ])
 
 
 # ---------------------------------------------------------------------

@@ -14,7 +14,7 @@ from apps.accounts.models import AccountTier, Subscription
 from apps.accounts.tiers import ensure_default_account_tiers
 from apps.websites import adapters, owner_resolution
 from apps.websites.kis_content_resolvers import resolve_kis_content_section
-from apps.websites.models import Website, WebsiteOwnerType, WebsitePage, WebsiteStatus
+from apps.websites.models import Website, WebsiteFormSubmission, WebsiteOwnerType, WebsitePage, WebsiteStatus
 from apps.websites.permissions import check_websites_quota
 from apps.websites.preview_tokens import sign_website_preview_token, verify_website_preview_token
 from apps.websites.serializers import WebsitePageSerializer
@@ -563,3 +563,109 @@ class RnSectionVocabularyTests(TestCase):
         serializer = WebsitePageSerializer()
         with self.assertRaises(ValidationError):
             serializer.validate_sections([{"id": "x", "type": "not_a_real_type", "data": {}}])
+
+
+class WebsiteFormSubmissionApiTests(APITestCase):
+    FORM_SECTION = {
+        "id": "form-1",
+        "type": "form",
+        "data": {
+            "title": "Contact Us",
+            "fields": [
+                {"key": "name", "label": "Name", "type": "text", "required": True},
+                {"key": "email", "label": "Email", "type": "email", "required": True},
+                {"key": "message", "label": "Message", "type": "textarea", "required": False},
+            ],
+        },
+    }
+
+    def setUp(self):
+        self.owner = _make_user("+2348011110050")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="Form Shop", slug="form-test-shop")
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        self.website_id = mine_response.data["id"]
+        self.website_slug = mine_response.data["slug"]
+        self.home_page_id = WebsitePage.objects.get(website_id=self.website_id, is_home=True).id
+
+        patch_response = self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [self.FORM_SECTION]}, format="json",
+        )
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK, patch_response.data)
+
+        self.client.post(reverse("websites:publish", args=[self.website_id]))
+        self.client.post(reverse("websites:page-publish", args=[self.website_id, self.home_page_id]))
+        self.client.logout()
+
+    def _submit_url(self):
+        return reverse("websites:public-form-submit", args=[self.website_slug, "home", "form-1"])
+
+    def test_valid_submission_is_stored(self):
+        response = self.client.post(self._submit_url(), {"name": "Jane", "email": "jane@example.com", "message": "Hi"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        submission = WebsiteFormSubmission.objects.get()
+        self.assertEqual(submission.data["name"], "Jane")
+        self.assertEqual(submission.data["email"], "jane@example.com")
+        self.assertLess(submission.spam_score, 0.5)
+
+    def test_missing_required_field_is_rejected(self):
+        response = self.client.post(self._submit_url(), {"name": "Jane"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(WebsiteFormSubmission.objects.count(), 0)
+
+    def test_unknown_fields_are_dropped_not_stored(self):
+        response = self.client.post(
+            self._submit_url(),
+            {"name": "Jane", "email": "jane@example.com", "admin": True, "extra_field": "sneaky"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        submission = WebsiteFormSubmission.objects.get()
+        self.assertNotIn("admin", submission.data)
+        self.assertNotIn("extra_field", submission.data)
+
+    def test_honeypot_is_silently_accepted_but_never_stored(self):
+        response = self.client.post(
+            self._submit_url(),
+            {"name": "Bot", "email": "bot@example.com", "_hp": "filled"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(WebsiteFormSubmission.objects.count(), 0)
+
+    def test_fast_submission_is_scored_but_still_stored(self):
+        response = self.client.post(
+            self._submit_url(),
+            {"name": "Jane", "email": "jane@example.com", "_elapsed_ms": 200},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        submission = WebsiteFormSubmission.objects.get()
+        self.assertGreaterEqual(submission.spam_score, 0.4)
+
+    def test_unpublished_page_rejects_submissions(self):
+        self.client.force_authenticate(self.owner)
+        self.client.post(reverse("websites:page-unpublish", args=[self.website_id, self.home_page_id]))
+        self.client.logout()
+        response = self.client.post(self._submit_url(), {"name": "Jane", "email": "jane@example.com"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_can_list_responses(self):
+        self.client.post(self._submit_url(), {"name": "Jane", "email": "jane@example.com"}, format="json")
+        self.client.force_authenticate(self.owner)
+        response = self.client.get(reverse("websites:form-responses", args=[self.website_id]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["data"]["name"], "Jane")
+
+    def test_stranger_cannot_list_responses(self):
+        self.client.post(self._submit_url(), {"name": "Jane", "email": "jane@example.com"}, format="json")
+        stranger = _make_user("+2348011110051")
+        self.client.force_authenticate(stranger)
+        response = self.client.get(reverse("websites:form-responses", args=[self.website_id]))
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

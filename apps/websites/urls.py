@@ -9,9 +9,14 @@ urlpatterns = [
     path("public/sites/<slug:website_slug>/", views.WebsitePublicSiteView.as_view(), name="public-site"),
     path("public/sites/<slug:website_slug>/pages/<slug:page_slug>/", views.WebsitePublicPageView.as_view(), name="public-page"),
     path("public/sitemap-plan/", views.WebsitePublicSitemapPlanView.as_view(), name="public-sitemap-plan"),
+    path(
+        "public/sites/<slug:website_slug>/pages/<slug:page_slug>/forms/<str:section_id>/submit/",
+        views.WebsitePublicFormSubmitView.as_view(), name="public-form-submit",
+    ),
 
     # Authenticated owner CRUD
     path("mine/", views.WebsiteMineView.as_view(), name="mine"),
+    path("<uuid:website_id>/form-responses/", views.WebsiteFormResponsesView.as_view(), name="form-responses"),
     path("<uuid:website_id>/", views.WebsiteDetailView.as_view(), name="detail"),
     path("<uuid:website_id>/publish/", views.WebsitePublishView.as_view(), name="publish"),
     path("<uuid:website_id>/unpublish/", views.WebsiteUnpublishView.as_view(), name="unpublish"),

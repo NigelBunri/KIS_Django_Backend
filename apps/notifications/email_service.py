@@ -6,6 +6,7 @@ EMAIL_HOST_PASSWORD / DEFAULT_FROM_EMAIL in .env.
 """
 from __future__ import annotations
 
+import html
 import logging
 from django.conf import settings
 from django.core.mail import send_mail, EmailMultiAlternatives
@@ -51,6 +52,13 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
         "<p>Your device recovery code is: <strong>{recovery_code}</strong></p>"
         "<p>It expires in {expires_minutes} minutes. If you didn't request this, "
         "ignore this email — your current primary device stays active.</p>",
+    ),
+    "website_form_submission": (
+        "New form response on {website_name}",
+        "<h2>New Form Response</h2>"
+        "<p>Someone submitted the <strong>{form_title}</strong> form on "
+        "<strong>{website_name}</strong> ({page_title}).</p>"
+        "<div>{fields_html}</div>",
     ),
 }
 
@@ -141,4 +149,24 @@ def send_membership_email(to_email: str, tier_title: str, channel_name: str) -> 
         body=f"You are now a {tier_title} member of {channel_name}.",
         template_key="membership_joined",
         context={"tier_title": tier_title, "channel_name": channel_name},
+    )
+
+
+def send_website_form_notification_email(
+    to_email: str, website_name: str, page_title: str, form_title: str, fields: dict,
+) -> bool:
+    fields_html = "".join(
+        f"<p><strong>{html.escape(str(k))}:</strong> {html.escape(str(v))}</p>" for k, v in fields.items()
+    )
+    return send_notification_email(
+        to_email=to_email,
+        title=f"New form response on {website_name}",
+        body=f"New {form_title} response on {website_name} ({page_title}).",
+        template_key="website_form_submission",
+        context={
+            "website_name": website_name,
+            "page_title": page_title,
+            "form_title": form_title,
+            "fields_html": fields_html,
+        },
     )
