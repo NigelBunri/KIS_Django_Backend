@@ -207,6 +207,182 @@ BROADCAST_CREATOR = [
     },
 ]
 
+SHOP_BOLD_COLLECTION = [
+    {
+        "slug": "", "title": "Home", "is_home": True, "sort_order": 0,
+        "sections": [
+            _section("hero_banner", {
+                **_bg("slate_air"), "backgroundImageUrl": "",
+                "title": "Made for people who notice the details",
+                "subtitle": "Limited runs. Real materials. No filler.",
+                "ctaText": "Shop the Collection", "ctaLink": "",
+            }),
+            _section("statistics", {
+                **_bg("mint_soft"), "title": "By the Numbers",
+                "metrics": [
+                    {"id": "m1", "label": "Happy Customers", "value": "1,000+"},
+                    {"id": "m2", "label": "5-Star Reviews", "value": "98%"},
+                    {"id": "m3", "label": "Ships In", "value": "48hrs"},
+                ],
+            }),
+            _section("about", {
+                **_bg("ocean_mist"), "title": "Why We're Different", "layout": "image_right", "imageUrl": "",
+                "description": "We keep runs small on purpose — every piece gets real attention instead of being "
+                                "one of a thousand identical units. When it's gone, it's gone.",
+            }),
+            _section("faqs", {
+                **_bg("sandstone"), "title": "Before You Buy",
+                "items": [
+                    {"id": "f1", "question": "What's your return policy?", "answer": "Update this with your actual return window and process."},
+                    {"id": "f2", "question": "Do you ship internationally?", "answer": "Update this with your actual shipping coverage."},
+                ],
+            }),
+            _section("social_links", {**_bg("mint_soft"), "title": "Follow the Drops", "links": []}),
+            _section("contact_information", {**_bg("slate_air"), "title": "Reach Us", "phone": "", "email": "", "address": ""}),
+        ],
+    },
+]
+
+HEALTH_TELEHEALTH_BOOKING = [
+    {
+        "slug": "", "title": "Home", "is_home": True, "sort_order": 0,
+        "sections": [
+            _section("hero_banner", {
+                **_bg("mint_soft"), "backgroundImageUrl": "",
+                "title": "See a provider today, from wherever you are",
+                "subtitle": "In-person and virtual visits — book in under two minutes.",
+                "ctaText": "Book a Visit", "ctaLink": "",
+            }),
+            _section("programs_services", {
+                **_bg("ocean_mist"), "title": "Ways to Be Seen",
+                "cards": [
+                    {"id": "c1", "name": "Virtual Visit", "description": "Talk to a provider from home for non-urgent care."},
+                    {"id": "c2", "name": "In-Person Visit", "description": "Come to us for exams and hands-on care."},
+                    {"id": "c3", "name": "Follow-Up", "description": "Ongoing check-ins for existing patients."},
+                ],
+            }),
+            _section("faqs", {
+                **_bg("slate_air"), "title": "Telehealth, Explained",
+                "items": [
+                    {"id": "f1", "question": "Is a virtual visit right for me?", "answer": "Good for non-urgent concerns, follow-ups, and prescription renewals — update with your own guidance."},
+                    {"id": "f2", "question": "What do I need for a virtual visit?", "answer": "A phone or computer with a camera and a stable connection."},
+                    {"id": "f3", "question": "Is it covered by insurance?", "answer": "Update this with your actual coverage/pricing info."},
+                ],
+            }),
+            _section("hours", {
+                **_bg("sandstone"), "title": "When We're Available",
+                "days": [
+                    {"id": "d1", "day": "Monday - Friday", "hours": "8:00 AM - 6:00 PM"},
+                    {"id": "d2", "day": "Saturday", "hours": "10:00 AM - 2:00 PM"},
+                ],
+            }),
+            _section("contact_information", {**_bg("mint_soft"), "title": "Questions First?", "phone": "", "email": "", "address": ""}),
+        ],
+    },
+]
+
+EDUCATION_COHORT_ENROLLMENT = [
+    {
+        "slug": "", "title": "Home", "is_home": True, "sort_order": 0,
+        "sections": [
+            _section("hero_banner", {
+                **_bg("slate_air"), "backgroundImageUrl": "",
+                "title": "The next cohort starts soon",
+                "subtitle": "A small group, real feedback, and an outcome you can point to.",
+                "ctaText": "Reserve Your Spot", "ctaLink": "",
+            }),
+            _section("statistics", {
+                **_bg("ocean_mist"), "title": "Track Record",
+                "metrics": [
+                    {"id": "m1", "label": "Graduates", "value": "500+"},
+                    {"id": "m2", "label": "Completion Rate", "value": "92%"},
+                    {"id": "m3", "label": "Avg. Rating", "value": "4.8/5"},
+                ],
+            }),
+            _section("testimonials", {
+                **_bg("mint_soft"), "title": "From Past Cohorts",
+                "items": [
+                    {"id": "t1", "quote": "Small enough that the instructor actually knew my name and where I was stuck.", "author": "A recent graduate"},
+                ],
+            }),
+            _section("faqs", {
+                **_bg("sandstone"), "title": "Before You Enroll",
+                "items": [
+                    {"id": "f1", "question": "When does the next cohort start?", "answer": "Update this with your actual upcoming dates."},
+                    {"id": "f2", "question": "Is there a payment plan?", "answer": "Update this with your actual payment options."},
+                ],
+            }),
+            _section("contact_information", {**_bg("slate_air"), "title": "Have Questions?", "phone": "", "email": "", "address": ""}),
+        ],
+    },
+]
+
+PARTNER_IMPACT_REPORT = [
+    {
+        "slug": "", "title": "Home", "is_home": True, "sort_order": 0,
+        "sections": [
+            _section("hero_banner", {
+                **_bg("ocean_mist"), "backgroundImageUrl": "",
+                "title": "Here's what your support made possible",
+                "subtitle": "A transparent look at the work, in numbers and in people.",
+                "ctaText": "Support This Work", "ctaLink": "",
+            }),
+            _section("statistics", {
+                **_bg("slate_air"), "title": "This Year's Impact",
+                "metrics": [
+                    {"id": "m1", "label": "People Reached", "value": "10,000+"},
+                    {"id": "m2", "label": "Communities Served", "value": "24"},
+                    {"id": "m3", "label": "Volunteer Hours", "value": "3,200"},
+                ],
+            }),
+            _section("programs_services", {
+                **_bg("mint_soft"), "title": "Where the Work Happens",
+                "cards": [
+                    {"id": "c1", "name": "Direct Programs", "description": "Ongoing, hands-on work in the communities we serve."},
+                    {"id": "c2", "name": "Partnerships", "description": "Collaborations that multiply what we can do alone."},
+                ],
+            }),
+            _section("testimonials", {
+                **_bg("sandstone"), "title": "In Their Words",
+                "items": [
+                    {"id": "t1", "quote": "What they built here changed how our whole community thinks about this work.", "author": "A community partner"},
+                ],
+            }),
+            _section("social_links", {**_bg("ocean_mist"), "title": "Follow the Work", "links": []}),
+            _section("contact_information", {**_bg("slate_air"), "title": "Get In Touch", "phone": "", "email": "", "address": ""}),
+        ],
+    },
+]
+
+BROADCAST_HIGHLIGHT_REEL = [
+    {
+        "slug": "", "title": "Home", "is_home": True, "sort_order": 0,
+        "sections": [
+            _section("hero_banner", {
+                **_bg("slate_air"), "backgroundImageUrl": "",
+                "title": "New here? Start with the highlights",
+                "subtitle": "A quick look at what this channel is all about.",
+                "ctaText": "Subscribe", "ctaLink": "",
+            }),
+            _section("programs_services", {
+                **_bg("mint_soft"), "title": "What You'll Find Here",
+                "cards": [
+                    {"id": "c1", "name": "Weekly Uploads", "description": "New content on a regular schedule — update with your own cadence."},
+                    {"id": "c2", "name": "Behind the Scenes", "description": "The stuff that doesn't make the main feed."},
+                ],
+            }),
+            _section("testimonials", {
+                **_bg("ocean_mist"), "title": "What Viewers Say",
+                "items": [
+                    {"id": "t1", "quote": "Found this channel and immediately watched everything.", "author": "A subscriber"},
+                ],
+            }),
+            _section("social_links", {**_bg("sandstone"), "title": "Find Me Everywhere", "links": []}),
+            _section("contact_information", {**_bg("mint_soft"), "title": "Business Inquiries", "phone": "", "email": "", "address": ""}),
+        ],
+    },
+]
+
 TEMPLATE_SEEDS = [
     {
         "owner_type": WebsiteOwnerType.SHOP, "name": "Modern Storefront",
@@ -232,5 +408,30 @@ TEMPLATE_SEEDS = [
         "owner_type": WebsiteOwnerType.BROADCAST_CHANNEL, "name": "Creator Channel",
         "description": "A simple landing page for a broadcast channel's audience to find you.",
         "seed_pages": BROADCAST_CREATOR,
+    },
+    {
+        "owner_type": WebsiteOwnerType.SHOP, "name": "Bold Collection",
+        "description": "A punchier, trust-numbers-forward layout for a shop selling limited or curated runs.",
+        "seed_pages": SHOP_BOLD_COLLECTION,
+    },
+    {
+        "owner_type": WebsiteOwnerType.HEALTH_INSTITUTION, "name": "Telehealth & Booking",
+        "description": "Built around getting a visitor booked — virtual and in-person options up front.",
+        "seed_pages": HEALTH_TELEHEALTH_BOOKING,
+    },
+    {
+        "owner_type": WebsiteOwnerType.EDUCATION_INSTITUTION, "name": "Cohort & Enrollment",
+        "description": "A layout built around a specific upcoming cohort and enrollment deadline.",
+        "seed_pages": EDUCATION_COHORT_ENROLLMENT,
+    },
+    {
+        "owner_type": WebsiteOwnerType.PARTNER, "name": "Impact Report",
+        "description": "A numbers-and-testimonials layout for reporting back to supporters.",
+        "seed_pages": PARTNER_IMPACT_REPORT,
+    },
+    {
+        "owner_type": WebsiteOwnerType.BROADCAST_CHANNEL, "name": "Highlight Reel",
+        "description": "A first-impression layout for a channel's most-asked-about content and links.",
+        "seed_pages": BROADCAST_HIGHLIGHT_REEL,
     },
 ]

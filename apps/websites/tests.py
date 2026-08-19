@@ -1283,6 +1283,14 @@ class WebsiteTemplateTests(APITestCase):
         self.assertNotIn("Clinic Essentials", shop_names)
         self.assertIn("Clinic Essentials", health_names)
 
+    def test_every_owner_type_has_at_least_two_templates(self):
+        from apps.websites.models import WebsiteOwnerType
+
+        for owner_type in WebsiteOwnerType.values:
+            response = self.client.get(reverse("websites:template-list"), {"owner_type": owner_type})
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertGreaterEqual(len(response.data), 2, f"{owner_type} should have at least 2 templates.")
+
     def test_template_seeds_a_genuinely_blank_website(self):
         from apps.websites.models import WebsiteTemplate
 
