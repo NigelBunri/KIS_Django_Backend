@@ -17,6 +17,7 @@ from apps.websites.kis_content_resolvers import resolve_kis_content_section
 from apps.websites.models import Website, WebsiteOwnerType, WebsitePage, WebsiteStatus
 from apps.websites.permissions import check_websites_quota
 from apps.websites.preview_tokens import sign_website_preview_token, verify_website_preview_token
+from apps.websites.serializers import WebsitePageSerializer
 
 User = get_user_model()
 
@@ -461,3 +462,104 @@ class WebsiteApiTests(APITestCase):
 
         after = self.client.get(reverse("websites:public-sitemap-plan"))
         self.assertIn(website_slug, [s["slug"] for s in after.data["sites"]])
+
+    def test_patch_accepts_valid_branding(self):
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        website_id = mine_response.data["id"]
+        response = self.client.patch(reverse("websites:detail", args=[website_id]), {
+            "branding": {
+                "palette": {"primary": "#1a1a2e", "secondary": "#fff", "background": "#ffffff", "text": "#000"},
+                "typography": {"preset": "serif"},
+                "buttons": {"shape": "pill", "fill": "outline"},
+            },
+        }, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["branding"]["typography"]["preset"], "serif")
+
+    def test_patch_rejects_invalid_hex_color(self):
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        website_id = mine_response.data["id"]
+        response = self.client.patch(reverse("websites:detail", args=[website_id]), {
+            "branding": {"palette": {"primary": "not-a-color"}},
+        }, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_patch_rejects_invalid_typography_preset(self):
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        website_id = mine_response.data["id"]
+        response = self.client.patch(reverse("websites:detail", args=[website_id]), {
+            "branding": {"typography": {"preset": "comic-sans"}},
+        }, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_patch_rejects_invalid_button_shape(self):
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        website_id = mine_response.data["id"]
+        response = self.client.patch(reverse("websites:detail", args=[website_id]), {
+            "branding": {"buttons": {"shape": "hexagon"}},
+        }, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class BrandingValidationTests(TestCase):
+    def test_valid_full_payload_passes(self):
+        from apps.websites.branding import validate_branding
+
+        validate_branding({
+            "palette": {"primary": "#123", "secondary": "#123456", "background": "#fff", "text": "#000"},
+            "typography": {"preset": "sans"},
+            "buttons": {"shape": "rounded", "fill": "solid"},
+        })
+
+    def test_empty_payload_passes(self):
+        from apps.websites.branding import validate_branding
+
+        validate_branding({})
+
+    def test_invalid_hex_color_raises(self):
+        from apps.websites.branding import validate_branding
+
+        with self.assertRaises(ValidationError):
+            validate_branding({"palette": {"primary": "blue"}})
+
+    def test_invalid_typography_preset_raises(self):
+        from apps.websites.branding import validate_branding
+
+        with self.assertRaises(ValidationError):
+            validate_branding({"typography": {"preset": "comic-sans"}})
+
+    def test_invalid_button_shape_raises(self):
+        from apps.websites.branding import validate_branding
+
+        with self.assertRaises(ValidationError):
+            validate_branding({"buttons": {"shape": "hexagon"}})
+
+    def test_invalid_button_fill_raises(self):
+        from apps.websites.branding import validate_branding
+
+        with self.assertRaises(ValidationError):
+            validate_branding({"buttons": {"fill": "gradient"}})
+
+
+class RnSectionVocabularyTests(TestCase):
+    """The RN Website Builder editor (KIS/src/components/section-builder)
+    writes section types from its own legacy-landing-page vocabulary
+    (hero_banner, about, image_gallery_grid, statistics,
+    programs_services, call_to_action, contact_information) rather than
+    this app's own (hero, text, gallery, cta, contact_info). Regression
+    coverage for the bug where these were silently rejected on every
+    save from the actual production editor."""
+
+    def test_every_rn_editor_section_type_is_accepted(self):
+        rn_types = [
+            "hero_banner", "about", "image_gallery_grid", "statistics",
+            "programs_services", "call_to_action", "contact_information",
+        ]
+        serializer = WebsitePageSerializer()
+        for section_type in rn_types:
+            serializer.validate_sections([{"id": "x", "type": section_type, "data": {}}])
+
+    def test_unknown_type_is_still_rejected(self):
+        serializer = WebsitePageSerializer()
+        with self.assertRaises(ValidationError):
+            serializer.validate_sections([{"id": "x", "type": "not_a_real_type", "data": {}}])

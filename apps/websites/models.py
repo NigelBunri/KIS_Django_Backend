@@ -155,18 +155,37 @@ class WebsitePage(BaseEntity):
 # Closed vocabulary for WebsitePage.sections[].type — enforced at the
 # serializer layer (apps.websites.serializers), not a DB constraint, since
 # the section body itself is intentionally freeform JSON.
+#
+# hero_banner/about/image_gallery_grid/statistics/programs_services/
+# call_to_action/contact_information are the RN Website Builder editor's
+# own section vocabulary (apps/section-builder toolkit, originally built
+# for the older per-owner-type legacy landing pages and reused as-is for
+# this app's editor screens — see KIS/src/components/section-builder/
+# types.ts). They're accepted here verbatim, field names and all, rather
+# than translated to this app's own hero/text/gallery/cta/contact_info
+# names, since the RN editor already writes this exact shape and a
+# translation layer would just be one more thing to keep in sync. See
+# website repo's components/website-builder/SectionRenderer.tsx for the
+# matching render cases.
 SECTION_TYPES = (
     "hero",
+    "hero_banner",
     "text",
+    "about",
     "image",
     "gallery",
+    "image_gallery_grid",
     "video",
     "testimonials",
+    "statistics",
+    "programs_services",
     "faqs",
     "social_links",
     "contact_info",
+    "contact_information",
     "hours",
     "cta",
+    "call_to_action",
     "map",
     "form",
     "kis_content",

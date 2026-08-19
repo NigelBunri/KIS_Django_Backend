@@ -10,6 +10,7 @@ from rest_framework.views import APIView
 
 from apps.core.public_web import public_web_base_url, public_web_enabled, safe_public_description
 from apps.websites import adapters
+from apps.websites.branding import validate_branding
 from apps.websites.kis_content_resolvers import resolve_kis_content_section
 from apps.websites.models import Website, WebsiteOwnerType, WebsitePage, WebsiteStatus
 from apps.websites.owner_resolution import resolve_owner_object, user_can_manage_website
@@ -198,6 +199,7 @@ class WebsiteDetailView(APIView):
         branding_payload = request.data.get("branding")
         if branding_payload:
             require_custom_branding_allowed(request.user, branding_payload)
+            validate_branding(branding_payload)
         serializer = WebsiteSerializer(website, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save(updated_by=request.user)
