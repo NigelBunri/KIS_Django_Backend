@@ -71,6 +71,8 @@ _EXTENSION_BY_CONTENT_TYPE = {
     "image/heic": "heic",
     "image/heif": "heif",
     "application/pdf": "pdf",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
     "video/mp4": "mp4",
     "video/quicktime": "mov",
     "video/webm": "webm",
@@ -146,6 +148,8 @@ def _education_material_allowed_content_types() -> set[str]:
     values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
     return values or {
         "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "image/jpeg",
         "image/png",
         "image/webp",
@@ -160,7 +164,11 @@ def _education_material_allowed_content_types() -> set[str]:
 
 
 def _education_material_max_bytes() -> int:
-    return int(getattr(settings, "EDUCATION_MATERIAL_MAX_UPLOAD_BYTES", 100 * 1024 * 1024))
+    # Uploads go straight to S3 via a single presigned PUT (never through
+    # Django), so the real ceiling is S3's own single-PUT limit (5 GiB) —
+    # not an app-imposed cap. Previously 100 MiB, which silently rejected
+    # anything but the shortest course videos.
+    return int(getattr(settings, "EDUCATION_MATERIAL_MAX_UPLOAD_BYTES", 5 * 1024 * 1024 * 1024))
 
 
 @dataclass(frozen=True)
