@@ -315,6 +315,126 @@ class KisContentResolverTests(TestCase):
         self.assertEqual(items, [])
 
 
+class KisContentOrderingPaginationTests(TestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110101")
+
+    def _make_products(self, names):
+        from apps.commerce.models import Product, Shop
+
+        shop = Shop.objects.create(owner=self.owner, name="Ordering Shop", slug=f"ordering-shop-{uuid.uuid4().hex[:8]}")
+        products = []
+        for name in names:
+            products.append(Product.objects.create(shop=shop, sku=f"SKU-{name}", name=name, slug=f"{name.lower()}-{uuid.uuid4().hex[:6]}", price=10))
+        return shop, products
+
+    def test_alphabetical_ordering(self):
+        from apps.websites.kis_content_resolvers import resolve_kis_content_section
+
+        shop, _ = self._make_products(["Zebra", "Apple", "Mango"])
+        items = resolve_kis_content_section(
+            owner_type=WebsiteOwnerType.SHOP, owner_id=shop.id,
+            section_data={"target_type": "product", "filter": {"ordering": "alphabetical"}, "presentation": {"limit": 10}},
+        )
+        self.assertEqual([i["title"] for i in items], ["Apple", "Mango", "Zebra"])
+
+    def test_manual_ordering_matches_target_ids_order(self):
+        from apps.websites.kis_content_resolvers import resolve_kis_content_section
+
+        shop, products = self._make_products(["First", "Second", "Third"])
+        manual_order = [str(products[2].id), str(products[0].id), str(products[1].id)]
+        items = resolve_kis_content_section(
+            owner_type=WebsiteOwnerType.SHOP, owner_id=shop.id,
+            section_data={
+                "target_type": "product", "target_ids": manual_order,
+                "filter": {"ordering": "manual"}, "presentation": {"limit": 10},
+            },
+        )
+        self.assertEqual([i["id"] for i in items], manual_order)
+
+    def test_pagination_has_more_and_offset(self):
+        from apps.websites.kis_content_resolvers import resolve_kis_content_section_page
+
+        shop, _ = self._make_products([f"Product{i}" for i in range(5)])
+        first_page = resolve_kis_content_section_page(
+            owner_type=WebsiteOwnerType.SHOP, owner_id=shop.id,
+            section_data={"target_type": "product", "filter": {"ordering": "alphabetical"}, "presentation": {"limit": 2}},
+            offset=0,
+        )
+        self.assertEqual(len(first_page["items"]), 2)
+        self.assertTrue(first_page["has_more"])
+
+        second_page = resolve_kis_content_section_page(
+            owner_type=WebsiteOwnerType.SHOP, owner_id=shop.id,
+            section_data={"target_type": "product", "filter": {"ordering": "alphabetical"}, "presentation": {"limit": 2}},
+            offset=2,
+        )
+        self.assertEqual(len(second_page["items"]), 2)
+        self.assertTrue(second_page["has_more"])
+
+        first_ids = {i["id"] for i in first_page["items"]}
+        second_ids = {i["id"] for i in second_page["items"]}
+        self.assertEqual(first_ids & second_ids, set())
+
+        last_page = resolve_kis_content_section_page(
+            owner_type=WebsiteOwnerType.SHOP, owner_id=shop.id,
+            section_data={"target_type": "product", "filter": {"ordering": "alphabetical"}, "presentation": {"limit": 2}},
+            offset=4,
+        )
+        self.assertEqual(len(last_page["items"]), 1)
+        self.assertFalse(last_page["has_more"])
+
+
+class WebsiteKisContentLoadMoreApiTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110102")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.commerce.models import Product, Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="LoadMore Shop", slug="loadmore-shop")
+        for i in range(5):
+            Product.objects.create(shop=self.shop, sku=f"SKU-{i}", name=f"Product {i}", slug=f"product-{i}", price=10)
+
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        self.website_id = mine_response.data["id"]
+        self.website_slug = mine_response.data["slug"]
+        self.home_page_id = WebsitePage.objects.get(website_id=self.website_id, is_home=True).id
+
+        self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{
+                "id": "grid1", "type": "kis_content",
+                "data": {"target_type": "product", "presentation": {"limit": 2}},
+            }]},
+            format="json",
+        )
+        self.client.post(reverse("websites:publish", args=[self.website_id]))
+        self.client.post(reverse("websites:page-publish", args=[self.website_id, self.home_page_id]))
+        self.client.logout()
+
+    def test_initial_page_reports_has_more(self):
+        response = self.client.get(reverse("websites:public-page", args=[self.website_slug, "home"]))
+        section = next(s for s in response.data["sections"] if s["id"] == "grid1")
+        self.assertEqual(len(section["resolved_items"]), 2)
+        self.assertTrue(section["has_more"])
+
+    def test_load_more_returns_next_page(self):
+        response = self.client.get(
+            reverse("websites:public-kis-content-load-more", args=[self.website_slug, "home", "grid1"]),
+            {"offset": 2},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["items"]), 2)
+        self.assertTrue(response.data["has_more"])
+
+    def test_load_more_unknown_section_404s(self):
+        response = self.client.get(
+            reverse("websites:public-kis-content-load-more", args=[self.website_slug, "home", "does-not-exist"]),
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
 class TierGateTests(TestCase):
     def setUp(self):
         self.free_user = _make_user("+2348011110030")

@@ -8,6 +8,10 @@ urlpatterns = [
     # Public read API (AllowAny) — kingdomimpactventures.org/page/<slug>[/<page-slug>]
     path("public/sites/<slug:website_slug>/", views.WebsitePublicSiteView.as_view(), name="public-site"),
     path("public/sites/<slug:website_slug>/pages/<slug:page_slug>/", views.WebsitePublicPageView.as_view(), name="public-page"),
+    path(
+        "public/sites/<slug:website_slug>/pages/<slug:page_slug>/sections/<str:section_id>/more/",
+        views.WebsitePublicKisContentLoadMoreView.as_view(), name="public-kis-content-load-more",
+    ),
     path("public/sitemap-plan/", views.WebsitePublicSitemapPlanView.as_view(), name="public-sitemap-plan"),
     path(
         "public/sites/<slug:website_slug>/pages/<slug:page_slug>/forms/<str:section_id>/submit/",

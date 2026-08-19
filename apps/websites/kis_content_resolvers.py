@@ -255,24 +255,68 @@ RESOLVERS = {
 }
 
 
-def resolve_kis_content_section(*, owner_type, owner_id, section_data: dict) -> list:
-    """Entry point used by the public page serializer for a `kis_content`
-    section — dispatches to the right resolver and honors `presentation.
-    limit`. Returns [] for an unknown target_type rather than raising, so
-    a malformed/legacy section never breaks the whole page render."""
+def _clamp_limit(value) -> int:
+    try:
+        return max(1, min(int(value), 50))
+    except (TypeError, ValueError):
+        return 6
+
+
+def _apply_ordering(items: list, ordering: str, target_ids) -> list:
+    """Resolvers themselves only ever fetch newest-first from the DB —
+    ordering beyond that (and pagination, see resolve_kis_content_section_page)
+    happens here, over each resolver's own fixed-cap fetch (see below),
+    not a live unbounded DB-level operation. Fine at this feature's actual
+    scale (the same 50-row cap target_ids has always been limited to);
+    this was never built to paginate thousands of rows."""
+    if ordering == "alphabetical":
+        return sorted(items, key=lambda item: (item.get("title") or "").lower())
+    if ordering == "manual" and target_ids:
+        order_index = {str(tid): idx for idx, tid in enumerate(target_ids)}
+        return sorted(items, key=lambda item: order_index.get(item.get("id"), len(order_index)))
+    return items  # "recent" (default) — resolvers already order by -created_at
+
+
+def _resolve_ordered_items(*, owner_type, owner_id, section_data: dict) -> list:
     target_type = section_data.get("target_type")
     resolver = RESOLVERS.get(target_type)
     if resolver is None:
         return []
+    target_ids = section_data.get("target_ids")
+    filter_config = section_data.get("filter") or {}
+    ordering = filter_config.get("ordering") or "recent"
+    # Always fetch the resolver's own max (50, matching the target_ids
+    # cap) regardless of the section's configured display limit — ordering
+    # and pagination both need the full candidate set to be correct, not
+    # just the first page's worth.
+    items = resolver(owner_type=owner_type, owner_id=owner_id, target_ids=target_ids, limit=50)
+    return _apply_ordering(items, ordering, target_ids)
+
+
+def resolve_kis_content_section(*, owner_type, owner_id, section_data: dict) -> list:
+    """Entry point used by the public page serializer for a `kis_content`
+    section — dispatches to the right resolver, honors `presentation.
+    limit` and `filter.ordering`. Returns [] for an unknown target_type
+    rather than raising, so a malformed/legacy section never breaks the
+    whole page render. See resolve_kis_content_section_page for the
+    has_more-aware variant used by the public "load more" pagination."""
     presentation = section_data.get("presentation") or {}
-    limit = presentation.get("limit") or 6
+    limit = _clamp_limit(presentation.get("limit"))
+    items = _resolve_ordered_items(owner_type=owner_type, owner_id=owner_id, section_data=section_data)
+    return items[:limit]
+
+
+def resolve_kis_content_section_page(*, owner_type, owner_id, section_data: dict, offset: int = 0) -> dict:
+    """Same resolution as resolve_kis_content_section, plus has_more —
+    used for the public page's initial render (offset=0, to know whether
+    to show a "Load more" button at all) and the load-more beacon itself
+    (offset>0)."""
+    presentation = section_data.get("presentation") or {}
+    limit = _clamp_limit(presentation.get("limit"))
     try:
-        limit = max(1, min(int(limit), 50))
+        offset = max(0, int(offset or 0))
     except (TypeError, ValueError):
-        limit = 6
-    return resolver(
-        owner_type=owner_type,
-        owner_id=owner_id,
-        target_ids=section_data.get("target_ids"),
-        limit=limit,
-    )
+        offset = 0
+    items = _resolve_ordered_items(owner_type=owner_type, owner_id=owner_id, section_data=section_data)
+    page_items = items[offset:offset + limit]
+    return {"items": page_items, "has_more": offset + limit < len(items)}

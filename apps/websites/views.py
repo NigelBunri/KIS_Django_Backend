@@ -24,7 +24,7 @@ from apps.websites.custom_domains import (
     validate_domain_format,
 )
 from apps.websites.forms import HONEYPOT_KEY, score_submission, validate_submission_data
-from apps.websites.kis_content_resolvers import resolve_kis_content_section
+from apps.websites.kis_content_resolvers import resolve_kis_content_section, resolve_kis_content_section_page
 from apps.websites.kis_video import resolve_kis_video, search_owner_kis_videos
 from apps.websites.models import (
     Website,
@@ -85,9 +85,11 @@ def _serialize_public_section(website: Website, section: dict) -> dict:
         return {}
     payload = {"id": section.get("id"), "type": section.get("type"), "data": section.get("data") or {}}
     if section.get("type") == "kis_content":
-        payload["resolved_items"] = resolve_kis_content_section(
+        page = resolve_kis_content_section_page(
             owner_type=website.owner_type, owner_id=website.owner_id, section_data=section.get("data") or {},
         )
+        payload["resolved_items"] = page["items"]
+        payload["has_more"] = page["has_more"]
     if section.get("type") == "kis_video":
         data = section.get("data") or {}
         payload["resolved_video"] = resolve_kis_video(data.get("source"), data.get("target_id"))
@@ -172,6 +174,39 @@ class WebsitePublicPageView(APIView):
         if page.status != WebsiteStatus.PUBLISHED and not is_preview:
             raise Http404("Page not found.")
         return Response(_public_page_payload(website, page), status=status.HTTP_200_OK)
+
+
+class WebsitePublicKisContentLoadMoreView(APIView):
+    """Backs the "Load more" button on a public kis_content section —
+    re-resolves live (never a cached/stale page) at a given offset. Public
+    (AllowAny) since the section itself is already publicly visible on the
+    page; this exposes no more than what resolve_kis_content_section_page
+    already returns for the page's own initial render."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, website_slug, page_slug, section_id):
+        _require_public_web_enabled()
+        website = get_object_or_404(Website, slug=website_slug)
+        if website.status != WebsiteStatus.PUBLISHED:
+            raise Http404("Website not found.")
+        lookup_slug = "" if page_slug == "home" else page_slug
+        page = get_object_or_404(WebsitePage, website=website, slug=lookup_slug)
+        if page.status != WebsiteStatus.PUBLISHED:
+            raise Http404("Page not found.")
+
+        section = next(
+            (s for s in (page.sections or []) if isinstance(s, dict) and s.get("id") == section_id), None,
+        )
+        if not section or section.get("type") != "kis_content":
+            raise Http404("Section not found.")
+
+        offset = request.query_params.get("offset") or 0
+        result = resolve_kis_content_section_page(
+            owner_type=website.owner_type, owner_id=website.owner_id,
+            section_data=section.get("data") or {}, offset=offset,
+        )
+        return Response(result)
 
 
 class WebsitePublicSitemapPlanView(APIView):
