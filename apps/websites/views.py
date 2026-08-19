@@ -14,7 +14,7 @@ from rest_framework.views import APIView
 from apps.core.public_web import public_web_base_url, public_web_enabled, safe_public_description
 from apps.notifications.email_service import send_website_form_notification_email
 from apps.websites import adapters
-from apps.websites.analytics import extract_referrer_host, hash_visitor_session
+from apps.websites.analytics import classify_device, extract_referrer_host, hash_visitor_session
 from apps.websites.branding import validate_branding
 from apps.websites.custom_domains import (
     check_hostname_status,
@@ -337,6 +337,7 @@ class WebsitePublicAnalyticsBeaconView(APIView):
             website=website, page=page,
             path=f"/page/{site_slug}" + (f"/{page_slug}" if page_slug and page_slug != "home" else ""),
             referrer_host=extract_referrer_host(referrer),
+            device_type=classify_device(user_agent),
             session_hash=hash_visitor_session(ip_address, user_agent),
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -369,6 +370,15 @@ class WebsiteAnalyticsSummaryView(APIView):
             .annotate(count=Count("id"))
             .order_by("-count")[:10]
         )
+        top_referrers = (
+            events.exclude(referrer_host="")
+            .values("referrer_host")
+            .annotate(count=Count("id"))
+            .order_by("-count")[:10]
+        )
+        device_breakdown = (
+            events.values("device_type").annotate(count=Count("id")).order_by("-count")
+        )
 
         return Response({
             "days": days,
@@ -378,6 +388,12 @@ class WebsiteAnalyticsSummaryView(APIView):
             "top_pages": [
                 {"page_id": str(p["page_id"]), "title": p["page__title"], "slug": p["page__slug"] or "home", "count": p["count"]}
                 for p in top_pages
+            ],
+            "top_referrers": [
+                {"referrer_host": r["referrer_host"], "count": r["count"]} for r in top_referrers
+            ],
+            "device_breakdown": [
+                {"device_type": d["device_type"], "count": d["count"]} for d in device_breakdown
             ],
         })
 

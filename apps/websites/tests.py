@@ -1152,6 +1152,51 @@ class WebsiteAnalyticsTests(APITestCase):
         self.assertEqual(len(response.data["top_pages"]), 1)
         self.assertEqual(response.data["top_pages"][0]["count"], 3)
 
+    def test_classify_device_mobile(self):
+        from apps.websites.analytics import classify_device
+
+        self.assertEqual(classify_device("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"), "mobile")
+        self.assertEqual(classify_device("Mozilla/5.0 (Linux; Android 14)"), "mobile")
+
+    def test_classify_device_tablet(self):
+        from apps.websites.analytics import classify_device
+
+        self.assertEqual(classify_device("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)"), "tablet")
+
+    def test_classify_device_desktop(self):
+        from apps.websites.analytics import classify_device
+
+        self.assertEqual(classify_device("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"), "desktop")
+
+    def test_classify_device_empty_is_other(self):
+        from apps.websites.analytics import classify_device
+
+        self.assertEqual(classify_device(""), "other")
+
+    def test_beacon_never_stores_raw_user_agent(self):
+        from apps.websites.models import WebsiteAnalyticsEvent
+
+        field_names = {f.name for f in WebsiteAnalyticsEvent._meta.get_fields()}
+        self.assertNotIn("user_agent", field_names)
+
+    def test_summary_includes_top_referrers_and_device_breakdown(self):
+        self.client.post(
+            reverse("websites:public-analytics-beacon"),
+            {"site_slug": self.website_slug, "page_slug": "home", "referrer": "https://google.com/search"},
+            format="json",
+        )
+        self.client.post(
+            reverse("websites:public-analytics-beacon"),
+            {"site_slug": self.website_slug, "page_slug": "home", "referrer": "https://google.com/other"},
+            format="json",
+        )
+        self.client.force_authenticate(self.owner)
+        response = self.client.get(reverse("websites:analytics-summary", args=[self.website_id]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["top_referrers"][0]["referrer_host"], "google.com")
+        self.assertEqual(response.data["top_referrers"][0]["count"], 2)
+        self.assertGreaterEqual(len(response.data["device_breakdown"]), 1)
+
     def test_stranger_cannot_view_analytics_summary(self):
         stranger = _make_user("+2348011110092")
         self.client.force_authenticate(stranger)

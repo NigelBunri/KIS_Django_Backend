@@ -392,10 +392,20 @@ class WebsiteAnalyticsEvent(BaseEntity):
     can dedup same-day visits without being a stable, reversible visitor
     identifier beyond that one day."""
 
+    class DeviceType(models.TextChoices):
+        MOBILE = "mobile", "Mobile"
+        TABLET = "tablet", "Tablet"
+        DESKTOP = "desktop", "Desktop"
+        OTHER = "other", "Other"
+
     website = models.ForeignKey(Website, on_delete=models.CASCADE, related_name="analytics_events")
     page = models.ForeignKey(WebsitePage, on_delete=models.CASCADE, related_name="analytics_events", null=True, blank=True)
     path = models.CharField(max_length=255, blank=True, default="")
     referrer_host = models.CharField(max_length=255, blank=True, default="")
+    # A coarse category only (apps.websites.analytics.classify_device) —
+    # never the raw User-Agent string itself, same "never the identifying
+    # raw thing" posture as session_hash never storing the raw IP.
+    device_type = models.CharField(max_length=16, choices=DeviceType.choices, default=DeviceType.OTHER)
     session_hash = models.CharField(max_length=64, db_index=True)
 
     class Meta:

@@ -28,3 +28,23 @@ def extract_referrer_host(referrer: str) -> str:
         return urlparse(referrer).netloc[:255]
     except Exception:
         return ""
+
+
+_TABLET_MARKERS = ("ipad", "tablet")
+_MOBILE_MARKERS = ("mobi", "iphone", "ipod", "android")
+
+
+def classify_device(user_agent: str) -> str:
+    """A coarse category only — the raw User-Agent string itself is never
+    persisted anywhere, only this classification, same posture as
+    hash_visitor_session never persisting the raw IP."""
+    ua = (user_agent or "").lower()
+    if not ua:
+        return "other"
+    if any(marker in ua for marker in _TABLET_MARKERS):
+        return "tablet"
+    if any(marker in ua for marker in _MOBILE_MARKERS):
+        return "mobile"
+    if "mozilla" in ua or "chrome" in ua or "safari" in ua or "firefox" in ua:
+        return "desktop"
+    return "other"
