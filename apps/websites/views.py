@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.conf import settings
 from django.http import Http404
 from django.shortcuts import get_object_or_404
@@ -12,11 +14,13 @@ from rest_framework.views import APIView
 from apps.core.public_web import public_web_base_url, public_web_enabled, safe_public_description
 from apps.notifications.email_service import send_website_form_notification_email
 from apps.websites import adapters
+from apps.websites.analytics import extract_referrer_host, hash_visitor_session
 from apps.websites.branding import validate_branding
 from apps.websites.forms import HONEYPOT_KEY, score_submission, validate_submission_data
 from apps.websites.kis_content_resolvers import resolve_kis_content_section
 from apps.websites.models import (
     Website,
+    WebsiteAnalyticsEvent,
     WebsiteCollaborator,
     WebsiteCollaboratorRole,
     WebsiteFormSubmission,
@@ -247,6 +251,86 @@ class WebsitePublicFormSubmitView(APIView):
             })
 
         return Response({"success": True, "id": str(submission.id)}, status=status.HTTP_201_CREATED)
+
+
+class WebsitePublicAnalyticsBeaconView(APIView):
+    """Fire-and-forget page-view beacon called from the public site on
+    load. Always returns 200/204 quickly, even when the site/page can't
+    be resolved — a tracking beacon isn't something client code should
+    ever need to handle an error branch for."""
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "website_analytics_beacon"
+
+    def post(self, request):
+        if not public_web_enabled():
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        site_slug = str(request.data.get("site_slug") or "").strip()
+        page_slug = str(request.data.get("page_slug") or "").strip()
+        referrer = str(request.data.get("referrer") or "")
+
+        website = Website.objects.filter(slug=site_slug, status=WebsiteStatus.PUBLISHED).first()
+        if website is None:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        page = None
+        if page_slug:
+            lookup_slug = "" if page_slug == "home" else page_slug
+            page = WebsitePage.objects.filter(website=website, slug=lookup_slug, status=WebsiteStatus.PUBLISHED).first()
+
+        forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+        ip_address = forwarded.split(",")[0].strip() if forwarded else str(request.META.get("REMOTE_ADDR") or "")
+        user_agent = str(request.META.get("HTTP_USER_AGENT") or "")
+
+        WebsiteAnalyticsEvent.objects.create(
+            website=website, page=page,
+            path=f"/page/{site_slug}" + (f"/{page_slug}" if page_slug and page_slug != "home" else ""),
+            referrer_host=extract_referrer_host(referrer),
+            session_hash=hash_visitor_session(ip_address, user_agent),
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class WebsiteAnalyticsSummaryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, website_id):
+        from django.db.models import Count
+        from django.db.models.functions import TruncDate
+
+        website = get_object_or_404(Website, id=website_id)
+        _require_manage_permission(request.user, website)
+
+        days = min(max(int(request.query_params.get("days") or 30), 1), 90)
+        since = timezone.now() - timedelta(days=days)
+        events = WebsiteAnalyticsEvent.objects.filter(website=website, created_at__gte=since)
+
+        daily = (
+            events.annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(count=Count("id"))
+            .order_by("day")
+        )
+        unique_visitors = events.values("session_hash").distinct().count()
+        top_pages = (
+            events.filter(page__isnull=False)
+            .values("page_id", "page__title", "page__slug")
+            .annotate(count=Count("id"))
+            .order_by("-count")[:10]
+        )
+
+        return Response({
+            "days": days,
+            "total_views": events.count(),
+            "unique_visitors": unique_visitors,
+            "daily": [{"date": d["day"].isoformat(), "count": d["count"]} for d in daily],
+            "top_pages": [
+                {"page_id": str(p["page_id"]), "title": p["page__title"], "slug": p["page__slug"] or "home", "count": p["count"]}
+                for p in top_pages
+            ],
+        })
 
 
 class WebsiteFormResponsesView(APIView):

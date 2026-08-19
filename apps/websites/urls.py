@@ -13,11 +13,13 @@ urlpatterns = [
         "public/sites/<slug:website_slug>/pages/<slug:page_slug>/forms/<str:section_id>/submit/",
         views.WebsitePublicFormSubmitView.as_view(), name="public-form-submit",
     ),
+    path("public/analytics/", views.WebsitePublicAnalyticsBeaconView.as_view(), name="public-analytics-beacon"),
 
     # Authenticated owner CRUD
     path("mine/", views.WebsiteMineView.as_view(), name="mine"),
     path("redeem-invite/", views.WebsiteInviteRedeemView.as_view(), name="redeem-invite"),
     path("<uuid:website_id>/form-responses/", views.WebsiteFormResponsesView.as_view(), name="form-responses"),
+    path("<uuid:website_id>/analytics/summary/", views.WebsiteAnalyticsSummaryView.as_view(), name="analytics-summary"),
     path("<uuid:website_id>/webhooks/", views.WebsiteWebhookListCreateView.as_view(), name="webhook-list-create"),
     path("<uuid:website_id>/webhooks/<uuid:webhook_id>/", views.WebsiteWebhookDetailView.as_view(), name="webhook-detail"),
     path("<uuid:website_id>/collaborators/", views.WebsiteCollaboratorListView.as_view(), name="collaborator-list"),

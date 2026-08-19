@@ -954,3 +954,83 @@ class WebsiteCollaborationApiTests(APITestCase):
         self.client.force_authenticate(fourth_user)
         response = self.client.post(reverse("websites:redeem-invite"), {"code": code}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class WebsiteAnalyticsTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110091")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="Analytics Shop", slug="analytics-test-shop")
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        self.website_id = mine_response.data["id"]
+        self.website_slug = mine_response.data["slug"]
+        self.home_page_id = WebsitePage.objects.get(website_id=self.website_id, is_home=True).id
+
+        self.client.post(reverse("websites:publish", args=[self.website_id]))
+        self.client.post(reverse("websites:page-publish", args=[self.website_id, self.home_page_id]))
+        self.client.logout()
+
+    def test_beacon_records_a_view_for_a_published_site(self):
+        from apps.websites.models import WebsiteAnalyticsEvent
+
+        response = self.client.post(
+            reverse("websites:public-analytics-beacon"),
+            {"site_slug": self.website_slug, "page_slug": "home", "referrer": "https://google.com/search"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        event = WebsiteAnalyticsEvent.objects.get()
+        self.assertEqual(event.website_id, uuid.UUID(self.website_id))
+        self.assertEqual(event.referrer_host, "google.com")
+        self.assertTrue(event.session_hash)
+
+    def test_beacon_never_stores_a_raw_ip_field(self):
+        from apps.websites.models import WebsiteAnalyticsEvent
+
+        field_names = {f.name for f in WebsiteAnalyticsEvent._meta.get_fields()}
+        self.assertNotIn("ip_address", field_names)
+        self.assertNotIn("ip", field_names)
+
+    def test_beacon_is_silent_no_op_for_unknown_site(self):
+        from apps.websites.models import WebsiteAnalyticsEvent
+
+        response = self.client.post(
+            reverse("websites:public-analytics-beacon"), {"site_slug": "does-not-exist", "page_slug": "home"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(WebsiteAnalyticsEvent.objects.count(), 0)
+
+    def test_session_hash_same_day_same_visitor_dedupes(self):
+        from apps.websites.analytics import hash_visitor_session
+
+        first = hash_visitor_session("203.0.113.5", "TestAgent/1.0")
+        second = hash_visitor_session("203.0.113.5", "TestAgent/1.0")
+        self.assertEqual(first, second)
+
+    def test_session_hash_different_visitors_differ(self):
+        from apps.websites.analytics import hash_visitor_session
+
+        first = hash_visitor_session("203.0.113.5", "TestAgent/1.0")
+        second = hash_visitor_session("203.0.113.9", "TestAgent/1.0")
+        self.assertNotEqual(first, second)
+
+    def test_owner_can_view_analytics_summary(self):
+        for _ in range(3):
+            self.client.post(
+                reverse("websites:public-analytics-beacon"), {"site_slug": self.website_slug, "page_slug": "home"}, format="json",
+            )
+        self.client.force_authenticate(self.owner)
+        response = self.client.get(reverse("websites:analytics-summary", args=[self.website_id]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["total_views"], 3)
+        self.assertEqual(len(response.data["top_pages"]), 1)
+        self.assertEqual(response.data["top_pages"][0]["count"], 3)
+
+    def test_stranger_cannot_view_analytics_summary(self):
+        stranger = _make_user("+2348011110092")
+        self.client.force_authenticate(stranger)
+        response = self.client.get(reverse("websites:analytics-summary", args=[self.website_id]))
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

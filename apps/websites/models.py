@@ -358,3 +358,28 @@ class WebsiteInvite(BaseEntity):
 
     def __str__(self):
         return f"Invite {self.code} for {self.website.slug}"
+
+
+class WebsiteAnalyticsEvent(BaseEntity):
+    """One row per public-page view — deliberately not GA-level: no
+    cross-site tracking, no third-party script, and never a raw IP.
+    `session_hash` (apps.websites.analytics.hash_visitor_session) salts
+    IP+user-agent with a server-only secret and buckets by day, so it
+    can dedup same-day visits without being a stable, reversible visitor
+    identifier beyond that one day."""
+
+    website = models.ForeignKey(Website, on_delete=models.CASCADE, related_name="analytics_events")
+    page = models.ForeignKey(WebsitePage, on_delete=models.CASCADE, related_name="analytics_events", null=True, blank=True)
+    path = models.CharField(max_length=255, blank=True, default="")
+    referrer_host = models.CharField(max_length=255, blank=True, default="")
+    session_hash = models.CharField(max_length=64, db_index=True)
+
+    class Meta:
+        db_table = "website_analytics_event"
+        indexes = [
+            models.Index(fields=["website", "created_at"]),
+            models.Index(fields=["website", "page", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"View of {self.path} at {self.created_at:%Y-%m-%d %H:%M}"
