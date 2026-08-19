@@ -17,6 +17,8 @@ urlpatterns = [
     # Authenticated owner CRUD
     path("mine/", views.WebsiteMineView.as_view(), name="mine"),
     path("<uuid:website_id>/form-responses/", views.WebsiteFormResponsesView.as_view(), name="form-responses"),
+    path("<uuid:website_id>/webhooks/", views.WebsiteWebhookListCreateView.as_view(), name="webhook-list-create"),
+    path("<uuid:website_id>/webhooks/<uuid:webhook_id>/", views.WebsiteWebhookDetailView.as_view(), name="webhook-detail"),
     path("<uuid:website_id>/", views.WebsiteDetailView.as_view(), name="detail"),
     path("<uuid:website_id>/publish/", views.WebsitePublishView.as_view(), name="publish"),
     path("<uuid:website_id>/unpublish/", views.WebsiteUnpublishView.as_view(), name="unpublish"),

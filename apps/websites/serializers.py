@@ -1,5 +1,6 @@
 from rest_framework import serializers
 
+from apps.websites.embeds import validate_embed
 from apps.websites.forms import validate_field_schema
 from apps.websites.models import KIS_CONTENT_TARGET_TYPES, SECTION_TYPES, Website, WebsitePage
 
@@ -30,6 +31,8 @@ class WebsitePageSerializer(serializers.ModelSerializer):
             if entry["type"] == "form":
                 fields = (entry.get("data") or {}).get("fields") or []
                 validate_field_schema(fields)
+            if entry["type"] == "embed":
+                validate_embed(entry.get("data") or {})
         return value
 
 

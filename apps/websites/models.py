@@ -188,6 +188,7 @@ SECTION_TYPES = (
     "call_to_action",
     "map",
     "form",
+    "embed",
     "kis_content",
 )
 
@@ -238,3 +239,51 @@ class WebsiteFormSubmission(BaseEntity):
 
     def __str__(self):
         return f"Submission on {self.page_id}/{self.section_id} at {self.created_at:%Y-%m-%d %H:%M}"
+
+
+# Closed vocabulary for an `embed` section's data.provider — an iframe
+# allowlist, not an open embed-any-url feature. Arbitrary iframe/script
+# embeds would be a stored-XSS-adjacent vector: any tier-eligible website
+# owner could point one at a malicious page rendered under
+# kingdomimpactventures.org to their own visitors. Restricting to known,
+# reputable providers (the same scope every mature builder actually
+# offers as "embeds") avoids that without banning the feature outright.
+# See apps.websites.embeds for the paired per-provider URL validation.
+EMBED_PROVIDERS = ("youtube", "vimeo", "calendly", "google_maps", "google_calendar", "spotify", "loom")
+
+
+class WebsiteWebhookEvent(models.TextChoices):
+    PUBLISHED = "published", "Published"
+    UNPUBLISHED = "unpublished", "Unpublished"
+    FORM_SUBMITTED = "form_submitted", "Form Submitted"
+
+
+class WebsiteWebhook(BaseEntity):
+    """A real integration point (not a plugin marketplace nobody would
+    populate) — fired synchronously, inline, at the point of the event
+    (apps.websites.webhooks.fire_webhook_event), not queued through
+    Celery: this deployment runs no Celery worker/beat process at all
+    (see the 2026-08-06 systems audit), so a queued task would simply
+    never execute. A slow/unreachable target gets a short timeout and
+    never blocks or fails the actual publish/submit request it's attached
+    to."""
+
+    website = models.ForeignKey(Website, on_delete=models.CASCADE, related_name="webhooks")
+    event_type = models.CharField(max_length=32, choices=WebsiteWebhookEvent.choices)
+    target_url = models.URLField(max_length=500)
+    # HMAC-SHA256 signing secret for the outbound payload — generated once
+    # on create, shown to the owner exactly once (WebsiteWebhookListCreateView),
+    # never re-exposed by any read endpoint afterward.
+    secret = models.CharField(max_length=64)
+    is_active = models.BooleanField(default=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="website_webhooks_created",
+    )
+
+    class Meta:
+        db_table = "website_webhook"
+        indexes = [models.Index(fields=["website", "event_type", "is_active"])]
+
+    def __str__(self):
+        return f"{self.get_event_type_display()} webhook for {self.website.slug}"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
@@ -669,3 +670,170 @@ class WebsiteFormSubmissionApiTests(APITestCase):
         self.client.force_authenticate(stranger)
         response = self.client.get(reverse("websites:form-responses", args=[self.website_id]))
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class EmbedValidationTests(TestCase):
+    def test_valid_youtube_embed_passes(self):
+        from apps.websites.embeds import validate_embed
+
+        validate_embed({"provider": "youtube", "url": "https://www.youtube.com/embed/dQw4w9WgXcQ"})
+
+    def test_valid_calendly_embed_passes(self):
+        from apps.websites.embeds import validate_embed
+
+        validate_embed({"provider": "calendly", "url": "https://calendly.com/acme/intro-call"})
+
+    def test_unknown_provider_rejected(self):
+        from apps.websites.embeds import validate_embed
+
+        with self.assertRaises(ValidationError):
+            validate_embed({"provider": "tiktok", "url": "https://tiktok.com/embed/123"})
+
+    def test_url_not_matching_provider_pattern_rejected(self):
+        from apps.websites.embeds import validate_embed
+
+        with self.assertRaises(ValidationError):
+            validate_embed({"provider": "youtube", "url": "https://evil.example.com/embed/x"})
+
+    def test_youtube_watch_url_rejected_only_embed_url_accepted(self):
+        from apps.websites.embeds import validate_embed
+
+        with self.assertRaises(ValidationError):
+            validate_embed({"provider": "youtube", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"})
+
+
+class WebsiteEmbedSectionApiTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110060")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="Embed Shop", slug="embed-test-shop")
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        self.website_id = mine_response.data["id"]
+        self.home_page_id = WebsitePage.objects.get(website_id=self.website_id, is_home=True).id
+
+    def test_valid_embed_section_saves(self):
+        response = self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{"id": "e1", "type": "embed", "data": {"provider": "youtube", "url": "https://www.youtube.com/embed/dQw4w9WgXcQ"}}]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_invalid_embed_section_rejected(self):
+        response = self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{"id": "e1", "type": "embed", "data": {"provider": "not_real", "url": "https://evil.example.com"}}]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class WebsiteWebhookApiTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110061")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="Webhook Shop", slug="webhook-test-shop")
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        self.website_id = mine_response.data["id"]
+
+    def test_owner_can_create_webhook_and_secret_is_returned_once(self):
+        response = self.client.post(
+            reverse("websites:webhook-list-create", args=[self.website_id]),
+            {"event_type": "published", "target_url": "https://example.com/hooks/kis"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(response.data["secret"])
+
+        list_response = self.client.get(reverse("websites:webhook-list-create", args=[self.website_id]))
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("secret", list_response.data[0])
+
+    def test_non_https_target_url_rejected(self):
+        response = self.client.post(
+            reverse("websites:webhook-list-create", args=[self.website_id]),
+            {"event_type": "published", "target_url": "http://example.com/hooks/kis"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_invalid_event_type_rejected(self):
+        response = self.client.post(
+            reverse("websites:webhook-list-create", args=[self.website_id]),
+            {"event_type": "not_a_real_event", "target_url": "https://example.com/hooks"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_owner_can_delete_webhook(self):
+        create_response = self.client.post(
+            reverse("websites:webhook-list-create", args=[self.website_id]),
+            {"event_type": "published", "target_url": "https://example.com/hooks"}, format="json",
+        )
+        webhook_id = create_response.data["id"]
+        delete_response = self.client.delete(reverse("websites:webhook-detail", args=[self.website_id, webhook_id]))
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_stranger_cannot_create_webhook(self):
+        stranger = _make_user("+2348011110062")
+        self.client.force_authenticate(stranger)
+        response = self.client.post(
+            reverse("websites:webhook-list-create", args=[self.website_id]),
+            {"event_type": "published", "target_url": "https://example.com/hooks"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class WebsiteWebhookFiringTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110063")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="Firing Shop", slug="firing-test-shop")
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        self.website_id = mine_response.data["id"]
+        self.website_slug = mine_response.data["slug"]
+        self.home_page_id = WebsitePage.objects.get(website_id=self.website_id, is_home=True).id
+
+        self.client.post(
+            reverse("websites:webhook-list-create", args=[self.website_id]),
+            {"event_type": "published", "target_url": "https://example.com/hooks/published"}, format="json",
+        )
+        self.client.post(
+            reverse("websites:webhook-list-create", args=[self.website_id]),
+            {"event_type": "form_submitted", "target_url": "https://example.com/hooks/form"}, format="json",
+        )
+
+    @patch("apps.websites.webhooks.requests.post")
+    def test_publish_fires_matching_webhook_only(self, mock_post):
+        self.client.post(reverse("websites:publish", args=[self.website_id]))
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(mock_post.call_args.args[0], "https://example.com/hooks/published")
+        self.assertIn("X-KIS-Signature", mock_post.call_args.kwargs["headers"])
+
+    @patch("apps.websites.webhooks.requests.post")
+    def test_form_submission_fires_form_submitted_webhook(self, mock_post):
+        self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{
+                "id": "f1", "type": "form",
+                "data": {"title": "Contact", "fields": [{"key": "name", "label": "Name", "type": "text", "required": True}]},
+            }]},
+            format="json",
+        )
+        self.client.post(reverse("websites:publish", args=[self.website_id]))
+        self.client.post(reverse("websites:page-publish", args=[self.website_id, self.home_page_id]))
+        mock_post.reset_mock()
+        self.client.logout()
+
+        self.client.post(
+            reverse("websites:public-form-submit", args=[self.website_slug, "home", "f1"]),
+            {"name": "Jane"}, format="json",
+        )
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(mock_post.call_args.args[0], "https://example.com/hooks/form")

@@ -15,8 +15,17 @@ from apps.websites import adapters
 from apps.websites.branding import validate_branding
 from apps.websites.forms import HONEYPOT_KEY, score_submission, validate_submission_data
 from apps.websites.kis_content_resolvers import resolve_kis_content_section
-from apps.websites.models import Website, WebsiteFormSubmission, WebsiteOwnerType, WebsitePage, WebsiteStatus
+from apps.websites.models import (
+    Website,
+    WebsiteFormSubmission,
+    WebsiteOwnerType,
+    WebsitePage,
+    WebsiteStatus,
+    WebsiteWebhook,
+    WebsiteWebhookEvent,
+)
 from apps.websites.owner_resolution import resolve_owner_object, resolve_owner_user, user_can_manage_website
+from apps.websites.webhooks import fire_webhook_event, generate_webhook_secret
 from apps.websites.permissions import (
     check_kis_content_sections_quota,
     check_pages_quota,
@@ -219,6 +228,9 @@ class WebsitePublicFormSubmitView(APIView):
 
         if spam_score < 0.5:
             _notify_owner_of_form_submission(website, page, section_data, cleaned)
+            fire_webhook_event(website, WebsiteWebhookEvent.FORM_SUBMITTED, {
+                "page_slug": page.slug or "home", "section_id": section_id, "data": cleaned,
+            })
 
         return Response({"success": True, "id": str(submission.id)}, status=status.HTTP_201_CREATED)
 
@@ -246,6 +258,54 @@ class WebsiteFormResponsesView(APIView):
             }
             for s in submissions
         ])
+
+
+class WebsiteWebhookListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, website_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_manage_permission(request.user, website)
+        return Response([
+            {
+                "id": str(w.id), "event_type": w.event_type, "target_url": w.target_url,
+                "is_active": w.is_active, "created_at": w.created_at.isoformat(),
+            }
+            for w in website.webhooks.order_by("-created_at")
+        ])
+
+    def post(self, request, website_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_manage_permission(request.user, website)
+        event_type = request.data.get("event_type")
+        target_url = str(request.data.get("target_url") or "").strip()
+        if event_type not in WebsiteWebhookEvent.values:
+            raise ValidationError({"event_type": f"event_type must be one of {WebsiteWebhookEvent.values}."})
+        if not target_url.startswith("https://"):
+            raise ValidationError({"target_url": "target_url must be an https:// URL."})
+
+        webhook = WebsiteWebhook.objects.create(
+            website=website, event_type=event_type, target_url=target_url,
+            secret=generate_webhook_secret(), created_by=request.user,
+        )
+        # The only time this endpoint (or any endpoint) ever returns the
+        # secret — used to compute X-KIS-Signature, so the owner needs it
+        # exactly once to verify deliveries on their own receiving end.
+        return Response({
+            "id": str(webhook.id), "event_type": webhook.event_type, "target_url": webhook.target_url,
+            "secret": webhook.secret, "is_active": webhook.is_active,
+        }, status=status.HTTP_201_CREATED)
+
+
+class WebsiteWebhookDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, website_id, webhook_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_manage_permission(request.user, website)
+        webhook = get_object_or_404(WebsiteWebhook, id=webhook_id, website=website)
+        webhook.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ---------------------------------------------------------------------
@@ -308,6 +368,7 @@ class WebsitePublishView(APIView):
         website.published_at = timezone.now()
         website.updated_by = request.user
         website.save(update_fields=["status", "published_at", "updated_by", "updated_at"])
+        fire_webhook_event(website, WebsiteWebhookEvent.PUBLISHED, {"slug": website.slug})
         return Response(WebsiteSerializer(website).data)
 
 
@@ -321,6 +382,7 @@ class WebsiteUnpublishView(APIView):
         website.unpublished_at = timezone.now()
         website.updated_by = request.user
         website.save(update_fields=["status", "unpublished_at", "updated_by", "updated_at"])
+        fire_webhook_event(website, WebsiteWebhookEvent.UNPUBLISHED, {"slug": website.slug})
         return Response(WebsiteSerializer(website).data)
 
 
