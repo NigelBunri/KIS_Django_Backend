@@ -281,9 +281,41 @@ _ADAPTERS = {
 }
 
 
-def get_or_seed_website(owner_type: str, owner_id, created_by=None) -> "Website | None":
+def apply_template_to_website(website: Website, template) -> None:
+    """Seeds `website` from a WebsiteTemplate's seed_pages — only ever
+    called on a genuinely blank website (see get_or_seed_website), so this
+    never overrides real legacy-landing-page content, which is always
+    seeded first and takes priority."""
+    with transaction.atomic():
+        for index, page_data in enumerate(template.seed_pages):
+            is_home = bool(page_data.get("is_home"))
+            if is_home:
+                home = website.pages.filter(is_home=True).first()
+                if home is not None:
+                    home.sections = page_data.get("sections") or []
+                    home.title = page_data.get("title") or home.title
+                    home.save(update_fields=["sections", "title", "updated_at"])
+                    continue
+            WebsitePage.objects.create(
+                website=website,
+                slug=page_data.get("slug") or "",
+                title=page_data.get("title") or "Page",
+                is_home=is_home,
+                sort_order=page_data.get("sort_order", index),
+                sections=page_data.get("sections") or [],
+                status=website.status,
+            )
+
+
+def get_or_seed_website(owner_type: str, owner_id, created_by=None, template_id=None) -> "Website | None":
     """Idempotent: returns the existing Website if one already exists for
     this owner, otherwise runs the matching adapter exactly once.
+
+    `template_id` only ever applies on the FIRST creation of a genuinely
+    blank website (the adapter's Home page ends up with zero sections —
+    no legacy landing data existed to seed from) — a template is a
+    starting point offered instead of a blank page, never a substitute
+    for real legacy data, which always wins when it exists.
 
     Deliberately does NOT tier-gate — callers (apps.websites.views) must
     check apps.websites.permissions.check_websites_quota themselves
@@ -296,4 +328,16 @@ def get_or_seed_website(owner_type: str, owner_id, created_by=None) -> "Website 
     adapter = _ADAPTERS.get(owner_type)
     if adapter is None:
         return None
-    return adapter(owner_id, created_by=created_by)
+    website = adapter(owner_id, created_by=created_by)
+
+    if website is not None and template_id:
+        home = website.pages.filter(is_home=True).first()
+        is_blank = home is not None and not home.sections
+        if is_blank:
+            from apps.websites.models import WebsiteTemplate
+
+            template = WebsiteTemplate.objects.filter(id=template_id, owner_type=owner_type, is_active=True).first()
+            if template is not None:
+                apply_template_to_website(website, template)
+
+    return website

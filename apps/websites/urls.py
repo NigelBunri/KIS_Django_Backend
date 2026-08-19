@@ -18,6 +18,7 @@ urlpatterns = [
 
     # Authenticated owner CRUD
     path("mine/", views.WebsiteMineView.as_view(), name="mine"),
+    path("templates/", views.WebsiteTemplateListView.as_view(), name="template-list"),
     path("redeem-invite/", views.WebsiteInviteRedeemView.as_view(), name="redeem-invite"),
     path("<uuid:website_id>/form-responses/", views.WebsiteFormResponsesView.as_view(), name="form-responses"),
     path("<uuid:website_id>/analytics/summary/", views.WebsiteAnalyticsSummaryView.as_view(), name="analytics-summary"),

@@ -406,3 +406,29 @@ class WebsiteAnalyticsEvent(BaseEntity):
 
     def __str__(self):
         return f"View of {self.path} at {self.created_at:%Y-%m-%d %H:%M}"
+
+
+class WebsiteTemplate(BaseEntity):
+    """A curated, honestly-sized starter — one or two per owner type, not
+    padded to look like a gallery (see apps.websites.template_seeds for
+    the actual hand-authored content). Only applies to a brand-new,
+    genuinely blank website (see adapters.get_or_seed_website) — never
+    overrides the legacy-landing-page adapter's own seeding, which stays
+    first priority when real legacy data exists."""
+
+    owner_type = models.CharField(max_length=32, choices=WebsiteOwnerType.choices, db_index=True)
+    name = models.CharField(max_length=255)
+    description = models.CharField(max_length=500, blank=True, default="")
+    thumbnail_url = models.URLField(max_length=500, blank=True, default="")
+    # [{slug, title, is_home, sort_order, sections: [...]}] — same section
+    # shape as WebsitePage.sections, just pre-authored per page.
+    seed_pages = models.JSONField(default=list)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "website_template"
+        indexes = [models.Index(fields=["owner_type", "is_active"])]
+        ordering = ["owner_type", "name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.owner_type})"

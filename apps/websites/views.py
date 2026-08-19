@@ -36,6 +36,7 @@ from apps.websites.models import (
     WebsiteOwnerType,
     WebsitePage,
     WebsiteStatus,
+    WebsiteTemplate,
     WebsiteWebhook,
     WebsiteWebhookEvent,
 )
@@ -569,12 +570,27 @@ class WebsiteMineView(APIView):
         owner_instance = resolve_owner_object(owner_type, owner_id)
         if owner_instance is None:
             raise ValidationError({"detail": "Owner not found."})
-        website = adapters.get_or_seed_website(owner_type, owner_id, created_by=request.user)
+        template_id = request.query_params.get("template_id")
+        website = adapters.get_or_seed_website(owner_type, owner_id, created_by=request.user, template_id=template_id)
         if website is None:
             raise ValidationError({"detail": "Unable to resolve or create a website for this owner."})
         return Response(WebsiteSerializer(website).data, status=status.HTTP_200_OK)
 
     post = get
+
+
+class WebsiteTemplateListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        owner_type = request.query_params.get("owner_type")
+        if owner_type not in WebsiteOwnerType.values:
+            raise ValidationError({"detail": "owner_type is required."})
+        templates = WebsiteTemplate.objects.filter(owner_type=owner_type, is_active=True)
+        return Response([
+            {"id": str(t.id), "name": t.name, "description": t.description, "thumbnail_url": t.thumbnail_url}
+            for t in templates
+        ])
 
 
 class WebsiteDetailView(APIView):

@@ -1139,3 +1139,77 @@ class WebsiteCustomDomainApiTests(APITestCase):
         active_response = self.client.get(reverse("websites:public-site-by-domain", args=["www.example.com"]))
         self.assertEqual(active_response.status_code, status.HTTP_200_OK)
         self.assertEqual(active_response.data["slug"], self.website_slug)
+
+
+class WebsiteTemplateTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110096")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="Template Shop", slug="template-test-shop")
+
+    def test_template_list_filters_by_owner_type(self):
+        response = self.client.get(reverse("websites:template-list"), {"owner_type": "shop"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(response.data), 1)
+        health_response = self.client.get(reverse("websites:template-list"), {"owner_type": "health_institution"})
+        health_names = {t["name"] for t in health_response.data}
+        shop_names = {t["name"] for t in response.data}
+        self.assertNotIn("Clinic Essentials", shop_names)
+        self.assertIn("Clinic Essentials", health_names)
+
+    def test_template_seeds_a_genuinely_blank_website(self):
+        from apps.websites.models import WebsiteTemplate
+
+        template = WebsiteTemplate.objects.get(owner_type="shop", name="Modern Storefront")
+        response = self.client.get(reverse("websites:mine"), {
+            "owner_type": "shop", "owner_id": str(self.shop.id), "template_id": str(template.id),
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        home = WebsitePage.objects.get(website_id=response.data["id"], is_home=True)
+        self.assertGreater(len(home.sections), 0)
+        section_types = {s["type"] for s in home.sections}
+        self.assertIn("hero_banner", section_types)
+
+    def test_template_never_overrides_real_legacy_data(self):
+        from apps.commerce.models import ShopLandingPage
+        from apps.websites.models import WebsiteTemplate
+
+        ShopLandingPage.objects.create(shop=self.shop, headline="Real Legacy Headline", is_published=True)
+        template = WebsiteTemplate.objects.get(owner_type="shop", name="Modern Storefront")
+
+        response = self.client.get(reverse("websites:mine"), {
+            "owner_type": "shop", "owner_id": str(self.shop.id), "template_id": str(template.id),
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        home = WebsitePage.objects.get(website_id=response.data["id"], is_home=True)
+        self.assertEqual(home.sections[0]["data"]["headline"], "Real Legacy Headline")
+
+    def test_template_not_reapplied_on_subsequent_calls(self):
+        from apps.websites.models import WebsiteTemplate
+
+        template = WebsiteTemplate.objects.get(owner_type="shop", name="Modern Storefront")
+        first = self.client.get(reverse("websites:mine"), {
+            "owner_type": "shop", "owner_id": str(self.shop.id), "template_id": str(template.id),
+        })
+        website_id = first.data["id"]
+        page_count_after_first = WebsitePage.objects.filter(website_id=website_id).count()
+
+        second = self.client.get(reverse("websites:mine"), {
+            "owner_type": "shop", "owner_id": str(self.shop.id), "template_id": str(template.id),
+        })
+        self.assertEqual(second.data["id"], website_id)
+        self.assertEqual(WebsitePage.objects.filter(website_id=website_id).count(), page_count_after_first)
+
+    def test_stranger_cannot_use_someone_elses_owner_id_with_a_template(self):
+        from apps.websites.models import WebsiteTemplate
+
+        stranger = _make_user("+2348011110097")
+        self.client.force_authenticate(stranger)
+        template = WebsiteTemplate.objects.get(owner_type="shop", name="Modern Storefront")
+        response = self.client.get(reverse("websites:mine"), {
+            "owner_type": "shop", "owner_id": str(self.shop.id), "template_id": str(template.id),
+        })
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
