@@ -17,16 +17,25 @@ from apps.websites.forms import HONEYPOT_KEY, score_submission, validate_submiss
 from apps.websites.kis_content_resolvers import resolve_kis_content_section
 from apps.websites.models import (
     Website,
+    WebsiteCollaborator,
+    WebsiteCollaboratorRole,
     WebsiteFormSubmission,
+    WebsiteInvite,
     WebsiteOwnerType,
     WebsitePage,
     WebsiteStatus,
     WebsiteWebhook,
     WebsiteWebhookEvent,
 )
-from apps.websites.owner_resolution import resolve_owner_object, resolve_owner_user, user_can_manage_website
+from apps.websites.owner_resolution import (
+    resolve_owner_object,
+    resolve_owner_user,
+    user_can_administer_website,
+    user_can_manage_website,
+)
 from apps.websites.webhooks import fire_webhook_event, generate_webhook_secret
 from apps.websites.permissions import (
+    check_collaborator_seat_quota,
     check_kis_content_sections_quota,
     check_pages_quota,
     check_websites_quota,
@@ -50,6 +59,11 @@ def _require_public_web_enabled():
 def _require_manage_permission(user, website: Website):
     if not user_can_manage_website(user, website.owner_type, website.owner_id):
         raise PermissionDenied("You do not manage this website.")
+
+
+def _require_administer_permission(user, website: Website):
+    if not user_can_administer_website(user, website.owner_type, website.owner_id):
+        raise PermissionDenied("Only the website owner can manage collaborators and invites.")
 
 
 def _serialize_public_section(website: Website, section: dict) -> dict:
@@ -306,6 +320,141 @@ class WebsiteWebhookDetailView(APIView):
         webhook = get_object_or_404(WebsiteWebhook, id=webhook_id, website=website)
         webhook.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _serialize_collaborator(c: WebsiteCollaborator) -> dict:
+    return {
+        "id": str(c.id),
+        "user_id": str(c.user_id),
+        "user_name": getattr(c.user, "display_name", None) or getattr(c.user, "phone", "") or str(c.user_id),
+        "role": c.role,
+        "is_active": c.is_active,
+        "created_at": c.created_at.isoformat(),
+    }
+
+
+class WebsiteCollaboratorListView(APIView):
+    """Admin-only (owner or role=owner collaborator) — see
+    apps.websites.owner_resolution.user_can_administer_website."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, website_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_administer_permission(request.user, website)
+        collaborators = website.collaborators.filter(is_active=True).select_related("user").order_by("-created_at")
+        return Response([_serialize_collaborator(c) for c in collaborators])
+
+
+class WebsiteCollaboratorDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, website_id, collaborator_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_administer_permission(request.user, website)
+        collaborator = get_object_or_404(WebsiteCollaborator, id=collaborator_id, website=website)
+        collaborator.is_active = False
+        collaborator.save(update_fields=["is_active", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _serialize_invite(invite: WebsiteInvite) -> dict:
+    return {
+        "id": str(invite.id),
+        "code": invite.code,
+        "role": invite.role,
+        "max_uses": invite.max_uses,
+        "use_count": invite.use_count,
+        "expires_at": invite.expires_at.isoformat() if invite.expires_at else None,
+        "is_active": invite.is_active,
+        "is_redeemable": invite.is_redeemable(),
+        "created_at": invite.created_at.isoformat(),
+    }
+
+
+class WebsiteInviteListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, website_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_administer_permission(request.user, website)
+        return Response([_serialize_invite(i) for i in website.invites.order_by("-created_at")])
+
+    def post(self, request, website_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_administer_permission(request.user, website)
+        role = request.data.get("role") or WebsiteCollaboratorRole.EDITOR
+        if role not in WebsiteCollaboratorRole.values:
+            raise ValidationError({"role": f"role must be one of {WebsiteCollaboratorRole.values}."})
+        max_uses = request.data.get("max_uses")
+        invite = WebsiteInvite.objects.create(
+            website=website, role=role,
+            max_uses=int(max_uses) if max_uses else None,
+            created_by=request.user,
+        )
+        return Response(_serialize_invite(invite), status=status.HTTP_201_CREATED)
+
+
+class WebsiteInviteRevokeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, website_id, invite_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_administer_permission(request.user, website)
+        invite = get_object_or_404(WebsiteInvite, id=invite_id, website=website)
+        invite.is_active = False
+        invite.save(update_fields=["is_active", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class WebsiteInviteRedeemView(APIView):
+    """Self-service: an already-authenticated user redeems a code they
+    were given out-of-band (mirrors apps.partners.views.redeem_invite,
+    the one complete working invite pattern in this codebase)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from django.db import transaction
+
+        code = str(request.data.get("code") or "").strip().upper()
+        if not code:
+            raise ValidationError({"code": "code is required."})
+
+        with transaction.atomic():
+            invite = WebsiteInvite.objects.select_for_update().filter(code=code).first()
+            if invite is None:
+                raise Http404("Invite not found.")
+            if not invite.is_redeemable():
+                raise ValidationError({"code": "This invite is no longer valid."})
+
+            website = invite.website
+            owner_instance = resolve_owner_object(website.owner_type, website.owner_id)
+            owner_user = resolve_owner_user(website.owner_type, owner_instance) if owner_instance else None
+            if owner_user is not None and owner_user.id == request.user.id:
+                raise ValidationError({"code": "You already own this website."})
+
+            existing = WebsiteCollaborator.objects.filter(website=website, user=request.user).first()
+            if existing is None or not existing.is_active:
+                if owner_user is not None:
+                    check_collaborator_seat_quota(owner_user, website)
+                if existing is None:
+                    WebsiteCollaborator.objects.create(
+                        website=website, user=request.user, role=invite.role, invited_by=invite.created_by,
+                    )
+                else:
+                    existing.is_active = True
+                    existing.role = invite.role
+                    existing.invited_by = invite.created_by
+                    existing.save(update_fields=["is_active", "role", "invited_by", "updated_at"])
+
+            invite.use_count += 1
+            invite.save(update_fields=["use_count", "updated_at"])
+
+        return Response({
+            "website_id": str(website.id), "website_slug": website.slug, "role": invite.role,
+            "owner_type": website.owner_type, "owner_id": str(website.owner_id),
+        })
 
 
 # ---------------------------------------------------------------------

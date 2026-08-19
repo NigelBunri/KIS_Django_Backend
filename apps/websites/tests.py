@@ -837,3 +837,120 @@ class WebsiteWebhookFiringTests(APITestCase):
         )
         self.assertEqual(mock_post.call_count, 1)
         self.assertEqual(mock_post.call_args.args[0], "https://example.com/hooks/form")
+
+
+class WebsiteCollaborationApiTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110070")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="Collab Shop", slug="collab-test-shop")
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        self.website_id = mine_response.data["id"]
+
+    def _create_invite(self, role="editor", max_uses=None):
+        payload = {"role": role}
+        if max_uses is not None:
+            payload["max_uses"] = max_uses
+        response = self.client.post(reverse("websites:invite-list-create", args=[self.website_id]), payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return response.data["code"]
+
+    def test_owner_can_create_and_list_invites(self):
+        self._create_invite()
+        response = self.client.get(reverse("websites:invite-list-create", args=[self.website_id]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+    def test_stranger_cannot_create_invite(self):
+        stranger = _make_user("+2348011110071")
+        self.client.force_authenticate(stranger)
+        response = self.client.post(reverse("websites:invite-list-create", args=[self.website_id]), {"role": "editor"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_editor_can_redeem_invite_and_gains_access(self):
+        code = self._create_invite(role="editor")
+        editor = _make_user("+2348011110072")
+        self.client.force_authenticate(editor)
+
+        redeem_response = self.client.post(reverse("websites:redeem-invite"), {"code": code}, format="json")
+        self.assertEqual(redeem_response.status_code, status.HTTP_200_OK, redeem_response.data)
+        self.assertEqual(redeem_response.data["role"], "editor")
+
+        patch_response = self.client.patch(
+            reverse("websites:detail", args=[self.website_id]), {"name": "Renamed by editor"}, format="json",
+        )
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK, patch_response.data)
+
+    def test_editor_cannot_administer_collaborators_or_invites(self):
+        code = self._create_invite(role="editor")
+        editor = _make_user("+2348011110073")
+        self.client.force_authenticate(editor)
+        self.client.post(reverse("websites:redeem-invite"), {"code": code}, format="json")
+
+        list_response = self.client.get(reverse("websites:collaborator-list", args=[self.website_id]))
+        self.assertEqual(list_response.status_code, status.HTTP_403_FORBIDDEN)
+
+        create_invite_response = self.client.post(reverse("websites:invite-list-create", args=[self.website_id]), {"role": "editor"}, format="json")
+        self.assertEqual(create_invite_response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_invalid_code_returns_404(self):
+        stranger = _make_user("+2348011110074")
+        self.client.force_authenticate(stranger)
+        response = self.client.post(reverse("websites:redeem-invite"), {"code": "NOTAREALCODE"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_max_uses_enforced(self):
+        code = self._create_invite(role="editor", max_uses=1)
+        first_user = _make_user("+2348011110075")
+        self.client.force_authenticate(first_user)
+        self.assertEqual(self.client.post(reverse("websites:redeem-invite"), {"code": code}, format="json").status_code, status.HTTP_200_OK)
+
+        second_user = _make_user("+2348011110076")
+        self.client.force_authenticate(second_user)
+        response = self.client.post(reverse("websites:redeem-invite"), {"code": code}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_revoked_invite_cannot_be_redeemed(self):
+        create_response = self.client.post(reverse("websites:invite-list-create", args=[self.website_id]), {"role": "editor"}, format="json")
+        invite_id = create_response.data["id"]
+        code = create_response.data["code"]
+        revoke_response = self.client.post(reverse("websites:invite-revoke", args=[self.website_id, invite_id]))
+        self.assertEqual(revoke_response.status_code, status.HTTP_204_NO_CONTENT)
+
+        stranger = _make_user("+2348011110077")
+        self.client.force_authenticate(stranger)
+        response = self.client.post(reverse("websites:redeem-invite"), {"code": code}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_owner_can_remove_collaborator_and_access_is_revoked(self):
+        code = self._create_invite(role="editor")
+        editor = _make_user("+2348011110078")
+        self.client.force_authenticate(editor)
+        self.client.post(reverse("websites:redeem-invite"), {"code": code}, format="json")
+
+        self.client.force_authenticate(self.owner)
+        list_response = self.client.get(reverse("websites:collaborator-list", args=[self.website_id]))
+        collaborator_id = list_response.data[0]["id"]
+        delete_response = self.client.delete(reverse("websites:collaborator-detail", args=[self.website_id, collaborator_id]))
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+
+        self.client.force_authenticate(editor)
+        patch_response = self.client.patch(reverse("websites:detail", args=[self.website_id]), {"name": "Should fail"}, format="json")
+        self.assertEqual(patch_response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_seat_quota_blocks_redemption_past_business_tier_limit(self):
+        # Business tier's team_seats is 3.
+        code = self._create_invite(role="editor")
+        for i in range(3):
+            user = _make_user(f"+234801111008{i}")
+            self.client.force_authenticate(user)
+            response = self.client.post(reverse("websites:redeem-invite"), {"code": code}, format="json")
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        fourth_user = _make_user("+2348011110090")
+        self.client.force_authenticate(fourth_user)
+        response = self.client.post(reverse("websites:redeem-invite"), {"code": code}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

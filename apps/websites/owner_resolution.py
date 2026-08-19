@@ -51,16 +51,50 @@ def resolve_owner_user(owner_type: str, owner_instance):
     return getattr(owner_instance, "owner", None)
 
 
+def _find_website(owner_type: str, owner_id):
+    from apps.websites.models import Website
+
+    return Website.objects.filter(owner_type=owner_type, owner_id=owner_id).first()
+
+
+def _is_active_collaborator(user, owner_type: str, owner_id, *, role=None) -> bool:
+    from apps.websites.models import WebsiteCollaborator
+
+    website = _find_website(owner_type, owner_id)
+    if website is None:
+        return False
+    qs = WebsiteCollaborator.objects.filter(website=website, user=user, is_active=True)
+    if role is not None:
+        qs = qs.filter(role=role)
+    return qs.exists()
+
+
 def user_can_manage_website(user, owner_type: str, owner_id) -> bool:
-    """Owner-only for now — each of the 4 institution apps has its own
-    membership/role model (manager, admin, etc.) that a future pass could
-    extend this to honor, but owner-only is a safe, correct floor and
-    matches how e.g. Shop landing pages are gated today
-    (apps.commerce.views ShopViewSet owner checks)."""
+    """True for the literal owner OR an active WebsiteCollaborator of
+    either role (owner/editor) — everyday editing (pages, sections,
+    branding, publish). See user_can_administer_website for the stricter
+    owner-only boundary (managing collaborators/invites themselves)."""
     if not getattr(user, "is_authenticated", False):
         return False
     owner_instance = resolve_owner_object(owner_type, owner_id)
-    if owner_instance is None:
+    if owner_instance is not None:
+        owner_user = resolve_owner_user(owner_type, owner_instance)
+        if owner_user is not None and owner_user.id == user.id:
+            return True
+    return _is_active_collaborator(user, owner_type, owner_id)
+
+
+def user_can_administer_website(user, owner_type: str, owner_id) -> bool:
+    """The literal owner OR a collaborator with role=owner — required to
+    manage collaborators/invites. An editor can edit everything on the
+    site but can't add/remove other collaborators or generate invites."""
+    if not getattr(user, "is_authenticated", False):
         return False
-    owner_user = resolve_owner_user(owner_type, owner_instance)
-    return owner_user is not None and owner_user.id == user.id
+    owner_instance = resolve_owner_object(owner_type, owner_id)
+    if owner_instance is not None:
+        owner_user = resolve_owner_user(owner_type, owner_instance)
+        if owner_user is not None and owner_user.id == user.id:
+            return True
+    from apps.websites.models import WebsiteCollaboratorRole
+
+    return _is_active_collaborator(user, owner_type, owner_id, role=WebsiteCollaboratorRole.OWNER)

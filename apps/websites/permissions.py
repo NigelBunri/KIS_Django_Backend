@@ -9,7 +9,7 @@ exceeded.
 """
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
-from apps.accounts.tiers import get_user_tier_features, normalize_limit_value, resolve_profile_limit
+from apps.accounts.tiers import get_feature_limit, get_user_tier_features, normalize_limit_value, resolve_profile_limit
 from apps.websites.models import Website, WebsitePage
 
 
@@ -70,3 +70,18 @@ def check_kis_content_sections_quota(user, page: WebsitePage, *, adding: int = 1
     existing = sum(1 for s in (page.sections or []) if isinstance(s, dict) and s.get("type") == "kis_content")
     if existing + adding > limit:
         raise ValidationError({"detail": f"Your current plan allows up to {limit} live-content section{'s' if limit != 1 else ''} per page. Upgrade to add more."})
+
+
+def check_collaborator_seat_quota(website_owner_user, website: Website):
+    """Gated against the WEBSITE OWNER's tier (not the invitee's) — seats
+    are a property of the owner's plan, same as apps.partners.views'
+    redeem_invite and apps.commerce.views' ShopTeamMemberViewSet both
+    check the owning user's tier, not the joining user's."""
+    seat_limit = normalize_limit_value(get_feature_limit(website_owner_user, "team_seats", None), default=0)
+    if seat_limit is None:
+        return
+    if seat_limit <= 0:
+        raise PermissionDenied("Collaborators require Business tier or higher. Upgrade to add team members.")
+    existing = website.collaborators.filter(is_active=True).count()
+    if existing >= seat_limit:
+        raise ValidationError({"detail": f"Your current plan allows up to {seat_limit} team seat{'s' if seat_limit != 1 else ''}. Upgrade to add more."})

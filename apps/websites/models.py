@@ -287,3 +287,74 @@ class WebsiteWebhook(BaseEntity):
 
     def __str__(self):
         return f"{self.get_event_type_display()} webhook for {self.website.slug}"
+
+
+class WebsiteCollaboratorRole(models.TextChoices):
+    OWNER = "owner", "Owner"
+    EDITOR = "editor", "Editor"
+
+
+class WebsiteCollaborator(BaseEntity):
+    """Website-scoped membership — mirrors the shape of
+    HealthInstitutionMembership/ShopTeamMember (this codebase's
+    established per-domain-membership convention) rather than a generic
+    cross-app model. `role=owner` is a co-owner, not the literal
+    Website.owner_type/owner_id — that stays the original resolved owner
+    (Shop.owner etc.) always; this only grants the SAME administrative
+    rights (see owner_resolution.user_can_administer_website)."""
+
+    website = models.ForeignKey(Website, on_delete=models.CASCADE, related_name="collaborators")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="website_collaborations")
+    role = models.CharField(max_length=16, choices=WebsiteCollaboratorRole.choices, default=WebsiteCollaboratorRole.EDITOR)
+    invited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="website_collaborators_invited",
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "website_collaborator"
+        constraints = [models.UniqueConstraint(fields=["website", "user"], name="website_collaborator_unique_user")]
+        indexes = [models.Index(fields=["website", "is_active"])]
+
+    def __str__(self):
+        return f"{self.get_role_display()} on {self.website.slug}"
+
+
+def generate_website_invite_code() -> str:
+    return uuid.uuid4().hex[:12].upper()
+
+
+class WebsiteInvite(BaseEntity):
+    """Directly mirrors apps.partners.models.PartnerInvite/redeem_invite —
+    the one complete working invite pattern in this codebase (self-service
+    redeem with an already-authenticated session, not a targeted-email
+    pending invite, which doesn't exist anywhere here)."""
+
+    website = models.ForeignKey(Website, on_delete=models.CASCADE, related_name="invites")
+    code = models.CharField(max_length=32, unique=True, default=generate_website_invite_code)
+    role = models.CharField(max_length=16, choices=WebsiteCollaboratorRole.choices, default=WebsiteCollaboratorRole.EDITOR)
+    max_uses = models.PositiveIntegerField(null=True, blank=True)
+    use_count = models.PositiveIntegerField(default=0)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="website_invites_created",
+    )
+
+    class Meta:
+        db_table = "website_invite"
+        indexes = [models.Index(fields=["website", "is_active"])]
+
+    @property
+    def is_expired(self) -> bool:
+        return bool(self.expires_at and self.expires_at <= timezone.now())
+
+    @property
+    def has_uses_remaining(self) -> bool:
+        return self.max_uses is None or self.use_count < self.max_uses
+
+    def is_redeemable(self) -> bool:
+        return self.is_active and not self.is_expired and self.has_uses_remaining
+
+    def __str__(self):
+        return f"Invite {self.code} for {self.website.slug}"
