@@ -212,6 +212,7 @@ SECTION_TYPES = (
     "map",
     "form",
     "embed",
+    "kis_video",
     "kis_content",
 )
 

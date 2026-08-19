@@ -1213,3 +1213,174 @@ class WebsiteTemplateTests(APITestCase):
             "owner_type": "shop", "owner_id": str(self.shop.id), "template_id": str(template.id),
         })
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class KisVideoResolverTests(TestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110098")
+
+    def _make_channel_video(self, *, is_public=True, status_value="published", visibility="public", content_type="video"):
+        from apps.broadcasts.models import BroadcastChannel, ChannelContent, ChannelContentAsset
+
+        channel = BroadcastChannel.objects.create(
+            owner_type="user", owner_id=self.owner.id, owner_user=self.owner,
+            handle=f"chan-{uuid.uuid4().hex[:8]}", display_name="Resolver Channel", is_public=is_public,
+        )
+        content = ChannelContent.objects.create(
+            channel=channel, content_type=content_type, title="Resolver Video",
+            description="A real video", status=status_value, visibility=visibility,
+        )
+        ChannelContentAsset.objects.create(
+            content=content, asset_type="video", url="https://kis-media.s3.amazonaws.com/videos/resolver.mp4",
+        )
+        return channel, content
+
+    def _make_health_video(self, *, is_active=True):
+        from apps.health_ops.models import EngineRegistry, HealthInstitution, HealthService, ServiceEngineMap, VideoEngineItem
+
+        institution = HealthInstitution.objects.create(owner=self.owner, name="Resolver Clinic", slug=f"resolver-clinic-{uuid.uuid4().hex[:8]}")
+        service = HealthService.objects.create(institution=institution, name="Wellness Check")
+        engine = EngineRegistry.objects.create(code=f"engine-{uuid.uuid4().hex[:8]}", name="Education Engine")
+        engine_map = ServiceEngineMap.objects.create(service=service, engine=engine)
+        item = VideoEngineItem.objects.create(
+            engine_map=engine_map, title="Resolver Health Video",
+            source_url="https://kis-media.s3.amazonaws.com/videos/health-resolver.mp4", is_active=is_active,
+        )
+        return institution, item
+
+    def test_resolve_broadcast_content_video(self):
+        from apps.websites.kis_video import resolve_kis_video
+
+        _, content = self._make_channel_video()
+        resolved = resolve_kis_video("broadcast_content", str(content.id))
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["title"], "Resolver Video")
+        self.assertTrue(resolved["video_url"].startswith("https://"))
+
+    def test_resolve_broadcast_content_video_excludes_private_content(self):
+        from apps.websites.kis_video import resolve_kis_video
+
+        _, content = self._make_channel_video(visibility="private")
+        self.assertIsNone(resolve_kis_video("broadcast_content", str(content.id)))
+
+    def test_resolve_broadcast_content_video_excludes_non_video_content(self):
+        from apps.websites.kis_video import resolve_kis_video
+
+        _, content = self._make_channel_video(content_type="image")
+        self.assertIsNone(resolve_kis_video("broadcast_content", str(content.id)))
+
+    def test_resolve_health_engine_item_video(self):
+        from apps.websites.kis_video import resolve_kis_video
+
+        _, item = self._make_health_video()
+        resolved = resolve_kis_video("health_engine_item", str(item.id))
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["title"], "Resolver Health Video")
+
+    def test_resolve_health_engine_item_video_excludes_inactive(self):
+        from apps.websites.kis_video import resolve_kis_video
+
+        _, item = self._make_health_video(is_active=False)
+        self.assertIsNone(resolve_kis_video("health_engine_item", str(item.id)))
+
+    def test_resolve_unknown_source_returns_none(self):
+        from apps.websites.kis_video import resolve_kis_video
+
+        self.assertIsNone(resolve_kis_video("education_video", "any-id"))
+
+    def test_search_owner_kis_videos_broadcast_channel(self):
+        from apps.websites.kis_video import search_owner_kis_videos
+
+        channel, _ = self._make_channel_video()
+        results = search_owner_kis_videos(owner_type="broadcast_channel", owner_id=str(channel.id))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source"], "broadcast_content")
+
+    def test_search_owner_kis_videos_health_institution(self):
+        from apps.websites.kis_video import search_owner_kis_videos
+
+        institution, _ = self._make_health_video()
+        results = search_owner_kis_videos(owner_type="health_institution", owner_id=str(institution.id))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source"], "health_engine_item")
+
+    def test_search_owner_kis_videos_unsupported_owner_type_returns_empty(self):
+        from apps.websites.kis_video import search_owner_kis_videos
+
+        results = search_owner_kis_videos(owner_type="shop", owner_id=str(uuid.uuid4()))
+        self.assertEqual(results, [])
+
+
+class WebsiteKisVideoSectionApiTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110099")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.broadcasts.models import BroadcastChannel, ChannelContent, ChannelContentAsset
+
+        self.channel = BroadcastChannel.objects.create(
+            owner_type="user", owner_id=self.owner.id, owner_user=self.owner,
+            handle=f"api-chan-{uuid.uuid4().hex[:8]}", display_name="API Channel", is_public=True,
+        )
+        self.content = ChannelContent.objects.create(
+            channel=self.channel, content_type="video", title="API Video",
+            status="published", visibility="public",
+        )
+        ChannelContentAsset.objects.create(
+            content=self.content, asset_type="video", url="https://kis-media.s3.amazonaws.com/videos/api.mp4",
+        )
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "broadcast_channel", "owner_id": str(self.channel.id)})
+        self.website_id = mine_response.data["id"]
+        self.website_slug = mine_response.data["slug"]
+        self.home_page_id = WebsitePage.objects.get(website_id=self.website_id, is_home=True).id
+
+    def test_valid_kis_video_section_saves(self):
+        response = self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{"id": "v1", "type": "kis_video", "data": {"source": "broadcast_content", "target_id": str(self.content.id)}}]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_missing_target_id_rejected(self):
+        response = self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{"id": "v1", "type": "kis_video", "data": {"source": "broadcast_content"}}]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_invalid_source_rejected(self):
+        response = self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{"id": "v1", "type": "kis_video", "data": {"source": "youtube", "target_id": "x"}}]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_public_page_resolves_video(self):
+        self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{"id": "v1", "type": "kis_video", "data": {"source": "broadcast_content", "target_id": str(self.content.id)}}]},
+            format="json",
+        )
+        self.client.post(reverse("websites:publish", args=[self.website_id]))
+        self.client.post(reverse("websites:page-publish", args=[self.website_id, self.home_page_id]))
+        self.client.logout()
+
+        response = self.client.get(reverse("websites:public-page", args=[self.website_slug, "home"]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        video_section = next(s for s in response.data["sections"] if s["type"] == "kis_video")
+        self.assertIsNotNone(video_section["resolved_video"])
+        self.assertEqual(video_section["resolved_video"]["title"], "API Video")
+
+    def test_owner_can_search_their_own_videos(self):
+        response = self.client.get(reverse("websites:kis-video-search"), {"owner_type": "broadcast_channel", "owner_id": str(self.channel.id)})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 1)
+
+    def test_stranger_cannot_search_someone_elses_videos(self):
+        stranger = _make_user("+2348011110100")
+        self.client.force_authenticate(stranger)
+        response = self.client.get(reverse("websites:kis-video-search"), {"owner_type": "broadcast_channel", "owner_id": str(self.channel.id)})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

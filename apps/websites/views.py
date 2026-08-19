@@ -25,6 +25,7 @@ from apps.websites.custom_domains import (
 )
 from apps.websites.forms import HONEYPOT_KEY, score_submission, validate_submission_data
 from apps.websites.kis_content_resolvers import resolve_kis_content_section
+from apps.websites.kis_video import resolve_kis_video, search_owner_kis_videos
 from apps.websites.models import (
     Website,
     WebsiteAnalyticsEvent,
@@ -87,6 +88,9 @@ def _serialize_public_section(website: Website, section: dict) -> dict:
         payload["resolved_items"] = resolve_kis_content_section(
             owner_type=website.owner_type, owner_id=website.owner_id, section_data=section.get("data") or {},
         )
+    if section.get("type") == "kis_video":
+        data = section.get("data") or {}
+        payload["resolved_video"] = resolve_kis_video(data.get("source"), data.get("target_id"))
     return payload
 
 
@@ -865,3 +869,24 @@ class WebsiteKisContentSearchView(APIView):
         if q:
             items = [i for i in items if q in str(i.get("title") or "").lower()]
         return Response({"results": items})
+
+
+class WebsiteKisVideoSearchView(APIView):
+    """Lets an owner browse their OWN KIS video content to embed via a
+    `kis_video` section — never a platform-wide search. See
+    apps.websites.kis_video's module docstring for which owner types
+    actually have video content to search (Broadcast Channel, Health
+    Institution only — Education and Marketplace have none)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        owner_type = request.query_params.get("owner_type")
+        owner_id = request.query_params.get("owner_id")
+        if owner_type not in WebsiteOwnerType.values or not owner_id:
+            raise ValidationError({"detail": "owner_type and owner_id are required."})
+        if not user_can_manage_website(request.user, owner_type, owner_id):
+            raise PermissionDenied("You do not manage this owner.")
+        q = str(request.query_params.get("q") or "").strip()
+        results = search_owner_kis_videos(owner_type=owner_type, owner_id=owner_id, q=q)
+        return Response({"results": results})

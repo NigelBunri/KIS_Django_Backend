@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from apps.websites.embeds import validate_embed
 from apps.websites.forms import validate_field_schema
+from apps.websites.kis_video import KIS_VIDEO_SOURCES
 from apps.websites.models import KIS_CONTENT_TARGET_TYPES, SECTION_TYPES, Website, WebsitePage
 
 
@@ -33,6 +34,14 @@ class WebsitePageSerializer(serializers.ModelSerializer):
                 validate_field_schema(fields)
             if entry["type"] == "embed":
                 validate_embed(entry.get("data") or {})
+            if entry["type"] == "kis_video":
+                data = entry.get("data") or {}
+                if data.get("source") not in KIS_VIDEO_SOURCES:
+                    raise serializers.ValidationError(
+                        f"kis_video section has an invalid source: {data.get('source')!r}."
+                    )
+                if not data.get("target_id"):
+                    raise serializers.ValidationError("kis_video section requires a target_id.")
         return value
 
 

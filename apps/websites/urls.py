@@ -42,4 +42,5 @@ urlpatterns = [
     path("<uuid:website_id>/pages/<uuid:page_id>/unpublish/", views.WebsitePageUnpublishView.as_view(), name="page-unpublish"),
 
     path("kis-content/<str:target_type>/search/", views.WebsiteKisContentSearchView.as_view(), name="kis-content-search"),
+    path("kis-video/search/", views.WebsiteKisVideoSearchView.as_view(), name="kis-video-search"),
 ]
