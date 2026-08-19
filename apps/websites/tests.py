@@ -854,6 +854,60 @@ class WebsiteEmbedSectionApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class WebsiteResponsiveSectionApiTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110062")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="Responsive Shop", slug="responsive-test-shop")
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        self.website_id = mine_response.data["id"]
+        self.website_slug = mine_response.data["slug"]
+        self.home_page_id = WebsitePage.objects.get(website_id=self.website_id, is_home=True).id
+
+    def test_valid_hidden_on_saves(self):
+        response = self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{
+                "id": "r1", "type": "text", "data": {"body": "hi"},
+                "responsive": {"hidden_on": ["mobile"]},
+            }]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_invalid_hidden_on_value_rejected(self):
+        response = self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{
+                "id": "r1", "type": "text", "data": {"body": "hi"},
+                "responsive": {"hidden_on": ["television"]},
+            }]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_public_page_passes_through_responsive_config(self):
+        self.client.patch(
+            reverse("websites:page-detail", args=[self.website_id, self.home_page_id]),
+            {"sections": [{
+                "id": "r1", "type": "text", "data": {"body": "hi"},
+                "responsive": {"hidden_on": ["desktop"]},
+            }]},
+            format="json",
+        )
+        self.client.post(reverse("websites:publish", args=[self.website_id]))
+        self.client.post(reverse("websites:page-publish", args=[self.website_id, self.home_page_id]))
+
+        self.client.logout()
+        public_response = self.client.get(reverse("websites:public-page", args=[self.website_slug, "home"]))
+        self.assertEqual(public_response.status_code, status.HTTP_200_OK, public_response.data)
+        section = public_response.data["sections"][0]
+        self.assertEqual(section["responsive"], {"hidden_on": ["desktop"]})
+
+
 class WebsiteWebhookApiTests(APITestCase):
     def setUp(self):
         self.owner = _make_user("+2348011110061")

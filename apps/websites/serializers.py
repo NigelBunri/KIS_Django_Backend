@@ -42,6 +42,15 @@ class WebsitePageSerializer(serializers.ModelSerializer):
                     )
                 if not data.get("target_id"):
                     raise serializers.ValidationError("kis_video section requires a target_id.")
+            responsive = entry.get("responsive")
+            if responsive is not None:
+                if not isinstance(responsive, dict):
+                    raise serializers.ValidationError("responsive must be an object.")
+                hidden_on = responsive.get("hidden_on") or []
+                if not isinstance(hidden_on, list) or any(v not in ("mobile", "desktop") for v in hidden_on):
+                    raise serializers.ValidationError(
+                        "responsive.hidden_on may only contain 'mobile' and/or 'desktop'."
+                    )
         return value
 
 

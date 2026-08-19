@@ -83,7 +83,12 @@ def _require_administer_permission(user, website: Website):
 def _serialize_public_section(website: Website, section: dict) -> dict:
     if not isinstance(section, dict):
         return {}
-    payload = {"id": section.get("id"), "type": section.get("type"), "data": section.get("data") or {}}
+    payload = {
+        "id": section.get("id"),
+        "type": section.get("type"),
+        "data": section.get("data") or {},
+        "responsive": section.get("responsive") if isinstance(section.get("responsive"), dict) else {},
+    }
     if section.get("type") == "kis_content":
         page = resolve_kis_content_section_page(
             owner_type=website.owner_type, owner_id=website.owner_id, section_data=section.get("data") or {},
