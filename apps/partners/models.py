@@ -1459,3 +1459,52 @@ class UserAppShortcut(models.Model):
 
     def __str__(self):
         return f"{self.user_id} → {self.shortcut_name}"
+
+
+class PartnerOrganizationLinkType(models.TextChoices):
+    """Subset of apps.websites.models.WebsiteOwnerType — everything except
+    PARTNER itself, since a partner linking to another partner isn't a
+    supported relationship here."""
+
+    SHOP = "shop", "Shop"
+    HEALTH_INSTITUTION = "health_institution", "Health Institution"
+    EDUCATION_INSTITUTION = "education_institution", "Education Institution"
+    BROADCAST_CHANNEL = "broadcast_channel", "Broadcast Channel"
+
+
+class PartnerOrganizationLink(models.Model):
+    """Connects a Partner to one of its owned organizations (Shop, Health
+    Institution, Education Institution, Broadcast Channel).
+
+    Deliberately NOT a new FK column on each of those four separate
+    models (which live in commerce/health_ops/broadcasts) — that would
+    give apps.partners four new cross-app dependencies for one feature.
+    Instead this reuses the polymorphic owner_type/owner_id pattern
+    apps.websites.owner_resolution already established for the exact
+    same five entity types, resolved lazily via django.apps at read time.
+
+    One organization can only ever be linked to one partner at a time
+    (unique on owner_type+owner_id, not on partner+owner_type+owner_id) —
+    an institution belongs to a single partner umbrella, not several.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="organization_links")
+    owner_type = models.CharField(max_length=32, choices=PartnerOrganizationLinkType.choices)
+    owner_id = models.UUIDField()
+    linked_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "partner_organization_link"
+        constraints = [
+            models.UniqueConstraint(fields=["owner_type", "owner_id"], name="partner_org_link_unique_owner"),
+        ]
+        indexes = [
+            models.Index(fields=["partner"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.partner_id} ↔ {self.owner_type}:{self.owner_id}"

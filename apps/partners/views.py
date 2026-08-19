@@ -57,6 +57,8 @@ from apps.partners.models import (
     PartnerProfileLink,
     PartnerServerCategory,
     PartnerModerationAction,
+    PartnerOrganizationLink,
+    PartnerOrganizationLinkType,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -242,6 +244,46 @@ def _normalize_landing_builder_config(raw_config):
     if "landingStyle" in candidate:
         normalized["landingStyle"] = _safe_json_value(candidate.get("landingStyle"))
     return normalized
+
+
+def _linkable_models() -> dict:
+    """Called fresh each time (avoids import-order coupling with
+    commerce/health_ops/broadcasts) — one entry per
+    PartnerOrganizationLinkType."""
+    from django.apps import apps as django_apps
+
+    return {
+        PartnerOrganizationLinkType.SHOP: django_apps.get_model("commerce", "Shop"),
+        PartnerOrganizationLinkType.HEALTH_INSTITUTION: django_apps.get_model("health_ops", "HealthInstitution"),
+        PartnerOrganizationLinkType.EDUCATION_INSTITUTION: django_apps.get_model("broadcasts", "EducationInstitution"),
+        PartnerOrganizationLinkType.BROADCAST_CHANNEL: django_apps.get_model("broadcasts", "BroadcastChannel"),
+    }
+
+
+def _resolve_linkable_organization(owner_type: str, owner_id: str, user):
+    model = _linkable_models().get(owner_type)
+    if model is None:
+        return None
+    org = model.objects.filter(pk=owner_id).first()
+    if org is None:
+        return None
+    owner_field = "owner_user" if owner_type == PartnerOrganizationLinkType.BROADCAST_CHANNEL else "owner"
+    if getattr(org, f"{owner_field}_id", None) != user.id:
+        return None
+    return org
+
+
+def _serialize_organization_link(link: "PartnerOrganizationLink") -> dict:
+    model = _linkable_models().get(link.owner_type)
+    org = model.objects.filter(pk=link.owner_id).first() if model else None
+    return {
+        "id": str(link.id),
+        "owner_type": link.owner_type,
+        "owner_id": str(link.owner_id),
+        "name": getattr(org, "name", "") if org else "",
+        "exists": org is not None,
+        "created_at": link.created_at.isoformat() if link.created_at else None,
+    }
 
 
 class PartnerViewSet(viewsets.ModelViewSet):
@@ -2039,6 +2081,77 @@ class PartnerViewSet(viewsets.ModelViewSet):
         )
         serializer = PartnerOrganizationAppSerializer(apps, many=True, context={"request": request})
         return Response({"apps": serializer.data}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="organizations")
+    def organizations(self, request, pk=None):
+        """Shop/Health/Education/Broadcast-Channel entities connected to
+        this partner's profile. Reuses apps.websites.owner_resolution's
+        polymorphic owner_type/owner_id resolver — see
+        PartnerOrganizationLink's model docstring for why this isn't a
+        new FK column on four separate apps' models."""
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this partner's organizations.")
+
+        if request.method == "POST":
+            if not self._user_can_manage_partner(partner, request.user):
+                raise PermissionDenied("Not allowed to manage this partner's organizations.")
+            owner_type = str(request.data.get("owner_type") or "")
+            owner_id = str(request.data.get("owner_id") or "")
+            if owner_type not in PartnerOrganizationLinkType.values:
+                raise ValidationError({"owner_type": f"Must be one of {PartnerOrganizationLinkType.values}."})
+            if not owner_id:
+                raise ValidationError({"owner_id": "owner_id is required."})
+
+            org = _resolve_linkable_organization(owner_type, owner_id, request.user)
+            if org is None:
+                raise ValidationError({"owner_id": "That organization doesn't exist, or you don't own it."})
+
+            if PartnerOrganizationLink.objects.filter(owner_type=owner_type, owner_id=owner_id).exclude(partner=partner).exists():
+                raise ValidationError({"owner_id": "That organization is already linked to a different partner."})
+
+            link, _ = PartnerOrganizationLink.objects.get_or_create(
+                owner_type=owner_type, owner_id=owner_id,
+                defaults={"partner": partner, "linked_by": request.user},
+            )
+            return Response(_serialize_organization_link(link), status=status.HTTP_201_CREATED)
+
+        links = PartnerOrganizationLink.objects.filter(partner=partner).order_by("-created_at")
+        return Response({"organizations": [_serialize_organization_link(link) for link in links]})
+
+    @action(detail=True, methods=["get"], url_path="organizations/linkable")
+    def linkable_organizations(self, request, pk=None):
+        """The requesting user's own institutions/shops/health orgs/
+        broadcast channels that are not yet linked to ANY partner —
+        populates the "connect an organization" picker."""
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to manage this partner's organizations.")
+
+        linked_ids = set(PartnerOrganizationLink.objects.values_list("owner_id", flat=True))
+        results = []
+        for owner_type, model in _linkable_models().items():
+            owner_field = "owner_user" if owner_type == PartnerOrganizationLinkType.BROADCAST_CHANNEL else "owner"
+            for org in model.objects.filter(**{owner_field: request.user}):
+                if org.id in linked_ids:
+                    continue
+                results.append({
+                    "owner_type": owner_type,
+                    "owner_id": str(org.id),
+                    "name": getattr(org, "name", "") or "",
+                })
+        return Response({"organizations": results})
+
+    @action(detail=True, methods=["post"], url_path="organizations/unlink")
+    def unlink_organization(self, request, pk=None):
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to manage this partner's organizations.")
+        link_id = str(request.data.get("link_id") or "")
+        deleted, _ = PartnerOrganizationLink.objects.filter(id=link_id, partner=partner).delete()
+        if not deleted:
+            raise ValidationError({"link_id": "No such linked organization."})
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["get", "post"], url_path="server-categories")
     def server_categories(self, request, pk=None):

@@ -24,6 +24,7 @@ from apps.partners.models import (
     PartnerModerationAction,
     PartnerOrganizationApp,
     PartnerOrganizationAppType,
+    PartnerOrganizationLink,
     PartnerOrganizationProfile,
     PartnerPost,
     PartnerRole,
@@ -604,3 +605,95 @@ class PartnerApiTests(TestCase):
         payload = PartnerPostSerializer(post).data
 
         self.assertEqual(payload["comments_count"], 6)
+
+
+class PartnerOrganizationLinkApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670001001", country="CM", password="pass1234")
+        self.stranger = User.objects.create_user(phone="+237670001002", country="CM", password="pass1234")
+        self.partner = Partner.objects.create(owner=self.owner, name="Org Link Partner", slug="org-link-partner")
+
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="My Shop", slug="org-link-shop")
+        self.strangers_shop = Shop.objects.create(owner=self.stranger, name="Not Mine", slug="org-link-not-mine")
+
+    def test_owner_can_link_their_own_shop(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/organizations/",
+            {"owner_type": "shop", "owner_id": str(self.shop.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["owner_id"], str(self.shop.id))
+
+        list_response = self.client.get(f"/api/v1/partners/{self.partner.id}/organizations/")
+        self.assertEqual(len(list_response.data["organizations"]), 1)
+
+    def test_cannot_link_someone_elses_shop(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/organizations/",
+            {"owner_type": "shop", "owner_id": str(self.strangers_shop.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_cannot_double_link_an_already_linked_organization(self):
+        self.client.force_authenticate(self.owner)
+        other_partner = Partner.objects.create(owner=self.owner, name="Other Partner", slug="org-link-other")
+        self.client.post(
+            f"/api/v1/partners/{self.partner.id}/organizations/",
+            {"owner_type": "shop", "owner_id": str(self.shop.id)},
+            format="json",
+        )
+        response = self.client.post(
+            f"/api/v1/partners/{other_partner.id}/organizations/",
+            {"owner_type": "shop", "owner_id": str(self.shop.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_linkable_organizations_excludes_already_linked(self):
+        self.client.force_authenticate(self.owner)
+        before = self.client.get(f"/api/v1/partners/{self.partner.id}/organizations/linkable/")
+        self.assertEqual(len(before.data["organizations"]), 1)
+
+        self.client.post(
+            f"/api/v1/partners/{self.partner.id}/organizations/",
+            {"owner_type": "shop", "owner_id": str(self.shop.id)},
+            format="json",
+        )
+        after = self.client.get(f"/api/v1/partners/{self.partner.id}/organizations/linkable/")
+        self.assertEqual(len(after.data["organizations"]), 0)
+
+    def test_owner_can_unlink(self):
+        self.client.force_authenticate(self.owner)
+        link_response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/organizations/",
+            {"owner_type": "shop", "owner_id": str(self.shop.id)},
+            format="json",
+        )
+        link_id = link_response.data["id"]
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/organizations/unlink/",
+            {"link_id": link_id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(PartnerOrganizationLink.objects.filter(partner=self.partner).count(), 0)
+
+    def test_stranger_cannot_link_organizations_to_someone_elses_partner(self):
+        # A total stranger (no ownership, no membership) never resolves the
+        # partner at all — PartnerViewSet.get_queryset excludes it entirely,
+        # so this 404s rather than 403s, same as every other stranger-access
+        # case against this ViewSet.
+        self.client.force_authenticate(self.stranger)
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/organizations/",
+            {"owner_type": "shop", "owner_id": str(self.strangers_shop.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
