@@ -6,6 +6,7 @@ from operator import or_
 
 from django.db.models import Q, QuerySet
 from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied
 
 from apps.accounts.models import AccountTier, Subscription, UsageQuota
 from .tier_presets import TIER_PRESETS
@@ -244,3 +245,68 @@ def ensure_default_account_tiers() -> None:
         if current is not None and all(getattr(current, field) == value for field, value in desired.items()):
             continue
         AccountTier.objects.update_or_create(name=preset["name"], defaults=desired)
+
+
+# --- Legacy tier-name ranking + profile-limit resolution ---------------
+# Moved here verbatim from apps.broadcasts.views (where it was originally
+# defined) so apps.websites can use the same gate-check-then-quota-check
+# pattern without importing from apps.broadcasts. apps.broadcasts.views
+# re-exports resolve_profile_limit under its original private name
+# (_resolve_profile_limit) as a thin aliasing import, so every existing
+# call site keeps working unchanged.
+#
+# Deliberately NOT unified with tier_rank()/_tier_weight() above: this is
+# a second, independent tier-name ranking used only by the legacy fallback
+# path below (when a tier's features_json doesn't yet have the requested
+# feature_key), with its own hardcoded order/aliases. Moved as-is to avoid
+# any behavior drift; unifying the two ranking systems is a separate,
+# out-of-scope change.
+_LEGACY_TIER_ORDER = ['free', 'basic', 'pro', 'business', 'market pro', 'business pro', 'partner', 'partner pro']
+_LEGACY_TIER_ALIASES = {
+    'market pro': 'business pro',
+}
+
+
+def _legacy_normalize_tier(label: str | None) -> str:
+    if not label:
+        return ''
+    normalized = str(label).strip().lower()
+    return _LEGACY_TIER_ALIASES.get(normalized, normalized)
+
+
+def _legacy_tier_rank(label: str | None) -> int:
+    normalized = _legacy_normalize_tier(label)
+    try:
+        return _LEGACY_TIER_ORDER.index(normalized)
+    except ValueError:
+        return 0
+
+
+def _legacy_is_tier_at_least(current: str | None, required: str) -> bool:
+    return _legacy_tier_rank(current) >= _legacy_tier_rank(required)
+
+
+def resolve_profile_limit(
+    user,
+    feature_key: str,
+    *,
+    legacy_required_tier: str,
+    permission_message: str,
+):
+    """
+    Return normalized profile limit:
+      - int: finite limit
+      - None: unlimited
+
+    If the feature key does not exist yet for a user tier, fall back to legacy
+    tier-name checks to keep backward compatibility.
+    """
+    features = get_user_tier_features(user)
+    if feature_key in features:
+        normalized = normalize_limit_value(features.get(feature_key), default=0)
+        if normalized is not None and normalized <= 0:
+            raise PermissionDenied(permission_message)
+        return normalized
+    if not _legacy_is_tier_at_least(user.tier, legacy_required_tier):
+        raise PermissionDenied(permission_message)
+    return None

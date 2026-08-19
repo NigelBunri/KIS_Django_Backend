@@ -13098,11 +13098,6 @@ class EducationInstitutionAssessmentSubmissionActionView(APIView):
         raise ValidationError({"action": "Unsupported action."})
 
 
-TIER_ORDER = ['free', 'basic', 'pro', 'business', 'market pro', 'business pro', 'partner', 'partner pro']
-TIER_ALIASES = {
-    'market pro': 'business pro',
-}
-
 HEALTH_SYSTEM_FEATURES = [
     'Telemedicine scheduling + reminders',
     'Electronic health records with audit trail',
@@ -13127,49 +13122,10 @@ HEALTH_SYSTEM_FEATURES = [
 ]
 
 
-def _normalize_tier(label: str | None) -> str:
-    if not label:
-        return ''
-    normalized = str(label).strip().lower()
-    return TIER_ALIASES.get(normalized, normalized)
-
-
-def _tier_rank(label: str | None) -> int:
-    normalized = _normalize_tier(label)
-    try:
-        return TIER_ORDER.index(normalized)
-    except ValueError:
-        return 0
-
-
-def _is_tier_at_least(current: str | None, required: str) -> bool:
-    return _tier_rank(current) >= _tier_rank(required)
-
-
-def _resolve_profile_limit(
-    user,
-    feature_key: str,
-    *,
-    legacy_required_tier: str,
-    permission_message: str,
-):
-    """
-    Return normalized profile limit:
-      - int: finite limit
-      - None: unlimited
-
-    If the feature key does not exist yet for a user tier, fall back to legacy
-    tier-name checks to keep backward compatibility.
-    """
-    features = get_user_tier_features(user)
-    if feature_key in features:
-        normalized = normalize_limit_value(features.get(feature_key), default=0)
-        if normalized is not None and normalized <= 0:
-            raise PermissionDenied(permission_message)
-        return normalized
-    if not _is_tier_at_least(user.tier, legacy_required_tier):
-        raise PermissionDenied(permission_message)
-    return None
+# Moved to apps.accounts.tiers (shared by apps.websites too) — re-exported
+# here under the original private name so every existing call site in
+# this file keeps working unchanged.
+from apps.accounts.tiers import resolve_profile_limit as _resolve_profile_limit
 
 
 class ProfileCreationView(APIView):
@@ -14162,42 +14118,17 @@ def _embed_public_base_url(request=None) -> str:
     return ""
 
 
-def _public_web_enabled() -> bool:
-    value = getattr(settings, "KIS_PUBLIC_WEB_ENABLED", os.getenv("KIS_PUBLIC_WEB_ENABLED", "True"))
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _public_web_base_url(request=None) -> str:
-    configured = str(getattr(settings, "KIS_PUBLIC_WEB_BASE_URL", os.getenv("KIS_PUBLIC_WEB_BASE_URL", "")) or "").strip().rstrip("/")
-    if configured:
-        return configured
-    if request is not None:
-        return request.build_absolute_uri("/").rstrip("/")
-    return "https://kis.app"
-
-
-def _public_indexing_enabled() -> bool:
-    value = getattr(settings, "KIS_PUBLIC_WEB_INDEXING_ENABLED", os.getenv("KIS_PUBLIC_WEB_INDEXING_ENABLED", "False"))
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _safe_public_description(*values) -> str:
-    text = " ".join(str(value or "").strip() for value in values if str(value or "").strip())
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:260]
-
-
-def _safe_public_media_url(value: str) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    parsed = urlparse(raw)
-    if parsed.scheme not in {"http", "https"}:
-        return ""
-    path = (parsed.path or "").lower()
-    if any(marker in path for marker in ("/private/", "/raw/", "/tmp/", "/temp/")):
-        return ""
-    return raw
+# Moved to apps.core.public_web (shared by apps.websites too) — re-exported
+# here under the original private names so every existing call site in
+# this file, and any test patching `apps.broadcasts.views._safe_public_*`,
+# keeps working unchanged.
+from apps.core.public_web import (
+    public_web_enabled as _public_web_enabled,
+    public_web_base_url as _public_web_base_url,
+    public_indexing_enabled as _public_indexing_enabled,
+    safe_public_description as _safe_public_description,
+    safe_public_media_url as _safe_public_media_url,
+)
 
 
 def _content_is_public_web_safe(content: ChannelContent) -> bool:

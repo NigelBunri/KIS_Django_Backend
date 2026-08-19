@@ -139,6 +139,7 @@ urlpatterns = [
     path("api/v1/", include("apps.otp.urls")),
     path("api/v1/", include("apps.chat.urls", namespace="chat-root")),
     path("api/v1/partners/", include("apps.partners.urls", namespace="partners")),
+    path("api/v1/websites/", include("apps.websites.urls", namespace="websites")),
     path("api/v1/partners/", include("apps.location.urls", namespace="location")),
     # The generic core app already owns /api/v1/communities/. Chat-backed
     # communities need a separate route that creates their conversations.

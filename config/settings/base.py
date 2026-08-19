@@ -259,6 +259,14 @@ KIS_PUBLIC_WEB_BASE_URL = os.environ.get("KIS_PUBLIC_WEB_BASE_URL", "https://kis
 KIS_PUBLIC_WEB_INDEXING_ENABLED = _env_bool("KIS_PUBLIC_WEB_INDEXING_ENABLED", False)
 KIS_PUBLIC_REFERRALS_ENABLED = _env_bool("KIS_PUBLIC_REFERRALS_ENABLED", False)
 
+# Website builder's public domain — deliberately separate from
+# KIS_PUBLIC_WEB_BASE_URL above (kis.app, used by broadcasts' channel/
+# content public pages). Website builder pages are served at
+# kingdomimpactventures.org/page/<slug> by the separate Next.js site, not
+# rendered by Django — this is only used to build canonical/preview URLs
+# returned in API responses.
+KIS_WEBSITE_PUBLIC_BASE_URL = os.environ.get("KIS_WEBSITE_PUBLIC_BASE_URL", "https://kingdomimpactventures.org").strip().rstrip("/")
+
 # Launch-cut controls. The 80% launch cut keeps high-risk/optional systems
 # behind approval flags while preserving the roadmap toward 95% and 120%.
 KIS_LAUNCH_CUT_MODE = os.environ.get("KIS_LAUNCH_CUT_MODE", "80").strip() or "80"
@@ -376,6 +384,7 @@ INSTALLED_APPS = [
     # chats
     "apps.chat.apps.ChatConfig",
     "apps.partners.apps.PartnersConfig",
+    "apps.websites.apps.WebsitesConfig",
     "apps.communities.apps.CommunitiesConfig",
     "apps.groups.apps.GroupsConfig",
     "apps.channels.apps.ChannelsConfig",
