@@ -105,7 +105,7 @@ OTP_TTL_SECONDS = 5 * 60
 RESEND_COOLDOWN_SECONDS = 60
 MAX_ATTEMPTS = 5
 
-ALLOWED_PURPOSES = {"register", "login", "reset", "email_verify"}
+ALLOWED_PURPOSES = {"register", "login", "reset", "email_verify", "web_login"}
 ALLOWED_CHANNELS = {"sms", "email", "whatsapp"}
 
 
@@ -522,6 +522,37 @@ class OtpVerifyView(APIView):
             user.email_verified = True
             user.save(update_fields=["email_verified", "updated_at"])
             return Response({"success": True, "verified": True}, status=200)
+
+        if purpose == "web_login":
+            # Website login for an EXISTING account only — deliberately does
+            # not fall through to the register/login tail below, which
+            # unconditionally activates the account (status="active",
+            # is_active=True, verification.phone.verified=True) regardless
+            # of whether it already was. A website sign-in must never
+            # silently "complete" a dormant or half-registered account.
+            user = _find_user_by_phone(phone, country)
+            if not user:
+                return Response({"success": False, "message": "No KIS account found for this phone number."}, status=404)
+            if not user.is_active or user.status != "active":
+                return Response({"success": False, "message": "This account isn't active yet. Finish setup in the KIS app first."}, status=403)
+            from apps.accounts.views import issue_tokens_for_user, upsert_device
+            upsert_device(user, device_id, device_platform, None, request)
+            tokens = issue_tokens_for_user(user, device_id=device_id)
+            return Response(
+                {
+                    "success": True,
+                    "access": tokens["access"],
+                    "refresh": tokens["refresh"],
+                    "device_id": device_id,
+                    "user": {
+                        "id": user.id,
+                        "phone": user.phone,
+                        "status": user.status,
+                        "is_active": user.is_active,
+                    },
+                },
+                status=200,
+            )
 
         # Robust user lookup: tries E.164, digits-only, with-plus, and national-number variants
         user = _find_user_by_phone(phone, country)

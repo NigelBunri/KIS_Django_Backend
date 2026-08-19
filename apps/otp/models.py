@@ -9,6 +9,7 @@ class PhoneOTP(models.Model):
         ("login", "login"),
         ("reset", "reset"),
         ("email_verify", "email_verify"),
+        ("web_login", "web_login"),
     )
     phone = models.CharField(max_length=20, db_index=True)
     purpose = models.CharField(max_length=16, choices=PURPOSE_CHOICES)
