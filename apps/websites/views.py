@@ -121,6 +121,7 @@ def _public_site_payload(website: Website) -> dict:
     return {
         "slug": website.slug,
         "name": website.name,
+        "owner_type": website.owner_type,
         "branding": website.branding or {},
         "seo": {
             "title": default_seo.get("title") or website.name,

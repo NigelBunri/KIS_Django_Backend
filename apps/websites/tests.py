@@ -393,6 +393,9 @@ class WebsiteApiTests(APITestCase):
         public_response = self.client.get(reverse("websites:public-page", args=[website_slug, "home"]))
         self.assertEqual(public_response.status_code, status.HTTP_200_OK, public_response.data)
 
+        site_response = self.client.get(reverse("websites:public-site", args=[website_slug]))
+        self.assertEqual(site_response.data["owner_type"], "shop")
+
     def test_unpublished_page_404s_for_anonymous_visitor(self):
         mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
         website_slug = mine_response.data["slug"]
