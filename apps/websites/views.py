@@ -16,6 +16,13 @@ from apps.notifications.email_service import send_website_form_notification_emai
 from apps.websites import adapters
 from apps.websites.analytics import extract_referrer_host, hash_visitor_session
 from apps.websites.branding import validate_branding
+from apps.websites.custom_domains import (
+    check_hostname_status,
+    custom_domains_enabled,
+    deregister_custom_hostname,
+    register_custom_hostname,
+    validate_domain_format,
+)
 from apps.websites.forms import HONEYPOT_KEY, score_submission, validate_submission_data
 from apps.websites.kis_content_resolvers import resolve_kis_content_section
 from apps.websites.models import (
@@ -23,6 +30,7 @@ from apps.websites.models import (
     WebsiteAnalyticsEvent,
     WebsiteCollaborator,
     WebsiteCollaboratorRole,
+    WebsiteCustomDomainStatus,
     WebsiteFormSubmission,
     WebsiteInvite,
     WebsiteOwnerType,
@@ -588,6 +596,101 @@ class WebsiteDetailView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save(updated_by=request.user)
         return Response(serializer.data)
+
+
+def _custom_domain_payload(website: Website) -> dict:
+    return {
+        "custom_domain": website.custom_domain,
+        "status": website.custom_domain_status,
+        "enabled": custom_domains_enabled(),
+        "cname_target": getattr(settings, "CLOUDFLARE_FALLBACK_ORIGIN_HOSTNAME", "kingdomimpactventures.org") if website.custom_domain else None,
+        "txt_record": website.custom_domain_txt_record or None,
+    }
+
+
+class WebsiteCustomDomainView(APIView):
+    """Application code for Cloudflare for SaaS custom hostnames — see
+    apps.websites.custom_domains's module docstring for why every branch
+    here degrades to a clear 400 rather than acting when
+    CLOUDFLARE_API_TOKEN/CLOUDFLARE_ZONE_ID aren't configured (they
+    aren't, on this deployment, as of writing this)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, website_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_manage_permission(request.user, website)
+
+        if website.custom_domain and website.custom_domain_cloudflare_id and custom_domains_enabled():
+            try:
+                new_status = check_hostname_status(website.custom_domain_cloudflare_id)
+                if new_status != website.custom_domain_status:
+                    website.custom_domain_status = new_status
+                    website.save(update_fields=["custom_domain_status", "updated_at"])
+            except Exception:
+                pass  # best-effort refresh; stale status is fine, a crash here isn't
+
+        return Response(_custom_domain_payload(website))
+
+    def post(self, request, website_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_manage_permission(request.user, website)
+
+        if not custom_domains_enabled():
+            raise ValidationError({"detail": "Custom domains aren't available on this deployment yet."})
+
+        domain = validate_domain_format(str(request.data.get("custom_domain") or ""))
+        if Website.objects.filter(custom_domain=domain).exclude(id=website.id).exists():
+            raise ValidationError({"custom_domain": "This domain is already in use by another website."})
+
+        registration = register_custom_hostname(domain)
+        website.custom_domain = domain
+        website.custom_domain_status = WebsiteCustomDomainStatus.PENDING
+        website.custom_domain_cloudflare_id = registration["cloudflare_id"]
+        website.custom_domain_txt_record = registration["txt_record"]
+        website.updated_by = request.user
+        website.save(update_fields=[
+            "custom_domain", "custom_domain_status", "custom_domain_cloudflare_id",
+            "custom_domain_txt_record", "updated_by", "updated_at",
+        ])
+
+        return Response(_custom_domain_payload(website), status=status.HTTP_201_CREATED)
+
+    def delete(self, request, website_id):
+        website = get_object_or_404(Website, id=website_id)
+        _require_manage_permission(request.user, website)
+
+        if website.custom_domain_cloudflare_id and custom_domains_enabled():
+            try:
+                deregister_custom_hostname(website.custom_domain_cloudflare_id)
+            except Exception:
+                pass  # best-effort — clear our own record either way
+
+        website.custom_domain = None
+        website.custom_domain_status = WebsiteCustomDomainStatus.NONE
+        website.custom_domain_cloudflare_id = ""
+        website.custom_domain_txt_record = {}
+        website.save(update_fields=[
+            "custom_domain", "custom_domain_status", "custom_domain_cloudflare_id",
+            "custom_domain_txt_record", "updated_at",
+        ])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class WebsitePublicSiteByDomainView(APIView):
+    """Resolves a custom domain to its Website's slug — called by the
+    website repo's host-based routing (see the plan's Batch E section)
+    to know which site to render when a request arrives on a domain
+    that isn't kingdomimpactventures.org itself."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, domain):
+        website = get_object_or_404(
+            Website, custom_domain=domain.strip().lower(), custom_domain_status=WebsiteCustomDomainStatus.ACTIVE,
+            status=WebsiteStatus.PUBLISHED,
+        )
+        return Response({"slug": website.slug})
 
 
 class WebsitePublishView(APIView):

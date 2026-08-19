@@ -54,6 +54,13 @@ class WebsiteStatus(models.TextChoices):
     UNPUBLISHED = "unpublished", "Unpublished"
 
 
+class WebsiteCustomDomainStatus(models.TextChoices):
+    NONE = "none", "Not configured"
+    PENDING = "pending", "Pending verification"
+    ACTIVE = "active", "Active"
+    FAILED = "failed", "Failed"
+
+
 class Website(BaseEntity):
     """One per owner entity (Shop/HealthInstitution/EducationInstitution/
     Partner/BroadcastChannel) — enforced by the unique_owner constraint
@@ -77,6 +84,22 @@ class Website(BaseEntity):
     status = models.CharField(max_length=16, choices=WebsiteStatus.choices, default=WebsiteStatus.DRAFT, db_index=True)
     published_at = models.DateTimeField(null=True, blank=True)
     unpublished_at = models.DateTimeField(null=True, blank=True)
+
+    # Cloudflare for SaaS custom hostname — see apps.websites.custom_domains.
+    # null/blank means "using the shared kingdomimpactventures.org/page/<slug>
+    # URL only", the default and only state until the Cloudflare zone/Worker
+    # route infra this depends on is actually set up (a separate,
+    # explicitly-confirmed step — see that module's docstring).
+    custom_domain = models.CharField(max_length=255, null=True, blank=True, unique=True)
+    custom_domain_status = models.CharField(
+        max_length=16, choices=WebsiteCustomDomainStatus.choices, default=WebsiteCustomDomainStatus.NONE,
+    )
+    custom_domain_cloudflare_id = models.CharField(max_length=64, blank=True, default="")
+    # {name, value} — Cloudflare's per-hostname TXT ownership-verification
+    # record, persisted (not just returned once at registration time) so
+    # the owner can come back to WebsiteCustomDomainView.get and see the
+    # DNS records they need to add again, not just on the initial POST.
+    custom_domain_txt_record = models.JSONField(default=dict, blank=True)
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="websites_created",

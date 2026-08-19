@@ -1034,3 +1034,108 @@ class WebsiteAnalyticsTests(APITestCase):
         self.client.force_authenticate(stranger)
         response = self.client.get(reverse("websites:analytics-summary", args=[self.website_id]))
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class CustomDomainValidationTests(TestCase):
+    def test_valid_domain_accepted(self):
+        from apps.websites.custom_domains import validate_domain_format
+
+        self.assertEqual(validate_domain_format("www.example.com"), "www.example.com")
+
+    def test_invalid_domain_rejected(self):
+        from apps.websites.custom_domains import validate_domain_format
+
+        with self.assertRaises(ValidationError):
+            validate_domain_format("not a domain")
+
+    def test_kingdomimpactventures_subdomain_rejected(self):
+        from apps.websites.custom_domains import validate_domain_format
+
+        with self.assertRaises(ValidationError):
+            validate_domain_format("evil.kingdomimpactventures.org")
+
+
+class WebsiteCustomDomainApiTests(APITestCase):
+    def setUp(self):
+        self.owner = _make_user("+2348011110093")
+        _give_tier(self.owner, "Business")
+        self.client.force_authenticate(self.owner)
+        from apps.commerce.models import Shop
+
+        self.shop = Shop.objects.create(owner=self.owner, name="Domain Shop", slug="domain-test-shop")
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        self.website_id = mine_response.data["id"]
+        self.website_slug = mine_response.data["slug"]
+
+    def test_get_reports_not_enabled_by_default(self):
+        response = self.client.get(reverse("websites:custom-domain", args=[self.website_id]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["enabled"])
+        self.assertIsNone(response.data["custom_domain"])
+
+    def test_post_rejected_when_not_configured(self):
+        response = self.client.post(reverse("websites:custom-domain", args=[self.website_id]), {"custom_domain": "www.example.com"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_stranger_cannot_manage_custom_domain(self):
+        stranger = _make_user("+2348011110094")
+        self.client.force_authenticate(stranger)
+        response = self.client.get(reverse("websites:custom-domain", args=[self.website_id]))
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @patch("apps.websites.views.custom_domains_enabled", return_value=True)
+    @patch("apps.websites.views.register_custom_hostname")
+    def test_post_registers_domain_when_configured(self, mock_register, _mock_enabled):
+        mock_register.return_value = {
+            "cloudflare_id": "cf-123",
+            "cname_target": "kingdomimpactventures.org",
+            "txt_record": {"name": "_cf-custom-hostname.www.example.com", "value": "abc123"},
+        }
+        response = self.client.post(reverse("websites:custom-domain", args=[self.website_id]), {"custom_domain": "www.example.com"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["status"], "pending")
+        self.assertEqual(response.data["cname_target"], "kingdomimpactventures.org")
+        self.assertTrue(response.data["txt_record"]["value"])
+
+        from apps.websites.models import Website
+
+        website = Website.objects.get(id=self.website_id)
+        self.assertEqual(website.custom_domain, "www.example.com")
+        self.assertEqual(website.custom_domain_cloudflare_id, "cf-123")
+
+    @patch("apps.websites.views.custom_domains_enabled", return_value=True)
+    @patch("apps.websites.views.register_custom_hostname")
+    def test_duplicate_domain_rejected(self, mock_register, _mock_enabled):
+        mock_register.return_value = {"cloudflare_id": "cf-1", "cname_target": "x", "txt_record": {"name": "n", "value": "v"}}
+        self.client.post(reverse("websites:custom-domain", args=[self.website_id]), {"custom_domain": "www.example.com"}, format="json")
+
+        from apps.commerce.models import Shop
+
+        other_owner = _make_user("+2348011110095")
+        _give_tier(other_owner, "Business")
+        self.client.force_authenticate(other_owner)
+        other_shop = Shop.objects.create(owner=other_owner, name="Other Shop", slug="other-domain-shop")
+        other_mine = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(other_shop.id)})
+        response = self.client.post(
+            reverse("websites:custom-domain", args=[other_mine.data["id"]]), {"custom_domain": "www.example.com"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_public_resolve_by_domain_requires_active_status(self):
+        from apps.websites.models import Website, WebsiteCustomDomainStatus
+
+        website = Website.objects.get(id=self.website_id)
+        website.custom_domain = "www.example.com"
+        website.custom_domain_status = WebsiteCustomDomainStatus.PENDING
+        website.status = WebsiteStatus.PUBLISHED
+        website.save()
+
+        self.client.logout()
+        pending_response = self.client.get(reverse("websites:public-site-by-domain", args=["www.example.com"]))
+        self.assertEqual(pending_response.status_code, status.HTTP_404_NOT_FOUND)
+
+        website.custom_domain_status = WebsiteCustomDomainStatus.ACTIVE
+        website.save()
+        active_response = self.client.get(reverse("websites:public-site-by-domain", args=["www.example.com"]))
+        self.assertEqual(active_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(active_response.data["slug"], self.website_slug)

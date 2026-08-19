@@ -44,9 +44,10 @@ class WebsiteSerializer(serializers.ModelSerializer):
         fields = [
             "id", "owner_type", "owner_id", "slug", "name", "branding", "default_seo",
             "status", "published_at", "unpublished_at", "seeded_from_legacy", "pages",
-            "created_at", "updated_at",
+            "custom_domain", "custom_domain_status", "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "owner_type", "owner_id", "status", "published_at", "unpublished_at",
-            "seeded_from_legacy", "pages", "created_at", "updated_at",
+            "seeded_from_legacy", "pages", "custom_domain", "custom_domain_status",
+            "created_at", "updated_at",
         ]

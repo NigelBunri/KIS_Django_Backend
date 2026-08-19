@@ -267,6 +267,15 @@ KIS_PUBLIC_REFERRALS_ENABLED = _env_bool("KIS_PUBLIC_REFERRALS_ENABLED", False)
 # returned in API responses.
 KIS_WEBSITE_PUBLIC_BASE_URL = os.environ.get("KIS_WEBSITE_PUBLIC_BASE_URL", "https://kingdomimpactventures.org").strip().rstrip("/")
 
+# Website Builder custom domains (Cloudflare for SaaS) — unset by default.
+# See apps.websites.custom_domains's module docstring: this is
+# APPLICATION code built ahead of a separate, not-yet-done, one-time
+# Cloudflare zone/Worker-route infrastructure step. Leave these unset
+# until that step is explicitly confirmed and completed.
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+CLOUDFLARE_ZONE_ID = os.environ.get("CLOUDFLARE_ZONE_ID", "").strip()
+CLOUDFLARE_FALLBACK_ORIGIN_HOSTNAME = os.environ.get("CLOUDFLARE_FALLBACK_ORIGIN_HOSTNAME", "kingdomimpactventures.org").strip()
+
 # Launch-cut controls. The 80% launch cut keeps high-risk/optional systems
 # behind approval flags while preserving the roadmap toward 95% and 120%.
 KIS_LAUNCH_CUT_MODE = os.environ.get("KIS_LAUNCH_CUT_MODE", "80").strip() or "80"
