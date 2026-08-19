@@ -225,6 +225,48 @@ class KisContentResolverTests(TestCase):
         ids = {item["id"] for item in items}
         self.assertIn(str(active.id), ids)
         self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["shop_id"], str(shop.id), "checkout needs shop_id on every resolved product item")
+
+    def test_resolve_courses_exposes_checkout_content_id_for_the_primary_priced_broadcast(self):
+        from apps.broadcasts.models import EducationInstitution, EducationInstitutionBroadcast, EducationInstitutionCourse
+
+        institution = EducationInstitution.objects.create(owner=self.owner, name="Resolver Institution")
+        course = EducationInstitutionCourse.objects.create(
+            institution=institution, title="Resolver Course", status="published", visibility="public",
+        )
+        # A draft broadcast must be ignored — only published ones are checkout-eligible.
+        EducationInstitutionBroadcast.objects.create(
+            institution=institution, created_by=self.owner, broadcast_kind="lesson", course=course,
+            title="Draft Session", status="draft", price_amount=10,
+        )
+        priced = EducationInstitutionBroadcast.objects.create(
+            institution=institution, created_by=self.owner, broadcast_kind="lesson", course=course,
+            title="Priced Session", status="published", price_amount=25,
+        )
+
+        items = resolve_kis_content_section(
+            owner_type=WebsiteOwnerType.EDUCATION_INSTITUTION, owner_id=institution.id,
+            section_data={"target_type": "course", "presentation": {"limit": 10}},
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["checkout_content_id"], str(priced.id))
+
+    def test_resolve_courses_leaves_checkout_content_id_null_with_no_broadcasts(self):
+        from apps.broadcasts.models import EducationInstitution, EducationInstitutionCourse
+
+        institution = EducationInstitution.objects.create(owner=self.owner, name="Bare Resolver Institution")
+        EducationInstitutionCourse.objects.create(
+            institution=institution, title="Bare Course", status="published", visibility="public",
+        )
+
+        items = resolve_kis_content_section(
+            owner_type=WebsiteOwnerType.EDUCATION_INSTITUTION, owner_id=institution.id,
+            section_data={"target_type": "course", "presentation": {"limit": 10}},
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0]["checkout_content_id"])
 
     def test_resolve_products_never_returns_another_shops_products(self):
         from apps.commerce.models import Product, Shop

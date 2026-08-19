@@ -45,6 +45,23 @@ def resolve_courses(*, owner_type, owner_id, target_ids=None, limit=6, **_):
         qs = qs.filter(id__in=_limit_ids(target_ids))
     items = []
     for course in qs.order_by("-created_at")[:limit]:
+        # Purchasing/enrolling operates on an EducationInstitutionBroadcast
+        # (a specific content item under the course), not the course row
+        # itself — there is no course-level purchase endpoint in this
+        # codebase. Best-effort: the first published, priced broadcast
+        # under this course is treated as "the thing you enroll in to buy
+        # this course." Courses with no such broadcast yet simply aren't
+        # checkout-able from the website (checkout_content_id is null) —
+        # the deep_link into the app still works either way.
+        enrollment_content_id = None
+        primary_broadcast = course.broadcasts.filter(
+            status="published",
+        ).exclude(price_amount__isnull=True).order_by("created_at").first()
+        if primary_broadcast is None:
+            primary_broadcast = course.broadcasts.filter(status="published").order_by("created_at").first()
+        if primary_broadcast is not None:
+            enrollment_content_id = str(primary_broadcast.id)
+
         items.append({
             "id": str(course.id),
             "title": course.title,
@@ -52,6 +69,7 @@ def resolve_courses(*, owner_type, owner_id, target_ids=None, limit=6, **_):
             "image_url": safe_public_media_url(course.cover_image_url),
             "price_display": "Free" if course.is_free else f"{course.price_amount} {course.price_currency}",
             "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/education/courses/{course.id}",
+            "checkout_content_id": enrollment_content_id,
         })
     return items
 
@@ -77,6 +95,7 @@ def resolve_products(*, owner_type, owner_id, target_ids=None, limit=6, **_):
             "image_url": image_url,
             "price_display": f"{product.sale_price or product.price} {product.currency}",
             "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/market/products/{product.id}",
+            "shop_id": str(product.shop_id),
         })
     return items
 
