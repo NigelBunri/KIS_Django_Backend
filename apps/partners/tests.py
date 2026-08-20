@@ -685,6 +685,43 @@ class PartnerOrganizationLinkApiTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertEqual(PartnerOrganizationLink.objects.filter(partner=self.partner).count(), 0)
 
+    def test_broadcast_channel_link_shows_display_name_not_blank(self):
+        # BroadcastChannel has no `name` field (it's `display_name`) —
+        # _serialize_organization_link previously used a blind
+        # getattr(org, "name", "") that silently returned "" for channels.
+        from apps.broadcasts.models import BroadcastChannel
+
+        channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle="org-link-test-channel",
+            display_name="My Test Channel",
+        )
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/organizations/",
+            {"owner_type": "broadcast_channel", "owner_id": str(channel.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["name"], "My Test Channel")
+
+        linkable_response = self.client.get(f"/api/v1/partners/{self.partner.id}/organizations/linkable/")
+        # Already linked, so it shouldn't appear in the linkable list, but
+        # any OTHER unlinked channel the owner has should show its
+        # display_name correctly too.
+        other_channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle="org-link-test-channel-2",
+            display_name="My Second Channel",
+        )
+        linkable_response = self.client.get(f"/api/v1/partners/{self.partner.id}/organizations/linkable/")
+        names = {org["name"] for org in linkable_response.data["organizations"]}
+        self.assertIn("My Second Channel", names)
+
     def test_stranger_cannot_link_organizations_to_someone_elses_partner(self):
         # A total stranger (no ownership, no membership) never resolves the
         # partner at all — PartnerViewSet.get_queryset excludes it entirely,

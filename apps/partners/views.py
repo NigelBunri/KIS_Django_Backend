@@ -260,6 +260,15 @@ def _linkable_models() -> dict:
     }
 
 
+def _organization_display_name(owner_type: str, org) -> str:
+    # BroadcastChannel has no `name` field — it's `display_name`. Every
+    # other linkable model (Shop, HealthInstitution, EducationInstitution)
+    # uses plain `name`.
+    if owner_type == PartnerOrganizationLinkType.BROADCAST_CHANNEL:
+        return getattr(org, "display_name", "") or ""
+    return getattr(org, "name", "") or ""
+
+
 def _resolve_linkable_organization(owner_type: str, owner_id: str, user):
     model = _linkable_models().get(owner_type)
     if model is None:
@@ -280,7 +289,7 @@ def _serialize_organization_link(link: "PartnerOrganizationLink") -> dict:
         "id": str(link.id),
         "owner_type": link.owner_type,
         "owner_id": str(link.owner_id),
-        "name": getattr(org, "name", "") if org else "",
+        "name": _organization_display_name(link.owner_type, org) if org else "",
         "exists": org is not None,
         "created_at": link.created_at.isoformat() if link.created_at else None,
     }
@@ -2138,7 +2147,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
                 results.append({
                     "owner_type": owner_type,
                     "owner_id": str(org.id),
-                    "name": getattr(org, "name", "") or "",
+                    "name": _organization_display_name(owner_type, org),
                 })
         return Response({"organizations": results})
 
