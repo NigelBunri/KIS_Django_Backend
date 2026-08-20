@@ -86,7 +86,11 @@ def _require_administer_permission(user, website: Website):
 
 _SECTION_IMAGE_STRING_FIELDS = ("image_url", "backgroundImageUrl", "imageUrl", "video_url", "thumbnail_url")
 _SECTION_IMAGE_LIST_FIELDS = ("images",)
-_SECTION_IMAGE_ITEM_LIST_FIELDS = ("items",)
+# field name -> the per-item key holding an image URL. "items" (kis_content-
+# style sections) uses snake_case image_url; "slides" (slideshow) uses the
+# RN editor's own camelCase imageUrl, same convention as its sibling
+# top-level *ImageUrl fields above.
+_SECTION_IMAGE_ITEM_LIST_FIELDS = {"items": "image_url", "slides": "imageUrl"}
 
 
 def _resolve_section_data_media(data: dict) -> dict:
@@ -101,11 +105,11 @@ def _resolve_section_data_media(data: dict) -> dict:
             resolved[field] = [
                 resolve_stale_media_url(item) if isinstance(item, str) else item for item in resolved[field]
             ]
-    for field in _SECTION_IMAGE_ITEM_LIST_FIELDS:
+    for field, image_key in _SECTION_IMAGE_ITEM_LIST_FIELDS.items():
         if isinstance(resolved.get(field), list):
             resolved[field] = [
-                {**item, "image_url": resolve_stale_media_url(item["image_url"])}
-                if isinstance(item, dict) and isinstance(item.get("image_url"), str) and item.get("image_url")
+                {**item, image_key: resolve_stale_media_url(item[image_key])}
+                if isinstance(item, dict) and isinstance(item.get(image_key), str) and item.get(image_key)
                 else item
                 for item in resolved[field]
             ]

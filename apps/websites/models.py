@@ -214,6 +214,8 @@ SECTION_TYPES = (
     "embed",
     "kis_video",
     "kis_content",
+    "slideshow",
+    "promo_bar",
 )
 
 # Alternate visual designs per section type, selected via a section's
