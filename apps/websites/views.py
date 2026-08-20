@@ -175,7 +175,18 @@ def _public_site_payload(website: Website) -> dict:
         },
         "canonical_url": f"{base_url}/page/{website.slug}",
         "pages": [
-            {"slug": p.slug, "title": p.title, "is_home": p.is_home}
+            {
+                "slug": p.slug,
+                "title": p.title,
+                "is_home": p.is_home,
+                # Sourced from the page's own existing SEO fields (already
+                # owner-editable, previously only used for <meta> tags) —
+                # gives the header's mega-menu flyout (WebsiteHeader.tsx)
+                # a real per-page blurb/image instead of a bare link list,
+                # with no new content-authoring surface required.
+                "description": safe_public_description((p.seo or {}).get("description") or ""),
+                "preview_image_url": (p.seo or {}).get("share_image_url") or "",
+            }
             for p in pages
         ],
         "updated_at": website.updated_at.isoformat() if website.updated_at else None,

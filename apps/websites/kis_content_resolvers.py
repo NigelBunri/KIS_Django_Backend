@@ -194,9 +194,32 @@ def resolve_product_detail(*, owner_type, owner_id, item_id, **_):
             url = ""
         if url:
             gallery.append(url)
+    # Display-only for now — price/stock preview per size/color option so
+    # a shopper can see what's available before deciding, matching a
+    # standard PDP swatch selector. NOT wired into checkout: the payment
+    # pipeline (apps.billing's DirectPaymentIntent flow) has no concept
+    # of a variant anywhere yet, so BuyButton still always charges the
+    # base product's price/stock regardless of which swatch is selected.
+    # Making checkout variant-aware is real payment-correctness work
+    # (price, stock decrement, and order records would all need to key
+    # off the chosen variant) that deserves its own careful pass, not a
+    # rushed addition here.
+    public_variants = [
+        {
+            "id": v.get("id", ""),
+            "name": v.get("name", ""),
+            "price_display": f"{v.get('sale_price') or v.get('price', '0.00')} {product.currency}",
+            "compare_at_price_display": f"{v.get('price', '0.00')} {product.currency}" if v.get("sale_price") else "",
+            "in_stock": product.inventory_type != "PHYSICAL" or int(v.get("stock_qty") or 0) > 0,
+            "options": v.get("options") or {},
+        }
+        for v in (product.variants or [])
+        if isinstance(v, dict) and v.get("is_active", True)
+    ]
     return {
         "id": str(product.id),
         "title": product.name,
+        "variants": public_variants,
         "description": safe_public_description(product.description, limit=2000),
         "image_url": image_url,
         "gallery": gallery,
