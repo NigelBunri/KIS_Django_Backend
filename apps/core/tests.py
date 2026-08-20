@@ -1235,3 +1235,49 @@ class PatientPhiCrossInstitutionAuthorizationTests(TestCase):
         )
         self.assertEqual(resp.status_code, 403)
         self.assertFalse(models.AllergyRecord.objects.filter(patient=self.patient_b, agent="Injected allergy").exists())
+
+
+class SafePublicMediaUrlTests(TestCase):
+    """safe_public_media_url previously rejected ANY URL whose path
+    contained /private/, /raw/, /tmp/, or /temp/ — but every presigned
+    upload in this codebase (apps.media.upload_intent) keys objects under
+    private/{context}/{user_id}/{uuid}.ext, so this silently blocked every
+    product photo, service image, course cover, and hero image from ever
+    reaching a public website page. Fixed to allow a genuinely SigV4-signed
+    presigned URL (X-Amz-Signature present) through regardless of path,
+    while still rejecting the exact unsigned cases
+    apps.broadcasts.management.commands.verify_public_web_launch already
+    asserts against."""
+
+    def test_signed_presigned_url_with_private_path_is_allowed(self):
+        from apps.core.public_web import safe_public_media_url
+
+        url = (
+            "https://kis-media.s3.eu-west-2.amazonaws.com/private/commerce/pmain/"
+            "user123/abc.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=x"
+            "&X-Amz-Date=20260820T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host"
+            "&X-Amz-Signature=deadbeef"
+        )
+        self.assertEqual(safe_public_media_url(url), url)
+
+    def test_unsigned_private_path_url_still_rejected(self):
+        from apps.core.public_web import safe_public_media_url
+
+        self.assertEqual(safe_public_media_url("https://cdn.example.com/private/raw/video.mp4"), "")
+
+    def test_raw_storage_key_still_rejected(self):
+        from apps.core.public_web import safe_public_media_url
+
+        self.assertEqual(safe_public_media_url("private/raw/video.mp4"), "")
+        self.assertEqual(safe_public_media_url("/media/private/raw/video.mp4"), "")
+
+    def test_non_http_scheme_still_rejected(self):
+        from apps.core.public_web import safe_public_media_url
+
+        self.assertEqual(safe_public_media_url("file:///tmp/private/raw/video.mp4"), "")
+
+    def test_genuinely_public_url_unaffected(self):
+        from apps.core.public_web import safe_public_media_url
+
+        url = "https://cdn.example.com/public/video.mp4"
+        self.assertEqual(safe_public_media_url(url), url)

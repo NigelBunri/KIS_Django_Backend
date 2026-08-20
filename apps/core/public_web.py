@@ -50,7 +50,20 @@ def safe_public_media_url(value: str) -> str:
     parsed = urlparse(raw)
     if parsed.scheme not in {"http", "https"}:
         return ""
+    # A genuine AWS SigV4 presigned URL always carries X-Amz-Signature (plus
+    # X-Amz-Algorithm/Credential/Date/Expires) in its query string — that
+    # signature is what actually gates access, not the object key's path.
+    # Every presigned upload in this codebase keys objects under
+    # private/{context}/{user_id}/{uuid}.ext (see apps.media.upload_intent),
+    # so rejecting any "/private/" path unconditionally blocked every
+    # legitimately-signed product photo, service image, course cover, and
+    # hero image from ever reaching a public page. Still reject a path
+    # containing these markers when there's no signature — that's the
+    # actual risk this was guarding against: a raw/unsigned storage
+    # reference passed off as a URL.
+    query = (parsed.query or "").lower()
+    is_presigned = "x-amz-signature" in query
     path = (parsed.path or "").lower()
-    if any(marker in path for marker in ("/private/", "/raw/", "/tmp/", "/temp/")):
+    if not is_presigned and any(marker in path for marker in ("/private/", "/raw/", "/tmp/", "/temp/")):
         return ""
     return raw
