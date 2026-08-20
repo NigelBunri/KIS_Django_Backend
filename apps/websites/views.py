@@ -125,6 +125,8 @@ def _serialize_public_section(website: Website, section: dict) -> dict:
         "data": _resolve_section_data_media(section.get("data") or {}),
         "responsive": section.get("responsive") if isinstance(section.get("responsive"), dict) else {},
     }
+    if isinstance(section.get("variant"), str) and section.get("variant"):
+        payload["variant"] = section["variant"]
     if section.get("type") == "kis_content":
         page = resolve_kis_content_section_page(
             owner_type=website.owner_type, owner_id=website.owner_id, section_data=section.get("data") or {},
