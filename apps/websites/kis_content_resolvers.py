@@ -315,20 +315,21 @@ def _post_is_public_safe(content) -> bool:
 
 def _post_image_url(content) -> str:
     """content.thumbnail_url is frequently empty — the actual uploaded
-    image/video/file for a post lives on its ChannelContentAsset rows
-    (content.assets), not on ChannelContent itself. Prefer the first
-    image-type asset's thumbnail (falls back to its own url for a plain
-    image asset with no separate thumbnail), then content.thumbnail_url,
-    then any asset at all — this is why post cards showed no image even
-    when the post clearly had one attached."""
+    image for a post lives on its ChannelContentAsset rows (content.
+    assets), not on ChannelContent itself. Prefer the first image-type
+    asset's thumbnail (falls back to its own url for a plain image asset
+    with no separate thumbnail), then content.thumbnail_url, then any
+    OTHER asset's thumbnail_url specifically — never an arbitrary asset's
+    raw .url, since for a video/file asset that's the video/document file
+    itself, not an image, and would render as a broken <img>."""
     asset = content.assets.filter(asset_type="image").order_by("sort_order").first()
     if asset:
         return resolve_stale_media_url(asset.thumbnail_url or asset.url)
     if content.thumbnail_url:
         return resolve_stale_media_url(content.thumbnail_url)
-    any_asset = content.assets.order_by("sort_order").first()
-    if any_asset:
-        return resolve_stale_media_url(any_asset.thumbnail_url or any_asset.url)
+    any_asset_with_thumbnail = content.assets.exclude(thumbnail_url="").order_by("sort_order").first()
+    if any_asset_with_thumbnail:
+        return resolve_stale_media_url(any_asset_with_thumbnail.thumbnail_url)
     return ""
 
 

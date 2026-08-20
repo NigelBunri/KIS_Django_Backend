@@ -307,6 +307,30 @@ class KisContentResolverTests(TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["image_url"], "https://example.com/photo.jpg")
 
+    def test_resolve_posts_never_uses_a_raw_video_file_as_the_image(self):
+        # A video asset with no separate thumbnail must never leak its
+        # raw .mp4 url into image_url — <img src="...mp4"> just renders
+        # as a broken image, worse than showing nothing.
+        from apps.broadcasts.models import BroadcastChannel, ChannelContent, ChannelContentAsset
+
+        channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            display_name="Video Resolver Channel", handle="video-resolver-channel", is_public=True,
+        )
+        content = ChannelContent.objects.create(
+            channel=channel, content_type="video", title="A Video Post",
+            visibility=ChannelContent.Visibility.PUBLIC, status=ChannelContent.Status.PUBLISHED,
+        )
+        ChannelContentAsset.objects.create(content=content, asset_type="video", url="https://example.com/clip.mp4", sort_order=0)
+
+        items = resolve_kis_content_section(
+            owner_type=WebsiteOwnerType.BROADCAST_CHANNEL, owner_id=channel.id,
+            section_data={"target_type": "post", "target_ids": [str(content.id)]},
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["image_url"], "")
+
     def test_resolve_courses_turns_a_stored_s3_key_into_a_real_image_url(self):
         # cover_image_url is free-text and, for an uploaded (not pasted)
         # cover, stores our own raw S3 object key verbatim (see
