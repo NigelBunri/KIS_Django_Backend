@@ -34,6 +34,28 @@ def _limit_ids(target_ids, cap=50):
     return [str(i) for i in (target_ids or [])][:cap]
 
 
+def _resolve_stored_media_url(value: str) -> str:
+    """Course/event cover_image_url is a free-text CharField holding one
+    of two shapes: a client-pasted external URL, or one of our own S3
+    object keys stored verbatim by _education_cover_image_from_payload —
+    always "private/<key_prefix>/<user>/<uuid>.<ext>" (see
+    apps.media.upload_intent._generate_object_key), never a real URL.
+    Passing that raw key straight into safe_public_media_url always
+    failed the scheme check (no "http"/"https") and silently dropped the
+    image. Mirrors apps.broadcasts.serializers._resolve_education_media_
+    display_url's own private/-prefix branch, which is the same fix
+    already applied for the authenticated course/institution API."""
+    text = str(value or "").strip()
+    if not text.startswith("private/"):
+        return text
+    try:
+        from django.core.files.storage import default_storage
+
+        return default_storage.url(text)
+    except Exception:
+        return text
+
+
 def resolve_courses(*, owner_type, owner_id, target_ids=None, limit=6, **_):
     if owner_type != WebsiteOwnerType.EDUCATION_INSTITUTION:
         return []
@@ -66,7 +88,7 @@ def resolve_courses(*, owner_type, owner_id, target_ids=None, limit=6, **_):
             "id": str(course.id),
             "title": course.title,
             "description": safe_public_description(course.summary, course.description),
-            "image_url": safe_public_media_url(course.cover_image_url),
+            "image_url": safe_public_media_url(_resolve_stored_media_url(course.cover_image_url)),
             "price_display": "Free" if course.is_free else f"{course.price_amount} {course.price_currency}",
             "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/education/courses/{course.id}",
             "checkout_content_id": enrollment_content_id,
@@ -215,7 +237,7 @@ def resolve_events(*, owner_type, owner_id, target_ids=None, limit=6, **_):
             "id": str(event.id),
             "title": event.title,
             "description": safe_public_description(event.summary, event.description),
-            "image_url": safe_public_media_url(event.cover_image_url),
+            "image_url": safe_public_media_url(_resolve_stored_media_url(event.cover_image_url)),
             "price_display": "",
             "starts_at": event.starts_at.isoformat() if event.starts_at else None,
             "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/education/events/{event.id}",

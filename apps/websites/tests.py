@@ -270,6 +270,28 @@ class KisContentResolverTests(TestCase):
         self.assertEqual(len(items), 1)
         self.assertIsNone(items[0]["checkout_content_id"])
 
+    def test_resolve_courses_turns_a_stored_s3_key_into_a_real_image_url(self):
+        # cover_image_url is free-text and, for an uploaded (not pasted)
+        # cover, stores our own raw S3 object key verbatim (see
+        # _education_cover_image_from_payload) — never a real URL. Passing
+        # that straight to safe_public_media_url always failed the scheme
+        # check and silently dropped the image for every uploaded cover.
+        from apps.broadcasts.models import EducationInstitution, EducationInstitutionCourse
+
+        institution = EducationInstitution.objects.create(owner=self.owner, name="Cover Resolver Institution")
+        course = EducationInstitutionCourse.objects.create(
+            institution=institution, title="Cover Course", status="published", visibility="public",
+            cover_image_url="private/education/cover/some-user/some-uuid.jpg",
+        )
+
+        items = resolve_kis_content_section(
+            owner_type=WebsiteOwnerType.EDUCATION_INSTITUTION, owner_id=institution.id,
+            section_data={"target_type": "course", "presentation": {"limit": 10}},
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertTrue(items[0]["image_url"], "an uploaded cover image must not resolve to an empty URL")
+
     def test_resolve_products_never_returns_another_shops_products(self):
         from apps.commerce.models import Product, Shop
 
