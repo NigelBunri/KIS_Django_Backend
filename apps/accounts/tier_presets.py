@@ -305,7 +305,7 @@ TIER_PRESETS: list[dict[str, Any]] = [
             "education_profiles": "unlimited",
             "live_streaming": True,
             "events": True,
-            "websites_limit": 5,
+            "websites_limit": "unlimited",
             "website_pages_limit": "unlimited",
             "website_kis_content_sections_limit": "unlimited",
             "website_custom_branding": True,
