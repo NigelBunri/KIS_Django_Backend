@@ -153,7 +153,7 @@ def _public_page_payload(website: Website, page: WebsitePage) -> dict:
             "title": seo.get("title") or page.title,
             "description": safe_public_description(seo.get("description") or ""),
             "canonical_url": canonical,
-            "share_image_url": seo.get("share_image_url") or "",
+            "share_image_url": resolve_stale_media_url(seo.get("share_image_url") or ""),
         },
         "updated_at": page.updated_at.isoformat() if page.updated_at else None,
     }
@@ -171,7 +171,7 @@ def _public_site_payload(website: Website) -> dict:
         "seo": {
             "title": default_seo.get("title") or website.name,
             "description": safe_public_description(default_seo.get("description") or ""),
-            "share_image_url": default_seo.get("share_image_url") or "",
+            "share_image_url": resolve_stale_media_url(default_seo.get("share_image_url") or ""),
         },
         "canonical_url": f"{base_url}/page/{website.slug}",
         "pages": [
@@ -185,7 +185,7 @@ def _public_site_payload(website: Website) -> dict:
                 # a real per-page blurb/image instead of a bare link list,
                 # with no new content-authoring surface required.
                 "description": safe_public_description((p.seo or {}).get("description") or ""),
-                "preview_image_url": (p.seo or {}).get("share_image_url") or "",
+                "preview_image_url": resolve_stale_media_url((p.seo or {}).get("share_image_url") or ""),
             }
             for p in pages
         ],
