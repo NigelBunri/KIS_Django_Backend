@@ -104,16 +104,23 @@ def resolve_shop_services(*, owner_type, owner_id, target_ids=None, limit=6, **_
     if owner_type != WebsiteOwnerType.SHOP:
         return []
     ShopService = django_apps.get_model("commerce", "ShopService")
-    qs = ShopService.objects.filter(shop_id=owner_id, visibility="public", status="published")
+    qs = ShopService.objects.filter(shop_id=owner_id, visibility="public", status="published").prefetch_related("images")
     if target_ids:
         qs = qs.filter(id__in=_limit_ids(target_ids))
     items = []
     for service in qs.order_by("-created_at")[:limit]:
+        image_url = ""
+        primary_image = next(iter(service.images.all()), None)
+        if primary_image and primary_image.image_file:
+            try:
+                image_url = safe_public_media_url(primary_image.image_file.url)
+            except (ValueError, AttributeError):
+                image_url = ""
         items.append({
             "id": str(service.id),
             "title": service.name,
             "description": safe_public_description(service.short_summary, service.description),
-            "image_url": "",
+            "image_url": image_url,
             "price_display": f"{service.price}" if service.price else "Contact for pricing",
             "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/market/services/{service.id}",
         })
