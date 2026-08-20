@@ -3,7 +3,7 @@ from rest_framework import serializers
 from apps.websites.embeds import validate_embed
 from apps.websites.forms import validate_field_schema
 from apps.websites.kis_video import KIS_VIDEO_SOURCES
-from apps.websites.models import KIS_CONTENT_TARGET_TYPES, SECTION_TYPES, Website, WebsitePage
+from apps.websites.models import KIS_CONTENT_TARGET_TYPES, SECTION_TYPES, SECTION_VARIANTS, Website, WebsitePage
 
 
 class WebsitePageSerializer(serializers.ModelSerializer):
@@ -42,6 +42,17 @@ class WebsitePageSerializer(serializers.ModelSerializer):
                     )
                 if not data.get("target_id"):
                     raise serializers.ValidationError("kis_video section requires a target_id.")
+            variant = entry.get("variant")
+            if variant is not None:
+                allowed_variants = SECTION_VARIANTS.get(entry["type"])
+                if not allowed_variants:
+                    raise serializers.ValidationError(
+                        f"Section type {entry['type']!r} does not support a variant."
+                    )
+                if variant not in allowed_variants:
+                    raise serializers.ValidationError(
+                        f"Unknown variant {variant!r} for section type {entry['type']!r}."
+                    )
             responsive = entry.get("responsive")
             if responsive is not None:
                 if not isinstance(responsive, dict):

@@ -216,6 +216,18 @@ SECTION_TYPES = (
     "kis_content",
 )
 
+# Alternate visual designs per section type, selected via a section's
+# `variant` key (sibling to `type`/`data`, not part of `data` itself).
+# Must mirror website repo's components/website-builder/SectionRenderer.tsx
+# SECTION_VARIANTS and KIS/src/components/section-builder/sectionVariants.ts
+# exactly — index 0 is always "classic", the original single design each
+# type had before variants existed, so a section with no `variant` key
+# (every section created before this feature) keeps rendering unchanged.
+SECTION_VARIANTS = {
+    "hero_banner": ("classic", "split_left", "split_right", "bottom_card", "minimal_banner"),
+    "about": ("classic", "centered_stack", "card_overlap", "bordered_quote", "full_width_banner"),
+}
+
 # Closed vocabulary for a `kis_content` section's data.target_type — the
 # same target_type/target_id idiom already used by
 # apps.billing.models.DirectPaymentIntent, resolved live (never persisted)
