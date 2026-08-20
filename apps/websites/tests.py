@@ -545,6 +545,42 @@ class WebsiteApiTests(APITestCase):
         response = self.client.get(reverse("websites:public-page", args=[website_slug, "home"]))
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_public_page_re_signs_a_stale_hero_image_url(self):
+        # Reproduces the real bug: an owner's hero image URL was stored at
+        # upload time as a presigned GET (see WebsiteBuilderScreen.tsx's
+        # uploadSectionImage), which is frozen with a fixed TTL. Once that
+        # elapses the stored URL 403s and the image just breaks. The public
+        # page must re-sign a fresh URL from the embedded key on every read.
+        from django.core.files.storage import default_storage
+
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        website_id = mine_response.data["id"]
+        website_slug = mine_response.data["slug"]
+        home_page_id = mine_response.data["pages"][0]["id"]
+
+        stale_url = (
+            f"https://s3.eu-west-2.amazonaws.com/kis-test-bucket/private/websites/hero/{website_id}/"
+            "abc123.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=3600&X-Amz-Signature=deadbeef"
+        )
+        patch_response = self.client.patch(
+            reverse("websites:page-detail", args=[website_id, home_page_id]),
+            {"sections": [{"id": "hero-1", "type": "hero", "data": {"headline": "Hi", "image_url": stale_url}}]},
+            format="json",
+        )
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK, patch_response.data)
+        self.client.post(reverse("websites:publish", args=[website_id]))
+        self.client.post(reverse("websites:page-publish", args=[website_id, home_page_id]))
+        self.client.logout()
+
+        with patch.object(default_storage, "bucket", "kis-test-bucket", create=True), \
+             patch.object(default_storage, "url", create=True) as mock_url:
+            mock_url.return_value = "https://s3.eu-west-2.amazonaws.com/kis-test-bucket/private/websites/hero/x/abc123.jpg?fresh=1"
+            response = self.client.get(reverse("websites:public-page", args=[website_slug, "home"]))
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            hero_section = next(s for s in response.data["sections"] if s["type"] == "hero")
+            self.assertEqual(hero_section["data"]["image_url"], mock_url.return_value)
+            mock_url.assert_called_once_with(f"private/websites/hero/{website_id}/abc123.jpg")
+
     def test_preview_token_bypasses_unpublished_gate(self):
         mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
         website_id = mine_response.data["id"]

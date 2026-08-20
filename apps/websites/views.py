@@ -80,13 +80,85 @@ def _require_administer_permission(user, website: Website):
         raise PermissionDenied("Only the website owner can manage collaborators and invites.")
 
 
+_SECTION_IMAGE_STRING_FIELDS = ("image_url", "backgroundImageUrl", "imageUrl", "video_url", "thumbnail_url")
+_SECTION_IMAGE_LIST_FIELDS = ("images",)
+_SECTION_IMAGE_ITEM_LIST_FIELDS = ("items",)
+
+
+def _resolve_stale_media_url(value: str) -> str:
+    """Section `data` (hero/about/gallery/image/video section image and
+    video fields) stores whatever the RN app's upload picker returned at
+    pick-time — a presigned GET URL frozen with a fixed TTL (see
+    apps.broadcasts.media_utils.build_media_url / uploadSectionImage in
+    KIS/src/screens/website-builder/WebsiteBuilderScreen.tsx), never the
+    raw object key. Once that TTL elapses the image just breaks with no
+    way to refresh it from the stored value alone — this is why hero
+    images silently stop loading roughly an hour after being uploaded.
+    Detect our own bucket's URLs (virtual-hosted or path-style) here and
+    re-sign a fresh URL from the embedded key on every read instead of
+    trusting the frozen one. Anything that isn't one of our bucket's URLs
+    (an external image the owner pasted in, or empty) passes through
+    unchanged."""
+    text = str(value or "").strip()
+    if not text:
+        return text
+    try:
+        from urllib.parse import unquote, urlparse
+
+        from django.core.files.storage import default_storage
+
+        parsed = urlparse(text)
+        if parsed.scheme not in {"http", "https"}:
+            return text
+        bucket = str(getattr(default_storage, "bucket", "") or "")
+        if not bucket:
+            return text
+        host = parsed.hostname or ""
+        path = unquote(parsed.path or "").lstrip("/")
+        key = ""
+        if host == f"{bucket}.s3.amazonaws.com" or host.startswith(f"{bucket}.s3."):
+            key = path
+        elif host.startswith("s3.") or host == "s3.amazonaws.com":
+            prefix = f"{bucket}/"
+            if path.startswith(prefix):
+                key = path[len(prefix):]
+        if not key:
+            return text
+        return default_storage.url(key)
+    except Exception:
+        return text
+
+
+def _resolve_section_data_media(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return data
+    resolved = dict(data)
+    for field in _SECTION_IMAGE_STRING_FIELDS:
+        if isinstance(resolved.get(field), str) and resolved.get(field):
+            resolved[field] = _resolve_stale_media_url(resolved[field])
+    for field in _SECTION_IMAGE_LIST_FIELDS:
+        if isinstance(resolved.get(field), list):
+            resolved[field] = [
+                _resolve_stale_media_url(item) if isinstance(item, str) else item for item in resolved[field]
+            ]
+    for field in _SECTION_IMAGE_ITEM_LIST_FIELDS:
+        if isinstance(resolved.get(field), list):
+            resolved[field] = [
+                {**item, "image_url": _resolve_stale_media_url(item["image_url"])}
+                if isinstance(item, dict) and isinstance(item.get("image_url"), str) and item.get("image_url")
+                else item
+                for item in resolved[field]
+            ]
+    return resolved
+
+
 def _serialize_public_section(website: Website, section: dict) -> dict:
     if not isinstance(section, dict):
         return {}
     payload = {
         "id": section.get("id"),
         "type": section.get("type"),
-        "data": section.get("data") or {},
+        "data": _resolve_section_data_media(section.get("data") or {}),
         "responsive": section.get("responsive") if isinstance(section.get("responsive"), dict) else {},
     }
     if section.get("type") == "kis_content":
