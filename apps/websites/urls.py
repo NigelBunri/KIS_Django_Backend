@@ -12,6 +12,10 @@ urlpatterns = [
         "public/sites/<slug:website_slug>/pages/<slug:page_slug>/sections/<str:section_id>/more/",
         views.WebsitePublicKisContentLoadMoreView.as_view(), name="public-kis-content-load-more",
     ),
+    path(
+        "public/sites/<slug:website_slug>/kis-content/<str:target_type>/<str:item_id>/",
+        views.WebsitePublicKisContentDetailView.as_view(), name="public-kis-content-detail",
+    ),
     path("public/sitemap-plan/", views.WebsitePublicSitemapPlanView.as_view(), name="public-sitemap-plan"),
     path(
         "public/sites/<slug:website_slug>/pages/<slug:page_slug>/forms/<str:section_id>/submit/",

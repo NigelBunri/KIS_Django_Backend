@@ -270,6 +270,43 @@ class KisContentResolverTests(TestCase):
         self.assertEqual(len(items), 1)
         self.assertIsNone(items[0]["checkout_content_id"])
 
+    def test_resolve_shop_services_includes_currency_in_price_display(self):
+        from apps.commerce.models import Shop, ShopService
+
+        shop = Shop.objects.create(owner=self.owner, name="Currency Shop", slug="currency-shop")
+        ShopService.objects.create(
+            shop=shop, name="Consulting", slug="consulting", price=50, visibility="public", status="published",
+        )
+
+        items = resolve_kis_content_section(
+            owner_type=WebsiteOwnerType.SHOP, owner_id=shop.id,
+            section_data={"target_type": "shop_service", "presentation": {"limit": 10}},
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["price_display"], "50.00 USD")
+
+    def test_resolve_posts_pulls_image_from_content_asset(self):
+        from apps.broadcasts.models import BroadcastChannel, ChannelContent, ChannelContentAsset
+
+        channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            display_name="Resolver Channel", handle="resolver-channel", is_public=True,
+        )
+        content = ChannelContent.objects.create(
+            channel=channel, content_type="image", title="A Post",
+            visibility=ChannelContent.Visibility.PUBLIC, status=ChannelContent.Status.PUBLISHED,
+        )
+        ChannelContentAsset.objects.create(content=content, asset_type="image", url="https://example.com/photo.jpg", sort_order=0)
+
+        items = resolve_kis_content_section(
+            owner_type=WebsiteOwnerType.BROADCAST_CHANNEL, owner_id=channel.id,
+            section_data={"target_type": "post", "target_ids": [str(content.id)]},
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["image_url"], "https://example.com/photo.jpg")
+
     def test_resolve_courses_turns_a_stored_s3_key_into_a_real_image_url(self):
         # cover_image_url is free-text and, for an uploaded (not pasted)
         # cover, stores our own raw S3 object key verbatim (see
@@ -580,6 +617,42 @@ class WebsiteApiTests(APITestCase):
             hero_section = next(s for s in response.data["sections"] if s["type"] == "hero")
             self.assertEqual(hero_section["data"]["image_url"], mock_url.return_value)
             mock_url.assert_called_once_with(f"private/websites/hero/{website_id}/abc123.jpg")
+
+    def test_public_kis_content_detail_returns_full_product_payload(self):
+        from apps.commerce.models import Product
+
+        product = Product.objects.create(
+            shop=self.shop, sku="DETAIL-1", name="Detail Product", slug="detail-product",
+            price=42, description="A longer description than the card summary shows.",
+        )
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        website_id = mine_response.data["id"]
+        website_slug = mine_response.data["slug"]
+        self.client.post(reverse("websites:publish", args=[website_id]))
+        self.client.logout()
+
+        response = self.client.get(reverse("websites:public-kis-content-detail", args=[website_slug, "product", str(product.id)]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["item"]["id"], str(product.id))
+        self.assertEqual(response.data["item"]["price_display"], "42.00 USD")
+        self.assertIn("A longer description", response.data["item"]["description"])
+
+    def test_public_kis_content_detail_404s_for_someone_elses_product(self):
+        from apps.commerce.models import Product, Shop
+
+        stranger = _make_user("+2348011110042")
+        other_shop = Shop.objects.create(owner=stranger, name="Other Shop", slug="other-detail-shop")
+        other_product = Product.objects.create(shop=other_shop, sku="DETAIL-2", name="Not Yours", slug="not-yours", price=5)
+
+        mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})
+        website_slug = mine_response.data["slug"]
+        self.client.post(reverse("websites:publish", args=[mine_response.data["id"]]))
+        self.client.logout()
+
+        response = self.client.get(
+            reverse("websites:public-kis-content-detail", args=[website_slug, "product", str(other_product.id)]),
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_preview_token_bypasses_unpublished_gate(self):
         mine_response = self.client.get(reverse("websites:mine"), {"owner_type": "shop", "owner_id": str(self.shop.id)})

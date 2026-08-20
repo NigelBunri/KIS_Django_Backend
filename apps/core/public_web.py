@@ -37,10 +37,10 @@ def public_indexing_enabled() -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def safe_public_description(*values) -> str:
+def safe_public_description(*values, limit: int = 260) -> str:
     text = " ".join(str(value or "").strip() for value in values if str(value or "").strip())
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:260]
+    return text[:limit]
 
 
 def safe_public_media_url(value: str) -> str:
@@ -67,3 +67,46 @@ def safe_public_media_url(value: str) -> str:
     if not is_presigned and any(marker in path for marker in ("/private/", "/raw/", "/tmp/", "/temp/")):
         return ""
     return raw
+
+
+def resolve_stale_media_url(value: str) -> str:
+    """Several freeform/legacy fields (website section `data`, broadcast
+    ChannelContent.thumbnail_url and ChannelContentAsset.url/thumbnail_url)
+    store whatever an upload endpoint returned at upload time — a
+    presigned S3 GET URL frozen with a fixed TTL (see
+    apps.broadcasts.media_utils.build_media_url) — rather than the raw
+    object key. Once that TTL elapses the stored URL 403s and the image
+    just silently stops rendering, with no way to refresh it from the
+    stored value alone. Detects our own bucket's URLs (virtual-hosted or
+    path-style) and re-signs a fresh URL from the embedded key on every
+    call instead of trusting the frozen one. Anything that isn't one of
+    our bucket's URLs (an external image someone pasted in, or empty)
+    passes through unchanged."""
+    text = str(value or "").strip()
+    if not text:
+        return text
+    try:
+        from urllib.parse import unquote
+
+        from django.core.files.storage import default_storage
+
+        parsed = urlparse(text)
+        if parsed.scheme not in {"http", "https"}:
+            return text
+        bucket = str(getattr(default_storage, "bucket", "") or "")
+        if not bucket:
+            return text
+        host = parsed.hostname or ""
+        path = unquote(parsed.path or "").lstrip("/")
+        key = ""
+        if host == f"{bucket}.s3.amazonaws.com" or host.startswith(f"{bucket}.s3."):
+            key = path
+        elif host.startswith("s3.") or host == "s3.amazonaws.com":
+            prefix = f"{bucket}/"
+            if path.startswith(prefix):
+                key = path[len(prefix):]
+        if not key:
+            return text
+        return default_storage.url(key)
+    except Exception:
+        return text

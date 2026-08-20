@@ -24,7 +24,8 @@ Phase 1 limitation (see resolver docstrings).
 """
 from django.apps import apps as django_apps
 
-from apps.core.public_web import safe_public_description, safe_public_media_url
+from apps.commerce.constants import KIS_COIN_CODE
+from apps.core.public_web import resolve_stale_media_url, safe_public_description, safe_public_media_url
 from apps.websites.models import WebsiteOwnerType
 
 KIS_APP_DEEP_LINK_BASE = "https://kis.app"
@@ -141,7 +142,7 @@ def resolve_shop_services(*, owner_type, owner_id, target_ids=None, limit=6, **_
             "title": service.name,
             "description": safe_public_description(service.short_summary, service.description),
             "image_url": image_url,
-            "price_display": f"{service.price}" if service.price else "Contact for pricing",
+            "price_display": f"{service.price} {KIS_COIN_CODE}" if service.price else "Contact for pricing",
             "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/market/services/{service.id}",
         })
     return items
@@ -161,10 +162,124 @@ def resolve_health_services(*, owner_type, owner_id, target_ids=None, limit=6, *
             "title": service.name,
             "description": safe_public_description(service.description),
             "image_url": "",
-            "price_display": f"{service.base_cost_micro / 1_000_000:.2f}" if service.base_cost_micro else "Contact for pricing",
+            "price_display": (
+                f"{service.base_cost_micro / 1_000_000:.2f} {KIS_COIN_CODE}" if service.base_cost_micro else "Contact for pricing"
+            ),
             "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/health/services/{service.id}",
         })
     return items
+
+
+def resolve_product_detail(*, owner_type, owner_id, item_id, **_):
+    """Full detail-page payload for a single product — the card summary
+    from resolve_products plus gallery images, stock, and category, so
+    the website's product detail page (like the app's own product screen)
+    isn't stuck with a 260-char blurb and one thumbnail."""
+    if owner_type != WebsiteOwnerType.SHOP:
+        return None
+    Product = django_apps.get_model("commerce", "Product")
+    product = Product.objects.filter(shop_id=owner_id, id=item_id, is_active=True).first()
+    if not product:
+        return None
+    image_url = ""
+    try:
+        image_url = safe_public_media_url(product.main_image.url) if product.main_image else ""
+    except (ValueError, AttributeError):
+        image_url = ""
+    gallery = []
+    for image in product.gallery_images.filter(is_active=True).order_by("sort_order"):
+        try:
+            url = safe_public_media_url(image.image_file.url) if image.image_file else ""
+        except (ValueError, AttributeError):
+            url = ""
+        if url:
+            gallery.append(url)
+    return {
+        "id": str(product.id),
+        "title": product.name,
+        "description": safe_public_description(product.description, limit=2000),
+        "image_url": image_url,
+        "gallery": gallery,
+        "price_display": f"{product.sale_price or product.price} {product.currency}",
+        "compare_at_price_display": f"{product.price} {product.currency}" if product.sale_price else "",
+        "in_stock": product.inventory_type != "PHYSICAL" or product.stock_qty > 0,
+        "categories": [c.name for c in product.catalog_categories.all()],
+        "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/market/products/{product.id}",
+        "shop_id": str(product.shop_id),
+    }
+
+
+def resolve_course_detail(*, owner_type, owner_id, item_id, **_):
+    if owner_type != WebsiteOwnerType.EDUCATION_INSTITUTION:
+        return None
+    EducationInstitutionCourse = django_apps.get_model("broadcasts", "EducationInstitutionCourse")
+    course = EducationInstitutionCourse.objects.filter(
+        institution_id=owner_id, id=item_id, status="published", visibility="public",
+    ).select_related("institution").first()
+    if not course:
+        return None
+    enrollment_content_id = None
+    primary_broadcast = course.broadcasts.filter(
+        status="published",
+    ).exclude(price_amount__isnull=True).order_by("created_at").first()
+    if primary_broadcast is None:
+        primary_broadcast = course.broadcasts.filter(status="published").order_by("created_at").first()
+    if primary_broadcast is not None:
+        enrollment_content_id = str(primary_broadcast.id)
+    return {
+        "id": str(course.id),
+        "title": course.title,
+        "description": safe_public_description(course.summary, course.description, limit=2000),
+        "image_url": safe_public_media_url(_resolve_stored_media_url(course.cover_image_url)),
+        "gallery": [],
+        "price_display": "Free" if course.is_free else f"{course.price_amount} {course.price_currency}",
+        "duration_minutes": course.duration_minutes,
+        "seat_limit": course.seat_limit,
+        "institution_name": course.institution.name if course.institution else "",
+        "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/education/courses/{course.id}",
+        "checkout_content_id": enrollment_content_id,
+    }
+
+
+def resolve_shop_service_detail(*, owner_type, owner_id, item_id, **_):
+    if owner_type != WebsiteOwnerType.SHOP:
+        return None
+    ShopService = django_apps.get_model("commerce", "ShopService")
+    service = ShopService.objects.filter(shop_id=owner_id, id=item_id, visibility="public", status="published").first()
+    if not service:
+        return None
+    image_url = ""
+    try:
+        image_url = safe_public_media_url(service.image_file.url) if service.image_file else ""
+    except (ValueError, AttributeError):
+        image_url = ""
+    return {
+        "id": str(service.id),
+        "title": service.name,
+        "description": safe_public_description(service.short_summary, service.description, limit=2000),
+        "image_url": image_url,
+        "gallery": [],
+        "price_display": f"{service.price} {KIS_COIN_CODE}" if service.price else "Contact for pricing",
+        "service_type": service.service_type,
+        "negotiable": service.negotiable,
+        "quote_required": service.quote_required,
+        "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/market/services/{service.id}",
+        "shop_id": str(service.shop_id),
+    }
+
+
+_DETAIL_RESOLVERS = {
+    "product": resolve_product_detail,
+    "course": resolve_course_detail,
+    "shop_service": resolve_shop_service_detail,
+}
+
+
+def resolve_kis_content_item_detail(*, target_type, owner_type, owner_id, item_id):
+    resolver = _DETAIL_RESOLVERS.get(target_type)
+    if not resolver:
+        return None
+    return resolver(owner_type=owner_type, owner_id=owner_id, item_id=item_id)
 
 
 def resolve_broadcast_channels(*, target_ids=None, limit=6, **_):
@@ -198,11 +313,30 @@ def _post_is_public_safe(content) -> bool:
     )
 
 
+def _post_image_url(content) -> str:
+    """content.thumbnail_url is frequently empty — the actual uploaded
+    image/video/file for a post lives on its ChannelContentAsset rows
+    (content.assets), not on ChannelContent itself. Prefer the first
+    image-type asset's thumbnail (falls back to its own url for a plain
+    image asset with no separate thumbnail), then content.thumbnail_url,
+    then any asset at all — this is why post cards showed no image even
+    when the post clearly had one attached."""
+    asset = content.assets.filter(asset_type="image").order_by("sort_order").first()
+    if asset:
+        return resolve_stale_media_url(asset.thumbnail_url or asset.url)
+    if content.thumbnail_url:
+        return resolve_stale_media_url(content.thumbnail_url)
+    any_asset = content.assets.order_by("sort_order").first()
+    if any_asset:
+        return resolve_stale_media_url(any_asset.thumbnail_url or any_asset.url)
+    return ""
+
+
 def resolve_posts(*, target_ids=None, limit=6, **_):
     if not target_ids:
         return []
     ChannelContent = django_apps.get_model("broadcasts", "ChannelContent")
-    qs = ChannelContent.objects.select_related("channel").filter(id__in=_limit_ids(target_ids))
+    qs = ChannelContent.objects.select_related("channel").prefetch_related("assets").filter(id__in=_limit_ids(target_ids))
     items = []
     for content in qs[:limit]:
         if not _post_is_public_safe(content):
@@ -211,7 +345,7 @@ def resolve_posts(*, target_ids=None, limit=6, **_):
             "id": str(content.id),
             "title": content.title or safe_public_description(content.text_plain)[:80],
             "description": safe_public_description(content.description, content.text_plain),
-            "image_url": safe_public_media_url(content.thumbnail_url),
+            "image_url": safe_public_media_url(_post_image_url(content)),
             "price_display": "",
             "deep_link": f"{KIS_APP_DEEP_LINK_BASE}/posts/{content.id}",
         })

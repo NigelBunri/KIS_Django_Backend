@@ -11,7 +11,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from apps.core.public_web import public_web_base_url, public_web_enabled, safe_public_description
+from apps.core.public_web import public_web_base_url, public_web_enabled, resolve_stale_media_url, safe_public_description
 from apps.notifications.email_service import send_website_form_notification_email
 from apps.websites import adapters
 from apps.websites.analytics import classify_device, extract_referrer_host, hash_visitor_session
@@ -24,7 +24,11 @@ from apps.websites.custom_domains import (
     validate_domain_format,
 )
 from apps.websites.forms import HONEYPOT_KEY, score_submission, validate_submission_data
-from apps.websites.kis_content_resolvers import resolve_kis_content_section, resolve_kis_content_section_page
+from apps.websites.kis_content_resolvers import (
+    resolve_kis_content_item_detail,
+    resolve_kis_content_section,
+    resolve_kis_content_section_page,
+)
 from apps.websites.kis_video import resolve_kis_video, search_owner_kis_videos
 from apps.websites.models import (
     Website,
@@ -85,66 +89,22 @@ _SECTION_IMAGE_LIST_FIELDS = ("images",)
 _SECTION_IMAGE_ITEM_LIST_FIELDS = ("items",)
 
 
-def _resolve_stale_media_url(value: str) -> str:
-    """Section `data` (hero/about/gallery/image/video section image and
-    video fields) stores whatever the RN app's upload picker returned at
-    pick-time — a presigned GET URL frozen with a fixed TTL (see
-    apps.broadcasts.media_utils.build_media_url / uploadSectionImage in
-    KIS/src/screens/website-builder/WebsiteBuilderScreen.tsx), never the
-    raw object key. Once that TTL elapses the image just breaks with no
-    way to refresh it from the stored value alone — this is why hero
-    images silently stop loading roughly an hour after being uploaded.
-    Detect our own bucket's URLs (virtual-hosted or path-style) here and
-    re-sign a fresh URL from the embedded key on every read instead of
-    trusting the frozen one. Anything that isn't one of our bucket's URLs
-    (an external image the owner pasted in, or empty) passes through
-    unchanged."""
-    text = str(value or "").strip()
-    if not text:
-        return text
-    try:
-        from urllib.parse import unquote, urlparse
-
-        from django.core.files.storage import default_storage
-
-        parsed = urlparse(text)
-        if parsed.scheme not in {"http", "https"}:
-            return text
-        bucket = str(getattr(default_storage, "bucket", "") or "")
-        if not bucket:
-            return text
-        host = parsed.hostname or ""
-        path = unquote(parsed.path or "").lstrip("/")
-        key = ""
-        if host == f"{bucket}.s3.amazonaws.com" or host.startswith(f"{bucket}.s3."):
-            key = path
-        elif host.startswith("s3.") or host == "s3.amazonaws.com":
-            prefix = f"{bucket}/"
-            if path.startswith(prefix):
-                key = path[len(prefix):]
-        if not key:
-            return text
-        return default_storage.url(key)
-    except Exception:
-        return text
-
-
 def _resolve_section_data_media(data: dict) -> dict:
     if not isinstance(data, dict):
         return data
     resolved = dict(data)
     for field in _SECTION_IMAGE_STRING_FIELDS:
         if isinstance(resolved.get(field), str) and resolved.get(field):
-            resolved[field] = _resolve_stale_media_url(resolved[field])
+            resolved[field] = resolve_stale_media_url(resolved[field])
     for field in _SECTION_IMAGE_LIST_FIELDS:
         if isinstance(resolved.get(field), list):
             resolved[field] = [
-                _resolve_stale_media_url(item) if isinstance(item, str) else item for item in resolved[field]
+                resolve_stale_media_url(item) if isinstance(item, str) else item for item in resolved[field]
             ]
     for field in _SECTION_IMAGE_ITEM_LIST_FIELDS:
         if isinstance(resolved.get(field), list):
             resolved[field] = [
-                {**item, "image_url": _resolve_stale_media_url(item["image_url"])}
+                {**item, "image_url": resolve_stale_media_url(item["image_url"])}
                 if isinstance(item, dict) and isinstance(item.get("image_url"), str) and item.get("image_url")
                 else item
                 for item in resolved[field]
@@ -284,6 +244,35 @@ class WebsitePublicKisContentLoadMoreView(APIView):
             section_data=section.get("data") or {}, offset=offset,
         )
         return Response(result)
+
+
+class WebsitePublicKisContentDetailView(APIView):
+    """Backs the on-site product/course/service detail page — a fuller
+    payload than the card summary (see resolve_kis_content_item_detail):
+    untruncated description, gallery images, stock/availability, etc.
+    Public (AllowAny), scoped to the website's own owner exactly like
+    every other kis_content resolver — a product/course/service only
+    resolves here if it actually belongs to this published website's
+    owner and is itself public/published, never by guessing an id
+    belonging to someone else's shop or institution."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, website_slug, target_type, item_id):
+        _require_public_web_enabled()
+        website = get_object_or_404(Website, slug=website_slug)
+        if website.status != WebsiteStatus.PUBLISHED:
+            raise Http404("Website not found.")
+
+        item = resolve_kis_content_item_detail(
+            target_type=target_type, owner_type=website.owner_type, owner_id=website.owner_id, item_id=item_id,
+        )
+        if not item:
+            raise Http404("Item not found.")
+        return Response({
+            "item": item,
+            "site": {"slug": website.slug, "name": website.name},
+        })
 
 
 class WebsitePublicSitemapPlanView(APIView):
