@@ -808,7 +808,32 @@ class ShopSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         if not validated_data.get('slug'):
             validated_data['slug'] = _generate_shop_slug(validated_data.get('name'))
-        return super().create(validated_data)
+        # landing_page and the four landing visibility fields are virtual
+        # (backed by a related ShopLandingPage, not real Shop columns) —
+        # update() already pops these before saving; create() previously
+        # didn't, so Shop.objects.create() crashed with a TypeError on
+        # every request where DRF populated them (which is every request,
+        # since the visibility fields default to None rather than being
+        # omitted from validated_data).
+        landing_payload = validated_data.pop('landing_page', None)
+        visibility_updates = {key: validated_data.pop(key, None) for key in self.VISIBILITY_FIELDS}
+        shop = super().create(validated_data)
+        needs_landing = landing_payload is not None or any(value is not None for value in visibility_updates.values())
+        if needs_landing:
+            actor = self._get_actor()
+            landing_page, created = self._ensure_landing_page(shop, actor)
+            updated_fields = set()
+            if created and actor:
+                updated_fields.add('created_by')
+            if landing_payload:
+                self._apply_landing_payload(landing_page, landing_payload, updated_fields)
+            self._apply_visibility(landing_page, visibility_updates, updated_fields)
+            if updated_fields:
+                if actor:
+                    updated_fields.add('updated_by')
+                updated_fields.add('updated_at')
+                landing_page.save(update_fields=list(updated_fields))
+        return shop
 
 
 class ShopVerificationRequestSerializer(serializers.ModelSerializer):

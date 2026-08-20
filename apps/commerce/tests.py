@@ -977,6 +977,54 @@ class ShopLandingPageSystemTests(APITestCase):
         self.assertEqual(landing['testimonials'][0]['quote'], 'This shop always delivers.')
 
 
+class ShopCreateApiTests(APITestCase):
+    """ShopSerializer.create() previously never popped landing_page/the
+    landing visibility fields before calling Shop.objects.create() (unlike
+    .update(), which does) — every POST to /api/v1/commerce/shops/ 500'd
+    with `Shop() got unexpected keyword arguments: 'landing_is_public', ...`
+    because those fields default to None rather than being omitted from
+    validated_data. No existing test exercised shop creation through the
+    real endpoint (only .update()), which is how this shipped unnoticed."""
+
+    def setUp(self):
+        from apps.accounts.models import AccountTier, Subscription
+        from apps.accounts.tiers import ensure_default_account_tiers
+
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5551119999', username='shop_create_owner', password='secret', country='NG',
+        )
+        ensure_default_account_tiers()
+        business_tier = AccountTier.objects.filter(name__iexact='Business').first()
+        Subscription.objects.create(user=self.owner, tier=business_tier, status='active')
+        self.client.force_authenticate(user=self.owner)
+
+    def test_creating_a_shop_does_not_500(self):
+        response = self.client.post(
+            '/api/v1/commerce/shops/',
+            {'name': 'Brand New Shop', 'description': 'A fresh shop with no landing page data.'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data['name'], 'Brand New Shop')
+        self.assertTrue(Shop.objects.filter(name='Brand New Shop', owner=self.owner).exists())
+
+    def test_creating_a_shop_with_landing_payload_creates_landing_page(self):
+        response = self.client.post(
+            '/api/v1/commerce/shops/',
+            {
+                'name': 'Shop With Landing',
+                'description': 'Created with landing data up front.',
+                'landing_page_is_public': True,
+                'landing_page': {'headline': 'Welcome'},
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        shop = Shop.objects.get(name='Shop With Landing')
+        self.assertTrue(ShopLandingPage.objects.filter(shop=shop, is_public=True, headline='Welcome').exists())
+
+
 class ServiceCategorySystemTests(TestCase):
     def setUp(self):
         User = get_user_model()
