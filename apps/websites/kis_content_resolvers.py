@@ -104,18 +104,16 @@ def resolve_shop_services(*, owner_type, owner_id, target_ids=None, limit=6, **_
     if owner_type != WebsiteOwnerType.SHOP:
         return []
     ShopService = django_apps.get_model("commerce", "ShopService")
-    qs = ShopService.objects.filter(shop_id=owner_id, visibility="public", status="published").prefetch_related("images")
+    qs = ShopService.objects.filter(shop_id=owner_id, visibility="public", status="published")
     if target_ids:
         qs = qs.filter(id__in=_limit_ids(target_ids))
     items = []
     for service in qs.order_by("-created_at")[:limit]:
         image_url = ""
-        primary_image = next(iter(service.images.all()), None)
-        if primary_image and primary_image.image_file:
-            try:
-                image_url = safe_public_media_url(primary_image.image_file.url)
-            except (ValueError, AttributeError):
-                image_url = ""
+        try:
+            image_url = safe_public_media_url(service.image_file.url) if service.image_file else ""
+        except (ValueError, AttributeError):
+            image_url = ""
         items.append({
             "id": str(service.id),
             "title": service.name,
