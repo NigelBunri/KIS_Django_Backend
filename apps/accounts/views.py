@@ -747,12 +747,20 @@ def password_login_requires_qr(user: User, device_id: str) -> bool:
     Password credentials may only resume an already-active device session.
     Any new device for an account with an active device must be linked by QR
     from the parent device under Profile -> Manage Devices.
+
+    Only ever called from the app's own password LoginView (never the
+    website, which signs in via OtpVerifyView's web_login purpose instead)
+    — so "active device" here deliberately excludes platform="web" rows.
+    Web and mobile are meant to stay signed in simultaneously regardless
+    of which one logged in first; an active browser session must never
+    QR-gate a fresh app login (or vice versa — see web_login's own
+    same-platform-only revocation in apps.otp.views).
     """
     normalized_device_id = str(device_id or "").strip()
     if not normalized_device_id:
         return True
 
-    active_devices = Device.objects.filter(user=user, revoked_at__isnull=True)
+    active_devices = Device.objects.filter(user=user, revoked_at__isnull=True).exclude(platform="web")
     if not active_devices.exists():
         return False
 

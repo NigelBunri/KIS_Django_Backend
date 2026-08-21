@@ -535,7 +535,20 @@ class OtpVerifyView(APIView):
                 return Response({"success": False, "message": "No KIS account found for this phone number."}, status=404)
             if not user.is_active or user.status != "active":
                 return Response({"success": False, "message": "This account isn't active yet. Finish setup in the KIS app first."}, status=403)
-            from apps.accounts.views import issue_tokens_for_user, upsert_device
+            from apps.accounts.models import Device
+            from apps.accounts.views import issue_tokens_for_user, revoke_device_session, upsert_device
+            # Only one browser may be signed in at a time — logging in from
+            # a new browser silently signs the previous one out (it keeps
+            # working until its next authenticated request, which then
+            # 401s — no explicit notice, matching how a real "signed out
+            # elsewhere" transition should feel). Scoped to platform="web"
+            # only, so this never touches the mobile app's own device —
+            # web and mobile are meant to stay signed in simultaneously.
+            other_web_devices = Device.objects.filter(
+                user=user, platform="web", revoked_at__isnull=True,
+            ).exclude(device_id=device_id)
+            for other_device in other_web_devices:
+                revoke_device_session(user, other_device, reason="Signed in from a different browser", request=request)
             upsert_device(user, device_id, device_platform, None, request)
             tokens = issue_tokens_for_user(user, device_id=device_id)
             return Response(
