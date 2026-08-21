@@ -1194,6 +1194,24 @@ class ProductSerializer(serializers.ModelSerializer):
                     "sale_price": "Sale price cannot be greater than price."
                 })
 
+            # Payment-readiness gate — is_active is commerce's actual
+            # "published" flag (there's no separate draft state on
+            # Product), so a shop can always save an inactive/draft
+            # product regardless of price; only an active, priced listing
+            # requires the shop to actually be able to receive money. This
+            # is a UX-layer check (tell the seller at listing time, not
+            # just at the buyer's checkout) — the real backstop that makes
+            # this unbypassable lives in
+            # apps.billing.direct_payments.create_direct_payment_intent.
+            shop = attrs.get("shop", getattr(self.instance, "shop", None))
+            is_active = attrs.get("is_active", getattr(self.instance, "is_active", True))
+            if shop is not None and is_active and price is not None and Decimal(str(price)) > 0:
+                from apps.billing.eligibility import PaymentSetupRequiredError, can_receive_payments
+
+                eligibility = can_receive_payments(shop)
+                if not eligibility.eligible:
+                    raise PaymentSetupRequiredError(eligibility)
+
             return attrs
         except serializers.ValidationError as exc:
             logger.warning(
@@ -1805,6 +1823,24 @@ class ShopServiceSerializer(serializers.ModelSerializer):
         if 'price' in attrs:
             if attrs['price'] is None or attrs['price'] < 0:
                 raise serializers.ValidationError({'price': 'Price must be greater than or equal to zero.'})
+
+        # Payment-readiness gate — 'published' is ShopService's actual
+        # publish state (unlike Product, it has a real draft/published/
+        # paused status field), so a shop can save a draft/paused service
+        # at any price; only a published, priced service requires the
+        # shop to actually be able to receive money. UX-layer check; the
+        # real backstop lives in
+        # apps.billing.direct_payments.create_direct_payment_intent.
+        shop = attrs.get('shop', getattr(self.instance, 'shop', None))
+        service_status = attrs.get('status', getattr(self.instance, 'status', 'draft'))
+        price = attrs.get('price', getattr(self.instance, 'price', None))
+        if shop is not None and service_status == 'published' and price is not None and price > 0:
+            from apps.billing.eligibility import PaymentSetupRequiredError, can_receive_payments
+
+            eligibility = can_receive_payments(shop)
+            if not eligibility.eligible:
+                raise PaymentSetupRequiredError(eligibility)
+
         if 'deposit_percent' in attrs and attrs['deposit_percent'] is not None:
             if attrs['deposit_percent'] < 0 or attrs['deposit_percent'] > 100:
                 raise serializers.ValidationError({'deposit_percent': 'Deposit percent must be between 0 and 100.'})

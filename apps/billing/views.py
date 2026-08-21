@@ -2017,6 +2017,43 @@ class PromoCodeViewSet(viewsets.ModelViewSet):
         }, status=status.HTTP_200_OK)
 
 
+def _sync_stripe_connect_account_status(account_obj: dict) -> None:
+    """account.updated is the authoritative sync point for Stripe Connect
+    status (per Stripe's own guidance — poll/webhook, never trust a
+    client's claim of "onboarding finished"). account_obj.id (`acct_...`)
+    is looked up across all four payout-holder tables since the webhook
+    itself carries no target_type/target_id metadata (Stripe doesn't
+    attach ours to Account objects) — each table's stripe_account_id is
+    unique enough in practice that at most one row across all four will
+    ever match a given account id."""
+    account_id = str(account_obj.get("id") or "")
+    if not account_id:
+        return
+
+    fields = {
+        "stripe_charges_enabled": bool(account_obj.get("charges_enabled", False)),
+        "stripe_payouts_enabled": bool(account_obj.get("payouts_enabled", False)),
+        "stripe_details_submitted": bool(account_obj.get("details_submitted", False)),
+    }
+
+    from apps.broadcasts.models import BroadcastChannel, EducationInstitution
+    from apps.commerce.models import Shop
+    from apps.health_ops.models import HealthInstitution
+
+    for model in (Shop, EducationInstitution, HealthInstitution, BroadcastChannel):
+        entity = model.objects.filter(stripe_account_id=account_id).first()
+        if entity is None:
+            continue
+        for field_name, value in fields.items():
+            setattr(entity, field_name, value)
+        entity.save(update_fields=[*fields.keys(), "updated_at"])
+        logger.info(
+            "[Stripe] account.updated synced %s id=%s charges_enabled=%s payouts_enabled=%s",
+            model.__name__, entity.id, fields["stripe_charges_enabled"], fields["stripe_payouts_enabled"],
+        )
+        return
+
+
 class StripeWebhookView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
@@ -2110,5 +2147,8 @@ class StripeWebhookView(APIView):
         elif event_type == "checkout.session.completed":
             session_id = data_obj.get("id") or ""
             logger.info("[Stripe] checkout.session.completed session=%s meta=%s", session_id, metadata)
+
+        elif event_type == "account.updated":
+            _sync_stripe_connect_account_status(data_obj)
 
         return Response({"received": True})

@@ -23,6 +23,7 @@ from apps.health_ops.models import (
     HealthCarePlan,
     HealthInstitution,
     HealthInstitutionMembership,
+    HealthInstitutionPayoutAccountStatus,
     HealthService,
     HealthVitalReading,
     MembershipRole,
@@ -105,6 +106,8 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
             timezone="UTC",
             settings={},
             is_active=True,
+            payout_account_status=HealthInstitutionPayoutAccountStatus.ACTIVE,
+            flutterwave_subaccount_id="RS_TEST_HEALTH",
         )
         self.service = HealthService.objects.create(
             institution=self.institution,

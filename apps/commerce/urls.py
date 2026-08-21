@@ -58,4 +58,9 @@ urlpatterns = [
         views.ShopPayoutAccountConnectView.as_view(),
         name='shop-payout-account-connect',
     ),
+    path(
+        'shops/<uuid:shop_id>/stripe-account/connect/',
+        views.ShopStripeConnectAccountView.as_view(),
+        name='shop-stripe-account-connect',
+    ),
 ]

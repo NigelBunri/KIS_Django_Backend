@@ -9509,6 +9509,61 @@ class EducationInstitutionPayoutAccountConnectView(APIView):
         )
 
 
+class EducationInstitutionStripeConnectAccountView(APIView):
+    """Connects the institution's Stripe Express account — the second
+    supported payout rail alongside
+    EducationInstitutionPayoutAccountConnectView's Flutterwave subaccount,
+    using the shared apps.billing.stripe_connect helpers (unlike that
+    Flutterwave view, which predates and duplicates the equivalent shared
+    Flutterwave helper — this one uses the shared module from the start)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, institution_id: str):
+        from apps.billing.stripe_connect import refresh_account_status
+
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+
+        if institution.stripe_account_id:
+            fields = refresh_account_status(institution.stripe_account_id)
+            for field_name, value in fields.items():
+                setattr(institution, field_name, value)
+            institution.save(update_fields=[*fields.keys(), "updated_at"])
+
+        return Response(
+            {
+                "stripe_account_id": institution.stripe_account_id,
+                "stripe_charges_enabled": institution.stripe_charges_enabled,
+                "stripe_payouts_enabled": institution.stripe_payouts_enabled,
+                "stripe_details_submitted": institution.stripe_details_submitted,
+            }
+        )
+
+    @transaction.atomic
+    def post(self, request, institution_id: str):
+        from apps.billing.stripe_connect import create_account_onboarding_link, create_stripe_express_account, onboarding_redirect_urls
+
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+
+        if not institution.stripe_account_id:
+            country = str(request.data.get("country") or "US").strip().upper()
+            institution.stripe_account_id = create_stripe_express_account(
+                email=institution.contact_email or request.user.email or "", country=country,
+            )
+            institution.save(update_fields=["stripe_account_id", "updated_at"])
+
+        refresh_url, return_url = onboarding_redirect_urls()
+        onboarding_url = create_account_onboarding_link(
+            account_id=institution.stripe_account_id, refresh_url=refresh_url, return_url=return_url,
+        )
+        return Response(
+            {"onboarding_url": onboarding_url, "stripe_account_id": institution.stripe_account_id},
+            status=status.HTTP_200_OK,
+        )
+
+
 class EducationInstitutionVerificationStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -10281,6 +10336,25 @@ class EducationInstitutionProgramDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def _require_payment_setup_for_paid_course(institution, *, status: str, price_amount) -> None:
+    """Payment-readiness gate for course create/update — 'published' is
+    the course's real publish state (EducationAcademicRecordStatus;
+    default is DRAFT), so a course can be saved as a draft at any price;
+    only a published, priced course requires the institution to actually
+    be able to receive money. UX-layer check, mirroring the one on
+    commerce's Product/ShopService — the real backstop lives in
+    apps.billing.direct_payments.create_direct_payment_intent."""
+    if status != EducationAcademicRecordStatus.PUBLISHED:
+        return
+    if not price_amount or price_amount <= 0:
+        return
+    from apps.billing.eligibility import PaymentSetupRequiredError, can_receive_payments
+
+    eligibility = can_receive_payments(institution)
+    if not eligibility.eligible:
+        raise PaymentSetupRequiredError(eligibility)
+
+
 class EducationInstitutionCourseListView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -10308,6 +10382,9 @@ class EducationInstitutionCourseListView(APIView):
             program = _get_institution_program_or_404(institution, str(program_id))
         cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
         raw_price_amount = request.data.get("price_amount")
+        new_status = _normalize_academic_status(request.data.get("status"))
+        new_price_amount = _normalize_education_decimal(raw_price_amount, "price_amount")
+        _require_payment_setup_for_paid_course(institution, status=new_status, price_amount=new_price_amount)
         course = EducationInstitutionCourse.objects.create(
             institution=institution,
             program=program,
@@ -10316,10 +10393,10 @@ class EducationInstitutionCourseListView(APIView):
             summary=str(request.data.get("summary") or "").strip(),
             description=str(request.data.get("description") or "").strip(),
             cover_image_url=cover_url,
-            status=_normalize_academic_status(request.data.get("status")),
+            status=new_status,
             duration_minutes=_to_bounded_int(request.data.get("duration_minutes"), 0, 0),
             seat_limit=_to_optional_positive_int(request.data.get("seat_limit")),
-            price_amount=_normalize_education_decimal(raw_price_amount, "price_amount"),
+            price_amount=new_price_amount,
             price_currency=KIS_COIN_CODE,
             visibility=_normalize_course_visibility(request.data.get("visibility")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
@@ -10382,6 +10459,7 @@ class EducationInstitutionCourseDetailView(APIView):
             course.metadata = request.data.get("metadata")
         if isinstance(request.data.get("settings"), dict):
             course.settings = request.data.get("settings")
+        _require_payment_setup_for_paid_course(institution, status=course.status, price_amount=course.price_amount)
         course.save()
         _sync_education_source_broadcasts(course)
         _sync_course_pricing_to_broadcasts(course)
@@ -13961,6 +14039,65 @@ class ChannelPayoutAccountConnectView(APIView):
                 "payout_account_name": channel.payout_account_name,
                 "payout_bank_last4": channel.payout_bank_last4,
             },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ChannelStripeConnectAccountView(APIView):
+    """Connects the channel's Stripe Express account — the second
+    supported payout rail alongside ChannelPayoutAccountConnectView's
+    Flutterwave subaccount, using the shared apps.billing.stripe_connect
+    helpers. Same owner_type=USER-only scope as the Flutterwave view —
+    institution-owned channels settle via their owning institution."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id: str):
+        from apps.billing.stripe_connect import refresh_account_status
+
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You do not have permission to manage this channel.")
+
+        if channel.stripe_account_id:
+            fields = refresh_account_status(channel.stripe_account_id)
+            for field_name, value in fields.items():
+                setattr(channel, field_name, value)
+            channel.save(update_fields=[*fields.keys(), "updated_at"])
+
+        return Response(
+            {
+                "stripe_account_id": channel.stripe_account_id,
+                "stripe_charges_enabled": channel.stripe_charges_enabled,
+                "stripe_payouts_enabled": channel.stripe_payouts_enabled,
+                "stripe_details_submitted": channel.stripe_details_submitted,
+            }
+        )
+
+    @transaction.atomic
+    def post(self, request, channel_id: str):
+        from apps.billing.stripe_connect import create_account_onboarding_link, create_stripe_express_account, onboarding_redirect_urls
+
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You do not have permission to manage this channel.")
+        if channel.owner_type != BroadcastChannel.OwnerType.USER:
+            raise ValidationError(
+                {"detail": "This channel settles through its owning organization's payout account instead."}
+            )
+
+        if not channel.stripe_account_id:
+            country = str(request.data.get("country") or "US").strip().upper()
+            owner_email = channel.owner_user.email if channel.owner_user else ""
+            channel.stripe_account_id = create_stripe_express_account(email=owner_email or "", country=country)
+            channel.save(update_fields=["stripe_account_id", "updated_at"])
+
+        refresh_url, return_url = onboarding_redirect_urls()
+        onboarding_url = create_account_onboarding_link(
+            account_id=channel.stripe_account_id, refresh_url=refresh_url, return_url=return_url,
+        )
+        return Response(
+            {"onboarding_url": onboarding_url, "stripe_account_id": channel.stripe_account_id},
             status=status.HTTP_200_OK,
         )
 
@@ -19265,30 +19402,51 @@ class ChannelContentTipView(APIView):
         ).order_by("-created_at")[:50]
         return Response(ChannelContentTipSerializer(tips, many=True, context={"request": request}).data)
 
+    @transaction.atomic
     def post(self, request, content_id):
+        from apps.billing.direct_payments import create_direct_payment_intent
+        from apps.billing.models import DirectPaymentIntent
+
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
         amount_cents = int(request.data.get("amount_cents") or 0)
         if amount_cents < 100:
             raise ValidationError({"amount_cents": "Minimum tip is 1.00."})
+        # Created PENDING, not COMPLETED — no money has actually moved yet.
+        # create_direct_payment_intent (below) is what actually initiates
+        # the charge; _mark_target_paid flips this to COMPLETED once the
+        # provider webhook confirms payment, exactly like every other paid
+        # target (MarketplaceOrder, ServiceBooking, etc.) already works.
         tip = ChannelContentTip.objects.create(
             content=content,
             user=request.user,
             amount_cents=amount_cents,
             currency=str(request.data.get("currency") or "USD").upper()[:3],
             message=str(request.data.get("message") or "")[:150],
-            status=ChannelContentTip.Status.COMPLETED,
+            status=ChannelContentTip.Status.PENDING,
         )
-        return Response(
-            ChannelContentTipSerializer(tip, context={"request": request}).data,
-            status=status.HTTP_201_CREATED,
+        intent = create_direct_payment_intent(
+            user=request.user,
+            target_type=DirectPaymentIntent.TARGET_CHANNEL_TIP,
+            target_id=tip.id,
+            provider=str(request.data.get("provider") or "flutterwave"),
+            metadata={"source": "channel_content_tip", "channel_id": str(content.channel_id)},
         )
+        payload = ChannelContentTipSerializer(tip, context={"request": request}).data
+        payload["payment_required"] = True
+        payload["payment_url"] = intent.payment_url or ""
+        payload["provider"] = intent.provider
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 # ─── Super Chat: tips during a live stream ────────────────────────────────────
 class ChannelLiveStreamTipView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, stream_id):
+        from apps.billing.direct_payments import create_direct_payment_intent
+        from apps.billing.models import DirectPaymentIntent
+
         live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
         try:
             amount_cents = int(request.data.get("amount_cents") or 0)
@@ -19296,22 +19454,31 @@ class ChannelLiveStreamTipView(APIView):
             raise ValidationError({"amount_cents": "Must be a whole number of cents."})
         if amount_cents < 100:
             raise ValidationError({"amount_cents": "Minimum tip is 1.00."})
+        # Created PENDING, not COMPLETED — see ChannelContentTipView.post
+        # for why. is_pinned is likewise deferred to _mark_target_paid's
+        # tip branch below, since a pin (and the "someone tipped $X" chat
+        # highlight it implies) shouldn't appear before payment is
+        # actually confirmed.
         tip = ChannelLiveStreamTip.objects.create(
             live_stream=live_stream,
             user=request.user,
             amount_cents=amount_cents,
             currency=str(request.data.get("currency") or "USD").upper()[:3],
             message=str(request.data.get("message") or "")[:150],
-            status=ChannelLiveStreamTip.Status.COMPLETED,
+            status=ChannelLiveStreamTip.Status.PENDING,
         )
-        if amount_cents >= 1000:
-            tip.is_pinned = True
-            tip.pinned_until = timezone.now() + timedelta(minutes=2)
-            tip.save(update_fields=["is_pinned", "pinned_until"])
-        return Response(
-            ChannelLiveStreamTipSerializer(tip, context={"request": request}).data,
-            status=status.HTTP_201_CREATED,
+        intent = create_direct_payment_intent(
+            user=request.user,
+            target_type=DirectPaymentIntent.TARGET_CHANNEL_TIP,
+            target_id=tip.id,
+            provider=str(request.data.get("provider") or "flutterwave"),
+            metadata={"source": "channel_live_stream_tip", "channel_id": str(live_stream.channel_id)},
         )
+        payload = ChannelLiveStreamTipSerializer(tip, context={"request": request}).data
+        payload["payment_required"] = True
+        payload["payment_url"] = intent.payment_url or ""
+        payload["provider"] = intent.provider
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class ChannelLiveStreamTipListView(APIView):

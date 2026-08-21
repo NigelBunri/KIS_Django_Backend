@@ -38,6 +38,7 @@ from .models import (
     ServiceBookingEscrow,
     ServiceBookingPayment,
     Shop,
+    ShopPayoutAccountStatus,
     ShopLandingPage,
     ShopService,
     ShopServiceImage,
@@ -155,7 +156,10 @@ class MarketplaceUsdCheckoutTests(TestCase):
         User = get_user_model()
         self.provider = User.objects.create_user(phone='5555551100', username='provider_usd', password='secret', country='NG')
         self.buyer = User.objects.create_user(phone='5555552200', username='buyer_usd', password='secret', country='NG')
-        self.shop = Shop.objects.create(owner=self.provider, name='USD Provider Shop', slug='usd-provider-shop')
+        self.shop = Shop.objects.create(
+            owner=self.provider, name='USD Provider Shop', slug='usd-provider-shop',
+            payout_account_status=ShopPayoutAccountStatus.ACTIVE, flutterwave_subaccount_id='RS_TEST_USD',
+        )
         self.product = Product.objects.create(
             shop=self.shop,
             sku='MP-USD-001',
@@ -713,7 +717,10 @@ class ServiceBookingMoneyNormalizationTests(APITestCase):
         User = get_user_model()
         self.owner = User.objects.create_user(phone='5556661111', username='owner_money_norm', password='secret', country='NG')
         self.customer = User.objects.create_user(phone='5556662222', username='customer_money_norm', password='secret', country='NG')
-        self.shop = Shop.objects.create(owner=self.owner, name='Money Norm Shop', slug='money-norm-shop')
+        self.shop = Shop.objects.create(
+            owner=self.owner, name='Money Norm Shop', slug='money-norm-shop',
+            payout_account_status=ShopPayoutAccountStatus.ACTIVE, flutterwave_subaccount_id='RS_TEST_MONEY_NORM',
+        )
         self.service = ShopService.objects.create(
             shop=self.shop,
             name='Deep Consult',
@@ -1232,6 +1239,8 @@ class ProductSystemTests(TestCase):
             owner=self.owner,
             name='Product Category Shop',
             slug=f'product-category-shop-{token}',
+            payout_account_status=ShopPayoutAccountStatus.ACTIVE,
+            flutterwave_subaccount_id='RS_TEST_CATEGORY',
         )
         ensure_catalog_categories()
 

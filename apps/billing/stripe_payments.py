@@ -75,8 +75,17 @@ def create_checkout_session(
     target_id: str = "",
     user_id: str = "",
     metadata: dict | None = None,
+    destination_account_id: str = "",
+    application_fee_amount: int = 0,
 ) -> dict[str, Any]:
-    """Create a Stripe Checkout Session (hosted payment page). Returns checkout URL."""
+    """Create a Stripe Checkout Session (hosted payment page). Returns
+    checkout URL. destination_account_id/application_fee_amount are
+    optional Stripe Connect Destination Charge params — when
+    destination_account_id is set, the seller's connected account
+    receives the payment directly and application_fee_amount (cents) is
+    what the platform keeps, mirroring the marketplace split Flutterwave
+    already does for its own subaccounts (see
+    apps.billing.direct_payments._split_subaccounts_for_intent)."""
     stripe = _stripe()
     payment_metadata = {
         "target_type": target_type,
@@ -84,6 +93,11 @@ def create_checkout_session(
         "user_id": str(user_id),
         **(metadata or {}),
     }
+    payment_intent_data: dict[str, Any] = {"metadata": payment_metadata}
+    if destination_account_id:
+        payment_intent_data["transfer_data"] = {"destination": destination_account_id}
+        if application_fee_amount > 0:
+            payment_intent_data["application_fee_amount"] = int(application_fee_amount)
     session = stripe.checkout.Session.create(
         payment_method_types=["card"],
         line_items=[{
@@ -98,7 +112,7 @@ def create_checkout_session(
         success_url=success_url,
         cancel_url=cancel_url,
         metadata=payment_metadata,
-        payment_intent_data={"metadata": payment_metadata},
+        payment_intent_data=payment_intent_data,
     )
     return {
         "provider": "stripe",

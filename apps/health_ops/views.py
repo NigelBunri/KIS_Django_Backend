@@ -1541,6 +1541,61 @@ class HealthInstitutionPayoutAccountConnectView(APIView):
         )
 
 
+class HealthInstitutionStripeConnectAccountView(APIView):
+    """Connects the institution's Stripe Express account — the second
+    supported payout rail alongside
+    HealthInstitutionPayoutAccountConnectView's Flutterwave subaccount,
+    using the shared apps.billing.stripe_connect helpers."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, institution_id: str):
+        from apps.billing.stripe_connect import refresh_account_status
+
+        institution = get_object_or_404(HealthInstitution, id=institution_id)
+        if not _can_manage_institution(request.user, institution):
+            raise PermissionDenied("You do not have permission to manage this institution.")
+
+        if institution.stripe_account_id:
+            fields = refresh_account_status(institution.stripe_account_id)
+            for field_name, value in fields.items():
+                setattr(institution, field_name, value)
+            institution.save(update_fields=[*fields.keys(), "updated_at"])
+
+        return Response(
+            {
+                "stripe_account_id": institution.stripe_account_id,
+                "stripe_charges_enabled": institution.stripe_charges_enabled,
+                "stripe_payouts_enabled": institution.stripe_payouts_enabled,
+                "stripe_details_submitted": institution.stripe_details_submitted,
+            }
+        )
+
+    @transaction.atomic
+    def post(self, request, institution_id: str):
+        from apps.billing.stripe_connect import create_account_onboarding_link, create_stripe_express_account, onboarding_redirect_urls
+
+        institution = get_object_or_404(HealthInstitution, id=institution_id)
+        if not _can_manage_institution(request.user, institution):
+            raise PermissionDenied("You do not have permission to manage this institution.")
+
+        if not institution.stripe_account_id:
+            country = str(request.data.get("country") or "US").strip().upper()
+            institution.stripe_account_id = create_stripe_express_account(
+                email=institution.owner.email or "", country=country,
+            )
+            institution.save(update_fields=["stripe_account_id", "updated_at"])
+
+        refresh_url, return_url = onboarding_redirect_urls()
+        onboarding_url = create_account_onboarding_link(
+            account_id=institution.stripe_account_id, refresh_url=refresh_url, return_url=return_url,
+        )
+        return Response(
+            {"onboarding_url": onboarding_url, "stripe_account_id": institution.stripe_account_id},
+            status=status.HTTP_200_OK,
+        )
+
+
 class HealthCareSummaryView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -4919,22 +4974,34 @@ class PaymentBillingSessionStartView(APIView):
         if not isinstance(metadata, dict):
             metadata = {}
 
-        total_amount_micro_value = serializer.validated_data.get("total_amount_micro")
-        total_amount_kisc_value = serializer.validated_data.get("total_amount_kisc")
+        # The billing total/insurance-coverage/payable amount are only ever
+        # trustworthy from institution staff — they're the ones authorized
+        # to set/adjust a quote (same authority that already sets
+        # ServiceEngineMap.cost_micro elsewhere). _can_access_workflow_session
+        # deliberately also allows the patient themselves to call this
+        # endpoint (to start their own billing session), but a patient must
+        # never be able to set their own bill: any client-supplied amount
+        # from a patient caller is ignored in favor of the server-derived
+        # engine cost, exactly like every other payment domain (commerce,
+        # education) already does at checkout.
+        is_billing_authority = _is_institution_member(request.user, workflow.institution)
+
+        total_amount_micro_value = serializer.validated_data.get("total_amount_micro") if is_billing_authority else None
+        total_amount_kisc_value = serializer.validated_data.get("total_amount_kisc") if is_billing_authority else None
         if total_amount_kisc_value not in (None, ""):
             total_amount_micro_value = _kisc_to_micro(total_amount_kisc_value, allow_empty=True)
         if total_amount_micro_value is None:
             total_amount_micro_value = int(engine_session.engine_map.cost_micro or 0)
         total_amount_micro = max(0, int(total_amount_micro_value or 0))
 
-        insurance_coverage_micro_value = serializer.validated_data.get("insurance_coverage_micro")
-        insurance_coverage_kisc_value = serializer.validated_data.get("insurance_coverage_kisc")
+        insurance_coverage_micro_value = serializer.validated_data.get("insurance_coverage_micro") if is_billing_authority else None
+        insurance_coverage_kisc_value = serializer.validated_data.get("insurance_coverage_kisc") if is_billing_authority else None
         if insurance_coverage_kisc_value not in (None, ""):
             insurance_coverage_micro_value = _kisc_to_micro(insurance_coverage_kisc_value, allow_empty=True)
         insurance_coverage_micro = max(0, int(insurance_coverage_micro_value or 0))
 
-        payable_amount_micro = serializer.validated_data.get("payable_amount_micro")
-        payable_amount_kisc = serializer.validated_data.get("payable_amount_kisc")
+        payable_amount_micro = serializer.validated_data.get("payable_amount_micro") if is_billing_authority else None
+        payable_amount_kisc = serializer.validated_data.get("payable_amount_kisc") if is_billing_authority else None
         if payable_amount_kisc not in (None, ""):
             payable_amount_micro = _kisc_to_micro(payable_amount_kisc, allow_empty=True)
         if payable_amount_micro is None:

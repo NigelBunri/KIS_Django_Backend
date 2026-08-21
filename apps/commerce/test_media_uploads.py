@@ -25,6 +25,7 @@ from .models import (
     Product,
     ProductImage,
     Shop,
+    ShopPayoutAccountStatus,
     ShopRole,
     ShopService,
     ShopTeamMember,
@@ -45,7 +46,10 @@ class CommerceMediaUploadTestBase(APITestCase):
         self.staff = User.objects.create_user(
             phone="+237670005003", password="TestPass123!", country="CM", is_staff=True,
         )
-        self.shop = Shop.objects.create(owner=self.owner, name="Test Shop", slug="test-shop-media")
+        self.shop = Shop.objects.create(
+            owner=self.owner, name="Test Shop", slug="test-shop-media",
+            payout_account_status=ShopPayoutAccountStatus.ACTIVE, flutterwave_subaccount_id="RS_TEST_MEDIA",
+        )
 
     def _initiate(self, user, **overrides):
         self.client.force_authenticate(user)

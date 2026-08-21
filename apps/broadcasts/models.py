@@ -157,6 +157,14 @@ class BroadcastChannel(models.Model):
     )
     payout_account_name = models.CharField(max_length=255, blank=True, default="")
     payout_bank_last4 = models.CharField(max_length=8, blank=True, default="")
+    # Stripe Connect (Express account) — second supported payout rail
+    # alongside the Flutterwave subaccount above, same owner_type=USER-only
+    # scope, kept in sync by the account.updated webhook
+    # (apps.billing.views.StripeWebhookView).
+    stripe_account_id = models.CharField(max_length=128, blank=True, default="")
+    stripe_charges_enabled = models.BooleanField(default=False)
+    stripe_payouts_enabled = models.BooleanField(default=False)
+    stripe_details_submitted = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1231,6 +1239,13 @@ class EducationInstitution(models.Model):
     )
     payout_account_name = models.CharField(max_length=255, blank=True, default="")
     payout_bank_last4 = models.CharField(max_length=8, blank=True, default="")
+    # Stripe Connect (Express account) — second supported payout rail
+    # alongside the Flutterwave subaccount above, kept in sync by the
+    # account.updated webhook (apps.billing.views.StripeWebhookView).
+    stripe_account_id = models.CharField(max_length=128, blank=True, default="")
+    stripe_charges_enabled = models.BooleanField(default=False)
+    stripe_payouts_enabled = models.BooleanField(default=False)
+    stripe_details_submitted = models.BooleanField(default=False)
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 

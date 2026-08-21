@@ -127,75 +127,123 @@ def _provider_links_enabled(provider: str) -> bool:
     return False
 
 
-def _payout_owner_for_intent(intent: DirectPaymentIntent):
-    """Resolves the seller/provider whose connected payout account (if
-    ACTIVE) this payment should split to, and who owns the commission-rate
-    tier — one model instance per DirectPaymentIntent target type, each
-    exposing the same flutterwave_subaccount_id/payout_account_status/
-    owner shape. Returns None if the target has no connected, active
-    payout account (or isn't a target type that supports one)."""
-    if intent.target_type == DirectPaymentIntent.TARGET_EDUCATION_BOOKING:
-        from apps.broadcasts.models import EducationInstitutionBooking, EducationInstitutionPayoutAccountStatus
+def resolve_payout_entity(target_type: str, target_id: uuid.UUID | str):
+    """Resolves the seller/provider entity (Shop/EducationInstitution/
+    HealthInstitution/BroadcastChannel) that owns a given payment target —
+    one model instance per DirectPaymentIntent target type, each exposing
+    the same flutterwave_subaccount_id/stripe_*/payout_account_status/
+    owner shape. Returns None if the target isn't a type that has a
+    payout-holding entity at all (e.g. an institution-owned broadcast
+    channel, which settles via its owning institution instead — see the
+    owner_type check below), regardless of whether that entity's payout
+    account is actually ready yet. Callers that care about readiness
+    (payout splitting, payment eligibility gating) check the resolved
+    entity's own status fields themselves — this function only answers
+    "which entity", not "is it ready"."""
+    if target_type == DirectPaymentIntent.TARGET_EDUCATION_BOOKING:
+        from apps.broadcasts.models import EducationInstitutionBooking
 
         booking = (
             EducationInstitutionBooking.objects.select_related("institution")
-            .filter(id=intent.target_id)
+            .filter(id=target_id)
             .first()
         )
         if not booking or not booking.course_id:
             return None
-        entity = booking.institution
-        active_status = EducationInstitutionPayoutAccountStatus.ACTIVE
-    elif intent.target_type == DirectPaymentIntent.TARGET_MARKETPLACE_ORDER:
-        from apps.commerce.models import MarketplaceOrder, ShopPayoutAccountStatus
+        return booking.institution
+    if target_type == DirectPaymentIntent.TARGET_MARKETPLACE_ORDER:
+        from apps.commerce.models import MarketplaceOrder
 
-        order = MarketplaceOrder.objects.select_related("shop").filter(id=intent.target_id).first()
-        if not order:
-            return None
-        entity = order.shop
-        active_status = ShopPayoutAccountStatus.ACTIVE
-    elif intent.target_type == DirectPaymentIntent.TARGET_SERVICE_BOOKING_PAYMENT:
-        from apps.commerce.models import ServiceBookingPayment, ShopPayoutAccountStatus
+        order = MarketplaceOrder.objects.select_related("shop").filter(id=target_id).first()
+        return order.shop if order else None
+    if target_type == DirectPaymentIntent.TARGET_SERVICE_BOOKING_PAYMENT:
+        from apps.commerce.models import ServiceBookingPayment
 
         payment = (
             ServiceBookingPayment.objects.select_related("booking__shop")
-            .filter(id=intent.target_id)
+            .filter(id=target_id)
             .first()
         )
-        if not payment:
-            return None
-        entity = payment.booking.shop
-        active_status = ShopPayoutAccountStatus.ACTIVE
-    elif intent.target_type == DirectPaymentIntent.TARGET_HEALTH_BILLING_SESSION:
-        from apps.health_ops.models import HealthInstitutionPayoutAccountStatus, PaymentBillingSession
+        return payment.booking.shop if payment else None
+    if target_type == DirectPaymentIntent.TARGET_HEALTH_BILLING_SESSION:
+        from apps.health_ops.models import PaymentBillingSession
 
         session = (
             PaymentBillingSession.objects.select_related("institution")
-            .filter(id=intent.target_id)
+            .filter(id=target_id)
             .first()
         )
-        if not session:
-            return None
-        entity = session.institution
-        active_status = HealthInstitutionPayoutAccountStatus.ACTIVE
-    elif intent.target_type == DirectPaymentIntent.TARGET_CHANNEL_MEMBERSHIP:
-        from apps.broadcasts.models import BroadcastChannel, BroadcastChannelPayoutAccountStatus, ChannelMembership
+        return session.institution if session else None
+    if target_type == DirectPaymentIntent.TARGET_CHANNEL_MEMBERSHIP:
+        from apps.broadcasts.models import BroadcastChannel, ChannelMembership
 
         membership = (
             ChannelMembership.objects.select_related("tier__channel")
-            .filter(id=intent.target_id)
+            .filter(id=target_id)
             .first()
         )
         if not membership or membership.tier.channel.owner_type != BroadcastChannel.OwnerType.USER:
             return None
-        entity = membership.tier.channel
-        active_status = BroadcastChannelPayoutAccountStatus.ACTIVE
-    else:
-        return None
+        return membership.tier.channel
+    if target_type == DirectPaymentIntent.TARGET_CHANNEL_TIP:
+        from apps.broadcasts.models import BroadcastChannel
 
-    if entity.payout_account_status != active_status or not entity.flutterwave_subaccount_id:
+        channel = _channel_for_tip_target(target_id)
+        if not channel or channel.owner_type != BroadcastChannel.OwnerType.USER:
+            return None
+        return channel
+    return None
+
+
+def _tip_for_target(target_id: uuid.UUID | str):
+    """A channel_tip's target_id may belong to either ChannelContentTip
+    (Super Thanks) or ChannelLiveStreamTip (Super Chat) — both routed
+    through the same DirectPaymentIntent target_type since they're the
+    same underlying concept (a one-off tip). UUID collision between the
+    two tables is not a realistic concern."""
+    from apps.broadcasts.models import ChannelContentTip, ChannelLiveStreamTip
+
+    tip = ChannelContentTip.objects.select_related("content__channel", "user").filter(id=target_id).first()
+    if tip is not None:
+        return tip
+    return ChannelLiveStreamTip.objects.select_related("live_stream__channel", "user").filter(id=target_id).first()
+
+
+def _channel_for_tip_target(target_id: uuid.UUID | str):
+    from apps.broadcasts.models import ChannelContentTip
+
+    tip = _tip_for_target(target_id)
+    if tip is None:
+        return None
+    if isinstance(tip, ChannelContentTip):
+        return tip.content.channel
+    return tip.live_stream.channel
+
+
+def _payout_owner_for_intent(intent: DirectPaymentIntent):
+    """Resolves the seller/provider whose connected Flutterwave payout
+    account (if ACTIVE) this payment should split to, and who owns the
+    commission-rate tier. Returns None if the target has no payout entity
+    at all, or that entity's Flutterwave subaccount isn't ACTIVE — this is
+    the Flutterwave-specific split-eligibility check; the Stripe
+    equivalent lives in _create_stripe_checkout_session, and the
+    provider-agnostic "can this seller receive money at all" check lives
+    in apps.billing.eligibility.can_receive_payments."""
+    entity = resolve_payout_entity(intent.target_type, intent.target_id)
+    if entity is None:
+        return None
+    if entity.payout_account_status != _ACTIVE_PAYOUT_STATUS or not entity.flutterwave_subaccount_id:
         return None
     return entity
+
+
+# Each payout-holder model (Shop/EducationInstitution/HealthInstitution/
+# BroadcastChannel) defines its own PayoutAccountStatus TextChoices
+# (deliberately not a shared cross-app enum, to avoid import-order risk
+# between apps — see each model's own docstring) but ACTIVE is always the
+# literal string "active" across all four, so comparing against this
+# constant avoids needing an extra import per entity type.
+_ACTIVE_PAYOUT_STATUS = "active"
 
 
 def _payout_entity_owner(entity) -> Any:
@@ -204,6 +252,41 @@ def _payout_entity_owner(entity) -> Any:
     EducationInstitution) — normalize here so callers can treat every
     payout entity uniformly."""
     return getattr(entity, "owner", None) or getattr(entity, "owner_user", None)
+
+
+def _commission_pct_for_entity(entity) -> float | None:
+    """The platform commission rate for this payment's seller/provider,
+    via the one existing rate resolver (apps.accounts.tiers.
+    get_platform_commission_pct — tiered by the seller's own AccountTier,
+    configurable via settings.PLATFORM_COMMISSION_BY_TIER). Takes an
+    already-resolved payout entity rather than re-resolving it from the
+    intent, since every caller already has one on hand (either
+    _payout_owner_for_intent's Flutterwave-specific resolution, or
+    resolve_payout_entity's provider-agnostic one) — avoids a redundant
+    second DB lookup, and keeps this usable in tests that mock the entity
+    directly without needing a real intent's target_type/target_id.
+    Shared by both providers so there is exactly one place the rate is
+    looked up — each provider's own payload-builder converts this
+    whole-number percentage into whatever shape its own API wants (see
+    _split_subaccounts_for_intent for Flutterwave's fraction convention,
+    and the Stripe checkout-session builder for its absolute-cents
+    application_fee_amount)."""
+    if entity is None:
+        return None
+    from apps.accounts.tiers import get_platform_commission_pct
+
+    return get_platform_commission_pct(_payout_entity_owner(entity))
+
+
+def _commission_cents_for_entity(intent: DirectPaymentIntent, entity) -> int:
+    """Commission amount in cents for this intent against the given
+    payout entity, using the same rate as _commission_pct_for_entity —
+    the absolute-cents shape Stripe's application_fee_amount wants. 0 if
+    entity is None."""
+    pct = _commission_pct_for_entity(entity)
+    if not pct:
+        return 0
+    return int(round(int(intent.amount_cents or 0) * pct / 100))
 
 
 def _split_subaccounts_for_intent(intent: DirectPaymentIntent) -> list[dict] | None:
@@ -230,9 +313,7 @@ def _split_subaccounts_for_intent(intent: DirectPaymentIntent) -> list[dict] | N
     entity = _payout_owner_for_intent(intent)
     if entity is None:
         return None
-    from apps.accounts.tiers import get_platform_commission_pct
-
-    commission_pct = get_platform_commission_pct(_payout_entity_owner(entity))
+    commission_pct = _commission_pct_for_entity(entity) or 0
     return [
         {
             "id": entity.flutterwave_subaccount_id,
@@ -296,6 +377,21 @@ def _create_stripe_checkout_session(intent: DirectPaymentIntent) -> tuple[str, d
         getattr(settings, "STRIPE_CHECKOUT_CANCEL_URL", "")
         or success_url
     )
+
+    # Stripe Connect Destination Charge split — mirrors Flutterwave's
+    # native subaccount split (_split_subaccounts_for_intent) using the
+    # same commission-rate lookup, applied in Stripe's own shape
+    # (absolute application_fee_amount cents rather than a percentage
+    # fraction). Only attached when the seller's Stripe account is
+    # actually ready to receive charges; otherwise this Checkout Session
+    # settles 100% to the platform's own account exactly like today.
+    destination_account_id = ""
+    application_fee_amount = 0
+    payout_entity = resolve_payout_entity(intent.target_type, intent.target_id)
+    if payout_entity is not None and getattr(payout_entity, "stripe_charges_enabled", False):
+        destination_account_id = payout_entity.stripe_account_id
+        application_fee_amount = _commission_cents_for_entity(intent, payout_entity)
+
     data = create_checkout_session(
         amount_cents=int(intent.amount_cents or 0),
         currency=(intent.currency or "USD").lower(),
@@ -306,6 +402,8 @@ def _create_stripe_checkout_session(intent: DirectPaymentIntent) -> tuple[str, d
         target_id=str(intent.target_id),
         user_id=str(intent.user_id),
         metadata=metadata,
+        destination_account_id=destination_account_id,
+        application_fee_amount=application_fee_amount,
     )
     link = str(data.get("checkout_url") or "")
     return link, redact_payment_payload(data)
@@ -408,6 +506,11 @@ def _target_owner_and_amount(target_type: str, target_id: uuid.UUID | str) -> tu
 
         membership = ChannelMembership.objects.select_related("user", "tier").get(id=target_uuid)
         return membership.user, int(membership.tier.price_cents or 0), "Channel membership payment", membership
+    if target_type == DirectPaymentIntent.TARGET_CHANNEL_TIP:
+        tip = _tip_for_target(target_uuid)
+        if tip is None:
+            raise DirectPaymentIntent.DoesNotExist("Tip not found")
+        return tip.user, int(tip.amount_cents or 0), "Channel tip payment", tip
     raise ValueError("Unsupported payment target type")
 
 
@@ -425,6 +528,21 @@ def create_direct_payment_intent(
         raise PermissionError("Payment target does not belong to this user.")
     if amount_cents <= 0:
         raise ValueError("Payment amount must be greater than zero.")
+
+    # Universal payment-readiness backstop — every domain (Market,
+    # Education, Health, Broadcast) already calls this one function to
+    # create a payment, so gating it here covers all of them with a single
+    # check rather than each domain re-implementing its own. Entities that
+    # resolve_payout_entity can't resolve to anything (e.g. an
+    # institution-owned broadcast channel, which settles via its
+    # institution instead) have nothing to gate here.
+    payout_entity = resolve_payout_entity(target_type, target_id)
+    if payout_entity is not None:
+        from .eligibility import PaymentSetupRequiredError, can_receive_payments
+
+        eligibility = can_receive_payments(payout_entity)
+        if not eligibility.eligible:
+            raise PaymentSetupRequiredError(eligibility)
     provider = (provider or "flutterwave").strip().lower()
     target_uuid = uuid.UUID(str(target_id))
     existing = DirectPaymentIntent.objects.filter(
@@ -778,6 +896,23 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
         target.payload = {**(target.payload or {}), **paid_metadata}
         target.metadata = {**(target.metadata or {}), **paid_metadata, "currency": "USD"}
         target.save(update_fields=["status", "payment_provider", "payment_reference", "amount_paid_micro", "paid_at", "payload", "metadata", "updated_at"])
+    elif intent.target_type == DirectPaymentIntent.TARGET_CHANNEL_TIP:
+        from apps.broadcasts.models import ChannelLiveStreamTip
+
+        # target is either a ChannelContentTip or ChannelLiveStreamTip
+        # (see _tip_for_target) — both share the same Status.COMPLETED /
+        # payment_reference shape.
+        target.status = target.Status.COMPLETED
+        target.payment_reference = intent.tx_ref
+        update_fields = ["status", "payment_reference", "updated_at"]
+        # Super Chat pin ($10+ tips get a highlighted chat message) only
+        # takes effect once payment is actually confirmed, not at the
+        # moment the tip was merely requested (see ChannelLiveStreamTipView.post).
+        if isinstance(target, ChannelLiveStreamTip) and int(target.amount_cents or 0) >= 1000:
+            target.is_pinned = True
+            target.pinned_until = timezone.now() + timezone.timedelta(minutes=2)
+            update_fields.extend(["is_pinned", "pinned_until"])
+        target.save(update_fields=update_fields)
 
 
 def _mark_target_failed(intent: DirectPaymentIntent, status_value: str) -> None:

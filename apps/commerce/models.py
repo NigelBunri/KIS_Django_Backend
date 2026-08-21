@@ -126,6 +126,16 @@ class Shop(BaseEntity):
     )
     payout_account_name = models.CharField(max_length=255, blank=True, default="")
     payout_bank_last4 = models.CharField(max_length=8, blank=True, default="")
+    # Stripe Connect (Express account) — the second supported payout rail
+    # alongside the Flutterwave subaccount above. charges_enabled/
+    # payouts_enabled/details_submitted mirror Stripe's own Account object
+    # fields and are kept in sync by the account.updated webhook (see
+    # apps.billing.views.StripeWebhookView) rather than trusted from the
+    # client at any point.
+    stripe_account_id = models.CharField(max_length=128, blank=True, default="")
+    stripe_charges_enabled = models.BooleanField(default=False)
+    stripe_payouts_enabled = models.BooleanField(default=False)
+    stripe_details_submitted = models.BooleanField(default=False)
 
     class Meta:
         indexes = [models.Index(fields=['slug'])]

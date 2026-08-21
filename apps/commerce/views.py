@@ -871,6 +871,62 @@ class ShopPayoutAccountConnectView(APIView):
         )
 
 
+class ShopStripeConnectAccountView(APIView):
+    """Connects the shop's Stripe Express account — the second supported
+    payout rail alongside ShopPayoutAccountConnectView's Flutterwave
+    subaccount, using the shared apps.billing.stripe_connect helpers. GET
+    re-queries Stripe directly for current status (never trusts stale
+    frontend state); POST creates the account on first call (idempotent —
+    reuses shop.stripe_account_id on repeat calls) and returns a fresh
+    onboarding link."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, shop_id: str):
+        from apps.billing.stripe_connect import refresh_account_status
+
+        shop = get_object_or_404(Shop, id=shop_id)
+        if shop.owner_id != request.user.id and not request.user.is_staff:
+            raise PermissionDenied("Only the shop owner can view payout account status.")
+
+        if shop.stripe_account_id:
+            fields = refresh_account_status(shop.stripe_account_id)
+            for field_name, value in fields.items():
+                setattr(shop, field_name, value)
+            shop.save(update_fields=[*fields.keys(), "updated_at"])
+
+        return Response(
+            {
+                "stripe_account_id": shop.stripe_account_id,
+                "stripe_charges_enabled": shop.stripe_charges_enabled,
+                "stripe_payouts_enabled": shop.stripe_payouts_enabled,
+                "stripe_details_submitted": shop.stripe_details_submitted,
+            }
+        )
+
+    @transaction.atomic
+    def post(self, request, shop_id: str):
+        from apps.billing.stripe_connect import create_account_onboarding_link, create_stripe_express_account, onboarding_redirect_urls
+
+        shop = get_object_or_404(Shop, id=shop_id)
+        if shop.owner_id != request.user.id and not request.user.is_staff:
+            raise PermissionDenied("Only the shop owner can connect a payout account.")
+
+        if not shop.stripe_account_id:
+            country = str(request.data.get("country") or "US").strip().upper()
+            shop.stripe_account_id = create_stripe_express_account(email=shop.owner.email or "", country=country)
+            shop.save(update_fields=["stripe_account_id", "updated_at"])
+
+        refresh_url, return_url = onboarding_redirect_urls()
+        onboarding_url = create_account_onboarding_link(
+            account_id=shop.stripe_account_id, refresh_url=refresh_url, return_url=return_url,
+        )
+        return Response(
+            {"onboarding_url": onboarding_url, "stripe_account_id": shop.stripe_account_id},
+            status=status.HTTP_200_OK,
+        )
+
+
 class CommerceDiscoveryView(APIView):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 

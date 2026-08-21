@@ -55,6 +55,7 @@ from apps.broadcasts.models import (
     EducationInstitutionMembershipPolicy,
     EducationInstitutionMembershipRole,
     EducationInstitutionMembershipStatus,
+    EducationInstitutionPayoutAccountStatus,
     EducationInstitutionEvent,
     EducationCourseQuestion,
     EducationCourseReview,
@@ -2807,6 +2808,8 @@ class EducationCourseraCoreTests(APITestCase):
             owner=self.owner,
             name='Royal Academy',
             description='Structured learning for families.',
+            payout_account_status=EducationInstitutionPayoutAccountStatus.ACTIVE,
+            flutterwave_subaccount_id='RS_TEST_EDU',
         )
         self.course = EducationInstitutionCourse.objects.create(
             institution=self.institution,
