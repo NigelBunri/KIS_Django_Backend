@@ -167,6 +167,12 @@ def _public_site_payload(website: Website) -> dict:
         "slug": website.slug,
         "name": website.name,
         "owner_type": website.owner_type,
+        # Needed client-side only for owner_type=="shop" sites, to scope
+        # cart operations (apps.commerce.models.Cart.shop) to this shop —
+        # previously not exposed at all, so the website had no way to
+        # add a shopping cart. Not sensitive: it's the same shop id the
+        # app already references in every product/service deep link.
+        "owner_id": str(website.owner_id),
         "branding": website.branding or {},
         "seo": {
             "title": default_seo.get("title") or website.name,
