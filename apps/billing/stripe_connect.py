@@ -15,10 +15,29 @@ from __future__ import annotations
 import logging
 
 from django.conf import settings
+from rest_framework.exceptions import ValidationError
 
 from .stripe_payments import _stripe, is_configured  # noqa: F401 - is_configured re-exported for callers
 
 logger = logging.getLogger(__name__)
+
+
+def _stripe_call(fn, *, action: str):
+    """Runs a Stripe SDK call, translating any stripe.StripeError into a
+    user-facing ValidationError instead of letting it bubble up as an
+    unhandled 500 — mirrors apps.billing.payout_accounts.
+    create_flutterwave_subaccount's own try/except around its provider
+    call. Stripe's own error message (e.g. "you haven't signed up for
+    Connect yet") is almost always more actionable to the caller than a
+    generic one, so it's surfaced directly rather than replaced."""
+    import stripe as stripe_lib
+
+    try:
+        return fn()
+    except stripe_lib.StripeError as exc:
+        message = getattr(exc, "user_message", None) or str(exc) or f"Stripe {action} failed."
+        logger.warning("[Stripe Connect] %s failed: %s", action, message)
+        raise ValidationError({"detail": message})
 
 
 def create_stripe_express_account(*, email: str, country: str = "US") -> str:
@@ -27,15 +46,19 @@ def create_stripe_express_account(*, email: str, country: str = "US") -> str:
     hosts the full onboarding/KYC flow (see create_account_onboarding_link),
     we only need the resulting charges_enabled/payouts_enabled status."""
     stripe = _stripe()
-    account = stripe.Account.create(
-        type="express",
-        country=(country or "US").upper()[:2],
-        email=email or None,
-        capabilities={
-            "card_payments": {"requested": True},
-            "transfers": {"requested": True},
-        },
-    )
+
+    def _create():
+        return stripe.Account.create(
+            type="express",
+            country=(country or "US").upper()[:2],
+            email=email or None,
+            capabilities={
+                "card_payments": {"requested": True},
+                "transfers": {"requested": True},
+            },
+        )
+
+    account = _stripe_call(_create, action="account creation")
     return str(account.id)
 
 
@@ -48,12 +71,16 @@ def create_account_onboarding_link(*, account_id: str, refresh_url: str, return_
     treat status as unconfirmed until account.updated arrives or
     refresh_account_status is called."""
     stripe = _stripe()
-    link = stripe.AccountLink.create(
-        account=account_id,
-        refresh_url=refresh_url,
-        return_url=return_url,
-        type="account_onboarding",
-    )
+
+    def _create_link():
+        return stripe.AccountLink.create(
+            account=account_id,
+            refresh_url=refresh_url,
+            return_url=return_url,
+            type="account_onboarding",
+        )
+
+    link = _stripe_call(_create_link, action="onboarding link creation")
     return str(link.url)
 
 
@@ -65,7 +92,7 @@ def refresh_account_status(account_id: str) -> dict:
     same field names persisted on each payout-holder model, so callers can
     apply it directly."""
     stripe = _stripe()
-    account = stripe.Account.retrieve(account_id)
+    account = _stripe_call(lambda: stripe.Account.retrieve(account_id), action="status refresh")
     return {
         "stripe_charges_enabled": bool(getattr(account, "charges_enabled", False)),
         "stripe_payouts_enabled": bool(getattr(account, "payouts_enabled", False)),
