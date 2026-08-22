@@ -295,6 +295,157 @@ class AccountsDeviceLoginPolicyTests(APITestCase):
         self.assertEqual(rogue.revoke_reason, "unapproved_secondary_device")
 
 
+class AccountsWebPairingTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            phone="+237670000031",
+            password="TestPass123!",
+            country="CM",
+        )
+        self.parent_device = Device.objects.create(
+            user=self.user,
+            device_id="dev_parent",
+            platform="ios",
+            name="Parent iPhone",
+            is_parent=True,
+            last_seen_at=timezone.now(),
+        )
+        self.secondary_device = Device.objects.create(
+            user=self.user,
+            device_id="dev_secondary",
+            platform="android",
+            is_parent=False,
+            linked_via_qr=True,
+            parent_device=self.parent_device,
+            last_seen_at=timezone.now(),
+        )
+
+    def _authed(self, device_id):
+        tokens = issue_tokens_for_user(self.user, device_id=device_id)
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {tokens['access']}",
+            HTTP_X_DEVICE_ID=device_id,
+        )
+
+    def test_parent_device_can_generate_web_pairing_code(self):
+        self._authed("dev_parent")
+
+        response = self.client.get(reverse("device-web-pairing-generate"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("code", response.data)
+        self.assertIn("qr_payload", response.data)
+        self.assertIn("/pair?code=", response.data["qr_payload"])
+        self.assertIn("expires_at", response.data)
+
+    def test_secondary_device_cannot_generate_web_pairing_code(self):
+        self._authed("dev_secondary")
+
+        response = self.client.get(reverse("device-web-pairing-generate"))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(
+            DeviceQRToken.objects.filter(
+                user=self.user, purpose=DeviceQRToken.PURPOSE_WEB_LOGIN,
+            ).exists()
+        )
+
+    def test_web_pairing_redeem_creates_web_device_without_auth(self):
+        _qr_token, code_plain = DeviceQRToken.generate_for_device(
+            self.user, self.parent_device, purpose=DeviceQRToken.PURPOSE_WEB_LOGIN,
+        )
+        self.client.credentials()  # no auth headers — redeem is AllowAny
+
+        response = self.client.post(
+            reverse("device-web-pairing-redeem"),
+            {
+                "code": code_plain,
+                "device_id": "dev_web_1",
+                "device_name": "Chrome on Mac",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.data)
+        web_device = Device.objects.get(user=self.user, device_id="dev_web_1")
+        self.assertEqual(web_device.platform, "web")
+        self.assertFalse(web_device.is_parent)
+        self.assertEqual(web_device.parent_device_id, self.parent_device.id)
+
+    def test_web_pairing_redeem_accepts_lowercase_and_dashed_code(self):
+        _qr_token, code_plain = DeviceQRToken.generate_for_device(
+            self.user, self.parent_device, purpose=DeviceQRToken.PURPOSE_WEB_LOGIN,
+        )
+        dashed_lower = f"{code_plain[:4]}-{code_plain[4:8]}-{code_plain[8:]}".lower()
+        self.client.credentials()
+
+        response = self.client.post(
+            reverse("device-web-pairing-redeem"),
+            {"code": dashed_lower, "device_id": "dev_web_2"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_web_pairing_code_is_single_use(self):
+        _qr_token, code_plain = DeviceQRToken.generate_for_device(
+            self.user, self.parent_device, purpose=DeviceQRToken.PURPOSE_WEB_LOGIN,
+        )
+        self.client.credentials()
+        first = self.client.post(
+            reverse("device-web-pairing-redeem"),
+            {"code": code_plain, "device_id": "dev_web_3"},
+            format="json",
+        )
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+
+        second = self.client.post(
+            reverse("device-web-pairing-redeem"),
+            {"code": code_plain, "device_id": "dev_web_4"},
+            format="json",
+        )
+        self.assertEqual(second.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_web_pairing_redeem_does_not_revoke_other_web_devices(self):
+        _first_token, first_code = DeviceQRToken.generate_for_device(
+            self.user, self.parent_device, purpose=DeviceQRToken.PURPOSE_WEB_LOGIN,
+        )
+        self.client.credentials()
+        self.client.post(
+            reverse("device-web-pairing-redeem"),
+            {"code": first_code, "device_id": "dev_web_a"},
+            format="json",
+        )
+
+        self._authed("dev_parent")
+        second_gen = self.client.get(reverse("device-web-pairing-generate"))
+        second_code = second_gen.data["code"].replace("-", "")
+        self.client.credentials()
+        self.client.post(
+            reverse("device-web-pairing-redeem"),
+            {"code": second_code, "device_id": "dev_web_b"},
+            format="json",
+        )
+
+        first_web_device = Device.objects.get(user=self.user, device_id="dev_web_a")
+        self.assertIsNone(first_web_device.revoked_at)
+
+    def test_web_pairing_phone_link_token_cannot_be_redeemed_as_web_login(self):
+        _qr_token, token_plain = DeviceQRToken.generate_for_device(
+            self.user, self.parent_device, purpose=DeviceQRToken.PURPOSE_PHONE_LINK,
+        )
+        self.client.credentials()
+
+        response = self.client.post(
+            reverse("device-web-pairing-redeem"),
+            {"code": token_plain, "device_id": "dev_web_5"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
 class AccountsSimPrimaryDeviceTests(APITestCase):
     """
     Reinstalling the app wipes the locally stored device_id, so a login from

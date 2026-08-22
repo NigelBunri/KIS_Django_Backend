@@ -41,6 +41,8 @@ from .views import (
     # Multi-device QR login
     DeviceQRGenerateView,
     DeviceQRLoginView,
+    DeviceWebPairingGenerateView,
+    DeviceWebPairingRedeemView,
     TransferParentDeviceView,
     RevokeAllSecondaryView,
     DeviceRenameView,
@@ -104,6 +106,8 @@ urlpatterns = [
     # Specific device sub-paths MUST come before the <str:device_id> wildcard
     path("auth/devices/qr/", DeviceQRGenerateView.as_view(), name="device-qr-generate"),
     path("auth/devices/qr-login/", DeviceQRLoginView.as_view(), name="device-qr-login"),
+    path("auth/devices/web-pairing/", DeviceWebPairingGenerateView.as_view(), name="device-web-pairing-generate"),
+    path("auth/devices/web-pairing/redeem/", DeviceWebPairingRedeemView.as_view(), name="device-web-pairing-redeem"),
     path("auth/devices/transfer-parent/", TransferParentDeviceView.as_view(), name="device-transfer-parent"),
     path("auth/devices/revoke-all-secondary/", RevokeAllSecondaryView.as_view(), name="device-revoke-all-secondary"),
     path("auth/devices/<str:device_id>/rename/", DeviceRenameView.as_view(), name="device-rename"),

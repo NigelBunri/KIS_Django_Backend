@@ -3133,6 +3133,181 @@ class DeviceQRLoginView(APIView):
         )
 
 
+@extend_schema(
+    summary="Generate a web-login pairing code for the parent device",
+    tags=["Auth", "Devices"],
+)
+class DeviceWebPairingGenerateView(APIView):
+    """
+    GET auth/devices/web-pairing/
+    Authenticated by the PARENT device only — a secondary device is refused
+    here (403), which is what enforces "a secondary device may create zero
+    web sessions": there's no other path that can mint a web session.
+    Returns a short-lived (10 min), single-use code as both a scannable QR
+    payload (a kingdomimpactventures.org/pair link) and plain text for
+    manual entry. Unlike phone_link tokens, generating a new one does NOT
+    invalidate other still-valid web_login codes for this device beyond the
+    single-active-code cleanup generate_for_device already does — a primary
+    device is allowed many *redeemed* concurrent web sessions, this view
+    only limits how many *unredeemed* codes can be outstanding at once.
+    """
+    authentication_classes = _QR_JWT_AUTH
+    permission_classes = IS_AUTH
+
+    def get(self, request):
+        device_id = request_device_id(request)
+        if not device_id:
+            return Response({"detail": "X-Device-Id header is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        device = Device.objects.filter(
+            user=request.user,
+            device_id=str(device_id),
+            is_parent=True,
+            revoked_at__isnull=True,
+        ).first()
+        if not device:
+            return Response(
+                {"detail": "Only your primary device can create a web login."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        qr_token, code_plain = DeviceQRToken.generate_for_device(
+            request.user, device, purpose=DeviceQRToken.PURPOSE_WEB_LOGIN,
+        )
+        formatted_code = f"{code_plain[:4]}-{code_plain[4:8]}-{code_plain[8:]}"
+        pairing_url = f"{settings.KIS_WEBSITE_PUBLIC_BASE_URL}/pair?code={code_plain}"
+        AuditLog.log(
+            actor=request.user,
+            action="device.web_pairing_generated",
+            meta={"parent_device_id": device_id},
+        )
+        return Response(
+            {
+                "code": formatted_code,
+                "qr_payload": pairing_url,
+                "expires_at": qr_token.expires_at.isoformat(),
+                "nonce": qr_token.nonce,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class _WebPairingRedeemSerializer(serializers.Serializer):
+    code = serializers.CharField()
+    device_id = serializers.CharField()
+    device_name = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+@extend_schema(
+    summary="Redeem a web-login pairing code (browser)",
+    tags=["Auth", "Devices"],
+)
+class DeviceWebPairingRedeemView(APIView):
+    """
+    POST auth/devices/web-pairing/redeem/
+    No auth required — called by the website itself (server-side, from its
+    own login route) with the code the user typed or arrived with via the
+    scanned QR link. On success, returns JWT tokens for a NEW platform="web"
+    Device. Deliberately does not revoke any other web device — a primary
+    account may have many concurrent web sessions, unlike the single-web-
+    session behavior of the password/OTP web login path.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        ser = _WebPairingRedeemSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        code_plain = data["code"]
+        device_id = data["device_id"].strip()
+        device_name = (data.get("device_name") or "").strip() or None
+
+        qr_token = DeviceQRToken.consume(code_plain, purpose=DeviceQRToken.PURPOSE_WEB_LOGIN)
+        if not qr_token:
+            return Response({"detail": "Invalid or expired code."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Re-check the generating device is still the active parent at
+        # redemption time — it may have been demoted/revoked in the minutes
+        # between code generation and redemption.
+        if not qr_token.parent_device or not Device.objects.filter(
+            id=qr_token.parent_device_id, is_parent=True, revoked_at__isnull=True,
+        ).exists():
+            return Response(
+                {"detail": "This code is no longer valid."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        user = qr_token.user
+        now = timezone.now()
+
+        with transaction.atomic():
+            existing = (
+                Device.objects.select_for_update()
+                .filter(user=user, device_id=str(device_id))
+                .first()
+            )
+            token_version = (
+                (existing.token_version + 1) if existing and existing.revoked_at
+                else (existing.token_version if existing else 1)
+            )
+            device, _ = Device.objects.update_or_create(
+                user=user,
+                device_id=str(device_id),
+                defaults={
+                    "platform": "web",
+                    "name": device_name,
+                    "last_seen_at": now,
+                    "last_ip": request.META.get("REMOTE_ADDR"),
+                    "user_agent": request.META.get("HTTP_USER_AGENT"),
+                    "token_version": token_version,
+                    "revoked_at": None,
+                    "revoke_reason": "",
+                    "is_parent": False,
+                    "linked_via_qr": True,
+                    "parent_device": qr_token.parent_device,
+                },
+            )
+            qr_token.used_by_device = device
+            qr_token.save(update_fields=["used_by_device"])
+
+        tokens = issue_tokens_for_user(user, device_id=device_id)
+
+        AuditLog.log(
+            actor=user,
+            action="device.web_pairing_redeemed",
+            meta={
+                "linked_device_id": device_id,
+                "parent_device_id": str(qr_token.parent_device.device_id),
+            },
+        )
+
+        _send_push_to_device(
+            user,
+            qr_token.parent_device,
+            title="Signed in on the web",
+            body=f"New web session started: {device_name or 'a browser'}",
+            dedup_key=f"device.linked:web_pairing:{qr_token.id}",
+        )
+
+        return Response(
+            {
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
+                "token_type": "Bearer",
+                "user": {
+                    "id": user.id,
+                    "phone": getattr(user, "phone", None),
+                    "status": getattr(user, "status", "active"),
+                    "is_active": user.is_active,
+                    "device_id": device_id,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class _TransferParentSerializer(serializers.Serializer):
     target_device_id = serializers.CharField()
 
