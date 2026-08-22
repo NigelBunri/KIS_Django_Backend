@@ -340,3 +340,8 @@ register_purpose("education_material", _PurposeSpec(
     target_types=("broadcasts.EducationInstitutionMaterial",), allow_attach=False,
     visibility_class="restricted",
 ))
+register_purpose("testimony_media", _PurposeSpec(
+    context="testimony", moderation_context="testimony", retention_days=None,
+    target_types=("testimony.UserTestimony",), allow_attach=False,
+    visibility_class="restricted",
+))

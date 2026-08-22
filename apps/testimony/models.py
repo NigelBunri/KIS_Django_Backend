@@ -20,6 +20,12 @@ VISIBILITY_CHOICES = [
     ("private",          "Private"),
 ]
 
+MEDIA_KIND_CHOICES = [
+    ("none",  "None"),
+    ("video", "Video"),
+    ("file",  "File"),
+]
+
 
 class UserSeason(models.Model):
     """Something a user is currently going through and is open about."""
@@ -48,6 +54,16 @@ class UserTestimony(models.Model):
     story = models.TextField(blank=True, default="")
     is_available = models.BooleanField(default=True, help_text="Willing to be contacted about this")
     endorsement_count = models.PositiveIntegerField(default=0)
+    # Optional single attachment — uploaded via the direct-to-S3
+    # initiate/confirm/attach flow (apps.media.upload_intent), same pattern
+    # as EducationInstitutionMaterial. resource_url stores a private S3
+    # object key ("private/testimony/media/<user>/<uuid>.<ext>"), never a
+    # client-pasted external link — resolve display URLs through
+    # UserTestimonySerializer.safe_resource_url, never this raw field.
+    media_kind = models.CharField(max_length=10, choices=MEDIA_KIND_CHOICES, default="none")
+    resource_url = models.URLField(blank=True, default="")
+    resource_name = models.CharField(max_length=255, blank=True, default="")
+    resource_mime_type = models.CharField(max_length=100, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

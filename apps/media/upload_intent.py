@@ -171,6 +171,26 @@ def _education_material_max_bytes() -> int:
     return int(getattr(settings, "EDUCATION_MATERIAL_MAX_UPLOAD_BYTES", 5 * 1024 * 1024 * 1024))
 
 
+def _testimony_media_allowed_content_types() -> set[str]:
+    configured = getattr(settings, "TESTIMONY_MEDIA_ALLOWED_CONTENT_TYPES", "")
+    values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
+    return values or {
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+
+
+def _testimony_media_max_bytes() -> int:
+    return int(getattr(settings, "TESTIMONY_MEDIA_MAX_UPLOAD_BYTES", 2 * 1024 * 1024 * 1024))
+
+
 @dataclass(frozen=True)
 class UploadContextConfig:
     allowed_content_types: Callable[[], set[str]]
@@ -269,6 +289,11 @@ UPLOAD_CONTEXTS: dict[str, UploadContextConfig] = {
         allowed_content_types=_education_material_allowed_content_types,
         max_bytes=_education_material_max_bytes,
         key_prefix="education/material",
+    ),
+    "testimony_media": UploadContextConfig(
+        allowed_content_types=_testimony_media_allowed_content_types,
+        max_bytes=_testimony_media_max_bytes,
+        key_prefix="testimony/media",
     ),
 }
 
@@ -718,6 +743,7 @@ ATTACH_HANDLERS: dict[str, Callable[[MediaUploadIntent], dict]] = {
     "education_institution_logo": _confirm_only_media_descriptor,
     "education_module_cover_image": _confirm_only_media_descriptor,
     "education_material": _confirm_only_media_descriptor,
+    "testimony_media": _confirm_only_media_descriptor,
 }
 
 
