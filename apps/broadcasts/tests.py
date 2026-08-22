@@ -4076,3 +4076,88 @@ class EducationInstitutionManagementDetailAccessControlTests(APITestCase):
     def test_unauthenticated_request_is_rejected(self):
         response = self.client.get(self._lesson_detail_url())
         self.assertIn(response.status_code, (401, 403))
+
+
+class EducationContentDetailProgressAccessSignalTests(APITestCase):
+    """Regression coverage for the second half of the same reported bug:
+    the student-facing /api/v1/education/contents/{id}/ booking-details
+    screen was flashing the full paid-lesson reader UI open for a
+    non-enrolled viewer before redirecting to checkout. The `content`
+    outline itself was already correctly sanitized
+    (resource_url/content blanked), but this endpoint unconditionally
+    returned a populated `progress`/`insights`/`current_item` object
+    regardless of access — the RN app read Boolean(progress) as an
+    implicit "this viewer is enrolled" signal, unlocking the reader UI
+    on that false signal alone. Every field on the response root that
+    could be read as that signal must be null for a non-access viewer,
+    and still populated for a genuinely enrolled one."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5558800201', username='progress_signal_owner', password='secret', country='NG',
+        )
+        self.learner = User.objects.create_user(
+            phone='5558800202', username='progress_signal_learner', password='secret', country='NG',
+        )
+        self.institution = EducationInstitution.objects.create(
+            owner=self.owner, name='Signal Academy', description='Paid content lives here.',
+            payout_account_status=EducationInstitutionPayoutAccountStatus.ACTIVE,
+            flutterwave_subaccount_id='RS_TEST_SIGNAL',
+        )
+        self.course = EducationInstitutionCourse.objects.create(
+            institution=self.institution, title='Paid Curriculum', status='published',
+            price_amount='49.00', price_currency='USD',
+        )
+        self.broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=self.institution,
+            created_by=self.owner,
+            broadcast_kind='course',
+            course=self.course,
+            title='Paid Curriculum',
+            summary='Should not unlock without payment.',
+            booking_enabled=True,
+            price_amount='49.00',
+            price_currency='USD',
+            status='published',
+        )
+        EducationInstitutionMembership.objects.create(
+            institution=self.institution, user=self.learner,
+            role=EducationInstitutionMembershipRole.STUDENT,
+            status=EducationInstitutionMembershipStatus.ACTIVE,
+        )
+
+    def _content_detail_url(self):
+        return f'/api/v1/education/contents/{self.broadcast.id}/'
+
+    def test_non_enrolled_viewer_gets_no_progress_access_signal(self):
+        self.client.force_authenticate(self.learner)
+        response = self.client.get(self._content_detail_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIsNone(response.data['progress'])
+        self.assertIsNone(response.data['insights'])
+        self.assertIsNone(response.data['current_item'])
+        self.assertIsNone(response.data['current_module'])
+        self.assertIsNone(response.data['next_item'])
+        self.assertFalse(response.data['certificate']['ready'])
+        self.assertEqual(response.data['certificate']['certificateId'], '')
+
+    def test_enrolled_viewer_still_gets_real_progress(self):
+        EducationInstitutionEnrollment.objects.create(
+            institution=self.institution,
+            broadcast=self.broadcast,
+            course=self.course,
+            user=self.learner,
+            status='enrolled',
+        )
+        self.client.force_authenticate(self.learner)
+        response = self.client.get(self._content_detail_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIsNotNone(response.data['progress'])
+        self.assertIsNotNone(response.data['insights'])
+
+    def test_pending_enroll_tap_does_not_return_progress_access_signal(self):
+        self.client.force_authenticate(self.learner)
+        response = self.client.post(f'{self._content_detail_url()}enroll/', {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIsNone(response.data['progress'])

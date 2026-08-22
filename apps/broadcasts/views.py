@@ -2788,6 +2788,17 @@ def _sanitize_learning_item_content_for_public_preview(
         content["questions"] = []
     elif item_type == EducationCourseModuleItemType.EVENT:
         content["meeting_url"] = ""
+    elif item_type == EducationCourseModuleItemType.BROADCAST:
+        # _module_item_content_payload's broadcast branch only returns
+        # broadcast_id/broadcast_kind/starts_at/ends_at/booking_enabled
+        # today (no URL fields), so this is currently a no-op — but
+        # blanking these defensively means a future meeting_url/
+        # recording_url/resource_url added to that branch is redacted
+        # here automatically rather than by remembering to update this
+        # function too.
+        for sensitive_key in ("meeting_url", "recording_url", "resource_url"):
+            if sensitive_key in content:
+                content[sensitive_key] = ""
     next_item["content"] = content
     return next_item
 
@@ -3021,6 +3032,10 @@ def _build_public_education_content_detail(
     )
     progress_payload = _build_learning_progress_payload(broadcast, course_outline, enrollment)
     insights_payload = _build_public_learning_insights(broadcast, course_outline, enrollment, progress_payload)
+    # progress_payload/insights_payload themselves stay real dicts for the
+    # rest of this function (certificate/offline/trust summaries below
+    # read from them) — only what actually goes back to the client is
+    # nulled out below, right before the response is built.
     enrollment_metadata = enrollment.metadata or {} if enrollment else {}
     institution_summary = _build_public_institution_summary(institution, request)
     trust_signals = _build_public_content_trust_signals(broadcast, course_outline)
@@ -3146,18 +3161,30 @@ def _build_public_education_content_detail(
         detail_item["locationText"] = broadcast.event.location_text
         detail_item["meetingUrl"] = broadcast.event.meeting_url
         detail_item["seatLimit"] = broadcast.event.seat_limit
+    # progress_payload/insights_payload are always populated dicts (never
+    # None) even for a viewer with zero enrollment — their currentItem/
+    # nextItem are already content-sanitized (built from the sanitized
+    # course_outline above), so nothing sensitive leaks through the values
+    # themselves either way. But a populated "progress"/"current_item"
+    # object was being read client-side as an implicit "this viewer has
+    # access" signal, causing the paid-content reader UI to unlock for
+    # non-enrolled viewers even though the actual resource_url/content
+    # fields inside it were empty strings. Every field below that could be
+    # read as that signal is nulled out for a non-access viewer at the
+    # response root, instead of relying on every client to never make this
+    # mistake.
     return {
         "content": detail_item,
-        "progress": progress_payload,
-        "insights": insights_payload,
+        "progress": progress_payload if has_learning_access else None,
+        "insights": insights_payload if has_learning_access else None,
         "certificate": {
-            "ready": bool(insights_payload.get("certificateReady")),
-            "certificateId": str(enrollment_metadata.get("certificate_id") or ""),
-            "issuedAt": enrollment_metadata.get("certificate_issued_at"),
+            "ready": bool(insights_payload.get("certificateReady")) if has_learning_access else False,
+            "certificateId": str(enrollment_metadata.get("certificate_id") or "") if has_learning_access else "",
+            "issuedAt": enrollment_metadata.get("certificate_issued_at") if has_learning_access else None,
         },
-        "current_item": progress_payload.get("currentItem"),
-        "current_module": progress_payload.get("currentModule"),
-        "next_item": progress_payload.get("nextItem"),
+        "current_item": progress_payload.get("currentItem") if has_learning_access else None,
+        "current_module": progress_payload.get("currentModule") if has_learning_access else None,
+        "next_item": progress_payload.get("nextItem") if has_learning_access else None,
         "reviews": EducationCourseReviewSerializer(
             broadcast.course_reviews.select_related("user").filter(status=EducationCourseReviewStatus.APPROVED)[:20],
             many=True,
@@ -12705,6 +12732,14 @@ class EducationContentEnrollmentView(APIView):
                 has_learning_access=has_learning_access,
             )
             progress_payload = _build_learning_progress_payload(broadcast, outline, enrollment)
+            if not has_learning_access:
+                # See the matching null-out in
+                # _build_public_education_content_detail — a populated
+                # progress object was being read client-side as an
+                # implicit access-granted signal, so a PENDING (tapped
+                # "Enroll" but never paid) enrollment must not return one
+                # here either.
+                progress_payload = None
             return Response(
                 {
                     "enrollmentId": str(booking.id),
