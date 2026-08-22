@@ -2018,40 +2018,59 @@ class PromoCodeViewSet(viewsets.ModelViewSet):
 
 
 def _sync_stripe_connect_account_status(account_obj: dict) -> None:
-    """account.updated is the authoritative sync point for Stripe Connect
-    status (per Stripe's own guidance — poll/webhook, never trust a
-    client's claim of "onboarding finished"). account_obj.id (`acct_...`)
-    is looked up across all four payout-holder tables since the webhook
-    itself carries no target_type/target_id metadata (Stripe doesn't
-    attach ours to Account objects) — each table's stripe_account_id is
-    unique enough in practice that at most one row across all four will
-    ever match a given account id."""
+    """account.updated is the sync TRIGGER for Stripe Connect status, but
+    not the source of truth for its fields — it's the legacy v1 webhook
+    shape (flat charges_enabled/payouts_enabled/details_submitted
+    booleans), and accounts here are created via the v2 Accounts API
+    with a "recipient" configuration (see apps.billing.stripe_connect),
+    whose real capability status lives in a differently-shaped
+    configuration.recipient.capabilities tree. Whether Stripe backfills
+    those legacy v1 fields meaningfully for a v2-native recipient account
+    isn't something to rely on, so this only takes the account id off the
+    webhook payload and re-fetches authoritative status via
+    refresh_account_status (the same v2 GET call the manual "Refresh
+    status" UI action uses) rather than trusting the payload's own
+    fields — matching how verify_flutterwave_transaction is the only
+    trusted source for Flutterwave, never a callback's own claim.
+    account_obj.id (`acct_...`) is looked up across all four
+    payout-holder tables since the webhook itself carries no
+    target_type/target_id metadata (Stripe doesn't attach ours to
+    Account objects) — each table's stripe_account_id is unique enough
+    in practice that at most one row across all four will ever match a
+    given account id."""
     account_id = str(account_obj.get("id") or "")
     if not account_id:
         return
-
-    fields = {
-        "stripe_charges_enabled": bool(account_obj.get("charges_enabled", False)),
-        "stripe_payouts_enabled": bool(account_obj.get("payouts_enabled", False)),
-        "stripe_details_submitted": bool(account_obj.get("details_submitted", False)),
-    }
 
     from apps.broadcasts.models import BroadcastChannel, EducationInstitution
     from apps.commerce.models import Shop
     from apps.health_ops.models import HealthInstitution
 
+    entity = None
+    model_name = ""
     for model in (Shop, EducationInstitution, HealthInstitution, BroadcastChannel):
         entity = model.objects.filter(stripe_account_id=account_id).first()
-        if entity is None:
-            continue
-        for field_name, value in fields.items():
-            setattr(entity, field_name, value)
-        entity.save(update_fields=[*fields.keys(), "updated_at"])
-        logger.info(
-            "[Stripe] account.updated synced %s id=%s charges_enabled=%s payouts_enabled=%s",
-            model.__name__, entity.id, fields["stripe_charges_enabled"], fields["stripe_payouts_enabled"],
-        )
+        if entity is not None:
+            model_name = model.__name__
+            break
+    if entity is None:
         return
+
+    from apps.billing.stripe_connect import refresh_account_status
+
+    try:
+        fields = refresh_account_status(account_id)
+    except Exception:
+        logger.exception("[Stripe] account.updated: status refresh failed for account_id=%s", account_id)
+        return
+
+    for field_name, value in fields.items():
+        setattr(entity, field_name, value)
+    entity.save(update_fields=[*fields.keys(), "updated_at"])
+    logger.info(
+        "[Stripe] account.updated synced %s id=%s charges_enabled=%s payouts_enabled=%s",
+        model_name, entity.id, fields["stripe_charges_enabled"], fields["stripe_payouts_enabled"],
+    )
 
 
 class StripeWebhookView(APIView):

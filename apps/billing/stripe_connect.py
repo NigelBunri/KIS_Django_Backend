@@ -1,5 +1,5 @@
 # apps/billing/stripe_connect.py
-"""Stripe Connect (Express accounts) — the Stripe-side counterpart to
+"""Stripe Connect account management — the Stripe-side counterpart to
 apps.billing.payout_accounts' Flutterwave subaccount helpers. Shared by
 every seller/provider payout-account connect endpoint (Market, Education,
 Health, Broadcast), same as the Flutterwave helper is. Only the
@@ -9,94 +9,190 @@ provide or store a provider secret key. A connected account's id
 ever persisted by callers; Stripe holds all sensitive KYC/bank data on
 its own onboarding-hosted pages, none of it ever passes through our
 backend.
+
+Uses Stripe's Accounts v2 API (POST /v2/core/accounts) directly via raw
+HTTP, NOT the `stripe` Python SDK's v1 `stripe.Account.*` resource
+methods — Stripe now rejects v1 account creation for new Connect
+integrations ("Stripe no longer recommends Accounts v1 for new Connect
+integrations"), and the pinned SDK version in requirements.txt (12.2.0)
+has no Python bindings for v2 Accounts yet (confirmed: `stripe.v2.core`
+exists but has no `Account`/`AccountService`). Raw HTTP against Stripe's
+documented, stable v2 REST endpoints — the same `requests`-based pattern
+already used for Flutterwave in payout_accounts.py — avoids depending on
+whichever version of SDK bindings happens to exist, so this doesn't need
+another rewrite the next time the SDK lags the API.
+
+KIS uses Stripe's "recipient" account configuration specifically (not
+"merchant"): sellers here only ever RECEIVE a transferred share of a
+charge the platform's own account processes (Destination Charges — see
+apps.billing.direct_payments._create_stripe_checkout_session's
+transfer_data/application_fee_amount), they never process their own
+card charges directly, so the merchant persona doesn't apply. The
+relevant v2 capability is `stripe_balance.stripe_transfers`.
+
+Payments themselves (PaymentIntent, Checkout Session, webhook signature
+verification) are UNAFFECTED by any of this and keep using the `stripe`
+SDK's v1 methods in stripe_payments.py — only Account creation was
+deprecated, v1 payment endpoints remain fully supported indefinitely and
+work identically against v2-created connected accounts (that's the
+explicit interoperability point of the v2 Accounts redesign).
 """
 from __future__ import annotations
 
 import logging
 
+import requests
 from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
-from .stripe_payments import _stripe, is_configured  # noqa: F401 - is_configured re-exported for callers
+from .stripe_payments import is_configured  # noqa: F401 - re-exported for callers
 
 logger = logging.getLogger(__name__)
 
+STRIPE_API_BASE = "https://api.stripe.com"
+# Pinned Stripe API version for all v2 calls — v2 endpoints don't fall
+# back to an account-level default version the way v1 does, so every
+# request must name one explicitly. Bump deliberately (test in sandbox
+# first) rather than following "latest" automatically.
+STRIPE_API_VERSION = "2026-07-29.dahlia"
 
-def _stripe_call(fn, *, action: str):
-    """Runs a Stripe SDK call, translating any stripe.StripeError into a
-    user-facing ValidationError instead of letting it bubble up as an
-    unhandled 500 — mirrors apps.billing.payout_accounts.
-    create_flutterwave_subaccount's own try/except around its provider
-    call. Stripe's own error message (e.g. "you haven't signed up for
-    Connect yet") is almost always more actionable to the caller than a
-    generic one, so it's surfaced directly rather than replaced."""
-    import stripe as stripe_lib
 
+def _stripe_v2_headers() -> dict[str, str]:
+    secret = getattr(settings, "STRIPE_SECRET_KEY", "") or ""
+    if not secret:
+        raise RuntimeError("STRIPE_SECRET_KEY is not configured.")
+    return {
+        "Authorization": f"Bearer {secret}",
+        "Stripe-Version": STRIPE_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _v2_request(method: str, path: str, *, action: str, json_body: dict | None = None, params=None) -> dict:
+    """Raises ValidationError with Stripe's own error message on any
+    failure (provider not configured, network failure, provider
+    rejection, or a malformed response) — mirrors
+    apps.billing.payout_accounts.create_flutterwave_subaccount's error
+    handling exactly, so every payout-connect endpoint fails the same
+    clean way regardless of provider."""
     try:
-        return fn()
-    except stripe_lib.StripeError as exc:
-        message = getattr(exc, "user_message", None) or str(exc) or f"Stripe {action} failed."
-        logger.warning("[Stripe Connect] %s failed: %s", action, message)
+        response = requests.request(
+            method,
+            f"{STRIPE_API_BASE}{path}",
+            json=json_body,
+            params=params,
+            headers=_stripe_v2_headers(),
+            timeout=30,
+        )
+        payload = response.json() if response.content else {}
+    except (requests.RequestException, ValueError) as exc:
+        raise ValidationError({"detail": f"Could not reach Stripe: {exc}"})
+
+    if response.status_code >= 400:
+        message = (payload.get("error") or {}).get("message") or f"Stripe {action} failed."
+        logger.warning("[Stripe Connect v2] %s failed: %s", action, message)
         raise ValidationError({"detail": message})
+    return payload
 
 
 def create_stripe_express_account(*, email: str, country: str = "US") -> str:
-    """Creates a new Stripe Express connected account and returns its id.
-    Express (not Standard/Custom) matches the platform's needs: Stripe
-    hosts the full onboarding/KYC flow (see create_account_onboarding_link),
-    we only need the resulting charges_enabled/payouts_enabled status."""
-    stripe = _stripe()
-
-    def _create():
-        return stripe.Account.create(
-            type="express",
-            country=(country or "US").upper()[:2],
-            email=email or None,
-            capabilities={
-                "card_payments": {"requested": True},
-                "transfers": {"requested": True},
+    """Creates a new Stripe v2 Account configured as a "recipient" (can
+    receive transfers into a Stripe balance) and returns its id.
+    dashboard="express" gives the seller a self-serve hosted dashboard to
+    check their payout status — Express dashboard access requires the
+    platform (not Stripe) to be the fees/losses collector, which is what
+    responsibilities.fees_collector/losses_collector="application" below
+    declares."""
+    body = {
+        "contact_email": email or None,
+        "dashboard": "express",
+        "configuration": {
+            "recipient": {
+                "capabilities": {
+                    "stripe_balance": {"stripe_transfers": {"requested": True}},
+                },
             },
-        )
-
-    account = _stripe_call(_create, action="account creation")
-    return str(account.id)
+        },
+        "defaults": {
+            "responsibilities": {"fees_collector": "application", "losses_collector": "application"},
+        },
+        "identity": {"country": (country or "US").lower()},
+        "include": ["configuration.recipient"],
+    }
+    data = _v2_request("POST", "/v2/core/accounts", action="account creation", json_body=body)
+    account_id = str(data.get("id") or "")
+    if not account_id:
+        raise ValidationError({"detail": "Stripe did not return an account id."})
+    return account_id
 
 
 def create_account_onboarding_link(*, account_id: str, refresh_url: str, return_url: str) -> str:
-    """Returns a one-time-use hosted onboarding URL for this Express
-    account. refresh_url is where Stripe sends the user back to if the
-    link expires or onboarding needs to restart; return_url is where they
-    land after completing (or abandoning) the flow — neither implies
-    onboarding actually finished, which is why the caller should still
-    treat status as unconfirmed until account.updated arrives or
-    refresh_account_status is called."""
-    stripe = _stripe()
-
-    def _create_link():
-        return stripe.AccountLink.create(
-            account=account_id,
-            refresh_url=refresh_url,
-            return_url=return_url,
-            type="account_onboarding",
-        )
-
-    link = _stripe_call(_create_link, action="onboarding link creation")
-    return str(link.url)
+    """Returns a one-time-use hosted onboarding URL for this account via
+    the v2 Account Links API (POST /v2/core/account_links — a v2-native
+    endpoint, not the older v1 /v1/account_links, since it natively
+    understands v2 configurations like "recipient"). refresh_url is
+    where Stripe sends the user back to if the link expires or
+    onboarding needs to restart; return_url is where they land after
+    completing (or abandoning) the flow — neither implies onboarding
+    actually finished, which is why the caller should still treat status
+    as unconfirmed until refresh_account_status is called."""
+    body = {
+        "account": account_id,
+        "use_case": {
+            "type": "account_onboarding",
+            "account_onboarding": {
+                "configurations": ["recipient"],
+                "return_url": return_url,
+                "refresh_url": refresh_url,
+            },
+        },
+    }
+    data = _v2_request("POST", "/v2/core/account_links", action="onboarding link creation", json_body=body)
+    url = str(data.get("url") or "")
+    if not url:
+        raise ValidationError({"detail": "Stripe did not return an onboarding URL."})
+    return url
 
 
 def refresh_account_status(account_id: str) -> dict:
     """Authoritative status check — queries Stripe directly rather than
-    trusting anything the frontend or a redirect landing page claims,
-    matching how apps.billing.direct_payments.verify_flutterwave_transaction
-    is the only trusted source for Flutterwave. Returns a dict with the
-    same field names persisted on each payout-holder model, so callers can
-    apply it directly."""
-    stripe = _stripe()
-    account = _stripe_call(lambda: stripe.Account.retrieve(account_id), action="status refresh")
+    trusting anything the frontend, a redirect landing page, or a
+    webhook payload claims, matching how
+    apps.billing.direct_payments.verify_flutterwave_transaction is the
+    only trusted source for Flutterwave. Returns a dict with the same
+    field names persisted on each payout-holder model, so callers can
+    apply it directly.
+
+    stripe_charges_enabled and stripe_payouts_enabled are both mapped to
+    the same underlying capability (stripe_balance.stripe_transfers) —
+    for a recipient-only account there's one capability that actually
+    matters to KIS: can this account receive a destination-charge
+    transfer at all. That's a deliberate simplification versus v1's
+    separate charges_enabled/payouts_enabled booleans (which meant
+    something different for merchant-persona accounts); a future
+    integration that also needs real bank-payout-method status would
+    extend this rather than change what these two fields mean elsewhere
+    in the codebase.
+    """
+    data = _v2_request(
+        "GET",
+        f"/v2/core/accounts/{account_id}",
+        action="status refresh",
+        params=[("include[]", "configuration.recipient"), ("include[]", "requirements")],
+    )
+    capability = (
+        (data.get("configuration") or {})
+        .get("recipient", {})
+        .get("capabilities", {})
+        .get("stripe_balance", {})
+        .get("stripe_transfers", {})
+    )
+    ready = capability.get("status") == "active"
+    currently_due = (data.get("requirements") or {}).get("currently_due") or []
     return {
-        "stripe_charges_enabled": bool(getattr(account, "charges_enabled", False)),
-        "stripe_payouts_enabled": bool(getattr(account, "payouts_enabled", False)),
-        "stripe_details_submitted": bool(getattr(account, "details_submitted", False)),
+        "stripe_charges_enabled": ready,
+        "stripe_payouts_enabled": ready,
+        "stripe_details_submitted": len(currently_due) == 0,
     }
 
 

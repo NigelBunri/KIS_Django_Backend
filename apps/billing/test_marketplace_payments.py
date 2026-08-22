@@ -10,8 +10,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.test import APIClient
 
 from apps.billing.eligibility import EligibilityResult, PaymentSetupRequiredError, can_receive_payments
@@ -139,29 +140,46 @@ class DirectPaymentIntentBackstopTests(TestCase):
         self.assertEqual(intent.amount_cents, 2500)
 
 
+def _fake_v2_response(status_code: int, json_body: dict):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.content = b"{}"
+    resp.json.return_value = json_body
+    return resp
+
+
 class StripeConnectTests(TestCase):
     """create_stripe_express_account/create_account_onboarding_link/
-    refresh_account_status wrap the Stripe SDK — mock the SDK itself
-    rather than hit the network, mirroring how apps.billing.stripe_payments
-    is tested elsewhere in this codebase."""
+    refresh_account_status hit Stripe's v2 REST API directly via
+    `requests` (the stripe SDK has no v2 Accounts bindings yet) — mock
+    requests.request rather than hit the network, mirroring how
+    apps.billing.payout_accounts' Flutterwave calls are tested
+    elsewhere in this codebase."""
 
     def test_create_stripe_express_account_returns_id(self):
         from apps.billing import stripe_connect
 
-        fake_stripe = MagicMock()
-        fake_stripe.Account.create.return_value = SimpleNamespace(id="acct_new123")
-        with patch.object(stripe_connect, "_stripe", return_value=fake_stripe):
+        with override_settings(STRIPE_SECRET_KEY="sk_test_fake"), patch(
+            "apps.billing.stripe_connect.requests.request",
+            return_value=_fake_v2_response(200, {"id": "acct_new123"}),
+        ) as mocked_request:
             account_id = stripe_connect.create_stripe_express_account(email="seller@example.com", country="US")
         self.assertEqual(account_id, "acct_new123")
-        fake_stripe.Account.create.assert_called_once()
-        self.assertEqual(fake_stripe.Account.create.call_args.kwargs["type"], "express")
+        mocked_request.assert_called_once()
+        call = mocked_request.call_args
+        self.assertEqual(call.args[0], "POST")
+        self.assertTrue(call.args[1].endswith("/v2/core/accounts"))
+        body = call.kwargs["json"]
+        self.assertEqual(body["dashboard"], "express")
+        self.assertIn("recipient", body["configuration"])
 
     def test_create_account_onboarding_link_returns_url(self):
         from apps.billing import stripe_connect
 
-        fake_stripe = MagicMock()
-        fake_stripe.AccountLink.create.return_value = SimpleNamespace(url="https://connect.stripe.com/setup/xyz")
-        with patch.object(stripe_connect, "_stripe", return_value=fake_stripe):
+        with override_settings(STRIPE_SECRET_KEY="sk_test_fake"), patch(
+            "apps.billing.stripe_connect.requests.request",
+            return_value=_fake_v2_response(200, {"url": "https://connect.stripe.com/setup/xyz"}),
+        ):
             url = stripe_connect.create_account_onboarding_link(
                 account_id="acct_new123", refresh_url="https://kis.app/refresh", return_url="https://kis.app/return",
             )
@@ -170,16 +188,55 @@ class StripeConnectTests(TestCase):
     def test_refresh_account_status_maps_fields(self):
         from apps.billing import stripe_connect
 
-        fake_stripe = MagicMock()
-        fake_stripe.Account.retrieve.return_value = SimpleNamespace(
-            charges_enabled=True, payouts_enabled=False, details_submitted=True,
-        )
-        with patch.object(stripe_connect, "_stripe", return_value=fake_stripe):
+        v2_payload = {
+            "configuration": {
+                "recipient": {
+                    "capabilities": {"stripe_balance": {"stripe_transfers": {"status": "active"}}},
+                },
+            },
+            "requirements": {"currently_due": []},
+        }
+        with override_settings(STRIPE_SECRET_KEY="sk_test_fake"), patch(
+            "apps.billing.stripe_connect.requests.request",
+            return_value=_fake_v2_response(200, v2_payload),
+        ):
             fields = stripe_connect.refresh_account_status("acct_new123")
         self.assertEqual(
             fields,
-            {"stripe_charges_enabled": True, "stripe_payouts_enabled": False, "stripe_details_submitted": True},
+            {"stripe_charges_enabled": True, "stripe_payouts_enabled": True, "stripe_details_submitted": True},
         )
+
+    def test_refresh_account_status_not_ready_when_capability_pending(self):
+        from apps.billing import stripe_connect
+
+        v2_payload = {
+            "configuration": {
+                "recipient": {
+                    "capabilities": {"stripe_balance": {"stripe_transfers": {"status": "pending"}}},
+                },
+            },
+            "requirements": {"currently_due": [{"requirement": "individual.id_number"}]},
+        }
+        with override_settings(STRIPE_SECRET_KEY="sk_test_fake"), patch(
+            "apps.billing.stripe_connect.requests.request",
+            return_value=_fake_v2_response(200, v2_payload),
+        ):
+            fields = stripe_connect.refresh_account_status("acct_new123")
+        self.assertEqual(
+            fields,
+            {"stripe_charges_enabled": False, "stripe_payouts_enabled": False, "stripe_details_submitted": False},
+        )
+
+    def test_stripe_error_response_raises_validation_error_with_stripe_message(self):
+        from apps.billing import stripe_connect
+
+        with override_settings(STRIPE_SECRET_KEY="sk_test_fake"), patch(
+            "apps.billing.stripe_connect.requests.request",
+            return_value=_fake_v2_response(400, {"error": {"message": "Accounts v2 is not enabled for your merchant."}}),
+        ):
+            with self.assertRaises(ValidationError) as ctx:
+                stripe_connect.create_stripe_express_account(email="seller@example.com")
+        self.assertIn("Accounts v2 is not enabled", str(ctx.exception.detail["detail"]))
 
 
 class StripeConnectWebhookSyncTests(TestCase):
@@ -195,9 +252,22 @@ class StripeConnectWebhookSyncTests(TestCase):
         shop = Shop.objects.create(
             owner=owner, name="Webhook Shop", slug="webhook-shop", stripe_account_id="acct_webhook123",
         )
-        _sync_stripe_connect_account_status(
-            {"id": "acct_webhook123", "charges_enabled": True, "payouts_enabled": True, "details_submitted": True}
-        )
+        # The webhook payload's own legacy-shaped fields (charges_enabled
+        # etc.) are deliberately NOT what drives the sync — only the
+        # account id is taken off it; the real status comes from a fresh
+        # refresh_account_status call, matching how a redirect landing
+        # page is never trusted either. False here (contradicting what a
+        # real webhook might send) proves that.
+        with patch(
+            "apps.billing.stripe_connect.refresh_account_status",
+            return_value={
+                "stripe_charges_enabled": True,
+                "stripe_payouts_enabled": True,
+                "stripe_details_submitted": True,
+            },
+        ) as mocked_refresh:
+            _sync_stripe_connect_account_status({"id": "acct_webhook123", "charges_enabled": False})
+        mocked_refresh.assert_called_once_with("acct_webhook123")
         shop.refresh_from_db()
         self.assertTrue(shop.stripe_charges_enabled)
         self.assertTrue(shop.stripe_payouts_enabled)
@@ -209,7 +279,11 @@ class StripeConnectWebhookSyncTests(TestCase):
         # No entity anywhere has this account id — should no-op silently,
         # not raise, since Stripe will send account.updated events for
         # accounts this platform doesn't recognize under some setups.
-        _sync_stripe_connect_account_status({"id": "acct_unknown", "charges_enabled": True})
+        # No mock needed: refresh_account_status must never even be
+        # called when there's no matching entity to update.
+        with patch("apps.billing.stripe_connect.refresh_account_status") as mocked_refresh:
+            _sync_stripe_connect_account_status({"id": "acct_unknown"})
+        mocked_refresh.assert_not_called()
 
 
 class StripeCommissionSplitTests(TestCase):
