@@ -227,9 +227,14 @@ def onboarding_redirect_urls() -> tuple[str, str]:
     """(refresh_url, return_url) for onboarding links — same
     getattr-with-fallback pattern as STRIPE_CHECKOUT_SUCCESS_URL/
     STRIPE_CHECKOUT_CANCEL_URL in direct_payments.py, since neither var is
-    required to be set in every environment."""
-    refresh_url = getattr(settings, "STRIPE_CONNECT_REFRESH_URL", "") or getattr(
-        settings, "FLW_REDIRECT_URL", ""
-    ) or "https://kis.app/payments/complete"
+    required to be set in every environment. Deliberately NOT
+    FLW_REDIRECT_URL as a fallback (that was tried and is wrong) — it
+    points at /payments/complete, a buyer-checkout status page keyed by
+    a tx_ref query param that a seller landing here from Stripe
+    onboarding will never have, producing a confusing "we couldn't find
+    your payment reference" message unrelated to what they just did. The
+    website's own /payments/onboarding-complete page exists specifically
+    for this landing instead."""
+    refresh_url = getattr(settings, "STRIPE_CONNECT_REFRESH_URL", "") or "https://kingdomimpactventures.org/payments/onboarding-complete"
     return_url = getattr(settings, "STRIPE_CONNECT_RETURN_URL", "") or refresh_url
     return refresh_url, return_url
