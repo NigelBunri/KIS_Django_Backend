@@ -49,7 +49,9 @@ from apps.broadcasts.models import (
     EducationInstitutionCourse,
     EducationInstitutionCourseModule,
     EducationInstitutionCourseModuleItem,
+    EducationInstitutionClassSession,
     EducationInstitutionEnrollment,
+    EducationInstitutionLesson,
     EducationInstitutionMaterial,
     EducationInstitutionMembership,
     EducationInstitutionMembershipPolicy,
@@ -3978,3 +3980,99 @@ class EducationBookingActionIDORTests(APITestCase):
             format='json',
         )
         self.assertEqual(response.status_code, 403)
+
+
+class EducationInstitutionManagementDetailAccessControlTests(APITestCase):
+    """Regression coverage for a real, confirmed production vulnerability:
+    EducationInstitutionLessonDetailView.get (and 11 sibling
+    Course/Program/CourseModule/CourseModuleItem/ClassSession/Material/
+    Assessment/AssessmentQuestion/AssessmentOption detail views) had
+    permission_classes = [IsAuthenticated] with NO staff-membership check
+    on their GET methods, while their own PATCH/DELETE methods on the
+    same class correctly required
+    _require_manage_institution_membership. Any low-barrier member of
+    the institution (a plain STUDENT-role membership, typically free to
+    join under an 'application'/open policy — not staff, not requiring
+    enrollment or payment for the specific paid course) could fetch the
+    full, unsanitized lesson/course/material/assessment
+    content (including EducationInstitutionLessonSerializer's raw
+    `content` field, assessment question text, and — most severely —
+    assessment option `is_correct` answer flags) for ANY institution's
+    paid course, given only the institution_id/lesson_id UUIDs (which a
+    non-enrolled user already legitimately has from the correctly-
+    sanitized public course-preview endpoint). This is a completely
+    separate, more severe endpoint than the student-facing
+    /api/v1/education/contents/{id}/ flow, which does correctly redact
+    content — this one returned it in full to anyone logged in."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5558800101', username='mgmt_access_owner', password='secret', country='NG',
+        )
+        self.stranger = User.objects.create_user(
+            phone='5558800102', username='mgmt_access_stranger', password='secret', country='NG',
+        )
+        self.institution = EducationInstitution.objects.create(
+            owner=self.owner, name='Guarded Academy', description='Paid content lives here.',
+            payout_account_status=EducationInstitutionPayoutAccountStatus.ACTIVE,
+            flutterwave_subaccount_id='RS_TEST_GUARD',
+        )
+        self.course = EducationInstitutionCourse.objects.create(
+            institution=self.institution, title='Secret Curriculum', status='published',
+            price_amount='49.00', price_currency='USD',
+        )
+        self.lesson = EducationInstitutionLesson.objects.create(
+            institution=self.institution, course=self.course, title='Confidential Lesson',
+            content='This is the actual paid lesson body — should never leak.',
+        )
+        self.material = EducationInstitutionMaterial.objects.create(
+            institution=self.institution, title='Answer Key PDF',
+            resource_url='https://example.com/private/answer-key.pdf', is_downloadable=True,
+        )
+        # _get_education_institution_or_404 scopes lookup to
+        # owner-or-any-membership, so the exploitable scenario isn't a
+        # total stranger (who'd 404 before even reaching the missing
+        # staff check) — it's any low-barrier STUDENT-role member (free
+        # to join under an 'application'/open membership policy)
+        # reaching a staff-only management endpoint with no staff role.
+        EducationInstitutionMembership.objects.create(
+            institution=self.institution, user=self.stranger,
+            role=EducationInstitutionMembershipRole.STUDENT,
+            status=EducationInstitutionMembershipStatus.ACTIVE,
+        )
+
+    def _lesson_detail_url(self):
+        return f'/api/v1/broadcasts/education/institutions/{self.institution.id}/lessons/{self.lesson.id}/'
+
+    def _course_detail_url(self):
+        return f'/api/v1/broadcasts/education/institutions/{self.institution.id}/courses/{self.course.id}/'
+
+    def _material_detail_url(self):
+        return f'/api/v1/broadcasts/education/institutions/{self.institution.id}/materials/{self.material.id}/'
+
+    def test_stranger_cannot_read_lesson_content(self):
+        self.client.force_authenticate(self.stranger)
+        response = self.client.get(self._lesson_detail_url())
+        self.assertEqual(response.status_code, 403, response.data)
+
+    def test_stranger_cannot_read_course_detail(self):
+        self.client.force_authenticate(self.stranger)
+        response = self.client.get(self._course_detail_url())
+        self.assertEqual(response.status_code, 403, response.data)
+
+    def test_stranger_cannot_read_material_detail(self):
+        self.client.force_authenticate(self.stranger)
+        response = self.client.get(self._material_detail_url())
+        self.assertEqual(response.status_code, 403, response.data)
+
+    def test_owner_can_still_read_lesson_content(self):
+        # The fix must not break legitimate staff access to their own content.
+        self.client.force_authenticate(self.owner)
+        response = self.client.get(self._lesson_detail_url())
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['lesson']['content'], self.lesson.content)
+
+    def test_unauthenticated_request_is_rejected(self):
+        response = self.client.get(self._lesson_detail_url())
+        self.assertIn(response.status_code, (401, 403))

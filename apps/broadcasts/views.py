@@ -10309,6 +10309,7 @@ class EducationInstitutionProgramDetailView(APIView):
 
     def get(self, request, institution_id: str, program_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         program = _get_institution_program_or_404(institution, program_id)
         return Response(
             _build_program_detail_payload(institution, program, request),
@@ -10431,6 +10432,7 @@ class EducationInstitutionCourseDetailView(APIView):
 
     def get(self, request, institution_id: str, course_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         course = _get_institution_course_or_404(institution, course_id)
         return Response(
             _build_course_detail_payload(institution, course, request),
@@ -10536,6 +10538,7 @@ class EducationInstitutionCourseModuleDetailView(APIView):
 
     def get(self, request, institution_id: str, course_id: str, module_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         course = _get_institution_course_or_404(institution, course_id)
         module = _get_institution_course_module_or_404(institution, course, module_id)
         module_payload = EducationInstitutionCourseModuleSerializer(module).data
@@ -10632,6 +10635,7 @@ class EducationInstitutionCourseModuleItemDetailView(APIView):
 
     def get(self, request, institution_id: str, course_id: str, module_id: str, item_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         course = _get_institution_course_or_404(institution, course_id)
         module = _get_institution_course_module_or_404(institution, course, module_id)
         item = _get_institution_course_module_item_or_404(institution, course, module, item_id)
@@ -10737,6 +10741,7 @@ class EducationInstitutionLessonDetailView(APIView):
 
     def get(self, request, institution_id: str, lesson_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         lesson = _get_institution_lesson_or_404(institution, lesson_id)
         return Response(
             _build_lesson_detail_payload(institution, lesson, request),
@@ -10856,6 +10861,7 @@ class EducationInstitutionClassSessionDetailView(APIView):
 
     def get(self, request, institution_id: str, session_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         session = _get_institution_class_session_or_404(institution, session_id)
         return Response(
             _build_class_session_detail_payload(institution, session, request),
@@ -11050,6 +11056,7 @@ class EducationInstitutionMaterialDetailView(APIView):
 
     def get(self, request, institution_id: str, material_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         material = _get_institution_material_or_404(institution, material_id)
         material = (
             institution.materials.prefetch_related(
@@ -12813,6 +12820,7 @@ class EducationInstitutionAssessmentDetailView(APIView):
 
     def get(self, request, institution_id: str, assessment_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         assessment = _get_institution_assessment_or_404(institution, assessment_id)
         return Response(
             _build_assessment_detail_payload(institution, assessment, request),
@@ -12888,6 +12896,7 @@ class EducationInstitutionAssessmentQuestionListView(APIView):
 
     def get(self, request, institution_id: str, assessment_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         assessment = _get_institution_assessment_or_404(institution, assessment_id)
         serializer = EducationInstitutionAssessmentQuestionSerializer(
             assessment.questions.prefetch_related("options").all(),
@@ -12922,6 +12931,7 @@ class EducationInstitutionAssessmentQuestionDetailView(APIView):
 
     def get(self, request, institution_id: str, assessment_id: str, question_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         assessment = _get_institution_assessment_or_404(institution, assessment_id)
         question = _get_assessment_question_or_404(assessment, question_id)
         serializer = EducationInstitutionAssessmentQuestionSerializer(question)
@@ -12970,6 +12980,7 @@ class EducationInstitutionAssessmentOptionListView(APIView):
 
     def get(self, request, institution_id: str, assessment_id: str, question_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         assessment = _get_institution_assessment_or_404(institution, assessment_id)
         question = _get_assessment_question_or_404(assessment, question_id)
         serializer = EducationInstitutionAssessmentOptionSerializer(question.options.all(), many=True)
@@ -13000,6 +13011,7 @@ class EducationInstitutionAssessmentOptionDetailView(APIView):
 
     def get(self, request, institution_id: str, assessment_id: str, question_id: str, option_id: str):
         institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
         assessment = _get_institution_assessment_or_404(institution, assessment_id)
         question = _get_assessment_question_or_404(assessment, question_id)
         option = _get_assessment_option_or_404(question, option_id)
