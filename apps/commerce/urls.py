@@ -63,4 +63,9 @@ urlpatterns = [
         views.ShopStripeConnectAccountView.as_view(),
         name='shop-stripe-account-connect',
     ),
+    path(
+        'shops/<uuid:shop_id>/partner/',
+        views.ShopPartnerConnectView.as_view(),
+        name='shop-partner-connect',
+    ),
 ]

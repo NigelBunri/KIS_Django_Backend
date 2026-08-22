@@ -1486,6 +1486,20 @@ class PartnerOrganizationLink(models.Model):
     One organization can only ever be linked to one partner at a time
     (unique on owner_type+owner_id, not on partner+owner_type+owner_id) —
     an institution belongs to a single partner umbrella, not several.
+
+    Answers a different question than Shop.partner/HealthInstitution.partner/
+    EducationInstitution.partner (added later, directly on those models):
+    this table is a personal-ownership directory listing only — linking
+    requires the requester to already personally own the organization
+    (_resolve_linkable_organization in apps/partners/views.py), and linking
+    grants no management rights to anyone. Those other .partner FKs are the
+    actual management-delegation mechanism (any manager of the partner
+    gains the same rights as the organization's own owner, via
+    apps.partners.services.partner_user_can_manage) - the two are
+    independent and can disagree (an org can be listed here under one
+    partner while delegated to a different one via .partner, or vice
+    versa). Not unified yet - a future pass could make this table read
+    from/write through the .partner FKs instead of tracking its own state.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

@@ -107,6 +107,7 @@ class PartnerListSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSer
     grace_expires_at = serializers.DateTimeField(read_only=True)
     can_reactivate = serializers.SerializerMethodField()
     verification_summary = serializers.SerializerMethodField()
+    can_manage = serializers.SerializerMethodField()
 
     class Meta:
         model = Partner
@@ -123,6 +124,7 @@ class PartnerListSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSer
             "verification_summary",
             "main_conversation_id",
             "member_role",
+            "can_manage",
             "created_at",
             "updated_at",
         ]
@@ -142,6 +144,20 @@ class PartnerListSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSer
             left_at__isnull=True,
         ).first()
         return member.base_role if member else None
+
+    def get_can_manage(self, obj):
+        # member_role above only reflects the legacy conversation base_role
+        # (or an owner/staff shortcut) - it does not check PartnerMembership.role
+        # at all, so a "manager"-tier PartnerMembership can under-report here.
+        # This is the field the "connect this shop/institution to a partner"
+        # picker filters on client-side, so it needs to reflect actual manage
+        # rights via the same helper the write-side endpoints enforce.
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or getattr(user, "is_anonymous", False):
+            return False
+        from apps.partners.services import partner_user_can_manage
+        return partner_user_can_manage(obj, user)
 
     def get_can_reactivate(self, obj):
         if obj.is_active:

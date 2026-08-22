@@ -1202,6 +1202,17 @@ class EducationInstitution(models.Model):
         on_delete=models.CASCADE,
         related_name="owned_education_institutions",
     )
+    # Optional partner-org ownership, additive to the single-user owner
+    # above — see Shop.partner (apps/commerce/models.py) for the identical
+    # pattern, rationale for SET_NULL over CASCADE, and how this differs
+    # from apps.partners.models.PartnerOrganizationLink.
+    partner = models.ForeignKey(
+        Partner,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="education_institutions",
+    )
     profile = models.ForeignKey(
         Profile,
         on_delete=models.CASCADE,
@@ -1255,6 +1266,7 @@ class EducationInstitution(models.Model):
         indexes = [
             models.Index(fields=["owner", "is_active"]),
             models.Index(fields=["institution_type", "is_active"]),
+            models.Index(fields=["partner"]),
         ]
 
     def __str__(self):

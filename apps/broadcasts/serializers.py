@@ -136,6 +136,8 @@ class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
     viewer_role = serializers.SerializerMethodField()
     is_broadcast = serializers.SerializerMethodField()
     broadcast_id = serializers.SerializerMethodField()
+    owner_id = serializers.SerializerMethodField()
+    owner_display_name = serializers.SerializerMethodField()
 
     class Meta:
         model = BroadcastChannel
@@ -158,10 +160,56 @@ class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
             "content_count",
             "is_subscribed",
             "viewer_role",
+            "owner_type",
+            "owner_id",
+            "owner_display_name",
             "created_at",
             "updated_at",
         ]
         read_only_fields = fields
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.owner_type == BroadcastChannel.OwnerType.USER:
+            # Never expose the raw owner_id for owner_type=user - that's a
+            # personal account id, not a business entity id, and this
+            # endpoint is otherwise public (see
+            # test_public_serializer_hides_private_owner_details, which
+            # requires the key be absent entirely, not just blank). Org
+            # owner ids (shop/health/education/partner) are business-entity
+            # ids already discoverable via their own public listing
+            # endpoints, so there's no equivalent privacy concern there.
+            data.pop("owner_id", None)
+        return data
+
+    def get_owner_id(self, obj: BroadcastChannel) -> str:
+        return str(obj.owner_id) if obj.owner_id else ""
+
+    def get_owner_display_name(self, obj: BroadcastChannel) -> str:
+        owner_type = obj.owner_type
+        owner_id = obj.owner_id
+        if not owner_id:
+            return ""
+        if owner_type == BroadcastChannel.OwnerType.USER:
+            user = obj.owner_user
+            if not user:
+                return ""
+            return getattr(user, "display_name", "") or getattr(user, "username", "") or ""
+        if owner_type == BroadcastChannel.OwnerType.SHOP:
+            from apps.commerce.models import Shop
+            shop = Shop.objects.filter(id=owner_id).only("name").first()
+            return shop.name if shop else ""
+        if owner_type == BroadcastChannel.OwnerType.HEALTH:
+            from apps.health_ops.models import HealthInstitution
+            institution = HealthInstitution.objects.filter(id=owner_id).only("name").first()
+            return institution.name if institution else ""
+        if owner_type == BroadcastChannel.OwnerType.EDUCATION:
+            institution = EducationInstitution.objects.filter(id=owner_id).only("name").first()
+            return institution.name if institution else ""
+        if owner_type == BroadcastChannel.OwnerType.PARTNER:
+            partner = Partner.objects.filter(id=owner_id).only("name").first()
+            return partner.name if partner else ""
+        return ""
 
     def get_is_subscribed(self, obj: BroadcastChannel) -> bool:
         user = self.context.get("user") or getattr(self.context.get("request"), "user", None)
@@ -942,6 +990,8 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
     logoUrl = serializers.SerializerMethodField()
     imageUrl = serializers.SerializerMethodField()
     bannerImageUrl = serializers.SerializerMethodField()
+    partner_id = serializers.UUIDField(source="partner.id", read_only=True, allow_null=True, default=None)
+    partner_name = serializers.CharField(source="partner.name", read_only=True, allow_null=True, default=None)
 
     class Meta:
         model = EducationInstitution
@@ -950,6 +1000,8 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
             "owner",
             "owner_user_id",
             "ownerUserId",
+            "partner_id",
+            "partner_name",
             "name",
             "description",
             "institution_type",
@@ -1037,11 +1089,26 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
 
     def get_can_manage(self, obj: EducationInstitution) -> bool:
         current = self.get_current_membership(obj) or {}
-        return current.get("status") == "active" and current.get("role") in {
+        if current.get("status") == "active" and current.get("role") in {
             "owner",
             "manager",
             "administrator",
-        }
+        }:
+            return True
+        # Computed independently of _require_manage_institution_membership
+        # (apps/broadcasts/views.py), which gates the actual write
+        # endpoints - without this branch, a partner manager with no real
+        # EducationInstitutionMembership row would be allowed to mutate
+        # the institution server-side while this field told the client
+        # can_manage: false, hiding the management UI from exactly the
+        # user we just unlocked.
+        if obj.partner_id:
+            request = self.context.get("request")
+            user = getattr(request, "user", None)
+            if user and getattr(user, "is_authenticated", False):
+                from apps.partners.services import partner_user_can_manage
+                return partner_user_can_manage(obj.partner, user)
+        return False
 
     def get_verification_summary(self, obj: EducationInstitution) -> dict:
         from apps.verification.services import current_education_institution_verification_status

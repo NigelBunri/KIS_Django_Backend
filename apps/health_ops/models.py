@@ -188,6 +188,17 @@ class HealthInstitutionPayoutAccountStatus(models.TextChoices):
 
 class HealthInstitution(TimeStampedUUIDModel):
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name="health_ops_owned_institutions")
+    # Optional partner-org ownership, additive to the single-user owner
+    # above — see Shop.partner (apps/commerce/models.py) for the identical
+    # pattern, rationale for SET_NULL over CASCADE, and how this differs
+    # from apps.partners.models.PartnerOrganizationLink.
+    partner = models.ForeignKey(
+        "partners.Partner",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="health_institutions",
+    )
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=280, unique=True)
     institution_type = models.CharField(max_length=40, choices=InstitutionType.choices, default=InstitutionType.CLINIC, db_index=True)
@@ -222,6 +233,7 @@ class HealthInstitution(TimeStampedUUIDModel):
         indexes = [
             models.Index(fields=["owner", "institution_type"]),
             models.Index(fields=["is_active"]),
+            models.Index(fields=["partner"]),
         ]
 
     def __str__(self):

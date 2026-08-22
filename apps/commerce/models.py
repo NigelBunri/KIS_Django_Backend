@@ -95,6 +95,22 @@ class Shop(BaseEntity):
     )
 
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='shops')
+    # Optional partner-org ownership, additive to the single-user owner
+    # above — a partner manager (apps.partners.services.partner_user_can_manage)
+    # gets the same manage rights as the owner once this is set. SET_NULL
+    # rather than CASCADE (unlike Channel/Group/Community's partner FK):
+    # this model carries real paid-order history, so deleting a Partner
+    # must detach the shop back to owner-only management, never delete it.
+    # Distinct from apps.partners.models.PartnerOrganizationLink, an
+    # unrelated personal-ownership directory listing with no management
+    # consequence — see that model's docstring for how the two differ.
+    partner = models.ForeignKey(
+        'partners.Partner',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='shops',
+    )
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=255, unique=True)
     description = models.TextField(blank=True)
@@ -138,7 +154,7 @@ class Shop(BaseEntity):
     stripe_details_submitted = models.BooleanField(default=False)
 
     class Meta:
-        indexes = [models.Index(fields=['slug'])]
+        indexes = [models.Index(fields=['slug']), models.Index(fields=['partner'])]
 
     def __str__(self):
         return f"{self.name} ({self.owner})"

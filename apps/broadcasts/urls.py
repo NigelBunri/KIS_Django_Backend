@@ -102,6 +102,7 @@ from .views import (
     EducationInstitutionDetailView,
     ChannelPayoutAccountConnectView,
     ChannelStripeConnectAccountView,
+    EducationInstitutionPartnerConnectView,
     EducationInstitutionPayoutAccountConnectView,
     EducationInstitutionStripeConnectAccountView,
     EducationInstitutionVerificationReviewView,
@@ -403,6 +404,11 @@ urlpatterns = [
         "broadcasts/education/institutions/<uuid:institution_id>/stripe-account/connect/",
         EducationInstitutionStripeConnectAccountView.as_view(),
         name="education-institution-stripe-account-connect",
+    ),
+    path(
+        "broadcasts/education/institutions/<uuid:institution_id>/partner/",
+        EducationInstitutionPartnerConnectView.as_view(),
+        name="education-institution-partner-connect",
     ),
     path(
         "broadcasts/education/institutions/<uuid:institution_id>/verification-status/",

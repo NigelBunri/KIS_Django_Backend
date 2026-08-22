@@ -734,3 +734,48 @@ class PartnerOrganizationLinkApiTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class PartnerListSerializerCanManageTests(TestCase):
+    """Regression coverage for PartnerListSerializer.can_manage, added so
+    the "connect this shop/institution to a partner" picker (which filters
+    client-side on this field) can tell a low-privilege member apart from
+    someone who can actually manage the partner - the pre-existing
+    member_role field only reflected the legacy conversation base_role, not
+    PartnerMembership.role, and would under-report a "manager" membership."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(phone="+237670002001", country="CM", password="pass1234")
+        self.manager_member = User.objects.create_user(phone="+237670002002", country="CM", password="pass1234")
+        self.plain_member = User.objects.create_user(phone="+237670002003", country="CM", password="pass1234")
+        self.stranger = User.objects.create_user(phone="+237670002004", country="CM", password="pass1234")
+        self.partner = Partner.objects.create(owner=self.owner, name="Serializer Partner", slug="serializer-partner")
+        PartnerMembership.objects.create(
+            partner=self.partner, user=self.manager_member,
+            status=PartnerMembershipStatus.MEMBER, role="manager",
+        )
+        PartnerMembership.objects.create(
+            partner=self.partner, user=self.plain_member,
+            status=PartnerMembershipStatus.MEMBER, role="member",
+        )
+
+    def _can_manage_for(self, user) -> bool:
+        from unittest.mock import MagicMock
+
+        from apps.partners.serializers import PartnerListSerializer
+
+        request = MagicMock(user=user)
+        data = PartnerListSerializer(self.partner, context={"request": request}).data
+        return data["can_manage"]
+
+    def test_owner_can_manage(self):
+        self.assertTrue(self._can_manage_for(self.owner))
+
+    def test_manager_role_member_can_manage(self):
+        self.assertTrue(self._can_manage_for(self.manager_member))
+
+    def test_plain_role_member_cannot_manage(self):
+        self.assertFalse(self._can_manage_for(self.plain_member))
+
+    def test_stranger_cannot_manage(self):
+        self.assertFalse(self._can_manage_for(self.stranger))

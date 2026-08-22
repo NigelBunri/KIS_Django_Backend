@@ -829,8 +829,14 @@ def _education_manage_roles() -> set[str]:
 
 
 def _education_institution_qs_for_user(user: User):
+    from apps.partners.services import partner_ids_user_can_access
+
+    query = Q(owner=user) | Q(memberships__user=user)
+    partner_ids = partner_ids_user_can_access(user)
+    if partner_ids:
+        query |= Q(partner_id__in=partner_ids)
     return (
-        EducationInstitution.objects.filter(Q(owner=user) | Q(memberships__user=user))
+        EducationInstitution.objects.filter(query)
         .prefetch_related("memberships__user")
         .distinct()
         .order_by("-updated_at")
@@ -879,11 +885,30 @@ def _require_manage_institution_membership(user: User, institution: EducationIns
     if institution.owner_id == user.id:
         return _get_institution_membership(user, institution)
     membership = _get_institution_membership(user, institution)
+    if membership and membership.status == EducationInstitutionMembershipStatus.ACTIVE and membership.role in _education_manage_roles():
+        return membership
+    if institution.partner_id:
+        from apps.partners.services import partner_user_can_manage
+        if partner_user_can_manage(institution.partner, user):
+            # Always synthesize a manager-role stand-in here rather than
+            # ever returning a real-but-insufficient membership row (e.g. a
+            # STUDENT-role membership the same user happens to also hold) -
+            # this mirrors _get_institution_membership's synthesis for the
+            # owner case, so every downstream call site that reads
+            # membership.role/.id/.status off the return value keeps seeing
+            # a manage-capable role rather than the unrelated lower role.
+            return SimpleNamespace(
+                id=None,
+                user=user,
+                user_id=user.id,
+                institution=institution,
+                institution_id=institution.id,
+                role=EducationInstitutionMembershipRole.MANAGER,
+                status=EducationInstitutionMembershipStatus.ACTIVE,
+            )
     if not membership or membership.status != EducationInstitutionMembershipStatus.ACTIVE:
         raise PermissionDenied("You do not belong to this institution.")
-    if membership.role not in _education_manage_roles():
-        raise PermissionDenied("You do not have permission to manage this institution.")
-    return membership
+    raise PermissionDenied("You do not have permission to manage this institution.")
 
 
 def _normalize_institution_membership_policy(value: object) -> str:
@@ -9618,6 +9643,42 @@ class EducationInstitutionStripeConnectAccountView(APIView):
         )
 
 
+class EducationInstitutionPartnerConnectView(APIView):
+    """Attaches/detaches this institution to a Partner organization.
+    Requires the caller to be able to manage BOTH the institution and the
+    target partner - mirrors ShopPartnerConnectView (apps/commerce/views.py)
+    and HealthInstitutionPartnerConnectView (apps/health_ops/views.py)
+    exactly."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, institution_id: str):
+        from apps.partners.models import Partner
+        from apps.partners.services import partner_user_can_manage
+
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+
+        partner_id = str(request.data.get("partner_id") or "").strip()
+        if not partner_id:
+            raise ValidationError({"partner_id": "This field is required."})
+        partner = get_object_or_404(Partner, id=partner_id)
+        if not partner_user_can_manage(partner, request.user):
+            raise PermissionDenied("You do not have permission to attach institutions to this partner.")
+
+        institution.partner = partner
+        institution.save(update_fields=["partner"])
+        return Response(EducationInstitutionSerializer(institution, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    def delete(self, request, institution_id: str):
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+
+        institution.partner = None
+        institution.save(update_fields=["partner"])
+        return Response(EducationInstitutionSerializer(institution, context={"request": request}).data, status=status.HTTP_200_OK)
+
+
 class EducationInstitutionVerificationStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -14784,24 +14845,68 @@ class BroadcastChannelListCreateView(APIView):
         if not getattr(request.user, "is_authenticated", False):
             return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
         owner_type = str(request.data.get("owner_type") or BroadcastChannel.OwnerType.USER).strip().lower()
-        if owner_type != BroadcastChannel.OwnerType.USER:
-            raise ValidationError({"owner_type": "Organization channel creation will be connected in a later phase."})
-        channel_limit = _resolve_profile_limit(
-            request.user,
-            "channels_create",
-            legacy_required_tier="pro",
-            permission_message="Creating a broadcast channel requires Pro tier or higher.",
-        )
-        if channel_limit is not None:
-            existing_channel_count = BroadcastChannel.objects.filter(
-                owner_type=BroadcastChannel.OwnerType.USER,
-                owner_user=request.user,
-                is_deleted=False,
-            ).count()
-            if existing_channel_count >= channel_limit:
-                raise ValidationError(
-                    {"detail": f"Your current plan allows up to {channel_limit} broadcast channel{'s' if channel_limit != 1 else ''}. Upgrade to create more."}
-                )
+        resolved_owner_id = request.user.id
+        resolved_owner_user = request.user
+        if owner_type == BroadcastChannel.OwnerType.USER:
+            pass
+        elif owner_type == BroadcastChannel.OwnerType.SHOP:
+            from apps.commerce.models import Shop
+            from apps.commerce.services import _provider_can_manage_shop
+
+            shop = get_object_or_404(Shop, id=str(request.data.get("owner_id") or ""))
+            if not _provider_can_manage_shop(request.user, shop) and not request.user.is_staff:
+                raise PermissionDenied("Not allowed to create a channel for this shop.")
+            resolved_owner_id = shop.id
+            resolved_owner_user = None
+        elif owner_type == BroadcastChannel.OwnerType.HEALTH:
+            from apps.health_ops.models import HealthInstitution
+            from apps.health_ops.views import _can_manage_institution
+
+            institution = get_object_or_404(HealthInstitution, id=str(request.data.get("owner_id") or ""))
+            if not _can_manage_institution(request.user, institution):
+                raise PermissionDenied("Not allowed to create a channel for this institution.")
+            resolved_owner_id = institution.id
+            resolved_owner_user = None
+        elif owner_type == BroadcastChannel.OwnerType.EDUCATION:
+            institution = _get_education_institution_or_404(request.user, str(request.data.get("owner_id") or ""))
+            _require_manage_institution_membership(request.user, institution)
+            resolved_owner_id = institution.id
+            resolved_owner_user = None
+        elif owner_type == BroadcastChannel.OwnerType.PARTNER:
+            from apps.partners.models import Partner
+            from apps.partners.services import partner_user_can_manage
+
+            partner = get_object_or_404(Partner, id=str(request.data.get("owner_id") or ""))
+            if not partner_user_can_manage(partner, request.user):
+                raise PermissionDenied("Not allowed to create a channel for this partner.")
+            resolved_owner_id = partner.id
+            resolved_owner_user = None
+        else:
+            raise ValidationError({"owner_type": "Unsupported owner_type."})
+        if owner_type == BroadcastChannel.OwnerType.USER:
+            # Org-owned channels (shop/health/education/partner) aren't
+            # gated on the creating individual's own personal-profile tier
+            # at all - a business owner on a free personal plan managing a
+            # paid business shouldn't need their own Pro subscription just
+            # to create a channel for that business. They're gated purely
+            # on manage-rights over the owning entity, already enforced
+            # above.
+            channel_limit = _resolve_profile_limit(
+                request.user,
+                "channels_create",
+                legacy_required_tier="pro",
+                permission_message="Creating a broadcast channel requires Pro tier or higher.",
+            )
+            if channel_limit is not None:
+                existing_channel_count = BroadcastChannel.objects.filter(
+                    owner_type=BroadcastChannel.OwnerType.USER,
+                    owner_user=request.user,
+                    is_deleted=False,
+                ).count()
+                if existing_channel_count >= channel_limit:
+                    raise ValidationError(
+                        {"detail": f"Your current plan allows up to {channel_limit} broadcast channel{'s' if channel_limit != 1 else ''}. Upgrade to create more."}
+                    )
         handle = _safe_channel_handle_from_value(request.data.get("handle"))
         if not handle:
             raise ValidationError({"handle": "A public channel handle is required."})
@@ -14812,9 +14917,9 @@ class BroadcastChannelListCreateView(APIView):
             raise ValidationError({"handle": "This channel handle is already in use."})
         try:
             channel = BroadcastChannel.objects.create(
-                owner_type=BroadcastChannel.OwnerType.USER,
-                owner_id=request.user.id,
-                owner_user=request.user,
+                owner_type=owner_type,
+                owner_id=resolved_owner_id,
+                owner_user=resolved_owner_user,
                 handle=handle,
                 display_name=display_name[:140],
                 description=str(request.data.get("description") or "").strip(),
@@ -14829,6 +14934,12 @@ class BroadcastChannelListCreateView(APIView):
             )
         except IntegrityError:
             raise ValidationError({"handle": "This channel handle is already in use."})
+        # Unconditional regardless of owner_type - this alone is what makes
+        # _user_can_manage_channel/_user_channel_role work correctly for the
+        # creator of an org-owned channel, with zero change needed to either
+        # of those functions (they already fall through to this role table
+        # once channel.owner_user_id is empty, which it is for every
+        # non-USER owner_type here).
         BroadcastChannelRole.objects.get_or_create(channel=channel, user=request.user, role=BroadcastChannelRole.Role.OWNER)
         return Response(BroadcastChannelDetailSerializer(channel, context={"request": request}).data, status=status.HTTP_201_CREATED)
 

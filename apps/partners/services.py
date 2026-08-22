@@ -317,6 +317,44 @@ def partner_user_can_manage(partner: Partner, user: Optional[User]) -> bool:
     return False
 
 
+def partner_ids_user_can_access(user: Optional[User]) -> list:
+    """Bulk id-set counterpart to partner_user_can_access, for shaping a
+    'my institutions' listing queryset (e.g. filtering Shop/HealthInstitution/
+    EducationInstitution by partner_id__in=...) without an N+1 per-row
+    permission check. Deliberately does NOT include the legacy
+    conversation-role fallback that partner_user_can_access falls back to —
+    that path only matters for older partner records pre-dating
+    PartnerMembership, and this helper only shapes what shows up in a list,
+    not the authoritative permission check (callers still enforce the real
+    per-object partner_user_can_access/partner_user_can_manage before
+    allowing a mutation)."""
+    if not user or getattr(user, "is_anonymous", False):
+        return []
+    owned = Partner.objects.filter(owner=user).values_list("id", flat=True)
+    member = PartnerMembership.objects.filter(
+        user=user,
+        status__in=(PartnerMembershipStatus.MEMBER, PartnerMembershipStatus.SUBSCRIBER),
+        is_banned=False,
+    ).values_list("partner_id", flat=True)
+    return list(set(owned) | set(member))
+
+
+def partner_ids_user_can_manage(user: Optional[User]) -> list:
+    """Bulk id-set counterpart to partner_user_can_manage — see
+    partner_ids_user_can_access's docstring for the same caveat about the
+    legacy conversation-role fallback being intentionally excluded here."""
+    if not user or getattr(user, "is_anonymous", False):
+        return []
+    owned = Partner.objects.filter(owner=user).values_list("id", flat=True)
+    managed = PartnerMembership.objects.filter(
+        user=user,
+        status__in=(PartnerMembershipStatus.MEMBER, PartnerMembershipStatus.SUBSCRIBER),
+        is_banned=False,
+        role__in=("owner", "admin", "manager"),
+    ).values_list("partner_id", flat=True)
+    return list(set(owned) | set(managed))
+
+
 def get_partner_user_roles(partner: Partner, user: Optional[User]) -> Set[str]:
     roles: Set[str] = set()
     if not user or user.is_anonymous:

@@ -139,6 +139,8 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
     viewer = serializers.SerializerMethodField()
     can_manage = serializers.SerializerMethodField()
     canManage = serializers.SerializerMethodField()
+    partner_id = serializers.UUIDField(source="partner.id", read_only=True, allow_null=True, default=None)
+    partner_name = serializers.CharField(source="partner.name", read_only=True, allow_null=True, default=None)
 
     class Meta:
         model = HealthInstitution
@@ -161,6 +163,8 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
             "viewer",
             "can_manage",
             "canManage",
+            "partner_id",
+            "partner_name",
             "created_at",
             "updated_at",
         ]
@@ -207,6 +211,19 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
         membership = self._viewer_membership(obj) or {}
         role = str(membership.get("role") or "").lower()
         can_manage = role in {MembershipRole.OWNER, MembershipRole.ADMIN, MembershipRole.MANAGER}
+        # This is computed independently of apps.health_ops.views'
+        # _can_manage_institution (that helper gates the actual write
+        # endpoints; this shapes what the RN app is told). Without this
+        # branch, a partner manager who isn't the owner and holds no
+        # HealthInstitutionMembership row would be allowed to mutate the
+        # institution server-side while this field told the client
+        # can_manage: false, hiding the management UI from exactly the
+        # user we just unlocked.
+        if not can_manage and obj.partner_id:
+            user = self._request_user()
+            if user:
+                from apps.partners.services import partner_user_can_manage
+                can_manage = partner_user_can_manage(obj.partner, user)
         return {
             "role": role or "unassigned",
             "can_manage": can_manage,

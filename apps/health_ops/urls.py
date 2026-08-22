@@ -30,6 +30,7 @@ from .views import (
     HealthCarePlanListCreateView,
     HealthCareSummaryView,
     HealthInstitutionListCreateView,
+    HealthInstitutionPartnerConnectView,
     HealthInstitutionPayoutAccountConnectView,
     HealthInstitutionStripeConnectAccountView,
     HealthInstitutionVerificationReviewView,
@@ -105,6 +106,11 @@ urlpatterns = [
         "health-ops/institutions/<str:institution_id>/stripe-account/connect/",
         HealthInstitutionStripeConnectAccountView.as_view(),
         name="health-ops-institution-stripe-account-connect",
+    ),
+    path(
+        "health-ops/institutions/<str:institution_id>/partner/",
+        HealthInstitutionPartnerConnectView.as_view(),
+        name="health-ops-institution-partner-connect",
     ),
     path(
         "health-ops/institutions/<str:institution_id>/verification-status/",

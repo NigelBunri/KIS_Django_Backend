@@ -636,6 +636,8 @@ class ShopSerializer(serializers.ModelSerializer):
     landing_is_published = LandingVisibilityField(attr_name='is_published')
     landing_page_is_public = LandingVisibilityField(attr_name='is_public')
     landing_page_is_published = LandingVisibilityField(attr_name='is_published')
+    partner_id = serializers.UUIDField(source='partner.id', read_only=True, allow_null=True, default=None)
+    partner_name = serializers.CharField(source='partner.name', read_only=True, allow_null=True, default=None)
 
     VISIBILITY_FIELDS = (
         'landing_is_public',
@@ -655,6 +657,11 @@ class ShopSerializer(serializers.ModelSerializer):
             'verification_summary',
             'image_url',
             'slug',
+            # 'partner' is only ever changed through the dedicated
+            # ShopPartnerConnectView (which enforces manage rights on both
+            # the shop and the target partner) - never writable via a
+            # plain PATCH, which fields='__all__' would otherwise allow.
+            'partner',
         )
 
     def get_image_url(self, obj):

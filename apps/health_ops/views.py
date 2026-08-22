@@ -216,22 +216,32 @@ def _is_restricted_managed_engine_key(value: str) -> bool:
 def _is_institution_member(user, institution: HealthInstitution) -> bool:
     if institution.owner_id == user.id:
         return True
-    return HealthInstitutionMembership.objects.filter(
+    if HealthInstitutionMembership.objects.filter(
         institution=institution,
         user=user,
         is_active=True,
-    ).exists()
+    ).exists():
+        return True
+    if institution.partner_id:
+        from apps.partners.services import partner_user_can_access
+        return partner_user_can_access(institution.partner, user)
+    return False
 
 
 def _can_manage_institution(user, institution: HealthInstitution) -> bool:
     if institution.owner_id == user.id:
         return True
-    return HealthInstitutionMembership.objects.filter(
+    if HealthInstitutionMembership.objects.filter(
         institution=institution,
         user=user,
         is_active=True,
         role__in=[MembershipRole.OWNER, MembershipRole.ADMIN, MembershipRole.MANAGER],
-    ).exists()
+    ).exists():
+        return True
+    if institution.partner_id:
+        from apps.partners.services import partner_user_can_manage
+        return partner_user_can_manage(institution.partner, user)
+    return False
 
 
 def _get_engine_total_steps(engine_map: ServiceEngineMap) -> int:
@@ -1109,12 +1119,13 @@ def _find_accessible_health_service(user, service_ref: str, institution_hint: st
 
 
 def _accessible_institutions_for_user(user):
-    return (
-        HealthInstitution.objects.filter(
-            Q(owner=user) | Q(memberships__user=user, memberships__is_active=True)
-        )
-        .distinct()
-    )
+    from apps.partners.services import partner_ids_user_can_access
+
+    partner_ids = partner_ids_user_can_access(user)
+    query = Q(owner=user) | Q(memberships__user=user, memberships__is_active=True)
+    if partner_ids:
+        query |= Q(partner_id__in=partner_ids)
+    return HealthInstitution.objects.filter(query).distinct()
 
 
 def _find_accessible_health_institution(user, institution_ref: str) -> HealthInstitution | None:
@@ -1594,6 +1605,43 @@ class HealthInstitutionStripeConnectAccountView(APIView):
             {"onboarding_url": onboarding_url, "stripe_account_id": institution.stripe_account_id},
             status=status.HTTP_200_OK,
         )
+
+
+class HealthInstitutionPartnerConnectView(APIView):
+    """Attaches/detaches this institution to a Partner organization.
+    Requires the caller to be able to manage BOTH the institution and the
+    target partner - mirrors ShopPartnerConnectView (apps/commerce/views.py)
+    exactly."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, institution_id: str):
+        from apps.partners.models import Partner
+        from apps.partners.services import partner_user_can_manage
+
+        institution = get_object_or_404(HealthInstitution, id=institution_id)
+        if not _can_manage_institution(request.user, institution):
+            raise PermissionDenied("You do not have permission to manage this institution.")
+
+        partner_id = str(request.data.get("partner_id") or "").strip()
+        if not partner_id:
+            raise ValidationError({"partner_id": "This field is required."})
+        partner = get_object_or_404(Partner, id=partner_id)
+        if not partner_user_can_manage(partner, request.user):
+            raise PermissionDenied("You do not have permission to attach institutions to this partner.")
+
+        institution.partner = partner
+        institution.save(update_fields=["partner"])
+        return Response(HealthInstitutionSerializer(institution, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    def delete(self, request, institution_id: str):
+        institution = get_object_or_404(HealthInstitution, id=institution_id)
+        if not _can_manage_institution(request.user, institution):
+            raise PermissionDenied("You do not have permission to manage this institution.")
+
+        institution.partner = None
+        institution.save(update_fields=["partner"])
+        return Response(HealthInstitutionSerializer(institution, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
 class HealthCareSummaryView(APIView):

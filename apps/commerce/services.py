@@ -540,13 +540,21 @@ def satisfy_marketplace_order_by_id(*, order_id, buyer):
 
 
 def _provider_can_manage_shop(user, shop):
+    if not user or getattr(user, "is_anonymous", False):
+        return False
     if shop.owner_id == user.id:
         return True
-    return ShopTeamMember.objects.filter(
+    if ShopTeamMember.objects.filter(
         shop=shop,
         user=user,
         role__in=[ShopRole.ADMIN, ShopRole.MANAGER],
-    ).exists()
+        is_active=True,
+    ).exists():
+        return True
+    if shop.partner_id:
+        from apps.partners.services import partner_user_can_manage
+        return partner_user_can_manage(shop.partner, user)
+    return False
 
 
 def provider_complete_marketplace_order_by_id(*, order_id, provider):

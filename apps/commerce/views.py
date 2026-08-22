@@ -730,8 +730,8 @@ class ShopViewSet(viewsets.ModelViewSet):
     def get_object(self):
         obj = super().get_object()
         if self.request.method not in permissions.SAFE_METHODS:
-            if obj.owner_id != self.request.user.id and not self.request.user.is_staff:
-                raise PermissionDenied("Only shop owners or staff can modify shops.")
+            if not _provider_can_manage_shop(self.request.user, obj) and not self.request.user.is_staff:
+                raise PermissionDenied("Only shop owners, team managers, partner managers, or staff can modify shops.")
         return obj
 
     def perform_create(self, serializer):
@@ -822,8 +822,8 @@ class ShopPayoutAccountConnectView(APIView):
         from apps.billing.payout_accounts import create_flutterwave_subaccount
 
         shop = get_object_or_404(Shop, id=shop_id)
-        if shop.owner_id != request.user.id and not request.user.is_staff:
-            raise PermissionDenied("Only the shop owner can connect a payout account.")
+        if not _provider_can_manage_shop(request.user, shop) and not request.user.is_staff:
+            raise PermissionDenied("Only the shop owner, team manager, or partner manager can connect a payout account.")
 
         account_bank = str(request.data.get("account_bank") or "").strip()
         account_number = str(request.data.get("account_number") or "").strip()
@@ -886,8 +886,8 @@ class ShopStripeConnectAccountView(APIView):
         from apps.billing.stripe_connect import refresh_account_status
 
         shop = get_object_or_404(Shop, id=shop_id)
-        if shop.owner_id != request.user.id and not request.user.is_staff:
-            raise PermissionDenied("Only the shop owner can view payout account status.")
+        if not _provider_can_manage_shop(request.user, shop) and not request.user.is_staff:
+            raise PermissionDenied("Only the shop owner, team manager, or partner manager can view payout account status.")
 
         if shop.stripe_account_id:
             fields = refresh_account_status(shop.stripe_account_id)
@@ -909,8 +909,8 @@ class ShopStripeConnectAccountView(APIView):
         from apps.billing.stripe_connect import create_account_onboarding_link, create_stripe_express_account, onboarding_redirect_urls
 
         shop = get_object_or_404(Shop, id=shop_id)
-        if shop.owner_id != request.user.id and not request.user.is_staff:
-            raise PermissionDenied("Only the shop owner can connect a payout account.")
+        if not _provider_can_manage_shop(request.user, shop) and not request.user.is_staff:
+            raise PermissionDenied("Only the shop owner, team manager, or partner manager can connect a payout account.")
 
         if not shop.stripe_account_id:
             country = str(request.data.get("country") or "US").strip().upper()
@@ -925,6 +925,44 @@ class ShopStripeConnectAccountView(APIView):
             {"onboarding_url": onboarding_url, "stripe_account_id": shop.stripe_account_id},
             status=status.HTTP_200_OK,
         )
+
+
+class ShopPartnerConnectView(APIView):
+    """Attaches/detaches this shop to a Partner organization. Requires the
+    caller to be able to manage BOTH the shop and the target partner - not
+    just one - so a low-level shop team member can't hijack the shop into
+    an unrelated partner they happen to manage, and a partner manager can't
+    attach a shop they have no rights over."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, shop_id: str):
+        from apps.partners.models import Partner
+        from apps.partners.services import partner_user_can_manage
+
+        shop = get_object_or_404(Shop, id=shop_id)
+        if not _provider_can_manage_shop(request.user, shop) and not request.user.is_staff:
+            raise PermissionDenied("Only the shop owner, team manager, or partner manager can connect a partner.")
+
+        partner_id = str(request.data.get("partner_id") or "").strip()
+        if not partner_id:
+            raise ValidationError({"partner_id": "This field is required."})
+        partner = get_object_or_404(Partner, id=partner_id)
+        if not partner_user_can_manage(partner, request.user):
+            raise PermissionDenied("You do not have permission to attach shops to this partner.")
+
+        shop.partner = partner
+        shop.save(update_fields=["partner"])
+        return Response(ShopSerializer(shop, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    def delete(self, request, shop_id: str):
+        shop = get_object_or_404(Shop, id=shop_id)
+        if not _provider_can_manage_shop(request.user, shop) and not request.user.is_staff:
+            raise PermissionDenied("Only the shop owner, team manager, or partner manager can disconnect a partner.")
+
+        shop.partner = None
+        shop.save(update_fields=["partner"])
+        return Response(ShopSerializer(shop, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
 class CommerceDiscoveryView(APIView):
@@ -1045,14 +1083,14 @@ class ProductViewSet(viewsets.ModelViewSet):
     def get_object(self):
         obj = super().get_object()
         if self.request.method not in permissions.SAFE_METHODS:
-            if obj.shop.owner_id != self.request.user.id and not self.request.user.is_staff:
-                raise PermissionDenied("Only product owners or staff can modify listings.")
+            if not _provider_can_manage_shop(self.request.user, obj.shop) and not self.request.user.is_staff:
+                raise PermissionDenied("Only product owners, team managers, partner managers, or staff can modify listings.")
         return obj
 
     def perform_create(self, serializer):
         shop = serializer.validated_data.get("shop")
-        if not shop or shop.owner_id != self.request.user.id:
-            raise PermissionDenied("You can only add products to your own shop.")
+        if not shop or not _provider_can_manage_shop(self.request.user, shop):
+            raise PermissionDenied("You can only add products to a shop you manage.")
 
         product_limit_raw = get_feature_limit(self.request.user, "products_per_shop_limit", 0)
         product_limit = _normalize_limit(product_limit_raw)
@@ -1151,9 +1189,9 @@ class ProductViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         shop = getattr(instance, 'shop', None)
-        if shop and shop.owner_id != self.request.user.pk and not self.request.user.is_staff:
+        if shop and not _provider_can_manage_shop(self.request.user, shop) and not self.request.user.is_staff:
             from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied("Only the shop owner can delete this product.")
+            raise PermissionDenied("Only the shop owner, team manager, or partner manager can delete this product.")
         instance.is_deleted = True
         instance.is_active = False
         instance.save(update_fields=["is_deleted", "is_active"])
@@ -1177,8 +1215,8 @@ class ProductViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post', 'delete'], url_path='broadcast')
     def broadcast(self, request, pk=None):
         product = self.get_object()
-        if product.shop.owner_id != request.user.id:
-            raise PermissionDenied("Only the shop owner can broadcast this product.")
+        if not _provider_can_manage_shop(request.user, product.shop):
+            raise PermissionDenied("Only the shop owner, team manager, or partner manager can broadcast this product.")
 
         from apps.broadcasts.models import BroadcastItem, BroadcastSourceType
         if request.method == 'DELETE':
@@ -1976,8 +2014,8 @@ class ShopServiceViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         shop = serializer.validated_data.get("shop")
-        if not shop or (shop.owner_id != self.request.user.id and not self.request.user.is_staff):
-            raise PermissionDenied("Only shop owners or staff can create services.")
+        if not shop or (not _provider_can_manage_shop(self.request.user, shop) and not self.request.user.is_staff):
+            raise PermissionDenied("Only shop owners, team managers, partner managers, or staff can create services.")
         image_file = serializer.validated_data.get("image_file")
         if image_file:
             validate_upload_file_safety(image_file, context="commerce")
@@ -1989,8 +2027,8 @@ class ShopServiceViewSet(viewsets.ModelViewSet):
     def get_object(self):
         obj = super().get_object()
         if self.request.method not in permissions.SAFE_METHODS:
-            if obj.shop.owner_id != self.request.user.id and not self.request.user.is_staff:
-                raise PermissionDenied("Only shop owners or staff can modify services.")
+            if not _provider_can_manage_shop(self.request.user, obj.shop) and not self.request.user.is_staff:
+                raise PermissionDenied("Only shop owners, team managers, partner managers, or staff can modify services.")
         return obj
 
     def perform_update(self, serializer):
@@ -2050,8 +2088,8 @@ class ShopServiceViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post', 'delete'], url_path='broadcast')
     def broadcast(self, request, pk=None):
         service = self.get_object()
-        if service.shop.owner_id != request.user.id:
-            raise PermissionDenied("Only the shop owner can broadcast this service.")
+        if not _provider_can_manage_shop(request.user, service.shop):
+            raise PermissionDenied("Only the shop owner, team manager, or partner manager can broadcast this service.")
 
         from apps.broadcasts.models import BroadcastItem, BroadcastSourceType
         if request.method == 'DELETE':
@@ -2414,14 +2452,7 @@ class ServiceBookingViewSet(
         if user.is_staff:
             return True
         shop = getattr(booking, "shop", None)
-        if shop and shop.owner_id == user.id:
-            return True
-        return ShopTeamMember.objects.filter(
-            shop=shop,
-            user=user,
-            role__in={ShopRole.MANAGER, ShopRole.ADMIN},
-            is_active=True,
-        ).exists()
+        return bool(shop) and _provider_can_manage_shop(user, shop)
 
     def _can_user_manage_booking(self, user, booking):
         if not user or not user.is_authenticated:
@@ -2429,14 +2460,7 @@ class ServiceBookingViewSet(
         if user.is_staff:
             return True
         shop = getattr(booking, "shop", None)
-        if shop and shop.owner_id == user.id:
-            return True
-        return ShopTeamMember.objects.filter(
-            shop=shop,
-            user=user,
-            role__in={ShopRole.MANAGER, ShopRole.ADMIN},
-            is_active=True,
-        ).exists()
+        return bool(shop) and _provider_can_manage_shop(user, shop)
 
     def _can_user_view_booking(self, user, booking):
         if not user or not user.is_authenticated:
@@ -2449,14 +2473,7 @@ class ServiceBookingViewSet(
         if provider and provider.id == user.id:
             return True
         shop = getattr(booking, "shop", None)
-        if shop and shop.owner_id == user.id:
-            return True
-        return ShopTeamMember.objects.filter(
-            shop=shop,
-            user=user,
-            role__in={ShopRole.MANAGER, ShopRole.ADMIN},
-            is_active=True,
-        ).exists()
+        return bool(shop) and _provider_can_manage_shop(user, shop)
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
