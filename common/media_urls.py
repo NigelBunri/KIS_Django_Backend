@@ -77,12 +77,63 @@ def should_strip_backend_origin(value: object, request=None) -> bool:
     return _host_is_private_or_loopback(parsed.hostname)
 
 
+def _is_presigned_object_storage_url(parsed) -> bool:
+    """S3 (and S3-compatible) presigned GET URLs carry their signature and
+    expiry entirely in the query string — that query string alone is
+    proof the value was resolved for one temporary read, never something
+    safe to persist as if it were the stable object key. Detected by the
+    SigV4 marker (X-Amz-Signature) rather than by host, so this catches
+    any bucket/region/CNAME rather than needing a host allowlist."""
+    query = parsed.query or ""
+    return "X-Amz-Signature=" in query
+
+
+def _presigned_object_key(parsed) -> str:
+    """Recovers the raw object key from a presigned S3 URL's path,
+    stripping the bucket name if it's present as a path segment.
+    boto3 (apps.media.storage_backends) generates path-style URLs —
+    https://s3.<region>.amazonaws.com/<bucket>/<key> — where the host is
+    the generic S3 endpoint and the bucket is the FIRST path segment,
+    unlike virtual-hosted-style URLs (https://<bucket>.s3.<region>.
+    amazonaws.com/<key>) where the whole path already IS the key.
+    Distinguishing the two only by whether the host itself starts with
+    "s3." (path-style) avoids needing to know the actual configured
+    bucket name here — this module doesn't otherwise depend on
+    apps.media's settings."""
+    path = (parsed.path or "").lstrip("/")
+    host = (parsed.hostname or "").lower()
+    if host.startswith("s3.") and host.endswith("amazonaws.com"):
+        # Path-style: first segment is the bucket, the rest is the key.
+        _bucket, _sep, key = path.partition("/")
+        return key
+    return path
+
+
 def strip_backend_origin(value: object, request=None) -> str:
-    """Store backend-hosted media as a path so changing API hosts does not stale DB rows."""
+    """Store backend-hosted media as a path so changing API hosts does not
+    stale DB rows.
+
+    Also self-heals a presigned object-storage URL (S3 X-Amz-Signature
+    query params) back down to its stable object key. Without this, a
+    value resolved for temporary display (e.g.
+    EducationInstitutionSerializer.to_representation resolving
+    branding.logo_url into a signed URL, or any equivalent
+    resolve-for-display step elsewhere) that gets round-tripped back
+    through an edit form's unmodified save would otherwise be persisted
+    as a frozen, soon-to-expire URL instead of the reusable key it
+    started as — confirmed in production for
+    EducationInstitution.branding.logo_url/logoUrl (a signed URL over 7
+    hours past its 1-hour expiry had been silently written back in,
+    which is exactly what stopped the logo from displaying after an
+    edit that never touched it)."""
     text = _clean_text(value)
-    if not should_strip_backend_origin(text, request=request):
+    if not text:
         return text
     parsed = urlparse(text)
+    if _is_presigned_object_storage_url(parsed):
+        return _presigned_object_key(parsed)
+    if not should_strip_backend_origin(text, request=request):
+        return text
     path = parsed.path or "/"
     return urlunparse(("", "", path, "", parsed.query, parsed.fragment))
 

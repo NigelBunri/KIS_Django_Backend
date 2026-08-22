@@ -1197,7 +1197,25 @@ def _normalize_education_branding_payload(payload, existing: dict | None = None,
     brand-new institution, that's right after .objects.create()). See
     _education_cover_image_from_payload for why a plain logo_url/logoUrl/
     etc string remains free text (never resolved server-side) while an
-    attachment object is."""
+    attachment object is.
+
+    Every logo_url/image_url/etc value read back through
+    EducationInstitutionSerializer.to_representation is a resolved,
+    presigned, EXPIRING display URL — the serializer overwrites the same
+    branding[key] in place with it rather than exposing it under a
+    separate field (see that method for why). An edit form that hydrates
+    its "current value" from a GET response and resends it unchanged on
+    a later PATCH would otherwise round-trip that temporary URL straight
+    back into storage, permanently replacing the stable object key with
+    a value that stops working the moment its signature expires —
+    confirmed in production (a signed url with X-Amz-Expires=3600, over
+    7 hours stale, is exactly what had been persisted into
+    branding.logo_url/logoUrl for Kingdom Impact Tech Academy). The fix
+    lives one level down: normalize_media_reference (via
+    common.media_urls.strip_backend_origin) now detects a presigned
+    object-storage URL and self-heals it back to the stable object key
+    before it's ever written to branding[target_key] below, rather than
+    persisting it verbatim — see that function's docstring."""
     branding = dict(existing or {})
     raw_branding = payload.get("branding") if hasattr(payload, "get") else None
     if isinstance(raw_branding, dict):
