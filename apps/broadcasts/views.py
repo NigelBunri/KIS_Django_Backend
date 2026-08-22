@@ -2760,6 +2760,15 @@ def _sanitize_learning_item_content_for_public_preview(
     item: dict[str, Any],
 ) -> dict[str, Any]:
     next_item = dict(item)
+    if next_item.get("is_preview"):
+        # The course owner explicitly marked this one lesson as a free
+        # sample (EducationInstitutionLesson.is_preview) so shoppers can
+        # judge quality before paying - previewItemCount/previewLesson
+        # already advertise this item's existence to non-enrolled viewers
+        # elsewhere in this file, so blanking its own content here would
+        # make that advertised "free preview" a dead end that never
+        # actually shows anything.
+        return next_item
     content = dict(next_item.get("content") or {})
     item_type = str(next_item.get("type") or "")
     if item_type == EducationCourseModuleItemType.LESSON:

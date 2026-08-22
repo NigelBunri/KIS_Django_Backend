@@ -4161,3 +4161,102 @@ class EducationContentDetailProgressAccessSignalTests(APITestCase):
         response = self.client.post(f'{self._content_detail_url()}enroll/', {}, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertIsNone(response.data['progress'])
+
+
+class EducationFreePreviewLessonTests(APITestCase):
+    """Regression coverage for completing the course owner's "free preview
+    lesson" feature (EducationInstitutionLesson.is_preview). The field and
+    its plumbing (previewItemCount, detail_item.previewLesson) already
+    existed, but _sanitize_learning_item_content_for_public_preview blanked
+    every item's content unconditionally for a non-enrolled viewer,
+    including ones explicitly marked as a free sample — the RN app's
+    "Preview" button was consequently a dead stub that never showed real
+    content. A lesson the owner marks is_preview=True must show its real
+    body text to a shopper who has not paid; every other lesson must stay
+    fully blanked exactly as before."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5558800301', username='preview_lesson_owner', password='secret', country='NG',
+        )
+        self.shopper = User.objects.create_user(
+            phone='5558800302', username='preview_lesson_shopper', password='secret', country='NG',
+        )
+        self.institution = EducationInstitution.objects.create(
+            owner=self.owner, name='Sampler Academy', description='Try before you buy.',
+            payout_account_status=EducationInstitutionPayoutAccountStatus.ACTIVE,
+            flutterwave_subaccount_id='RS_TEST_PREVIEW',
+        )
+        self.course = EducationInstitutionCourse.objects.create(
+            institution=self.institution, title='Sampler Curriculum', status='published',
+            price_amount='49.00', price_currency='USD',
+        )
+        self.broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=self.institution,
+            created_by=self.owner,
+            broadcast_kind='course',
+            course=self.course,
+            title='Sampler Curriculum',
+            summary='Free preview lesson should be visible.',
+            booking_enabled=True,
+            price_amount='49.00',
+            price_currency='USD',
+            status='published',
+        )
+        self.preview_lesson = EducationInstitutionLesson.objects.create(
+            institution=self.institution, course=self.course, title='Free Sample Lesson',
+            content='This is the real free-sample body text.',
+            is_preview=True,
+        )
+        self.locked_lesson = EducationInstitutionLesson.objects.create(
+            institution=self.institution, course=self.course, title='Paid-Only Lesson',
+            content='This must stay hidden until purchase.',
+            is_preview=False,
+        )
+
+    def _content_detail_url(self):
+        return f'/api/v1/education/contents/{self.broadcast.id}/'
+
+    def _outline_items(self, response):
+        outline = response.data['content']['courseOutline']
+        return [item for module in outline for item in module['items']]
+
+    def test_non_enrolled_shopper_sees_real_content_for_preview_lesson_only(self):
+        self.client.force_authenticate(self.shopper)
+        response = self.client.get(self._content_detail_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        items = self._outline_items(response)
+        preview_item = next(i for i in items if i['title'] == 'Free Sample Lesson')
+        locked_item = next(i for i in items if i['title'] == 'Paid-Only Lesson')
+        self.assertEqual(
+            preview_item['content']['content'],
+            'This is the real free-sample body text.',
+        )
+        self.assertEqual(locked_item['content']['content'], '')
+
+    def test_anonymous_lookup_never_sees_locked_content_regardless_of_preview(self):
+        # Sanity check the preview exemption didn't loosen anything else -
+        # a non-preview lesson on the same course must still be blanked.
+        self.client.force_authenticate(self.shopper)
+        response = self.client.get(self._content_detail_url())
+        items = self._outline_items(response)
+        locked_item = next(i for i in items if i['title'] == 'Paid-Only Lesson')
+        self.assertFalse(locked_item['content'].get('is_downloadable', False))
+
+    def test_enrolled_learner_sees_both_lessons_in_full(self):
+        EducationInstitutionEnrollment.objects.create(
+            institution=self.institution,
+            broadcast=self.broadcast,
+            course=self.course,
+            user=self.shopper,
+            status='enrolled',
+        )
+        self.client.force_authenticate(self.shopper)
+        response = self.client.get(self._content_detail_url())
+        items = self._outline_items(response)
+        locked_item = next(i for i in items if i['title'] == 'Paid-Only Lesson')
+        self.assertEqual(
+            locked_item['content']['content'],
+            'This must stay hidden until purchase.',
+        )
