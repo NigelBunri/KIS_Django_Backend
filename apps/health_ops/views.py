@@ -10,7 +10,7 @@ from django.core.cache import cache
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
-from django.http import HttpResponse
+from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -63,6 +63,7 @@ from .models import (
     HealthInstitution,
     HealthInstitutionMembership,
     HealthInstitutionPayoutAccountStatus,
+    InstitutionType,
     HomeLogisticsSession,
     HomeLogisticsStatus,
     HealthService,
@@ -1489,6 +1490,41 @@ class HealthInstitutionDetailView(APIView):
             return error_response
         return Response({"institution": HealthInstitutionSerializer(institution, context={"request": request}).data}, status=status.HTTP_200_OK)
 
+    def patch(self, request, institution_id):
+        # Previously GET-only — the mobile app's own "edit institution" flow
+        # only ever wrote to a display-layer JSON profile blob
+        # (broadcasts/profiles/manage/, profile_type="health_profile"),
+        # never to this real relational HealthInstitution row, so there was
+        # no actual edit capability to build a web admin panel on. This is
+        # that missing capability.
+        institution, error_response = _resolve_institution_for_request(
+            request.user,
+            institution_id,
+            allow_bootstrap=False,
+        )
+        if error_response:
+            return error_response
+        if not _can_manage_institution(request.user, institution):
+            return Response({"detail": "You cannot manage this institution."}, status=status.HTTP_403_FORBIDDEN)
+
+        name = request.data.get("name")
+        if isinstance(name, str) and name.strip():
+            institution.name = name.strip()[:255]
+        if "institution_type" in request.data:
+            raw_type = str(request.data.get("institution_type") or "").strip().lower()
+            if raw_type in InstitutionType.values:
+                institution.institution_type = raw_type
+        if "timezone" in request.data:
+            timezone_name = str(request.data.get("timezone") or "").strip()
+            if timezone_name:
+                institution.timezone = timezone_name[:64]
+        if "is_active" in request.data:
+            institution.is_active = bool(request.data.get("is_active"))
+        if isinstance(request.data.get("settings"), dict):
+            institution.settings = request.data.get("settings")
+        institution.save()
+        return Response({"institution": HealthInstitutionSerializer(institution, context={"request": request}).data}, status=status.HTTP_200_OK)
+
 
 class HealthInstitutionPayoutAccountConnectView(APIView):
     """Connects the institution's Flutterwave subaccount for direct-to-
@@ -1800,6 +1836,42 @@ class HealthServiceListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         service = serializer.save()
         return Response({"service": HealthServiceSerializer(service).data}, status=status.HTTP_201_CREATED)
+
+
+class HealthServiceDetailView(APIView):
+    """Previously missing entirely — HealthServiceListCreateView only ever
+    supported list/create, so once a service existed there was no way to
+    edit or remove it short of a direct DB write."""
+
+    permission_classes = [IsAuthenticated]
+
+    def _get_service_or_404(self, request, service_id):
+        service = get_object_or_404(HealthService.objects.select_related("institution"), id=service_id)
+        if not _can_manage_institution(request.user, service.institution):
+            raise Http404
+        return service
+
+    def get(self, request, service_id):
+        service = self._get_service_or_404(request, service_id)
+        return Response({"service": HealthServiceSerializer(service).data}, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def patch(self, request, service_id):
+        service = self._get_service_or_404(request, service_id)
+        payload = dict(request.data)
+        if "base_cost_micro" not in payload and "base_cost_kisc" in payload:
+            payload["base_cost_micro"] = _kisc_to_micro(payload.get("base_cost_kisc"), allow_empty=True) or 0
+        payload.pop("base_cost_kisc", None)
+        payload.pop("institution", None)
+        serializer = HealthServiceSerializer(service, data=payload, partial=True)
+        serializer.is_valid(raise_exception=True)
+        service = serializer.save()
+        return Response({"service": HealthServiceSerializer(service).data}, status=status.HTTP_200_OK)
+
+    def delete(self, request, service_id):
+        service = self._get_service_or_404(request, service_id)
+        service.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class HealthCarePlanListCreateView(APIView):

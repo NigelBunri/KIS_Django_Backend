@@ -37,6 +37,7 @@ from .views import (
     HealthInstitutionVerificationStartView,
     HealthInstitutionVerificationStatusView,
     HealthServiceListCreateView,
+    HealthServiceDetailView,
     HomeLogisticsSessionDetailView,
     HomeLogisticsSessionEndView,
     HomeLogisticsSessionPayloadView,
@@ -131,6 +132,11 @@ urlpatterns = [
         "health-ops/institutions/<str:institution_id>/services/",
         HealthServiceListCreateView.as_view(),
         name="health-ops-service-list-create",
+    ),
+    path(
+        "health-ops/services/<str:service_id>/",
+        HealthServiceDetailView.as_view(),
+        name="health-ops-service-detail",
     ),
     path(
         "health-ops/services/<str:service_id>/engines/",
