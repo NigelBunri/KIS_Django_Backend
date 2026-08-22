@@ -3513,10 +3513,16 @@ class EducationUploadIntentTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_oversized_material_upload_rejected(self, mock_client):
+        # education_material's cap is 5 GiB (S3's own single-PUT ceiling —
+        # see _education_material_max_bytes), raised from a previous 100
+        # MiB that was silently rejecting anything but the shortest course
+        # videos. 500 MiB, this test's old size, is now comfortably inside
+        # that limit and no longer exercises this rejection path at all -
+        # go just over the real current ceiling instead.
         response = self._initiate_and_confirm(
             mock_client, user=self.owner, context='education_material',
             institution_id=str(self.institution.id), content_type='application/pdf',
-            size_bytes=500 * 1024 * 1024,
+            size_bytes=6 * 1024 * 1024 * 1024,
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
