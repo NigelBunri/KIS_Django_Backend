@@ -157,6 +157,7 @@ TIER_PRESETS: list[dict[str, Any]] = [
                 "Unlimited market profile creation",
                 "Branding controls",
                 "Faster support response",
+                "Web control panel — manage your shops from any computer",
             ],
             "communities": "unlimited",
             "groups_per_community": "unlimited",
@@ -185,6 +186,7 @@ TIER_PRESETS: list[dict[str, Any]] = [
             "website_kis_content_sections_limit": "unlimited",
             "website_custom_branding": True,
             "website_publish": True,
+            "web_control_panel": True,
         },
     },
     {
@@ -209,6 +211,7 @@ TIER_PRESETS: list[dict[str, Any]] = [
                 "Higher media limits (13 GB for broadcast feeds and profile gallery)",
                 "Unlimited health profiles creation",
                 "Unlimited education profiles creation",
+                "Web control panel — manage your partner org from any computer",
             ],
             "communities": "unlimited",
             "groups_per_community": "unlimited",
@@ -247,6 +250,7 @@ TIER_PRESETS: list[dict[str, Any]] = [
             "website_kis_content_sections_limit": 5,
             "website_custom_branding": True,
             "website_publish": True,
+            "web_control_panel": True,
         },
     },
     {
@@ -270,6 +274,7 @@ TIER_PRESETS: list[dict[str, Any]] = [
                 "Unlimited media limits",
                 "Better groups, communities, channels, and feeds management",
                 "Organizational management tools",
+                "Web control panel — manage your entire partner network from any computer",
             ],
             "communities": "unlimited",
             "groups_per_community": "unlimited",
@@ -310,6 +315,7 @@ TIER_PRESETS: list[dict[str, Any]] = [
             "website_kis_content_sections_limit": "unlimited",
             "website_custom_branding": True,
             "website_publish": True,
+            "web_control_panel": True,
         },
     },
 ]
