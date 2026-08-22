@@ -102,7 +102,18 @@ def create_stripe_express_account(*, email: str, country: str = "US") -> str:
     check their payout status — Express dashboard access requires the
     platform (not Stripe) to be the fees/losses collector, which is what
     responsibilities.fees_collector/losses_collector="application" below
-    declares."""
+    declares.
+
+    Also requests configuration.merchant.capabilities.card_payments
+    alongside the recipient capability — confirmed live against this
+    platform account that stripe_balance.stripe_transfers is rejected
+    without it ("cannot be requested without the
+    configuration.merchant.capabilities.card_payments capability").
+    KIS still never routes a charge through the connected account
+    directly (see the module docstring — Destination Charges keep the
+    platform's own account as merchant of record); this is a
+    platform-level activation precondition for holding a Stripe balance
+    via transfers, not a change to how charges are actually processed."""
     body = {
         "contact_email": email or None,
         "dashboard": "express",
@@ -112,12 +123,17 @@ def create_stripe_express_account(*, email: str, country: str = "US") -> str:
                     "stripe_balance": {"stripe_transfers": {"requested": True}},
                 },
             },
+            "merchant": {
+                "capabilities": {
+                    "card_payments": {"requested": True},
+                },
+            },
         },
         "defaults": {
             "responsibilities": {"fees_collector": "application", "losses_collector": "application"},
         },
         "identity": {"country": (country or "US").lower()},
-        "include": ["configuration.recipient"],
+        "include": ["configuration.recipient", "configuration.merchant"],
     }
     data = _v2_request("POST", "/v2/core/accounts", action="account creation", json_body=body)
     account_id = str(data.get("id") or "")
@@ -141,7 +157,14 @@ def create_account_onboarding_link(*, account_id: str, refresh_url: str, return_
         "use_case": {
             "type": "account_onboarding",
             "account_onboarding": {
-                "configurations": ["recipient"],
+                # Both configurations requested at account-creation time
+                # (see create_stripe_express_account) need their
+                # requirements collected here, or onboarding will
+                # complete only the recipient side and leave the
+                # merchant.card_payments capability (a hard precondition
+                # for stripe_balance.stripe_transfers on this platform)
+                # permanently pending.
+                "configurations": ["recipient", "merchant"],
                 "return_url": return_url,
                 "refresh_url": refresh_url,
             },
@@ -178,7 +201,11 @@ def refresh_account_status(account_id: str) -> dict:
         "GET",
         f"/v2/core/accounts/{account_id}",
         action="status refresh",
-        params=[("include[]", "configuration.recipient"), ("include[]", "requirements")],
+        params=[
+            ("include[]", "configuration.recipient"),
+            ("include[]", "configuration.merchant"),
+            ("include[]", "requirements"),
+        ],
     )
     capability = (
         (data.get("configuration") or {})
