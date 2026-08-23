@@ -1,8 +1,10 @@
+from datetime import timedelta
 from unittest.mock import patch
 from io import StringIO
 
 from django.core.management import call_command
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -17,6 +19,7 @@ from apps.partners.models import (
     PartnerAutomationRule,
     PartnerIntegration,
     PartnerInvite,
+    PartnerJobPost,
     PartnerJoinConfig,
     PartnerMembership,
     PartnerMembershipStatus,
@@ -607,6 +610,160 @@ class PartnerApiTests(TestCase):
         self.assertEqual(payload["comments_count"], 6)
 
 
+class PartnerPostModerationEnforcementApiTests(TestCase):
+    """moderate_member's mute/timeout actions set PartnerMembership flags,
+    but nothing in PartnerPostViewSet ever read them back — a muted or
+    timed-out member could post/comment/react without any restriction."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670005001", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670005002", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Moderation Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        ConversationMember.objects.create(conversation=conversation, user=self.member, base_role=BaseConversationRole.MEMBER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Moderation Partner", slug="moderation-partner", main_conversation=conversation)
+        self.membership = PartnerMembership.objects.create(
+            partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER,
+        )
+        self.post = PartnerPost.objects.create(partner=self.partner, author=self.owner, text_plain="Hello", text_preview="Hello")
+
+    def test_muted_member_cannot_post(self):
+        self.membership.is_muted = True
+        self.membership.save(update_fields=["is_muted"])
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post("/api/v1/partners/posts/", {"partner": str(self.partner.id)}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    def test_muted_member_cannot_comment_or_react(self):
+        self.membership.is_muted = True
+        self.membership.save(update_fields=["is_muted"])
+        self.client.force_authenticate(self.member)
+
+        comment_response = self.client.post(f"/api/v1/partners/posts/{self.post.id}/comment/", {"text": "hi"}, format="json")
+        react_response = self.client.post(f"/api/v1/partners/posts/{self.post.id}/react/", {"emoji": "👍"}, format="json")
+
+        self.assertEqual(comment_response.status_code, status.HTTP_403_FORBIDDEN, comment_response.data)
+        self.assertEqual(react_response.status_code, status.HTTP_403_FORBIDDEN, react_response.data)
+
+    def test_timed_out_member_cannot_post(self):
+        self.membership.timed_out_until = timezone.now() + timedelta(hours=1)
+        self.membership.save(update_fields=["timed_out_until"])
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post("/api/v1/partners/posts/", {"partner": str(self.partner.id)}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    def test_expired_timeout_no_longer_blocks(self):
+        self.membership.timed_out_until = timezone.now() - timedelta(hours=1)
+        self.membership.save(update_fields=["timed_out_until"])
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post("/api/v1/partners/posts/", {"partner": str(self.partner.id)}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_unmuted_member_can_post(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post("/api/v1/partners/posts/", {"partner": str(self.partner.id)}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+
+class PartnerJobPostingTierGateApiTests(TestCase):
+    """jobs/update_job only ever checked _user_can_manage_partner — any
+    manager/admin/owner could post jobs regardless of their own account's
+    tier. Also covers the field-drop bug where job creation silently
+    ignored location/is_remote/job_type/salary/tags."""
+
+    def setUp(self):
+        self.client = APIClient()
+        ensure_default_account_tiers()
+        self.owner = User.objects.create_user(phone="+237670006001", country="CM", password="pass1234")
+        self.business_pro_manager = User.objects.create_user(phone="+237670006002", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Jobs Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Jobs Partner", slug="jobs-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(
+            partner=self.partner, user=self.business_pro_manager, role="manager", status=PartnerMembershipStatus.MEMBER,
+        )
+
+        partner_tier = AccountTier.objects.filter(name__iexact="Partner").first()
+        Subscription.objects.create(user=self.owner, tier=partner_tier, status="active")
+        business_pro_tier = AccountTier.objects.filter(name__iexact="Business Pro").first()
+        Subscription.objects.create(user=self.business_pro_manager, tier=business_pro_tier, status="active")
+
+    def _url(self, suffix=""):
+        return f"/api/v1/partners/{self.partner.id}/jobs/{suffix}"
+
+    def test_partner_tier_owner_can_create_job_with_full_field_set(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            self._url(),
+            {
+                "title": "Youth Pastor", "description": "Lead youth ministry", "requirements": "5 years experience",
+                "location": "Douala", "is_remote": False, "job_type": "part_time",
+                "salary_min_cents": 50000, "salary_max_cents": 90000, "salary_currency": "XAF",
+                "tags": ["ministry", "youth"],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        job = PartnerJobPost.objects.get(partner=self.partner)
+        self.assertEqual(job.location, "Douala")
+        self.assertEqual(job.job_type, "part_time")
+        self.assertEqual(job.salary_min_cents, 50000)
+        self.assertEqual(job.salary_max_cents, 90000)
+        self.assertEqual(job.salary_currency, "XAF")
+        self.assertEqual(job.tags, ["ministry", "youth"])
+
+    def test_manager_below_partner_tier_cannot_create_job(self):
+        self.client.force_authenticate(self.business_pro_manager)
+
+        response = self.client.post(self._url(), {"title": "Should be blocked"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertFalse(PartnerJobPost.objects.filter(partner=self.partner).exists())
+
+    def test_manager_below_partner_tier_cannot_update_job(self):
+        job = PartnerJobPost.objects.create(partner=self.partner, title="Existing role")
+        self.client.force_authenticate(self.business_pro_manager)
+
+        response = self.client.patch(self._url(f"{job.id}/"), {"title": "Renamed"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        job.refresh_from_db()
+        self.assertEqual(job.title, "Existing role")
+
+    def test_update_job_persists_full_field_set(self):
+        job = PartnerJobPost.objects.create(partner=self.partner, title="Existing role")
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.patch(
+            self._url(f"{job.id}/"),
+            {"location": "Remote", "is_remote": True, "job_type": "contract", "salary_min_cents": 10000, "tags": ["remote"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        job.refresh_from_db()
+        self.assertEqual(job.location, "Remote")
+        self.assertTrue(job.is_remote)
+        self.assertEqual(job.job_type, "contract")
+        self.assertEqual(job.salary_min_cents, 10000)
+        self.assertEqual(job.tags, ["remote"])
+
+
 class PartnerMemberRoleUpdateApiTests(TestCase):
     """Covers the new PATCH /partners/{id}/members/{user_id}/ endpoint —
     previously there was no way anywhere (not either client, not Django
@@ -766,6 +923,67 @@ class PartnerApplicationReviewApiTests(TestCase):
         self.assertTrue(
             PartnerAuditEvent.objects.filter(partner=self.partner, action="partner.application.approve").exists()
         )
+
+
+class PartnerApplicationCvApiTests(TestCase):
+    """A user's existing KIS profile (headline/bio/industry/experience/
+    education/skills/projects) already existed but was never surfaced to a
+    partner reviewing an application — PartnerApplicationDetailSerializer
+    only ever returned display_name/phone/avatar_url, and there was no
+    resume field on PartnerApplication to begin with."""
+
+    def setUp(self):
+        from datetime import date
+
+        from apps.accounts.models import Education, Experience
+
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670007001", country="CM", password="pass1234")
+        self.applicant = User.objects.create_user(phone="+237670007002", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="CV Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="CV Partner", slug="cv-partner", main_conversation=conversation)
+
+        self.applicant.profile.headline = "Backend Engineer"
+        self.applicant.profile.bio = "I build things."
+        self.applicant.profile.open_to_work = True
+        self.applicant.profile.save(update_fields=["headline", "bio", "open_to_work", "updated_at"])
+        Experience.objects.create(user=self.applicant, title="Engineer", description="Built stuff", start_date=date(2020, 1, 1), currently_working=True)
+        Education.objects.create(user=self.applicant, school="KIS University", description="CS degree", start_date=date(2016, 1, 1), end_date=date(2020, 1, 1))
+
+    def _apply(self, profile_visible=True):
+        self.client.force_authenticate(self.applicant)
+        return self.client.post(
+            f"/api/v1/partners/{self.partner.id}/apply/",
+            {"method": "application", "message": "hire me", "profile_visible": profile_visible},
+            format="json",
+        )
+
+    def test_reviewer_sees_full_cv_when_profile_visible(self):
+        self._apply(profile_visible=True)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/applications/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        cv = response.data[0]["user"]["cv"]
+        self.assertEqual(cv["headline"], "Backend Engineer")
+        self.assertTrue(cv["open_to_work"])
+        self.assertEqual(len(cv["experiences"]), 1)
+        self.assertEqual(cv["experiences"][0]["title"], "Engineer")
+        self.assertEqual(len(cv["educations"]), 1)
+        self.assertEqual(cv["educations"][0]["school"], "KIS University")
+
+    def test_no_cv_leaks_when_profile_not_visible(self):
+        self._apply(profile_visible=False)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/applications/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data[0]["user"], {"id": str(self.applicant.id)})
 
 
 class UserAppShortcutApiTests(TestCase):

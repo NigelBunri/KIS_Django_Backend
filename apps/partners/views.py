@@ -3222,6 +3222,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
 
         if not self._user_can_manage_partner(partner, request.user):
             raise PermissionDenied("Not allowed to manage job posts.")
+        self._require_partner_feature(request.user, "job_posting", "Job posting is available on the Partner and Partner Pro plans.")
 
         serializer = PartnerJobPostSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -3230,6 +3231,13 @@ class PartnerViewSet(viewsets.ModelViewSet):
             title=serializer.validated_data.get("title", ""),
             description=serializer.validated_data.get("description", ""),
             requirements=serializer.validated_data.get("requirements", ""),
+            location=serializer.validated_data.get("location", ""),
+            is_remote=serializer.validated_data.get("is_remote", False),
+            job_type=serializer.validated_data.get("job_type", "full_time"),
+            salary_min_cents=serializer.validated_data.get("salary_min_cents"),
+            salary_max_cents=serializer.validated_data.get("salary_max_cents"),
+            salary_currency=serializer.validated_data.get("salary_currency", "USD"),
+            tags=serializer.validated_data.get("tags", []),
             steps=serializer.validated_data.get("steps", []),
             auto_assign=serializer.validated_data.get("auto_assign", {}),
             is_active=serializer.validated_data.get("is_active", True),
@@ -3241,12 +3249,17 @@ class PartnerViewSet(viewsets.ModelViewSet):
         partner = self.get_object()
         if not self._user_can_manage_partner(partner, request.user):
             raise PermissionDenied("Not allowed to manage job posts.")
+        self._require_partner_feature(request.user, "job_posting", "Job posting is available on the Partner and Partner Pro plans.")
 
         job = PartnerJobPost.objects.filter(partner=partner, id=job_id).first()
         if not job:
             return Response({"detail": "Job post not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        fields = ["title", "description", "requirements", "steps", "auto_assign", "is_active"]
+        fields = [
+            "title", "description", "requirements", "location", "is_remote", "job_type",
+            "salary_min_cents", "salary_max_cents", "salary_currency", "tags",
+            "steps", "auto_assign", "is_active",
+        ]
         for field in fields:
             if field in request.data:
                 setattr(job, field, request.data.get(field))
@@ -3606,7 +3619,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
             qs = qs.filter(job_type=job_type)
         if is_remote in ("true", "1"):
             qs = qs.filter(is_remote=True)
-        return Response(PartnerJobPostSerializer(qs, many=True).data)
+        return Response(PartnerJobPostSerializer(qs[:200], many=True).data)
 
     @action(detail=False, methods=["get"], url_path="my-applications", permission_classes=[IsAuthenticated])
     def my_applications(self, request):
@@ -3680,6 +3693,18 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
         role = self._member_role(partner, user)
         if role == BaseConversationRole.READONLY:
             raise PermissionDenied("Subscribers cannot post or react.")
+        # moderate_member's mute/timeout actions only ever touched
+        # PartnerMembership — nothing here read those flags back, so a
+        # muted or timed-out member could post/comment/react without any
+        # restriction. The legacy base_role check above never covered this.
+        membership = PartnerMembership.objects.filter(partner=partner, user=user).first()
+        if not membership:
+            return
+        now = timezone.now()
+        if membership.is_muted and (membership.muted_until is None or membership.muted_until > now):
+            raise PermissionDenied("You are muted in this partner organization.")
+        if membership.timed_out_until and membership.timed_out_until > now:
+            raise PermissionDenied("You are temporarily timed out in this partner organization.")
 
     def get_queryset(self):
         user = self.request.user
@@ -3943,8 +3968,14 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
                 },
             )
         except Exception:
-            pass
-        return Response({"detail": "Post broadcasted."}, status=status.HTTP_200_OK)
+            # Previously swallowed entirely — the endpoint reported success
+            # even when the post never actually reached the global feed.
+            logger.exception("partner post %s marked is_broadcast but BroadcastItem creation failed", post.id)
+            return Response(
+                {"detail": "Post saved, but publishing to the global feed failed. Try again shortly.", "is_broadcast": True, "published": False},
+                status=status.HTTP_207_MULTI_STATUS,
+            )
+        return Response({"detail": "Post broadcasted.", "is_broadcast": True, "published": True}, status=status.HTTP_200_OK)
 
 
 class UserAppShortcutViewSet(viewsets.ViewSet):

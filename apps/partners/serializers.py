@@ -621,6 +621,60 @@ class PartnerApplicationDetailSerializer(serializers.ModelSerializer):
             "display_name": getattr(user, "display_name", None),
             "phone": getattr(user, "phone", None),
             "avatar_url": getattr(profile, "avatar_url", None) if profile else None,
+            "cv": self._get_cv(user, profile),
+        }
+
+    def _get_cv(self, user, profile):
+        # A user's existing KIS profile doubles as their CV — this data
+        # already existed (Profile.headline/bio/industry/open_to_work,
+        # Experience/Education/UserSkill/Project) but nothing exposed it to
+        # a partner reviewing an application; there was no resume field on
+        # PartnerApplication to begin with.
+        from apps.accounts.models import Education, Experience, Project, UserSkill
+
+        return {
+            "headline": getattr(profile, "headline", "") if profile else "",
+            "bio": getattr(profile, "bio", "") if profile else "",
+            "industry": getattr(profile, "industry", "") if profile else "",
+            "open_to_work": bool(getattr(profile, "open_to_work", False)) if profile else False,
+            "experiences": [
+                {
+                    "title": exp.title,
+                    "description": exp.description,
+                    "start_date": exp.start_date.isoformat() if exp.start_date else None,
+                    "end_date": exp.end_date.isoformat() if exp.end_date else None,
+                    "currently_working": exp.currently_working,
+                }
+                for exp in Experience.objects.filter(user=user).order_by("-start_date")
+            ],
+            "educations": [
+                {
+                    "school": edu.school,
+                    "description": edu.description,
+                    "start_date": edu.start_date.isoformat() if edu.start_date else None,
+                    "end_date": edu.end_date.isoformat() if edu.end_date else None,
+                    "currently_studying": edu.currently_studying,
+                }
+                for edu in Education.objects.filter(user=user).order_by("-start_date")
+            ],
+            "skills": [
+                {
+                    "skill_id": str(skill.skill_id),
+                    "verified": skill.verified,
+                    "endorsements": skill.endorsements,
+                    "description": skill.description or "",
+                }
+                for skill in UserSkill.objects.filter(user=user)
+            ],
+            "projects": [
+                {
+                    "name": project.name,
+                    "description": project.description,
+                    "project_url": project.project_url or "",
+                    "technologies": project.technologies or [],
+                }
+                for project in Project.objects.filter(user=user).order_by("-start_date")
+            ],
         }
 
 
@@ -793,6 +847,7 @@ class PartnerJobPostSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+        read_only_fields = ["id", "partner", "partner_id", "partner_name", "created_at", "updated_at"]
 
     def get_salary_min(self, obj):
         return obj.salary_min_cents / 100 if obj.salary_min_cents else None
