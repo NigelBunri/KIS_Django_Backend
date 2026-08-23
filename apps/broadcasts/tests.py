@@ -243,6 +243,97 @@ class BroadcastChannelModelTests(APITestCase):
         self.assertNotIn('owner_id', detail)
         self.assertNotIn('owner_user', detail)
 
+    def test_go_owned_channel_shows_official_kis_logo(self):
+        from apps.partners.seed import GO_EMAIL
+        go_user = get_user_model().objects.create_user(
+            phone='5557000099', username='go_account', password='secret', country='NG', email=GO_EMAIL,
+        )
+        channel = self._create_channel(owner_id=go_user.id, owner_user=go_user, handle='go-channel')
+
+        data = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+
+        self.assertEqual(data['avatar_kind'], 'logo')
+        self.assertTrue(data['avatar_display_url'].endswith('/images/kis-logo-512.png'))
+        self.assertEqual(data['avatar_initials'], '')
+
+    def test_regular_user_channel_shows_profile_photo_when_set(self):
+        # Mutate self.user.profile in place (not a separately re-fetched
+        # Profile row) — the resolver reads owner_user.profile off the same
+        # cached self.user object _create_channel passes as owner_user, so
+        # a separately fetched instance's save() wouldn't be reflected in
+        # that reverse-relation cache.
+        profile = self.user.profile
+        profile.avatar_url = 'https://example.com/me.jpg'
+        profile.save(update_fields=['avatar_url'])
+        channel = self._create_channel()
+
+        data = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+
+        self.assertEqual(data['avatar_kind'], 'photo')
+        self.assertEqual(data['avatar_display_url'], 'https://example.com/me.jpg')
+
+    def test_regular_user_channel_falls_back_to_initials_without_a_photo(self):
+        profile, _ = Profile.objects.get_or_create(user=self.user)
+        profile.avatar_url = ''
+        profile.save(update_fields=['avatar_url'])
+        self.user.display_name = 'Jane Doe'
+        self.user.save(update_fields=['display_name'])
+        channel = self._create_channel()
+
+        data = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+
+        self.assertEqual(data['avatar_kind'], 'initials')
+        self.assertEqual(data['avatar_display_url'], '')
+        self.assertEqual(data['avatar_initials'], 'JD')
+
+    def test_shop_owned_channel_uses_shop_image_or_its_initials(self):
+        from apps.commerce.models import Shop
+        shop = Shop.objects.create(owner=self.user, name='Grace Bakery', slug='grace-bakery-avatar-test')
+        channel = self._create_channel(
+            owner_type=BroadcastChannel.OwnerType.SHOP, owner_id=shop.id, owner_user=None, handle='shop-channel',
+        )
+
+        data = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+
+        self.assertEqual(data['avatar_kind'], 'initials')
+        self.assertEqual(data['avatar_initials'], 'GB')
+
+    def test_health_institution_channel_is_always_initials(self):
+        from apps.health_ops.models import HealthInstitution
+        institution = HealthInstitution.objects.create(owner=self.user, name='Grace Clinic', slug='grace-clinic-avatar-test')
+        channel = self._create_channel(
+            owner_type=BroadcastChannel.OwnerType.HEALTH, owner_id=institution.id, owner_user=None, handle='health-channel',
+        )
+
+        data = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+
+        self.assertEqual(data['avatar_kind'], 'initials')
+        self.assertEqual(data['avatar_initials'], 'GC')
+
+    def test_education_institution_channel_uses_branding_logo(self):
+        institution = EducationInstitution.objects.create(
+            owner=self.user, name='Grace Academy', branding={'logo_url': 'https://example.com/logo.png'},
+        )
+        channel = self._create_channel(
+            owner_type=BroadcastChannel.OwnerType.EDUCATION, owner_id=institution.id, owner_user=None, handle='education-channel',
+        )
+
+        data = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+
+        self.assertEqual(data['avatar_kind'], 'photo')
+        self.assertEqual(data['avatar_display_url'], 'https://example.com/logo.png')
+
+    def test_partner_owned_channel_uses_partner_avatar_or_its_initials(self):
+        partner = Partner.objects.create(owner=self.user, name='Grace Network', slug='grace-network-avatar-test')
+        channel = self._create_channel(
+            owner_type=BroadcastChannel.OwnerType.PARTNER, owner_id=partner.id, owner_user=None, handle='partner-channel',
+        )
+
+        data = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+
+        self.assertEqual(data['avatar_kind'], 'initials')
+        self.assertEqual(data['avatar_initials'], 'GN')
+
 
 class ChannelContentCompatibilityTests(APITestCase):
     def setUp(self):

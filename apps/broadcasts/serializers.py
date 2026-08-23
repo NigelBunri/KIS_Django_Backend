@@ -1,5 +1,7 @@
+import re
 from decimal import Decimal
 
+from django.conf import settings
 from django.urls import reverse
 from rest_framework import serializers
 
@@ -101,6 +103,7 @@ from .models import (
     ChannelFingerprintMatch,
 )
 from apps.partners.models import Partner
+from apps.partners.permissions import is_platform_go
 from apps.communities.models import Community
 from apps.accounts.models import User
 
@@ -131,6 +134,86 @@ def _viewer_channel_role(channel: BroadcastChannel, user) -> str:
     return str(role or "")
 
 
+def _initials_from_name(name: str) -> str:
+    parts = [p for p in re.split(r"\s+", (name or "").strip()) if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[-1][0]).upper()
+
+
+def _kis_official_logo_url() -> str:
+    base = str(getattr(settings, "KIS_WEBSITE_PUBLIC_BASE_URL", "https://kingdomimpactventures.org") or "").rstrip("/")
+    return f"{base}/images/kis-logo-512.png"
+
+
+def _resolve_channel_avatar(obj: "BroadcastChannel") -> tuple[str, str, str]:
+    """Returns (kind, url, initials); kind is one of 'logo'/'photo'/'initials'.
+
+    Display rule (deliberately ignores the freely-editable `avatar_url`
+    field for this computed trio): a channel owned by GO always shows the
+    official KIS logo; a user-owned channel shows that user's own profile
+    photo, or their initials if they have none; an org-owned channel (shop/
+    health institution/education institution/partner) shows that org's own
+    image, or its initials if it has none. HealthInstitution has no image
+    field on the model at all today, so it's always initials.
+    """
+    owner_type = obj.owner_type
+    owner_id = obj.owner_id
+
+    if owner_type == BroadcastChannel.OwnerType.USER:
+        user = obj.owner_user
+        if user and is_platform_go(user):
+            return "logo", _kis_official_logo_url(), ""
+        if user:
+            profile = getattr(user, "profile", None)
+            avatar = str(getattr(profile, "avatar_url", "") or "").strip()
+            if avatar:
+                return "photo", avatar, ""
+            name = getattr(user, "display_name", "") or getattr(user, "username", "") or ""
+            return "initials", "", _initials_from_name(name)
+        return "initials", "", ""
+
+    if owner_type == BroadcastChannel.OwnerType.SHOP:
+        from apps.commerce.models import Shop
+        shop = Shop.objects.filter(id=owner_id).first()
+        if not shop:
+            return "initials", "", ""
+        image = str(shop.image_url or "").strip()
+        if image:
+            return "photo", image, ""
+        return "initials", "", _initials_from_name(shop.name)
+
+    if owner_type == BroadcastChannel.OwnerType.HEALTH:
+        from apps.health_ops.models import HealthInstitution
+        institution = HealthInstitution.objects.filter(id=owner_id).only("name").first()
+        if not institution:
+            return "initials", "", ""
+        return "initials", "", _initials_from_name(institution.name)
+
+    if owner_type == BroadcastChannel.OwnerType.EDUCATION:
+        institution = EducationInstitution.objects.filter(id=owner_id).only("name", "branding").first()
+        if not institution:
+            return "initials", "", ""
+        branding = institution.branding if isinstance(institution.branding, dict) else {}
+        image = str(branding.get("logo_url") or branding.get("image_url") or "").strip()
+        if image:
+            return "photo", image, ""
+        return "initials", "", _initials_from_name(institution.name)
+
+    if owner_type == BroadcastChannel.OwnerType.PARTNER:
+        partner = Partner.objects.filter(id=owner_id).only("name", "avatar_url").first()
+        if not partner:
+            return "initials", "", ""
+        avatar = str(partner.avatar_url or "").strip()
+        if avatar:
+            return "photo", avatar, ""
+        return "initials", "", _initials_from_name(partner.name)
+
+    return "initials", "", ""
+
+
 class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
     is_subscribed = serializers.SerializerMethodField()
     viewer_role = serializers.SerializerMethodField()
@@ -138,6 +221,9 @@ class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
     broadcast_id = serializers.SerializerMethodField()
     owner_id = serializers.SerializerMethodField()
     owner_display_name = serializers.SerializerMethodField()
+    avatar_kind = serializers.SerializerMethodField()
+    avatar_display_url = serializers.SerializerMethodField()
+    avatar_initials = serializers.SerializerMethodField()
 
     class Meta:
         model = BroadcastChannel
@@ -148,6 +234,9 @@ class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
             "description",
             "avatar_url",
             "banner_url",
+            "avatar_kind",
+            "avatar_display_url",
+            "avatar_initials",
             "country",
             "language",
             "category",
@@ -181,6 +270,25 @@ class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
             # endpoints, so there's no equivalent privacy concern there.
             data.pop("owner_id", None)
         return data
+
+    def _cached_avatar(self, obj: BroadcastChannel) -> tuple[str, str, str]:
+        # Memoized on the instance itself so the 3 avatar_* fields below
+        # (each its own SerializerMethodField, called once per row by DRF)
+        # share one resolution/DB-lookup pass instead of three.
+        cached = getattr(obj, "_resolved_display_avatar", None)
+        if cached is None:
+            cached = _resolve_channel_avatar(obj)
+            obj._resolved_display_avatar = cached
+        return cached
+
+    def get_avatar_kind(self, obj: BroadcastChannel) -> str:
+        return self._cached_avatar(obj)[0]
+
+    def get_avatar_display_url(self, obj: BroadcastChannel) -> str:
+        return self._cached_avatar(obj)[1]
+
+    def get_avatar_initials(self, obj: BroadcastChannel) -> str:
+        return self._cached_avatar(obj)[2]
 
     def get_owner_id(self, obj: BroadcastChannel) -> str:
         return str(obj.owner_id) if obj.owner_id else ""
