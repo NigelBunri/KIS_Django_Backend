@@ -3326,6 +3326,15 @@ class PartnerViewSet(viewsets.ModelViewSet):
         if application.job_post_id:
             self._auto_assign_membership(partner, application.user, application.job_post.auto_assign)
         self._upsert_onboarding_progress(partner=partner, user=application.user)
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.application.approve",
+            target_type="partner_application",
+            target_id=str(application.id),
+            metadata={"user_id": str(application.user_id)},
+            request=request,
+        )
         dispatch_partner_webhooks(
             partner=partner,
             event="member.joined",
@@ -3347,6 +3356,35 @@ class PartnerViewSet(viewsets.ModelViewSet):
         )
 
         return Response({"detail": "Application approved."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="applications/(?P<app_id>[^/.]+)/reject")
+    def reject_application(self, request, pk=None, app_id=None):
+        """Applications only ever had an approve path — PartnerApplicationStatus.REJECTED
+        was a defined status nothing could ever set, so a manager reviewing
+        applicants had no way to decline one; it just sat pending forever
+        (an applicant's own withdraw_application is the only other exit)."""
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to reject applications.")
+
+        application = PartnerApplication.objects.filter(id=app_id, partner=partner).first()
+        if not application:
+            return Response({"detail": "Application not found."}, status=status.HTTP_404_NOT_FOUND)
+        if application.status != PartnerApplicationStatus.PENDING:
+            raise ValidationError({"detail": "Only pending applications can be rejected."})
+
+        application.status = PartnerApplicationStatus.REJECTED
+        application.save(update_fields=["status", "updated_at"])
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.application.reject",
+            target_type="partner_application",
+            target_id=str(application.id),
+            metadata={"user_id": str(application.user_id)},
+            request=request,
+        )
+        return Response({"detail": "Application rejected."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get"], url_path="members")
     def members(self, request, pk=None):

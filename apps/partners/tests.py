@@ -697,6 +697,77 @@ class PartnerMemberRoleUpdateApiTests(TestCase):
         )
 
 
+class PartnerApplicationReviewApiTests(TestCase):
+    """PartnerApplicationStatus.REJECTED was a defined status nothing could
+    ever set — approve_application existed but there was no reject
+    counterpart anywhere, so a manager reviewing an applicant could only
+    approve or leave it pending forever."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670004001", country="CM", password="pass1234")
+        self.manager = User.objects.create_user(phone="+237670004002", country="CM", password="pass1234")
+        self.applicant = User.objects.create_user(phone="+237670004003", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Application Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Application Partner", slug="application-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.manager, role="manager", status=PartnerMembershipStatus.MEMBER)
+        self.application = PartnerApplication.objects.create(partner=self.partner, user=self.applicant, method="application", message="Let me in")
+
+    def _url(self, suffix):
+        return f"/api/v1/partners/{self.partner.id}/{suffix}"
+
+    def test_manager_can_reject_a_pending_application(self):
+        self.client.force_authenticate(self.manager)
+
+        response = self.client.post(self._url(f"applications/{self.application.id}/reject/"), {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.application.refresh_from_db()
+        self.assertEqual(self.application.status, "rejected")
+        self.assertFalse(PartnerMembership.objects.filter(partner=self.partner, user=self.applicant).exists())
+
+    def test_rejecting_an_already_decided_application_is_rejected(self):
+        self.client.force_authenticate(self.manager)
+        self.application.status = "approved"
+        self.application.save(update_fields=["status"])
+
+        response = self.client.post(self._url(f"applications/{self.application.id}/reject/"), {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+
+    def test_applicant_cannot_reject_their_own_application(self):
+        # The applicant has no membership on this partner, so they're outside
+        # get_object()'s visible queryset — 404, not 403, same as every other
+        # partner-scoped endpoint (doesn't leak that the partner exists).
+        self.client.force_authenticate(self.applicant)
+
+        response = self.client.post(self._url(f"applications/{self.application.id}/reject/"), {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+
+    def test_reject_is_audit_logged(self):
+        self.client.force_authenticate(self.owner)
+
+        self.client.post(self._url(f"applications/{self.application.id}/reject/"), {}, format="json")
+
+        self.assertTrue(
+            PartnerAuditEvent.objects.filter(partner=self.partner, action="partner.application.reject").exists()
+        )
+
+    def test_approve_is_audit_logged(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(self._url(f"applications/{self.application.id}/approve/"), {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(
+            PartnerAuditEvent.objects.filter(partner=self.partner, action="partner.application.approve").exists()
+        )
+
+
 class UserAppShortcutApiTests(TestCase):
     """log_partner_audit is keyword-only (services.py:1316) but
     UserAppShortcutViewSet.create/destroy called it with four positional
