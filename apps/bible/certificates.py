@@ -123,7 +123,7 @@ def theme_light(brand_hex: Optional[str] = None) -> CertificateTheme:
         accent=accent,
         gold_1=Color(0.86, 0.72, 0.37, alpha=1),
         gold_2=Color(0.62, 0.48, 0.20, alpha=1),
-        watermark_alpha=0.085,
+        watermark_alpha=0.035,
     )
 
 
@@ -139,7 +139,7 @@ def theme_dark(brand_hex: Optional[str] = None) -> CertificateTheme:
         accent=accent,
         gold_1=Color(0.90, 0.77, 0.45, alpha=1),
         gold_2=Color(0.60, 0.45, 0.18, alpha=1),
-        watermark_alpha=0.08,
+        watermark_alpha=0.03,
     )
 
 
@@ -235,7 +235,7 @@ def _draw_watermark_inside_panel(c: canvas.Canvas, th: CertificateTheme, panel: 
     c.saveState()
     _set_alpha(c, th.watermark_alpha)
     if os.path.exists(logo_path):
-        size = min(pw, ph) * 0.55
+        size = min(pw, ph) * 0.42
         c.drawImage(
             logo_path,
             px + (pw - size) / 2,
