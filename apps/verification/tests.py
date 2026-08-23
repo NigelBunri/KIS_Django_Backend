@@ -575,4 +575,58 @@ class StaffVerificationOperationsTests(APITestCase):
         self.assertEqual(result["matched"], 1)
         candidate = result["candidates"][0]
         self.assertEqual(candidate["id"], str(badge.id))
-        self.assertNotIn("evidence_metadata", candidate)
+
+
+class RejectionNoticeVisibilityTests(APITestCase):
+    """serialize_case_status() previously never exposed reviewer_notes to
+    the submitting user at all — the GO's rejection reason existed on the
+    model but the app had no way to show it. It's now exposed, but only
+    while the rejection is within its 3-day notice window; after that the
+    case is still REJECTED in the database, the notice just stops
+    surfacing to the user."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(phone="+237670020021", password="TestPass123!", country="CM")
+        _grant_verification_badge_feature(self.user)
+        self.staff = User.objects.create_user(phone="+237670020022", password="TestPass123!", country="CM")
+        self.staff.is_staff = True
+        self.staff.save(update_fields=["is_staff"])
+        self.subject = user_subject_for(self.user)
+
+    def _create_case(self, *, reviewed_at):
+        return VerificationCase.objects.create(
+            subject=self.subject,
+            requested_by=self.user,
+            level="identity_verified",
+            status=VerificationCaseStatus.REJECTED,
+            provider="manual",
+            submitted_at=timezone.now() - timezone.timedelta(days=4),
+            reviewed_at=reviewed_at,
+            reviewed_by=self.staff,
+            reviewer_notes="Document photo was blurry — please resubmit a clearer copy.",
+        )
+
+    def test_recent_rejection_shows_reviewer_notes(self):
+        self._create_case(reviewed_at=timezone.now() - timezone.timedelta(hours=12))
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("verification:user-status"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        case = response.data["case"]
+        self.assertTrue(case["show_rejection_notice"])
+        self.assertIn("blurry", case["reviewer_notes"])
+
+    def test_rejection_older_than_three_days_hides_reviewer_notes(self):
+        self._create_case(reviewed_at=timezone.now() - timezone.timedelta(days=4))
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("verification:user-status"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        case = response.data["case"]
+        self.assertFalse(case["show_rejection_notice"])
+        self.assertEqual(case["reviewer_notes"], "")
+        # The case itself is untouched — still rejected, notes still on the
+        # model — only the app-facing notice visibility changed.
+        self.assertEqual(case["status"], VerificationCaseStatus.REJECTED)

@@ -1185,9 +1185,23 @@ def sync_legacy_shop_from_central_case(case: VerificationCase):
     return target
 
 
+# How long a rejected case keeps surfacing its reviewer_notes/rejection
+# messaging to the submitting user in the app — after this window the
+# case is still REJECTED in the database (status/reviewed_at/reviewer_notes
+# are never cleared), the app just stops showing the "not successful,
+# please try again" notice for it.
+REJECTION_NOTICE_WINDOW = timezone.timedelta(days=3)
+
+
 def serialize_case_status(case: VerificationCase | None) -> dict | None:
     if not case:
         return None
+    is_rejected = case.status == VerificationCaseStatus.REJECTED
+    show_rejection_notice = bool(
+        is_rejected
+        and case.reviewed_at
+        and timezone.now() - case.reviewed_at < REJECTION_NOTICE_WINDOW
+    )
     return {
         "id": str(case.id),
         "level": case.level,
@@ -1197,6 +1211,11 @@ def serialize_case_status(case: VerificationCase | None) -> dict | None:
         "submitted_at": case.submitted_at.isoformat() if case.submitted_at else None,
         "reviewed_at": case.reviewed_at.isoformat() if case.reviewed_at else None,
         "public_summary": case.public_summary or {},
+        # Only exposed to the submitting user while the rejection notice is
+        # still within its visibility window — this is the GO's comment on
+        # why the submission wasn't approved.
+        "reviewer_notes": case.reviewer_notes if show_rejection_notice else "",
+        "show_rejection_notice": show_rejection_notice,
         "created_at": case.created_at.isoformat() if case.created_at else None,
         "updated_at": case.updated_at.isoformat() if case.updated_at else None,
     }
