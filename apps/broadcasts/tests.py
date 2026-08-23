@@ -2455,6 +2455,16 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         self.assertEqual(booking["currency"], "USD")
         self.assertTrue(booking["payment_required"])
 
+        # resolve_payout_entity now correctly resolves the institution for
+        # non-course bookings too (previously it only did so when
+        # booking.course_id was set, which let bookings like this one skip
+        # the payment-eligibility check entirely) — so paying out requires
+        # an active payout account, same as any other seller.
+        institution = EducationInstitution.objects.get(id=institution_id)
+        institution.payout_account_status = EducationInstitutionPayoutAccountStatus.ACTIVE
+        institution.flutterwave_subaccount_id = "test-subaccount-usd"
+        institution.save(update_fields=["payout_account_status", "flutterwave_subaccount_id"])
+
         payment_response = self.client.post(
             f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/{broadcast_id}/bookings/{booking['id']}/pay/",
             {},

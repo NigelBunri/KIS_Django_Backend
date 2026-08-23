@@ -148,8 +148,17 @@ def resolve_payout_entity(target_type: str, target_id: uuid.UUID | str):
             .filter(id=target_id)
             .first()
         )
-        if not booking or not booking.course_id:
+        if not booking:
             return None
+        # Previously required booking.course_id, which silently exempted
+        # program/class_session/event bookings (course_id is only set for
+        # course purchases) from the payment-setup eligibility check below —
+        # they'd sail straight through to _ensure_provider_payment_link with
+        # no institution payout account configured, land on a payment_url
+        # of None, and surface only a generic "waiting for a provider
+        # checkout link" message instead of the clear PAYMENT_SETUP_REQUIRED
+        # one course bookings already got. All booking kinds settle to the
+        # same institution, so all of them should be gated the same way.
         return booking.institution
     if target_type == DirectPaymentIntent.TARGET_MARKETPLACE_ORDER:
         from apps.commerce.models import MarketplaceOrder
@@ -542,7 +551,7 @@ def create_direct_payment_intent(
 
         eligibility = can_receive_payments(payout_entity)
         if not eligibility.eligible:
-            raise PaymentSetupRequiredError(eligibility)
+            raise PaymentSetupRequiredError(eligibility, buyer_facing=True)
     provider = (provider or "flutterwave").strip().lower()
     target_uuid = uuid.UUID(str(target_id))
     existing = DirectPaymentIntent.objects.filter(

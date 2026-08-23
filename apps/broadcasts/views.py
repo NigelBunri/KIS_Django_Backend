@@ -8029,7 +8029,14 @@ class BroadcastFeedView(APIView):
                     "text_doc": build_plain_text_document(text_plain),
                     "text_plain": text_plain,
                     "text_preview": text_plain[:200],
-                    "attachments": [],
+                    # product_images was already computed above but never
+                    # wired into the item the generic feed card actually
+                    # reads (BroadcastFeedCard.tsx resolves its displayed
+                    # image from item.attachments, not item.product.images)
+                    # — images configured on the product never showed up in
+                    # the feed even though they render fine on the shop's
+                    # own product page, which reads product.images directly.
+                    "attachments": [{"url": url, "type": "image"} for url in product_images],
                     "author": {"id": str(shop.owner_id) if shop else None},
                     "created_at": product.created_at.isoformat(),
                     "broadcasted_at": item.broadcasted_at.isoformat(),
@@ -8115,7 +8122,11 @@ class BroadcastFeedView(APIView):
                         "text_doc": build_plain_text_document(text_plain),
                         "text_plain": text_plain,
                         "text_preview": text_plain[:200],
-                        "attachments": [],
+                        # Same fix as market_product above — service_images
+                        # was already computed but never reached
+                        # item.attachments, which is what the feed card
+                        # actually reads for its displayed image.
+                        "attachments": [{"url": url, "type": "image"} for url in service_images],
                         "author": {"id": str(shop.owner_id) if shop else None},
                         "created_at": service.created_at.isoformat(),
                         "broadcasted_at": item.broadcasted_at.isoformat(),
