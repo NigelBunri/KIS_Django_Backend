@@ -1940,6 +1940,20 @@ class ShopTeamMemberViewSet(viewsets.ModelViewSet):
                     )
         serializer.save()
 
+    # perform_create above already gates who can add a member, but nothing
+    # gated PATCH/DELETE on an existing row — get_queryset()'s shop=
+    # filter only applies to list(), not to the detail lookup used by
+    # retrieve/update/destroy, so any authenticated user who knew (or
+    # enumerated) a ShopTeamMember id could edit its role or remove it
+    # regardless of which shop it belonged to. Mirrors ShopServiceViewSet's
+    # identical get_object() guard just above.
+    def get_object(self):
+        obj = super().get_object()
+        if self.request.method not in permissions.SAFE_METHODS:
+            if not _provider_can_manage_shop(self.request.user, obj.shop) and not self.request.user.is_staff:
+                raise PermissionDenied("Only shop owners, team managers, partner managers, or staff can modify team members.")
+        return obj
+
     def list(self, request, *args, **kwargs):
         response = super().list(request, *args, **kwargs)
         self._attach_owner_entry(response, request)

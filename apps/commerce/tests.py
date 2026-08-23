@@ -1998,3 +1998,49 @@ class ServiceBookingAPITests(APITestCase):
         # $180.00 base * 1.10 (10% exclusive tax) -> 19,800 cents (was
         # asserting 1_980_000, 100x too large).
         self.assertEqual(booking.price_cents, 19_800)
+
+
+class ShopTeamMemberAPITests(APITestCase):
+    def setUp(self):
+        User = get_user_model()
+        token = uuid.uuid4().hex[:8]
+        self.owner = User.objects.create_user(phone=f'555444{token[:4]}', username=f'shopowner_{token}', password='secret', country='NG')
+        self.staffer = User.objects.create_user(phone=f'555555{token[:4]}', username=f'staffer_{token}', password='secret', country='NG')
+        self.outsider = User.objects.create_user(phone=f'555666{token[:4]}', username=f'outsider_{token}', password='secret', country='NG')
+        self.shop = Shop.objects.create(owner=self.owner, name='Members Shop', slug=f'members-shop-{token}')
+        self.member = ShopTeamMember.objects.create(shop=self.shop, user=self.staffer, role=ShopRole.MEMBER, is_active=True)
+
+    def test_owner_can_update_member_role(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.patch(f'/api/v1/commerce/shop-members/{self.member.id}/', {'role': ShopRole.MANAGER}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.role, ShopRole.MANAGER)
+
+    def test_owner_can_remove_member(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.delete(f'/api/v1/commerce/shop-members/{self.member.id}/')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(ShopTeamMember.objects.filter(id=self.member.id).exists())
+
+    def test_unrelated_user_cannot_update_another_shops_member(self):
+        # Regression test: get_queryset()'s shop= filter only applied to
+        # list(), so PATCH/DELETE on a specific id previously had no
+        # ownership check at all - any authenticated user could edit or
+        # remove any shop's team member by id.
+        self.client.force_authenticate(user=self.outsider)
+        response = self.client.patch(f'/api/v1/commerce/shop-members/{self.member.id}/', {'role': ShopRole.MANAGER}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.role, ShopRole.MEMBER)
+
+    def test_unrelated_user_cannot_remove_another_shops_member(self):
+        self.client.force_authenticate(user=self.outsider)
+        response = self.client.delete(f'/api/v1/commerce/shop-members/{self.member.id}/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(ShopTeamMember.objects.filter(id=self.member.id).exists())
+
+    def test_the_staff_member_themself_cannot_promote_their_own_role(self):
+        self.client.force_authenticate(user=self.staffer)
+        response = self.client.patch(f'/api/v1/commerce/shop-members/{self.member.id}/', {'role': ShopRole.MANAGER}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
