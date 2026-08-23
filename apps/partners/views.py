@@ -3365,6 +3365,45 @@ class PartnerViewSet(viewsets.ModelViewSet):
         actions = partner.moderation_actions.select_related("actor", "user", "membership").order_by("-created_at")[:100]
         return Response(PartnerModerationActionSerializer(actions, many=True).data, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["patch"], url_path=r"members/(?P<member_user_id>[^/.]+)")
+    def update_member(self, request, pk=None, member_user_id=None):
+        """Change an existing member's core team role (member/manager/admin —
+        never "owner", which is the single Partner.owner FK, not assignable
+        here). This endpoint didn't exist anywhere before — the only paths
+        that ever set PartnerMembership.role were invite redemption and
+        application approval, so an owner/manager had no way to promote or
+        demote an existing member without recreating their membership."""
+        partner = self.get_object()
+        if not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to manage members.")
+        membership = PartnerMembership.objects.filter(partner=partner, user_id=member_user_id).first()
+        if not membership:
+            return Response({"detail": "Partner membership not found."}, status=status.HTTP_404_NOT_FOUND)
+        if partner.owner_id == membership.user_id:
+            raise PermissionDenied("The partner owner's role cannot be changed here.")
+
+        new_role = str(request.data.get("role") or "").strip().lower()
+        allowed_roles = {"member", "manager", "admin"}
+        if new_role not in allowed_roles:
+            raise ValidationError({"role": f"role must be one of: {', '.join(sorted(allowed_roles))}."})
+
+        previous_role = membership.role
+        membership.role = new_role
+        membership.save(update_fields=["role", "updated_at"])
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.member.role_changed",
+            target_type="partner_membership",
+            target_id=str(membership.id),
+            metadata={"user_id": str(membership.user_id), "previous_role": previous_role, "new_role": new_role},
+            request=request,
+        )
+        payload = self._member_directory_payload(partner)
+        entry = next((row for row in payload if row["user_id"] == str(membership.user_id)), None)
+        serializer = PartnerMemberDirectoryEntrySerializer(entry) if entry else None
+        return Response({"member": serializer.data if serializer else None}, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["post"], url_path=r"members/(?P<member_user_id>[^/.]+)/moderate")
     def moderate_member(self, request, pk=None, member_user_id=None):
         partner = self.get_object()
@@ -3956,7 +3995,10 @@ class UserAppShortcutViewSet(viewsets.ViewSet):
             deep_link=deep_link,
             pinned=pinned,
         )
-        log_partner_audit(partner, request.user, "shortcut.created", {"shortcut_id": str(shortcut.id), "device_id": device_id})
+        log_partner_audit(
+            partner=partner, actor=request.user, action="shortcut.created",
+            metadata={"shortcut_id": str(shortcut.id), "device_id": device_id}, request=request,
+        )
         return Response({"detail": "created", "id": str(shortcut.id)}, status=status.HTTP_201_CREATED)
 
     def destroy(self, request, pk=None):
@@ -3966,7 +4008,10 @@ class UserAppShortcutViewSet(viewsets.ViewSet):
         except UserAppShortcut.DoesNotExist:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
         partner = shortcut.partner
-        log_partner_audit(partner, request.user, "shortcut.removed", {"shortcut_id": pk})
+        log_partner_audit(
+            partner=partner, actor=request.user, action="shortcut.removed",
+            metadata={"shortcut_id": pk}, request=request,
+        )
         shortcut.delete()
         return Response({"detail": "removed."}, status=status.HTTP_200_OK)
 

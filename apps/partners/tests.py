@@ -607,6 +607,135 @@ class PartnerApiTests(TestCase):
         self.assertEqual(payload["comments_count"], 6)
 
 
+class PartnerMemberRoleUpdateApiTests(TestCase):
+    """Covers the new PATCH /partners/{id}/members/{user_id}/ endpoint —
+    previously there was no way anywhere (not either client, not Django
+    admin) to change an existing member's PartnerMembership.role."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670003001", country="CM", password="pass1234")
+        self.manager = User.objects.create_user(phone="+237670003002", country="CM", password="pass1234")
+        self.target = User.objects.create_user(phone="+237670003003", country="CM", password="pass1234")
+        self.stranger = User.objects.create_user(phone="+237670003004", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Role Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Role Partner", slug="role-partner", main_conversation=conversation)
+        self.manager_membership = PartnerMembership.objects.create(
+            partner=self.partner, user=self.manager, role="manager", status=PartnerMembershipStatus.MEMBER,
+        )
+        self.target_membership = PartnerMembership.objects.create(
+            partner=self.partner, user=self.target, role="member", status=PartnerMembershipStatus.MEMBER,
+        )
+
+    def _url(self, user_id):
+        return f"/api/v1/partners/{self.partner.id}/members/{user_id}/"
+
+    def test_manager_can_promote_a_member(self):
+        self.client.force_authenticate(self.manager)
+
+        response = self.client.patch(self._url(self.target.id), {"role": "manager"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.target_membership.refresh_from_db()
+        self.assertEqual(self.target_membership.role, "manager")
+        self.assertEqual(response.data["member"]["membership_role"], "manager")
+
+    def test_owner_can_demote_a_manager(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.patch(self._url(self.manager.id), {"role": "member"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.manager_membership.refresh_from_db()
+        self.assertEqual(self.manager_membership.role, "member")
+
+    def test_plain_member_cannot_change_roles(self):
+        self.client.force_authenticate(self.target)
+
+        response = self.client.patch(self._url(self.manager.id), {"role": "member"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    def test_stranger_cannot_change_roles(self):
+        # A total stranger isn't even in the partner's visible queryset —
+        # get_object() 404s before the permission check runs, same as any
+        # other partner-scoped endpoint (not a 403, since that would leak
+        # that a partner with this id exists at all).
+        self.client.force_authenticate(self.stranger)
+
+        response = self.client.patch(self._url(self.target.id), {"role": "manager"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+
+    def test_owner_role_cannot_be_changed_here(self):
+        self.client.force_authenticate(self.owner)
+        PartnerMembership.objects.create(partner=self.partner, user=self.owner, role="owner", status=PartnerMembershipStatus.MEMBER)
+
+        response = self.client.patch(self._url(self.owner.id), {"role": "manager"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    def test_invalid_role_is_rejected(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.patch(self._url(self.target.id), {"role": "owner"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.target_membership.refresh_from_db()
+        self.assertEqual(self.target_membership.role, "member")
+
+    def test_role_change_is_audit_logged(self):
+        self.client.force_authenticate(self.owner)
+
+        self.client.patch(self._url(self.target.id), {"role": "admin"}, format="json")
+
+        self.assertTrue(
+            PartnerAuditEvent.objects.filter(partner=self.partner, action="partner.member.role_changed").exists()
+        )
+
+
+class UserAppShortcutApiTests(TestCase):
+    """log_partner_audit is keyword-only (services.py:1316) but
+    UserAppShortcutViewSet.create/destroy called it with four positional
+    args — a TypeError on every real create/delete call, never caught by
+    any existing test since none exercised this viewset at all."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670002001", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Shortcut Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Shortcut Partner", slug="shortcut-partner", main_conversation=conversation)
+        self.client.force_authenticate(self.owner)
+
+    def test_create_shortcut_does_not_crash_on_audit_logging(self):
+        response = self.client.post(
+            "/api/v1/partners/app-shortcuts/",
+            {"partner_id": str(self.partner.id), "device_id": "device-1", "shortcut_name": "My Shortcut"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(PartnerAuditEvent.objects.filter(partner=self.partner, action="shortcut.created").exists())
+
+    def test_destroy_shortcut_does_not_crash_on_audit_logging(self):
+        create_response = self.client.post(
+            "/api/v1/partners/app-shortcuts/",
+            {"partner_id": str(self.partner.id), "device_id": "device-1", "shortcut_name": "My Shortcut"},
+            format="json",
+        )
+        shortcut_id = create_response.data["id"]
+
+        response = self.client.delete(f"/api/v1/partners/app-shortcuts/{shortcut_id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(PartnerAuditEvent.objects.filter(partner=self.partner, action="shortcut.removed").exists())
+
+
 class PartnerOrganizationLinkApiTests(TestCase):
     def setUp(self):
         self.client = APIClient()
