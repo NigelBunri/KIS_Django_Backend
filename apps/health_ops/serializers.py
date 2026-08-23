@@ -155,6 +155,9 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
             "timezone",
             "settings",
             "is_active",
+            "payout_account_status",
+            "payout_account_name",
+            "payout_bank_last4",
             "verification_summary",
             "trust_summary",
             "care_summary",
@@ -168,7 +171,7 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["owner", "slug", "created_at", "updated_at"]
+        read_only_fields = ["owner", "slug", "created_at", "updated_at", "payout_account_status", "payout_account_name", "payout_bank_last4"]
 
 
     def _request_user(self):

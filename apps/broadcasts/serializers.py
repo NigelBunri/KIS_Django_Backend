@@ -348,12 +348,18 @@ class BroadcastChannelDetailSerializer(BroadcastChannelSummarySerializer):
     links = serializers.JSONField(read_only=True)
     branding = serializers.JSONField(read_only=True)
     settings = serializers.SerializerMethodField()
+    payout_account_status = serializers.SerializerMethodField()
+    payout_account_name = serializers.SerializerMethodField()
+    payout_bank_last4 = serializers.SerializerMethodField()
 
     class Meta(BroadcastChannelSummarySerializer.Meta):
         fields = BroadcastChannelSummarySerializer.Meta.fields + [
             "links",
             "branding",
             "settings",
+            "payout_account_status",
+            "payout_account_name",
+            "payout_bank_last4",
         ]
 
     def get_settings(self, obj: BroadcastChannel) -> dict:
@@ -362,6 +368,19 @@ class BroadcastChannelDetailSerializer(BroadcastChannelSummarySerializer):
         if role in {"owner", "manager", "staff"}:
             return obj.settings or {}
         return {}
+
+    def _can_view_payout(self, obj: BroadcastChannel) -> bool:
+        user = self.context.get("user") or getattr(self.context.get("request"), "user", None)
+        return _viewer_channel_role(obj, user) in {"owner", "manager"}
+
+    def get_payout_account_status(self, obj: BroadcastChannel) -> str:
+        return obj.payout_account_status if self._can_view_payout(obj) else ""
+
+    def get_payout_account_name(self, obj: BroadcastChannel) -> str:
+        return obj.payout_account_name if self._can_view_payout(obj) else ""
+
+    def get_payout_bank_last4(self, obj: BroadcastChannel) -> str:
+        return obj.payout_bank_last4 if self._can_view_payout(obj) else ""
 
 
 class BroadcastChannelSubscriptionSerializer(serializers.ModelSerializer):
