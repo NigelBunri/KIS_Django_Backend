@@ -2164,6 +2164,32 @@ class ServiceBookingViewSet(
         scheduled_at = serializer.validated_data["scheduled_at"]
         instructions = serializer.validated_data.get("instructions", "")
 
+        # A dropped connection or the client's own automatic retry-on-timeout
+        # must not create two separate bookings for the same slot request.
+        # Without this, a retry after an apparent timeout hits the slot-
+        # capacity check below against the caller's OWN just-created
+        # booking and gets "409 slot already booked" — the booking actually
+        # succeeded, but the user is told it failed. Mirrors
+        # MarketplaceOrderViewSet.create's identical idempotency pattern.
+        idempotency_key = str(
+            request.headers.get("X-Idempotency-Key")
+            or request.data.get("idempotency_key")
+            or ""
+        ).strip()
+        if idempotency_key:
+            existing_booking = (
+                ServiceBooking.objects.filter(
+                    user=request.user,
+                    service_id=service_id,
+                    metadata__idempotency_key=idempotency_key,
+                )
+                .order_by("-created_at")
+                .first()
+            )
+            if existing_booking:
+                output = ServiceBookingSerializer(existing_booking, context=self.get_serializer_context())
+                return Response(output.data, status=status.HTTP_200_OK)
+
         service = get_object_or_404(
             ShopService,
             pk=service_id,
@@ -2347,6 +2373,7 @@ class ServiceBookingViewSet(
                         "payment_method": requested_payment_method,
                         "payment_provider": requested_payment_method,
                         "payment_required": bool(not skip_payment and deposit_cents > 0),
+                        **({"idempotency_key": idempotency_key} if idempotency_key else {}),
                     },
                 )
                 if wallet_locked:

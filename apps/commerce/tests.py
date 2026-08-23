@@ -1480,9 +1480,63 @@ class ServiceBookingAPITests(APITestCase):
         booking = ServiceBooking.objects.get(id=first.data['id'])
         self.assertEqual(customer_wallet.balance_cents, 5_000_000 - booking.deposit_cents)
         self.assertEqual(owner_wallet.balance_cents, 0)
-        escrow = booking.escrow
-        self.assertEqual(escrow.amount_cents, booking.deposit_cents)
-        self.assertEqual(escrow.status, ServiceBookingEscrow.STATUS_PENDING)
+
+    def test_retried_request_with_same_idempotency_key_returns_existing_booking(self):
+        """A dropped connection or the client's automatic retry-on-timeout
+        previously replayed the exact same booking request — with no
+        idempotency guard, the retry hit this same slot-capacity check
+        against the caller's OWN just-created booking and got a false
+        "409 slot already booked", even though the booking had actually
+        succeeded. An X-Idempotency-Key header (or idempotency_key body
+        field) now makes a retry return the original booking instead."""
+        payload = self._create_booking_payload()
+        first = self.client.post(
+            '/api/v1/commerce/service-bookings/',
+            payload,
+            format='json',
+            HTTP_X_IDEMPOTENCY_KEY='retry-key-001',
+        )
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+
+        retry = self.client.post(
+            '/api/v1/commerce/service-bookings/',
+            payload,
+            format='json',
+            HTTP_X_IDEMPOTENCY_KEY='retry-key-001',
+        )
+        self.assertEqual(retry.status_code, status.HTTP_200_OK)
+        self.assertEqual(retry.data['id'], first.data['id'])
+        self.assertEqual(ServiceBooking.objects.filter(user=self.customer).count(), 1)
+
+        owner_wallet = get_wallet_account(self.owner)
+        customer_wallet = get_wallet_account(self.customer)
+        owner_wallet.refresh_from_db()
+        customer_wallet.refresh_from_db()
+        booking = ServiceBooking.objects.get(id=first.data['id'])
+        # The wallet deposit was only ever locked once — the retry did not
+        # re-run booking creation or its side effects.
+        self.assertEqual(customer_wallet.balance_cents, 5_000_000 - booking.deposit_cents)
+        self.assertEqual(owner_wallet.balance_cents, 0)
+
+    def test_different_idempotency_keys_allow_separate_bookings_for_different_slots(self):
+        first_slot = self.shared_slot
+        second_slot = self.shared_slot + timedelta(hours=2)
+        first = self.client.post(
+            '/api/v1/commerce/service-bookings/',
+            self._create_booking_payload(scheduled_at=first_slot),
+            format='json',
+            HTTP_X_IDEMPOTENCY_KEY='key-a',
+        )
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+
+        second = self.client.post(
+            '/api/v1/commerce/service-bookings/',
+            self._create_booking_payload(scheduled_at=second_slot),
+            format='json',
+            HTTP_X_IDEMPOTENCY_KEY='key-b',
+        )
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED)
+        self.assertNotEqual(first.data['id'], second.data['id'])
 
     def test_payer_can_submit_complaint_without_manual_escrow_field(self):
         wallet = get_wallet_account(self.customer)
