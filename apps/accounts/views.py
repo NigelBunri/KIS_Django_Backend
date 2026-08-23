@@ -2743,29 +2743,49 @@ class CheckContact(APIView):
 # ConnectionSerializer
 # ---------------------------------------------------------------------------
 class ConnectionSerializer(serializers.ModelSerializer):
-    from_user_id = serializers.UUIDField(source="from_user.id", read_only=True)
-    from_user_name = serializers.CharField(source="from_user.display_name", read_only=True)
-    from_user_avatar = serializers.SerializerMethodField()
-    to_user_id = serializers.UUIDField(source="to_user.id", read_only=True)
-    to_user_name = serializers.CharField(source="to_user.display_name", read_only=True)
-    to_user_avatar = serializers.SerializerMethodField()
+    # ConnectionsScreen.tsx (src/screens/profile/ConnectionsScreen.tsx) was
+    # written expecting nested from_user/to_user objects — this serializer
+    # previously emitted flat from_user_id/from_user_name/from_user_avatar
+    # fields instead, so the screen's getOtherUser() always got undefined.
+    # That screen also was never registered in AppNavigator and this whole
+    # feature was unreachable; fixing the contract here as part of wiring
+    # it up for real.
+    from_user = serializers.SerializerMethodField()
+    to_user = serializers.SerializerMethodField()
+    conversation_id = serializers.SerializerMethodField()
 
     class Meta:
         model = UserConnection
         fields = [
-            "id", "from_user_id", "from_user_name", "from_user_avatar",
-            "to_user_id", "to_user_name", "to_user_avatar",
-            "status", "note", "created_at",
+            "id", "from_user", "to_user", "status", "note", "created_at", "conversation_id",
         ]
         read_only_fields = ["id", "created_at"]
 
-    def get_from_user_avatar(self, obj):
-        p = getattr(obj.from_user, "profile", None)
-        return getattr(p, "avatar_url", "") or ""
+    def _user_payload(self, user):
+        profile = getattr(user, "profile", None)
+        return {
+            "id": str(user.id),
+            "display_name": user.display_name or user.username,
+            "avatar_url": getattr(profile, "avatar_url", "") or "",
+            "headline": getattr(profile, "headline", "") or "",
+        }
 
-    def get_to_user_avatar(self, obj):
-        p = getattr(obj.to_user, "profile", None)
-        return getattr(p, "avatar_url", "") or ""
+    def get_from_user(self, obj):
+        return self._user_payload(obj.from_user)
+
+    def get_to_user(self, obj):
+        return self._user_payload(obj.to_user)
+
+    def get_conversation_id(self, obj):
+        if obj.status != UserConnection.STATUS_ACCEPTED:
+            return None
+        from apps.chat.services import get_or_create_direct_conversation
+
+        # get_or_create is idempotent — the room was already created at
+        # accept time, so this just resolves its id without creating a
+        # second one.
+        conversation, _created = get_or_create_direct_conversation(obj.from_user, obj.to_user)
+        return str(conversation.id)
 
 
 # ---------------------------------------------------------------------------
@@ -2797,6 +2817,13 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             return Response({"detail": "User not found."}, status=404)
         if target == request.user:
             return Response({"detail": "Cannot connect to yourself."}, status=400)
+        from apps.moderation.models import UserBlock
+
+        blocked = UserBlock.objects.filter(
+            Q(blocker=request.user, blocked=target) | Q(blocker=target, blocked=request.user)
+        ).exists()
+        if blocked:
+            return Response({"detail": "Unable to send a connection request to this user."}, status=403)
         existing = UserConnection.objects.filter(
             Q(from_user=request.user, to_user=target) |
             Q(from_user=target, to_user=request.user)
@@ -2816,7 +2843,64 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Invalid status."}, status=400)
         conn.status = new_status
         conn.save(update_fields=["status", "updated_at"])
+        if new_status == UserConnection.STATUS_ACCEPTED:
+            # The chat room is created here, at acceptance — not when the
+            # request was sent — so "not accepted = no chat room" holds by
+            # construction rather than as a bolt-on permission check.
+            from apps.chat.services import get_or_create_direct_conversation
+
+            get_or_create_direct_conversation(conn.from_user, conn.to_user)
         return Response(ConnectionSerializer(conn).data)
+
+    @action(detail=False, methods=["get"], url_path="search")
+    def search(self, request):
+        """Search people by name/username or by job (Profile.headline/industry) —
+        the actual "search for others using name, jobs and so on" ask; the
+        existing people_you_may_know only ever surfaced algorithmic
+        suggestions with no query support."""
+        user = request.user
+        query = (request.query_params.get("q") or "").strip()
+        job = (request.query_params.get("job") or "").strip()
+        if not query and not job:
+            return Response([])
+
+        from apps.moderation.models import UserBlock
+
+        blocked_ids = set(UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)) | set(
+            UserBlock.objects.filter(blocked=user).values_list("blocker_id", flat=True)
+        )
+        UserModel = get_user_model()
+        qs = UserModel.objects.filter(is_active=True).exclude(id=user.id)
+        if blocked_ids:
+            qs = qs.exclude(id__in=blocked_ids)
+        if query:
+            qs = qs.filter(Q(display_name__icontains=query) | Q(username__icontains=query))
+        if job:
+            qs = qs.filter(Q(profile__headline__icontains=job) | Q(profile__industry__icontains=job))
+        qs = qs.select_related("profile")[:30]
+
+        connection_map = {}
+        for conn in UserConnection.objects.filter(Q(from_user=user) | Q(to_user=user), status__in=(
+            UserConnection.STATUS_PENDING, UserConnection.STATUS_ACCEPTED,
+        )):
+            other_id = conn.to_user_id if conn.from_user_id == user.id else conn.from_user_id
+            connection_map[str(other_id)] = (
+                "accepted" if conn.status == UserConnection.STATUS_ACCEPTED
+                else ("pending_sent" if conn.from_user_id == user.id else "pending_received")
+            )
+
+        data = []
+        for u in qs:
+            p = getattr(u, "profile", None)
+            data.append({
+                "id": str(u.id),
+                "display_name": u.display_name or u.username,
+                "headline": getattr(p, "headline", "") or "",
+                "avatar_url": getattr(p, "avatar_url", "") or "",
+                "industry": getattr(p, "industry", "") or "",
+                "connection_status": connection_map.get(str(u.id), "none"),
+            })
+        return Response(data)
 
     @action(detail=False, methods=["get"], url_path="people-you-may-know")
     def people_you_may_know(self, request):

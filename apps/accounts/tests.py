@@ -17,6 +17,7 @@ from .models import (
     ProfileLanguage,
     ProfileShowcase,
     User,
+    UserConnection,
     UserContact,
 )
 from .serializers import ProfileSerializer
@@ -861,3 +862,127 @@ class AccountsProfileCoreTests(APITestCase):
 
         self.assertEqual(denied_response.status_code, status.HTTP_200_OK)
         self.assertEqual(denied_response.data["sections"]["articles"], [])
+
+
+class ConnectionApiTests(APITestCase):
+    """ConnectionViewSet/UserConnection existed and were even wired into a
+    real (but never-registered) RN screen — but the serializer's flat
+    from_user_id/... shape didn't match what that screen expected, nothing
+    ever created a chat room on acceptance, there was no search, and
+    blocked users could still send requests."""
+
+    def setUp(self):
+        self.alice = User.objects.create_user(phone="+237670000030", password="TestPass123!", country="CM", display_name="Alice")
+        self.bob = User.objects.create_user(phone="+237670000031", password="TestPass123!", country="CM", display_name="Bob")
+        self.carol = User.objects.create_user(phone="+237670000032", password="TestPass123!", country="CM", display_name="Carol")
+        self.bob.profile.headline = "Software Engineer"
+        self.bob.profile.industry = "Technology"
+        self.bob.profile.save(update_fields=["headline", "industry", "updated_at"])
+
+    def test_send_request_returns_nested_user_payload(self):
+        self.client.force_authenticate(self.alice)
+
+        response = self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["from_user"]["id"], str(self.alice.id))
+        self.assertEqual(response.data["to_user"]["id"], str(self.bob.id))
+        self.assertEqual(response.data["to_user"]["headline"], "Software Engineer")
+        self.assertEqual(response.data["status"], "pending")
+        self.assertIsNone(response.data["conversation_id"])
+
+    def test_no_conversation_exists_until_accepted(self):
+        from apps.chat.models import Conversation, ConversationType
+        from apps.chat.services import direct_conversation_key
+
+        key = direct_conversation_key(self.alice, self.bob)
+
+        self.client.force_authenticate(self.alice)
+        create_response = self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+        conn_id = create_response.data["id"]
+
+        self.assertFalse(Conversation.objects.filter(type=ConversationType.DIRECT, direct_key=key).exists())
+
+        self.client.force_authenticate(self.bob)
+        accept_response = self.client.patch(f"/api/v1/connections/{conn_id}/", {"status": "accepted"}, format="json")
+
+        self.assertEqual(accept_response.status_code, status.HTTP_200_OK, accept_response.data)
+        self.assertTrue(Conversation.objects.filter(type=ConversationType.DIRECT, direct_key=key).exists())
+        self.assertIsNotNone(accept_response.data["conversation_id"])
+
+    def test_declined_request_creates_no_conversation(self):
+        from apps.chat.models import Conversation, ConversationType
+        from apps.chat.services import direct_conversation_key
+
+        self.client.force_authenticate(self.alice)
+        create_response = self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+        conn_id = create_response.data["id"]
+
+        self.client.force_authenticate(self.bob)
+        response = self.client.patch(f"/api/v1/connections/{conn_id}/", {"status": "rejected"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        key = direct_conversation_key(self.alice, self.bob)
+        self.assertFalse(Conversation.objects.filter(type=ConversationType.DIRECT, direct_key=key).exists())
+        self.assertIsNone(response.data["conversation_id"])
+
+    def test_cannot_send_duplicate_request_either_direction(self):
+        self.client.force_authenticate(self.alice)
+        self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+
+        self.client.force_authenticate(self.bob)
+        response = self.client.post("/api/v1/connections/", {"user_id": str(self.alice.id)}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(UserConnection.objects.count(), 1)
+
+    def test_blocked_user_cannot_send_request(self):
+        from apps.moderation.models import UserBlock
+
+        UserBlock.objects.create(blocker=self.bob, blocked=self.alice)
+        self.client.force_authenticate(self.alice)
+
+        response = self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertEqual(UserConnection.objects.count(), 0)
+
+    def test_search_by_job(self):
+        self.client.force_authenticate(self.alice)
+
+        response = self.client.get("/api/v1/connections/search/?job=Engineer")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        ids = [row["id"] for row in response.data]
+        self.assertIn(str(self.bob.id), ids)
+        self.assertNotIn(str(self.carol.id), ids)
+
+    def test_search_excludes_blocked_users(self):
+        from apps.moderation.models import UserBlock
+
+        UserBlock.objects.create(blocker=self.alice, blocked=self.bob)
+        self.client.force_authenticate(self.alice)
+
+        response = self.client.get("/api/v1/connections/search/?q=Bob")
+
+        ids = [row["id"] for row in response.data]
+        self.assertNotIn(str(self.bob.id), ids)
+
+    def test_search_reports_pending_connection_status(self):
+        self.client.force_authenticate(self.alice)
+        self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+
+        response = self.client.get("/api/v1/connections/search/?q=Bob")
+
+        row = next(r for r in response.data if r["id"] == str(self.bob.id))
+        self.assertEqual(row["connection_status"], "pending_sent")
+
+    def test_stranger_cannot_accept_someone_elses_request(self):
+        self.client.force_authenticate(self.alice)
+        create_response = self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+        conn_id = create_response.data["id"]
+
+        self.client.force_authenticate(self.carol)
+        response = self.client.patch(f"/api/v1/connections/{conn_id}/", {"status": "accepted"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
