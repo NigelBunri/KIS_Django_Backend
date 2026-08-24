@@ -23,6 +23,7 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.core.phone_utils import to_e164
+from apps.notifications.models import NotificationDeviceToken
 from common.media_urls import absolutize_backend_media
 from django.utils.translation import gettext_lazy as _
 from django.contrib.auth.hashers import make_password, check_password
@@ -626,7 +627,7 @@ class IsOwnerReadOnlyOrStaff(permissions.BasePermission):
     sessions): staff get full CRUD; a normal authenticated user may only
     read their own record. Direct mutation by non-staff is blocked at the
     view level (has_permission) so POST/PUT/PATCH/DELETE never even reach
-    per-object checks — those records must only change via the controlled
+    per-object checks - those records must only change via the controlled
     billing/device services, not this generic REST surface.
     """
     def has_permission(self, request, view):
@@ -650,11 +651,11 @@ class IsAdminOrReadOnly(permissions.BasePermission):
     """
     For platform-wide, not-per-user resources (AccountTier pricing/feature
     definitions): IsAuthenticatedOrReadOnly previously let ANY authenticated
-    user write here — since AccountTier rows are shared across every user
+    user write here - since AccountTier rows are shared across every user
     (not owned by anyone), that meant any registered account could rewrite
     another tier's price_cents/features_json/rank, affecting the whole
     platform's billing, not just their own account. Read stays open to
-    everyone (including anonymous — this is public pricing-page data);
+    everyone (including anonymous - this is public pricing-page data);
     only staff may write.
     """
     def has_permission(self, request, view):
@@ -666,11 +667,11 @@ class IsAdminOrReadOnly(permissions.BasePermission):
 class IsProfileOwnerOrStaffForWrites(permissions.BasePermission):
     """
     ProfileViewSet's base update/partial_update/destroy actions had no
-    object-level check at all — any authenticated user could PATCH or
+    object-level check at all - any authenticated user could PATCH or
     DELETE another user's Profile (bio, headline, industry, visibility,
     avatar/cover) via /api/v1/profiles/<id>/. list/retrieve/discover/view
     stay open to any authenticated user (unchanged) since ProfileSerializer
-    doesn't expose raw phone/email — this only closes the write path.
+    doesn't expose raw phone/email - this only closes the write path.
     """
     def has_permission(self, request, view):
         return bool(request.user and request.user.is_authenticated)
@@ -687,11 +688,11 @@ class IsProfileOwnerOrStaffForWrites(permissions.BasePermission):
 class IsSelfOrStaffForUserWrites(permissions.BasePermission):
     """
     For UserViewSet specifically: any authenticated user may READ (list,
-    search, retrieve) any account — the view layer swaps in
+    search, retrieve) any account - the view layer swaps in
     PublicUserSerializer for anyone who isn't the target themselves or
     staff, so a read never actually exposes phone/email/verification/
     preferences for someone else's account. Writes (update, partial_update,
-    destroy) are restricted to the account's own owner or staff — 'create'
+    destroy) are restricted to the account's own owner or staff - 'create'
     is staff-only, since real account creation goes through RegisterView
     (a UserCreateSerializer flow with password handling this viewset's
     UserSerializer doesn't have), not this generic REST surface.
@@ -750,10 +751,10 @@ def password_login_requires_qr(user: User, device_id: str) -> bool:
 
     Only ever called from the app's own password LoginView (never the
     website, which signs in via OtpVerifyView's web_login purpose instead)
-    — so "active device" here deliberately excludes platform="web" rows.
+    - so "active device" here deliberately excludes platform="web" rows.
     Web and mobile are meant to stay signed in simultaneously regardless
     of which one logged in first; an active browser session must never
-    QR-gate a fresh app login (or vice versa — see web_login's own
+    QR-gate a fresh app login (or vice versa - see web_login's own
     same-platform-only revocation in apps.otp.views).
     """
     normalized_device_id = str(device_id or "").strip()
@@ -769,7 +770,7 @@ def password_login_requires_qr(user: User, device_id: str) -> bool:
 
 def sim_matches_account(user: User, sim_phone_number: Optional[str]) -> bool:
     """
-    Best-effort SIM ownership check (Android only — iOS has no API for an app
+    Best-effort SIM ownership check (Android only - iOS has no API for an app
     to read its own device's phone number, so this is always False there).
     Compares by digit suffix since carriers inconsistently include the country
     code / trunk prefix in TelephonyManager's reported line number.
@@ -792,7 +793,7 @@ def promote_device_via_sim(
 ) -> "Device":
     """
     SIM ownership is out-of-band proof this device belongs to the account
-    holder, so it becomes the sole primary ("parent") device — demoting any
+    holder, so it becomes the sole primary ("parent") device - demoting any
     other active parent (e.g. a stale record left behind by a deleted app on
     the original device_id).
     """
@@ -872,7 +873,7 @@ def upsert_device(
     # device for this user. This existence check and the write below are not
     # under the same row lock (there's nothing to lock when zero rows exist
     # yet), so two concurrent first-device upserts can both observe "no
-    # parent" — the DB-level accounts_device_one_active_parent_per_user
+    # parent" - the DB-level accounts_device_one_active_parent_per_user
     # constraint is the actual source of truth: if the promoting write loses
     # the race, retry once as a non-promoting write instead of erroring.
     has_active_parent = Device.objects.filter(
@@ -892,6 +893,18 @@ def revoke_device_session(user: User, device: Device, *, reason: str, request=No
     device.save(update_fields=["token_version", "revoked_at", "revoke_reason", "updated_at"])
     E2EDeviceKey.objects.filter(user=user, device=device).delete()
     E2EPreKey.objects.filter(user=user, device=device).delete()
+    # Push tokens are keyed loosely (user_id, device_id, push_token) with no FK
+    # to this Device row, so nothing else ever disabled them on revoke/logout —
+    # the same physical device re-logging in as a different user kept the
+    # previous owner's row "enabled", and push delivery (apps/notifications/
+    # tasks.py) filters purely by user_id, so that stale row still received
+    # and pushed the PREVIOUS owner's notifications to whoever now holds the
+    # device. Disabling here, at the one canonical revoke path every logout/
+    # password-reset/recovery/device-revoke flow already goes through, closes
+    # that cross-account leak at its source.
+    NotificationDeviceToken.objects.filter(
+        user_id=user.id, device_id=device.device_id, is_deleted=False,
+    ).update(enabled=False, is_deleted=True, updated_at=timezone.now())
     log_security_event(
         user,
         "security.device.revoked",
@@ -990,7 +1003,7 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
             raise DRFValidationError({"detail": "Duplicate or invalid data."})
 
         upsert_device(user, device_id, device_platform or None, device_name or None, request)
-        # Send welcome email (non-blocking) — a failure here must not block
+        # Send welcome email (non-blocking) - a failure here must not block
         # registration, but previously it vanished with zero trace (bare
         # except: pass). Now logged + audited so a provider outage is
         # actually visible instead of silently losing the email forever.
@@ -1018,7 +1031,7 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
             user.is_active = True
             user.save(update_fields=["verification", "status", "is_active", "updated_at"])
 
-            # Referral rewards are no longer granted at account activation —
+            # Referral rewards are no longer granted at account activation -
             # see apps.referrals.services.apply_referral_reward_if_pending's
             # docstring. The Referral row created by register_referral()
             # (elsewhere in this view) stays PENDING until a real qualifying
@@ -1043,7 +1056,7 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
                 status=status.HTTP_201_CREATED,
             )
 
-        # Do NOT issue tokens yet — the account must be phone-verified first.
+        # Do NOT issue tokens yet - the account must be phone-verified first.
         # Tokens are issued by OtpVerifyView after successful code verification.
         phone_verified = bool(
             (user.verification or {}).get("phone", {}).get("verified")
@@ -1089,7 +1102,7 @@ class LoginView(APIView):
                     or request.data.get("email")
                 )
             record_failed_auth(request, identifier=login_identifier)
-            # DRF wraps each dict value in a list — flatten single-item lists so
+            # DRF wraps each dict value in a list - flatten single-item lists so
             # mobile clients can do `error_code === "phone_not_verified"` directly.
             raw = exc.detail if isinstance(exc.detail, dict) else {"detail": exc.detail}
             flat: dict = {}
@@ -1692,12 +1705,12 @@ class UserViewSet(viewsets.ModelViewSet):
     (everything except password/is_superuser/is_staff/user_permissions/
     groups). That meant anonymous requests could read every user's email,
     full phone number, verification detail, and preferences; and any
-    authenticated user could PATCH/DELETE *any other* user's record —
+    authenticated user could PATCH/DELETE *any other* user's record -
     including tier and status, which weren't read-only, making this a
     free self-service tier upgrade / account-tampering path that bypassed
     apps.billing entirely. Now: auth is required for everything, only the
     owner or staff can write, and only the owner or staff ever see the
-    full UserSerializer — everyone else gets PublicUserSerializer.
+    full UserSerializer - everyone else gets PublicUserSerializer.
     """
     queryset = User.objects.select_related("profile").all()
     serializer_class = UserSerializer
@@ -1705,7 +1718,7 @@ class UserViewSet(viewsets.ModelViewSet):
     permission_classes = (IsSelfOrStaffForUserWrites,)
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["tier", "status"]
-    # email deliberately excluded from search_fields — searching by name is
+    # email deliberately excluded from search_fields - searching by name is
     # the legitimate "find someone" feature this endpoint supports (see
     # apps.accounts.tests_qa_full.ProfileDiscoverabilityTests.test_users_search);
     # searching by email would let anyone probe whether a specific address
@@ -1905,11 +1918,11 @@ class UserViewSet(viewsets.ModelViewSet):
 class ProfileViewSet(viewsets.ModelViewSet):
     """
     Base list/retrieve/update/partial_update/destroy previously had
-    IS_AUTH_OR_RO (IsAuthenticatedOrReadOnly) with no object-level check —
+    IS_AUTH_OR_RO (IsAuthenticatedOrReadOnly) with no object-level check -
     any authenticated user could PATCH or DELETE another user's Profile.
     The dedicated me/view/discover/set_open_to_work actions each already
     define their own explicit, deliberate permission_classes and are
-    unaffected by this — see IsProfileOwnerOrStaffForWrites.
+    unaffected by this - see IsProfileOwnerOrStaffForWrites.
     """
     queryset = Profile.objects.select_related("user").all()
     serializer_class = ProfileSerializer
@@ -2287,7 +2300,7 @@ class ApiTokenViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Des
 )
 class AccountTierViewSet(viewsets.ModelViewSet):
     """
-    Previously IS_AUTH_OR_RO — any authenticated user could write here,
+    Previously IS_AUTH_OR_RO - any authenticated user could write here,
     even though AccountTier rows are shared platform-wide pricing/feature
     definitions, not per-user data. See IsAdminOrReadOnly.
     """
@@ -2310,7 +2323,7 @@ class SubscriptionViewSet(viewsets.ModelViewSet):
     Read-only for normal users, scoped to their own subscription(s). Staff
     get full CRUD for support/admin tooling. Subscription state itself must
     only change through apps.billing's controlled upgrade/downgrade/cancel
-    services — this endpoint intentionally does not let a normal user
+    services - this endpoint intentionally does not let a normal user
     create, alter, or delete their own subscription row directly.
     """
     serializer_class = SubscriptionSerializer
@@ -2338,7 +2351,7 @@ class SubscriptionViewSet(viewsets.ModelViewSet):
     retrieve=extend_schema(summary="Retrieve session (own record only, unless staff)"),
 )
 class SessionViewSet(viewsets.ModelViewSet):
-    """Same own-records-only posture as SubscriptionViewSet — see there for rationale."""
+    """Same own-records-only posture as SubscriptionViewSet - see there for rationale."""
     serializer_class = SessionSerializer
     authentication_classes = JWT_AUTH
     permission_classes = (IsOwnerReadOnlyOrStaff,)
@@ -2669,7 +2682,7 @@ class CheckContact(APIView):
 
         Returns: { "results": { "+237676...": { "registered": bool, "user_id": int|null } } }
 
-        Single bulk DB query (both phone fields are indexed) — does NOT run
+        Single bulk DB query (both phone fields are indexed) - does NOT run
         the full-table-scan digits fallback used by the single-phone GET path.
         """
         phones_raw = request.data.get("phones")
@@ -2697,7 +2710,7 @@ class CheckContact(APIView):
                 if d:
                     all_digit_variants.add(d)
 
-        # Single bulk DB query — O(index scan), not O(table scan)
+        # Single bulk DB query - O(index scan), not O(table scan)
         matched_users = (
             User.objects
             .filter(Q(phone__in=all_phone_variants) | Q(phone_number__in=all_digit_variants))
@@ -2744,7 +2757,7 @@ class CheckContact(APIView):
 # ---------------------------------------------------------------------------
 class ConnectionSerializer(serializers.ModelSerializer):
     # ConnectionsScreen.tsx (src/screens/profile/ConnectionsScreen.tsx) was
-    # written expecting nested from_user/to_user objects — this serializer
+    # written expecting nested from_user/to_user objects - this serializer
     # previously emitted flat from_user_id/from_user_name/from_user_avatar
     # fields instead, so the screen's getOtherUser() always got undefined.
     # That screen also was never registered in AppNavigator and this whole
@@ -2781,7 +2794,7 @@ class ConnectionSerializer(serializers.ModelSerializer):
             return None
         from apps.chat.services import get_or_create_direct_conversation
 
-        # get_or_create is idempotent — the room was already created at
+        # get_or_create is idempotent - the room was already created at
         # accept time, so this just resolves its id without creating a
         # second one.
         conversation, _created = get_or_create_direct_conversation(obj.from_user, obj.to_user)
@@ -2844,8 +2857,8 @@ class ConnectionViewSet(viewsets.ModelViewSet):
         conn.status = new_status
         conn.save(update_fields=["status", "updated_at"])
         if new_status == UserConnection.STATUS_ACCEPTED:
-            # The chat room is created here, at acceptance — not when the
-            # request was sent — so "not accepted = no chat room" holds by
+            # The chat room is created here, at acceptance - not when the
+            # request was sent - so "not accepted = no chat room" holds by
             # construction rather than as a bolt-on permission check.
             from apps.chat.services import get_or_create_direct_conversation
 
@@ -2854,7 +2867,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="search")
     def search(self, request):
-        """Search people by name/username or by job (Profile.headline/industry) —
+        """Search people by name/username or by job (Profile.headline/industry) -
         the actual "search for others using name, jobs and so on" ask; the
         existing people_you_may_know only ever surfaced algorithmic
         suggestions with no query support."""
@@ -3002,17 +3015,17 @@ def _send_push_to_device(user: User, device: Device, title: str, body: str, dedu
 
     Was previously an ad-hoc direct call into apps.notifications.firebase
     that referenced fields that don't exist on either model involved
-    (NotificationDeviceToken has no `user`/`token` fields — it's `user_id`/
-    `push_token`; Notification has no `user`/`notification_type` fields —
+    (NotificationDeviceToken has no `user`/`token` fields - it's `user_id`/
+    `push_token`; Notification has no `user`/`notification_type` fields -
     it's `user_id`/`type`), so every call raised inside the try/except and
-    was silently swallowed — this notification has never actually been
+    was silently swallowed - this notification has never actually been
     delivered. Routed through the canonical apps.notifications.services
     entrypoint instead, which is also the only path that creates the in-app
     record, applies the user's notification preferences/quiet hours, and
-    tracks delivery — none of which the old code did even when it worked.
+    tracks delivery - none of which the old code did even when it worked.
 
     Goes to all of the user's registered devices/tokens (not just the named
-    `device` parameter) — this is a security-relevant alert about the
+    `device` parameter) - this is a security-relevant alert about the
     account, not a per-device chat message, so every device should see it,
     matching how a "new device linked" notice works on mainstream messaging
     apps.
@@ -3026,7 +3039,7 @@ def _send_push_to_device(user: User, device: Device, title: str, body: str, dedu
             title=title,
             body=body,
             target_type="accounts.Device",
-            # Notification.target_id is a UUIDField — Device.device_id is an
+            # Notification.target_id is a UUIDField - Device.device_id is an
             # arbitrary client-supplied string, not guaranteed to be a UUID.
             # Device.id (the row's own UUID primary key) is the field that
             # actually satisfies that constraint.
@@ -3038,7 +3051,7 @@ def _send_push_to_device(user: User, device: Device, title: str, body: str, dedu
 
 
 def _send_recovery_email(user: User, recovery_code: str) -> None:
-    """Best-effort recovery email. Swallows all errors — the caller (init
+    """Best-effort recovery email. Swallows all errors - the caller (init
     view) must not vary its response based on delivery success, to avoid
     account enumeration."""
     try:
@@ -3067,6 +3080,7 @@ class DeviceQRGenerateView(APIView):
     """
     authentication_classes = _QR_JWT_AUTH
     permission_classes = IS_AUTH
+    throttle_scope = "device_link"
 
     def get(self, request):
         device_id = request_device_id(request)
@@ -3120,6 +3134,7 @@ class DeviceQRLoginView(APIView):
     """
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_scope = "device_link"
 
     def post(self, request):
         ser = _QRLoginSerializer(data=request.data)
@@ -3224,19 +3239,20 @@ class DeviceQRLoginView(APIView):
 class DeviceWebPairingGenerateView(APIView):
     """
     GET auth/devices/web-pairing/
-    Authenticated by the PARENT device only — a secondary device is refused
+    Authenticated by the PARENT device only - a secondary device is refused
     here (403), which is what enforces "a secondary device may create zero
     web sessions": there's no other path that can mint a web session.
     Returns a short-lived (10 min), single-use code as both a scannable QR
     payload (a kingdomimpactventures.org/pair link) and plain text for
     manual entry. Unlike phone_link tokens, generating a new one does NOT
     invalidate other still-valid web_login codes for this device beyond the
-    single-active-code cleanup generate_for_device already does — a primary
+    single-active-code cleanup generate_for_device already does - a primary
     device is allowed many *redeemed* concurrent web sessions, this view
     only limits how many *unredeemed* codes can be outstanding at once.
     """
     authentication_classes = _QR_JWT_AUTH
     permission_classes = IS_AUTH
+    throttle_scope = "device_link"
 
     def get(self, request):
         device_id = request_device_id(request)
@@ -3289,15 +3305,16 @@ class _WebPairingRedeemSerializer(serializers.Serializer):
 class DeviceWebPairingRedeemView(APIView):
     """
     POST auth/devices/web-pairing/redeem/
-    No auth required — called by the website itself (server-side, from its
+    No auth required - called by the website itself (server-side, from its
     own login route) with the code the user typed or arrived with via the
     scanned QR link. On success, returns JWT tokens for a NEW platform="web"
-    Device. Deliberately does not revoke any other web device — a primary
+    Device. Deliberately does not revoke any other web device - a primary
     account may have many concurrent web sessions, unlike the single-web-
     session behavior of the password/OTP web login path.
     """
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_scope = "device_link"
 
     def post(self, request):
         ser = _WebPairingRedeemSerializer(data=request.data)
@@ -3313,7 +3330,7 @@ class DeviceWebPairingRedeemView(APIView):
             return Response({"detail": "Invalid or expired code."}, status=status.HTTP_401_UNAUTHORIZED)
 
         # Re-check the generating device is still the active parent at
-        # redemption time — it may have been demoted/revoked in the minutes
+        # redemption time - it may have been demoted/revoked in the minutes
         # between code generation and redemption.
         if not qr_token.parent_device or not Device.objects.filter(
             id=qr_token.parent_device_id, is_parent=True, revoked_at__isnull=True,
@@ -3495,7 +3512,7 @@ class RevokeAllSecondaryView(APIView):
             )
 
         # Routed through the same canonical revoke_device_session() used by
-        # logout/single-device revoke — a bare bulk .update() previously
+        # logout/single-device revoke - a bare bulk .update() previously
         # skipped the token_version bump and E2EE key wipe that make
         # revocation actually stick, leaving an already-issued access token
         # valid until its natural expiry even after "revoking" it here.
@@ -3587,6 +3604,7 @@ class ParentRecoveryInitView(APIView):
     """
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_scope = "password_reset"
 
     def post(self, request):
         ser = _ParentRecoveryInitSerializer(data=request.data)
@@ -3607,7 +3625,7 @@ class ParentRecoveryInitView(APIView):
                 is_active=True,
             ).first()
 
-        # Always return the same message regardless of whether user exists —
+        # Always return the same message regardless of whether user exists -
         # and, importantly, regardless of whether they have a verified email.
         # Only a VERIFIED email is eligible to authorize replacing the
         # primary device (see apps.otp purpose="email_verify"); an
@@ -3650,6 +3668,7 @@ class ParentRecoveryConfirmView(APIView):
     """
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_scope = "password_reset"
 
     def post(self, request):
         ser = _ParentRecoveryConfirmSerializer(data=request.data)
@@ -3726,11 +3745,11 @@ class ParentRecoveryConfirmView(APIView):
                 )
         except IntegrityError:
             # Lost a race against a concurrent recovery/QR/login promoting a
-            # different device to parent first — the one-active-parent
+            # different device to parent first - the one-active-parent
             # constraint caught it. Ask the client to retry with a fresh
             # recovery token rather than surfacing a bare 500.
             return Response(
-                {"detail": "Recovery could not complete — please retry."},
+                {"detail": "Recovery could not complete - please retry."},
                 status=status.HTTP_409_CONFLICT,
             )
 
@@ -3767,8 +3786,8 @@ _QUICKLOCK_PIN_RE = re.compile(r"^\d{4,6}$")
 
 class QuickLockPinView(APIView):
     """
-    POST   /api/v1/auth/quicklock-pin/        — save (or replace) a PIN
-    DELETE /api/v1/auth/quicklock-pin/        — clear the PIN
+    POST   /api/v1/auth/quicklock-pin/        - save (or replace) a PIN
+    DELETE /api/v1/auth/quicklock-pin/        - clear the PIN
     """
     authentication_classes = JWT_AUTH
     permission_classes = (IsAuthenticated,)
@@ -3794,7 +3813,7 @@ class QuickLockPinView(APIView):
 
 class QuickLockPinVerifyView(APIView):
     """
-    POST /api/v1/auth/quicklock-pin/verify/  — verify a PIN without changing it
+    POST /api/v1/auth/quicklock-pin/verify/  - verify a PIN without changing it
     """
     authentication_classes = JWT_AUTH
     permission_classes = (IsAuthenticated,)
@@ -3891,7 +3910,7 @@ class PasswordChangeView(APIView):
             )
 
         # Same validator chain as the OTP-based reset flow (apps.otp.views.
-        # PasswordResetView) — previously this only checked len >= 8, letting
+        # PasswordResetView) - previously this only checked len >= 8, letting
         # a user set a materially weaker password via "change" than via
         # "forgot password" (10-char minimum, common-password, similarity,
         # and numeric-only checks were all skipped here).
@@ -3912,7 +3931,7 @@ class PasswordChangeView(APIView):
             # stays authenticated; every other active device is revoked so a
             # changed password actually locks out anyone else already logged
             # in (previously neither change nor reset touched other devices
-            # at all — tokens stayed valid up to their 90-day natural expiry).
+            # at all - tokens stayed valid up to their 90-day natural expiry).
             other_devices = Device.objects.select_for_update().filter(
                 user=user, revoked_at__isnull=True
             ).exclude(device_id=current_device_id)

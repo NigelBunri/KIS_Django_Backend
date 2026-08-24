@@ -116,7 +116,7 @@ DEBUG = _env_bool("DEBUG", False)
 ALLOWED_HOSTS = _env_csv("ALLOWED_HOSTS", f"{DEV_SERVER_HOST},10.0.2.2")
 CSRF_TRUSTED_ORIGINS = _env_csv("CSRF_TRUSTED_ORIGINS", "")
 
-# CORS — django-cors-headers
+# CORS - django-cors-headers
 # In production, set CORS_ALLOWED_ORIGINS to comma-separated list of allowed origins.
 # The mobile app (React Native) does not use browsers, so CORS is primarily for the web client.
 CORS_ALLOWED_ORIGINS = _env_csv("CORS_ALLOWED_ORIGINS", f"http://{DEV_SERVER_HOST}:{DEV_SERVER_PORT}")
@@ -143,12 +143,12 @@ SECURE_HSTS_PRELOAD = _env_bool("SECURE_HSTS_PRELOAD", not DEBUG)
 if _env_bool("USE_X_FORWARDED_PROTO", False):
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
-# Phone verification (OTP) gate. Suspended by default — accounts register and
+# Phone verification (OTP) gate. Suspended by default - accounts register and
 # log in without an SMS code. Set KIS_PHONE_VERIFICATION_ENABLED=true to restore
 # the requirement.
 KIS_PHONE_VERIFICATION_ENABLED = _env_bool("KIS_PHONE_VERIFICATION_ENABLED", False)
 
-# Email provider — Resend (HTTP API). See config/settings/production.py for
+# Email provider - Resend (HTTP API). See config/settings/production.py for
 # how this selects EMAIL_BACKEND; local/test environments never send real
 # email regardless (console backend / eager test settings), so this is safe
 # to leave blank there.
@@ -162,12 +162,12 @@ FLW_REDIRECT_URL = os.environ.get("FLW_REDIRECT_URL", "https://kis.app/payments/
 KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED = _env_bool("KIS_DIRECT_PAYMENT_PROVIDER_LINKS_ENABLED", False)
 PAYMENTS_MOCK = os.environ.get("PAYMENTS_MOCK", "False").lower() in ("1", "true", "yes")
 
-# Platform commission taken on paid marketplace transactions — Education
+# Platform commission taken on paid marketplace transactions - Education
 # course purchases, Market orders/service bookings, Health billing
-# sessions, and Broadcast tips/memberships/PPV — before the remainder
+# sessions, and Broadcast tips/memberships/PPV - before the remainder
 # settles to the seller/provider's connected Flutterwave subaccount (or,
 # on the legacy wallet rail, before crediting their wallet). This is
-# entirely separate from subscription/tier pricing — it is a
+# entirely separate from subscription/tier pricing - it is a
 # per-transaction marketplace fee, not part of any AccountTier price.
 #
 # Scaled by the seller/provider's own account tier (not per-shop/per-
@@ -201,7 +201,7 @@ except (ValueError, TypeError, AttributeError):
     PLATFORM_COMMISSION_BY_TIER = dict(_PLATFORM_COMMISSION_BY_TIER_DEFAULT)
 # Optional: a system User id to credit with the platform's commission on
 # the legacy wallet-payment rail (apps/billing/services.py:
-# release_locked_booking_funds_split). Not required — the production
+# release_locked_booking_funds_split). Not required - the production
 # payment path settles its split at the Flutterwave provider level via
 # the institution's connected subaccount instead (see
 # _education_course_split_subaccounts in apps/billing/direct_payments.py).
@@ -259,15 +259,15 @@ KIS_PUBLIC_WEB_BASE_URL = os.environ.get("KIS_PUBLIC_WEB_BASE_URL", "https://kis
 KIS_PUBLIC_WEB_INDEXING_ENABLED = _env_bool("KIS_PUBLIC_WEB_INDEXING_ENABLED", False)
 KIS_PUBLIC_REFERRALS_ENABLED = _env_bool("KIS_PUBLIC_REFERRALS_ENABLED", False)
 
-# Website builder's public domain — deliberately separate from
+# Website builder's public domain - deliberately separate from
 # KIS_PUBLIC_WEB_BASE_URL above (kis.app, used by broadcasts' channel/
 # content public pages). Website builder pages are served at
 # kingdomimpactventures.org/page/<slug> by the separate Next.js site, not
-# rendered by Django — this is only used to build canonical/preview URLs
+# rendered by Django - this is only used to build canonical/preview URLs
 # returned in API responses.
 KIS_WEBSITE_PUBLIC_BASE_URL = os.environ.get("KIS_WEBSITE_PUBLIC_BASE_URL", "https://kingdomimpactventures.org").strip().rstrip("/")
 
-# Website Builder custom domains (Cloudflare for SaaS) — unset by default.
+# Website Builder custom domains (Cloudflare for SaaS) - unset by default.
 # See apps.websites.custom_domains's module docstring: this is
 # APPLICATION code built ahead of a separate, not-yet-done, one-time
 # Cloudflare zone/Worker-route infrastructure step. Leave these unset
@@ -296,10 +296,10 @@ FIREBASE_SERVER_KEY = os.environ.get("FIREBASE_SERVER_KEY", "")
 # Debug-only OTP code logging. Keep false unless explicitly debugging locally.
 OTP_DEBUG_LOG_CODES = _env_bool("OTP_DEBUG_LOG_CODES", False)
 
-# SendGrid — transactional email (OTP, welcome, receipts)
+# SendGrid - transactional email (OTP, welcome, receipts)
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "").strip()
 
-# Infobip — SMS and WhatsApp OTP delivery
+# Infobip - SMS and WhatsApp OTP delivery
 INFOBIP_API_KEY = os.environ.get("INFOBIP_API_KEY", "").strip()
 INFOBIP_BASE = os.environ.get("INFOBIP_BASE", "").strip().rstrip("/")
 INFOBIP_SMS_SENDER = os.environ.get("INFOBIP_SMS_SENDER", "").strip()
@@ -310,7 +310,7 @@ WHATSAPP_SENDER_NUMBER = os.environ.get("WHATSAPP_SENDER_NUMBER", "").strip()
 WHATSAPP_TEMPLATE_NAME = os.environ.get("WHATSAPP_TEMPLATE_NAME", "").strip()
 WHATSAPP_TEMPLATE_LANGUAGE = os.environ.get("WHATSAPP_TEMPLATE_LANGUAGE", "en").strip() or "en"
 
-# Override OTP code that always passes verification — development/QA only.
+# Override OTP code that always passes verification - development/QA only.
 # No default value: an override is only active when BOTH OTP_OVERRIDE_ENABLED
 # is explicitly true AND OTP_OVERRIDE_CODE is set. production.py refuses to
 # start if either is configured. Never commit a real value for either.
@@ -562,18 +562,25 @@ REST_FRAMEWORK = {
         "register": _env_throttle_rate("THROTTLE_REGISTER", dev_default="6000/min", prod_default="20/min"),
         "otp": _env_throttle_rate("THROTTLE_OTP", dev_default="6000/min", prod_default="20/min"),
         "password_reset": _env_throttle_rate("THROTTLE_PASSWORD_RESET", dev_default="6000/min", prod_default="20/min"),
+        # QR/pairing-code device-link and account-recovery endpoints - these
+        # accept a bearer secret (QR token, pairing code, or recovery token)
+        # with AllowAny/no prior session, so the generic anon/user rate
+        # (600-3000/min) was the only thing standing between an attacker and
+        # brute-forcing them. Reusing password_reset's rate for recovery
+        # (same risk class: a guessable token there is account takeover).
+        "device_link": _env_throttle_rate("THROTTLE_DEVICE_LINK", dev_default="6000/min", prod_default="20/min"),
         "upload": _env_throttle_rate("THROTTLE_UPLOAD", dev_default="6000/min", prod_default="300/min"),
         "search": _env_throttle_rate("THROTTLE_SEARCH", dev_default="6000/min", prod_default="600/min"),
         "messaging": _env_throttle_rate("THROTTLE_MESSAGING", dev_default="6000/min", prod_default="1200/min"),
         # Trusted-internal Nest->Django chat-voice URL signing. Keyed by IP
-        # (AllowAny + internal-token auth means there's no request.user) —
+        # (AllowAny + internal-token auth means there's no request.user) -
         # a blanket cap on the whole endpoint if the internal token ever
         # leaked, not per-end-user limiting (Nest already rate-limits the
         # RN-facing playback-url endpoint per user).
         "chat_voice_sign": _env_throttle_rate("THROTTLE_CHAT_VOICE_SIGN", dev_default="6000/min", prod_default="1200/min"),
         # Public, unauthenticated payment-status check (the kingdomimpact
         # ventures.org/payments/complete redirect landing page polls this
-        # after a Flutterwave checkout) — keyed by IP since there's no
+        # after a Flutterwave checkout) - keyed by IP since there's no
         # request.user, capped low enough to make tx_ref brute-forcing
         # impractical (tx_ref is a 128-bit uuid4 hex, so this is defense in
         # depth, not the primary protection) without blocking a real user
@@ -607,7 +614,7 @@ SPECTACULAR_SETTINGS = {
     },
 }
 
-# Simple JWT — read signing/validation config from environment
+# Simple JWT - read signing/validation config from environment
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=int(os.environ.get("JWT_ACCESS_MINUTES", 60))),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=int(os.environ.get("JWT_REFRESH_DAYS", 90))),
@@ -630,7 +637,7 @@ ENTITLEMENTS_CACHE_TTL = int(os.environ.get("ENTITLEMENTS_CACHE_TTL", 300))  # s
 API_TOKEN_PLAIN_LENGTH = int(os.environ.get("API_TOKEN_PLAIN_LENGTH", 32))  # used by secrets.token_urlsafe(n)
 API_TOKEN_DEFAULT_EXPIRES_DAYS = int(os.environ.get("API_TOKEN_DEFAULT_EXPIRES_DAYS", 30))
 
-# Caching (e.g., Redis) — used by quota enforcement and feature flags
+# Caching (e.g., Redis) - used by quota enforcement and feature flags
 CACHES = {
     "default": {
         # For local/dev the locmem cache is fine; override in production to Redis/Memcached
@@ -645,12 +652,12 @@ CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", f"redis://{DEV_S
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
-CELERY_TASK_SOFT_TIME_LIMIT = 300   # seconds — raises SoftTimeLimitExceeded for graceful cleanup
+CELERY_TASK_SOFT_TIME_LIMIT = 300   # seconds - raises SoftTimeLimitExceeded for graceful cleanup
 CELERY_TASK_TIME_LIMIT = 360        # hard kill after 6 minutes
 
 # Redeploy-safe periodic scheduling: django_celery_beat has been installed
 # (and migrated) since before this phase, but nothing ever pointed Celery
-# Beat at it — the default PersistentScheduler persists "last run" state to
+# Beat at it - the default PersistentScheduler persists "last run" state to
 # a local file, which does not survive a redeploy on an ephemeral
 # filesystem (e.g. Render). DatabaseScheduler persists that state to
 # Postgres instead, and seeds CELERY_BEAT_SCHEDULE into the PeriodicTask
@@ -659,7 +666,7 @@ CELERY_TASK_TIME_LIMIT = 360        # hard kill after 6 minutes
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
 # Reliability pairing: acks_late means a task is only acknowledged (removed
-# from the broker) after it finishes, not the moment a worker picks it up —
+# from the broker) after it finishes, not the moment a worker picks it up -
 # so a worker crashing/OOM-killing mid-task gets that task redelivered
 # instead of silently losing it. prefetch_multiplier=1 stops a worker from
 # hoarding a batch of tasks in memory ahead of when it can actually work on
@@ -670,7 +677,7 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 
 # Periodic media-upload cleanup (apps/media/tasks.py). Both tasks wrap
 # functions in apps/media/upload_intent.py that were already correct but had
-# no scheduler actually invoking them — the management command
+# no scheduler actually invoking them - the management command
 # (expire_media_uploads) was the only working invocation path, requiring an
 # external cron. Without one of the two, abandoned upload intents and
 # confirmed-but-never-attached uploads accumulate indefinitely (S3 objects
@@ -679,7 +686,7 @@ CELERY_BEAT_SCHEDULE = {
     "expire-abandoned-media-uploads": {
         "task": "apps.media.tasks.expire_abandoned_media_uploads",
         # Matches the shortest default presign lifetime (10 min) with room
-        # to spare — see PROFILE_IMAGE_PRESIGN_EXPIRY_SECONDS below.
+        # to spare - see PROFILE_IMAGE_PRESIGN_EXPIRY_SECONDS below.
         "schedule": 15 * 60,
     },
     "expire-unattached-media-uploads": {
@@ -690,8 +697,8 @@ CELERY_BEAT_SCHEDULE = {
     },
     # Subscription expiry (apps/billing/tasks.py, apps/billing/services.py
     # sweep_expired_subscriptions). Previously a subscription that lapsed
-    # without the user explicitly cancelling/downgrading stayed "active" —
-    # and the user's paid tier stayed in effect — indefinitely, since the
+    # without the user explicitly cancelling/downgrading stayed "active" -
+    # and the user's paid tier stayed in effect - indefinitely, since the
     # only expiry processing was a lazy check on two GET endpoints the user
     # had to happen to hit. Hourly matches the media-upload sweep cadence;
     # a subscription being briefly (up to an hour) late to expire has no
@@ -712,7 +719,7 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 60 * 60,
     },
     # Reward/referral scheduled maintenance (Phase 11 of the billing/
-    # rewards project — apps/rewards/tasks.py, apps/referrals/tasks.py).
+    # rewards project - apps/rewards/tasks.py, apps/referrals/tasks.py).
     "expire-reward-ledger-entries": {
         "task": "apps.rewards.tasks.expire_reward_ledger_entries",
         # Matches the other sweeps' hourly cadence; a KIS Coin sitting
@@ -724,13 +731,13 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.referrals.tasks.confirm_settled_referrals",
         # REFERRAL_SETTLEMENT_WINDOW_DAYS (apps/referrals/services.py) is
         # measured in days, so an hourly sweep is already far more granular
-        # than the window itself needs — this just bounds how long a
+        # than the window itself needs - this just bounds how long a
         # referral sits QUALIFIED-but-past-window before settling.
         "schedule": 60 * 60,
     },
     "reconcile-rewards-and-referrals": {
         "task": "apps.rewards.tasks.reconcile_rewards_and_referrals_task",
-        # Read-only consistency check, not a corrective action — daily is
+        # Read-only consistency check, not a corrective action - daily is
         # frequent enough to catch drift without adding noise to whatever
         # log/alerting pipeline watches this task's anomalies.
         "schedule": 24 * 60 * 60,
@@ -738,7 +745,7 @@ CELERY_BEAT_SCHEDULE = {
     # Phase 4 of the Education system production-hardening project: backstop
     # for auto_complete_education_booking, which is otherwise only ever
     # scheduled as a one-off apply_async(countdown=...) at the moment a
-    # booking enters AWAITING_SATISFACTION — see
+    # booking enters AWAITING_SATISFACTION - see
     # apps.broadcasts.tasks.sweep_stuck_education_bookings's own docstring
     # for why a one-off schedule alone isn't enough. Hourly matches every
     # other sweep's cadence; escrowed booking funds sitting locked for up
@@ -773,7 +780,7 @@ MEDIA_SAFETY_BLOCKED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_BLOCKED_EXTENSION
 # Direct-to-S3 presigned-PUT upload handshake (apps/media/upload_intent.py).
 # Secure-by-default: a conservative size cap, a short presign lifetime, and
 # an explicit MIME allow-list rather than trusting the client. No bucket
-# name, domain, or AWS key ever belongs in these — they're read from the
+# name, domain, or AWS key ever belongs in these - they're read from the
 # existing AWS_* / S3MediaStorage env vars.
 PROFILE_IMAGE_MAX_UPLOAD_BYTES = int(os.environ.get("PROFILE_IMAGE_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 PROFILE_IMAGE_PRESIGN_EXPIRY_SECONDS = int(os.environ.get("PROFILE_IMAGE_PRESIGN_EXPIRY_SECONDS", 600))
@@ -782,7 +789,7 @@ PROFILE_IMAGE_ALLOWED_CONTENT_TYPES = os.environ.get(
     "image/jpeg,image/png,image/webp,image/heic,image/heif",
 )
 # Grace window past the presign's own expiry before an unconfirmed upload
-# intent is swept by expire_abandoned_media_uploads (apps/media/tasks.py) —
+# intent is swept by expire_abandoned_media_uploads (apps/media/tasks.py) -
 # gives a client mid-upload right at the presign deadline room to still
 # confirm before cleanup marks the record expired.
 MEDIA_UPLOAD_INTENT_EXPIRY_SECONDS = int(
@@ -802,7 +809,7 @@ NEST_INTERNAL_TOKEN = os.environ.get(
 # When the frontend resolves backend assets, it should reuse the API server's host instead of the chat/Nest host.
 NEST_API_BASE_URL = API_BASE_URL
 
-# Logging — JSON structured output so log aggregators (Datadog, CloudWatch, etc.) can parse fields
+# Logging - JSON structured output so log aggregators (Datadog, CloudWatch, etc.) can parse fields
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
