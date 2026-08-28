@@ -6,3 +6,6 @@ class HealthOpsConfig(AppConfig):
     name = "apps.health_ops"
     verbose_name = "Health Operations"
 
+    def ready(self):
+        from . import signals  # noqa: F401
+

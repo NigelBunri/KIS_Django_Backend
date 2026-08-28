@@ -264,3 +264,46 @@ def create_notification(user_id, type, template_key=None, context=None, channel=
     )
 
     return notif
+
+
+def notify_engagement(*, owner_user_id, actor_user, notification_type, verb, target_type, target_id, target_title=None, dedup_key=None):
+    """Shared entrypoint for like/comment/follow-style notifications across
+    every content-owning app (bible, broadcasts, commerce, communities,
+    health_ops, partners) - "someone engaged with your content". Routed
+    through create_notification like every other producer, same as
+    _notify_channel_subscribers/_notify_course_enrollees in
+    apps/broadcasts/views.py, just for the 1:1 (single owner) case instead
+    of fanning out to many subscribers.
+
+    - Skips self-notification (liking/commenting on your own content).
+    - Defaults dedup_key to one notification per (type, target, actor) so
+      an unlike+relike, or a reaction emoji change, doesn't re-fire - the
+      dedup key intentionally doesn't include a timestamp.
+    - actor_user is the already-fetched User instance (every caller is a
+      post_save signal receiver that already has it via instance.user /
+      instance.author), not just an id, so the display name can be
+      resolved without an extra query.
+    """
+    if not owner_user_id or not actor_user or str(owner_user_id) == str(actor_user.id):
+        return None
+    actor_name = getattr(actor_user, "display_name", None) or getattr(actor_user, "username", None) or "Someone"
+    title = f"{actor_name} {verb}"
+    body = target_title or "Tap to view."
+    try:
+        return create_notification(
+            user_id=owner_user_id,
+            type=notification_type,
+            title=title[:400],
+            body=body[:1000],
+            target_type=target_type,
+            target_id=target_id,
+            priority="MEDIUM",
+            dedup_key=dedup_key or f"{notification_type}:{target_id}:{actor_user.id}",
+            context={"actor_id": str(actor_user.id), "actor_name": actor_name},
+        )
+    except Exception:
+        logger.exception(
+            "Unable to send engagement notification type=%s target=%s owner=%s",
+            notification_type, target_id, owner_user_id,
+        )
+        return None
