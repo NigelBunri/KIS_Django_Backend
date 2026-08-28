@@ -10840,6 +10840,15 @@ class EducationInstitutionLessonListView(APIView):
         )
         if cover_intent is not None:
             education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionLesson", target_id=str(lesson.id))
+        if lesson.status == EducationAcademicRecordStatus.PUBLISHED:
+            _notify_course_enrollees(
+                course,
+                notification_type="COURSE_LESSON_PUBLISHED",
+                title=f"New lesson in {course.title}",
+                body=lesson.title,
+                target_type="education_lesson",
+                target_id=lesson.id,
+            )
         serializer = EducationInstitutionLessonSerializer(lesson)
         return Response({"lesson": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -10861,6 +10870,7 @@ class EducationInstitutionLessonDetailView(APIView):
         institution = _get_education_institution_or_404(request.user, institution_id)
         _require_manage_institution_membership(request.user, institution)
         lesson = _get_institution_lesson_or_404(institution, lesson_id)
+        was_published = lesson.status == EducationAcademicRecordStatus.PUBLISHED
         title = request.data.get("title")
         if isinstance(title, str) and title.strip():
             lesson.title = title.strip()
@@ -10892,6 +10902,18 @@ class EducationInstitutionLessonDetailView(APIView):
             lesson.metadata = request.data.get("metadata")
         lesson.save()
         _sync_education_source_broadcasts(lesson)
+        # Only the draft/archived -> published transition is push-worthy -
+        # every subsequent edit to an already-published lesson would
+        # otherwise re-notify the entire course on every typo fix.
+        if lesson.status == EducationAcademicRecordStatus.PUBLISHED and not was_published:
+            _notify_course_enrollees(
+                lesson.course,
+                notification_type="COURSE_LESSON_PUBLISHED",
+                title=f"New lesson in {lesson.course.title}",
+                body=lesson.title,
+                target_type="education_lesson",
+                target_id=lesson.id,
+            )
         serializer = EducationInstitutionLessonSerializer(lesson)
         return Response({"lesson": serializer.data}, status=status.HTTP_200_OK)
 
@@ -14803,6 +14825,46 @@ def _notify_channel_subscribers(channel: BroadcastChannel, *, notification_type:
             count += 1
         except Exception:
             logger.exception("Unable to notify channel subscriber channel=%s user=%s", channel.id, user_id)
+    return count
+
+
+def _notify_course_enrollees(course: "EducationInstitutionCourse", *, notification_type: str, title: str, body: str, target_type: str, target_id):
+    """Mirrors _notify_channel_subscribers above, for the education side:
+    a new/published lesson notifies everyone actively enrolled in its
+    course. Enrollment.course is a direct FK (set when the enrolling
+    broadcast is course-scoped) so this needs no traversal through the
+    broadcast/program hierarchy - see EducationInstitutionEnrollment.
+    """
+    try:
+        from apps.notifications import services as notification_services
+    except Exception:
+        return 0
+    enrollee_ids = (
+        EducationInstitutionEnrollment.objects
+        .filter(course=course, status=EducationEnrollmentStatus.ENROLLED)
+        .values_list("user_id", flat=True)
+    )
+    count = 0
+    for user_id in enrollee_ids[:500]:
+        try:
+            notification_services.create_notification(
+                user_id=user_id,
+                type=notification_type,
+                title=title[:400],
+                body=body[:1000],
+                target_type=target_type,
+                target_id=target_id,
+                priority="MEDIUM",
+                dedup_key=f"{notification_type}:{target_id}:{user_id}",
+                context={
+                    "institution_id": str(course.institution_id),
+                    "course_id": str(course.id),
+                    "course_title": course.title,
+                },
+            )
+            count += 1
+        except Exception:
+            logger.exception("Unable to notify course enrollee course=%s user=%s", course.id, user_id)
     return count
 
 

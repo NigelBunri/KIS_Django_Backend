@@ -198,3 +198,15 @@ def compile_and_send_digests(period_start_iso: str, period_end_iso: str):
             ):
                 logger.warning("Digest email failed for user_id=%s digest_id=%s", uid, digest.id)
     return True
+
+
+@shared_task
+def compile_daily_digests():
+    """Celery-beat entrypoint for compile_and_send_digests. That task takes
+    an explicit (start, end) window rather than a schedule, so nothing
+    could call it without a beat-cron wrapper computing one - it had no
+    caller anywhere outside its own test. Runs once daily against the
+    previous full day (00:00 to 00:00 UTC)."""
+    end = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    start = end - timezone.timedelta(days=1)
+    return compile_and_send_digests(start.isoformat(), end.isoformat())

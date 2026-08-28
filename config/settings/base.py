@@ -755,6 +755,25 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.broadcasts.tasks.sweep_stuck_education_bookings",
         "schedule": 60 * 60,
     },
+    # Bible reading reminders (apps/bible/tasks.py wrapping the
+    # dispatch_bible_reading_reminders management command). The command's
+    # own default --lookback-minutes is 10; every 5 minutes keeps a
+    # comfortable overlap margin so a reminder can never fall through a
+    # gap between runs. Was previously never scheduled anywhere - only
+    # ever invoked directly by its own test.
+    "dispatch-bible-reading-reminders": {
+        "task": "apps.bible.tasks.dispatch_bible_reading_reminders",
+        "schedule": 5 * 60,
+    },
+    # Notification digest emails (apps/notifications/tasks.py). Same
+    # "written but never scheduled" gap as the bible reminders above -
+    # compile_and_send_digests takes an explicit window so needed a
+    # beat-cron wrapper to compute one. Once daily is the digest's own
+    # intended cadence (see compile_daily_digests).
+    "compile-daily-digests": {
+        "task": "apps.notifications.tasks.compile_daily_digests",
+        "schedule": 24 * 60 * 60,
+    },
 }
 
 # NEW: media-service URL for background removal microservice
