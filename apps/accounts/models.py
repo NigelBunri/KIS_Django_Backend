@@ -483,6 +483,56 @@ class Device(BaseEntity):
         ]
 
 
+class RestoreCredential(BaseEntity):
+    """
+    A WebAuthn public-key credential registered through Android's Restore
+    Credentials API (androidx.credentials.CreateRestoreCredentialRequest),
+    letting a user's account be silently re-established on a new Android
+    device after an OS-level app/data migration - Google Play's "Zero-Tap
+    Sign-In" quality requirement (see the Play Console device-migration
+    announcement). This is functionally an ordinary WebAuthn/passkey
+    credential; the ceremony and server-side verification are identical to
+    a passkey registration/authentication (py_webauthn handles both the
+    same way) - this model exists purely to track that a given credential
+    was created for device-migration continuity rather than as a
+    general-purpose login method, and which device originally registered it.
+
+    Deliberately NOT deleted/rotated on each successful use: per Google's
+    own guidance, a restore key is meant to persist for the app's install
+    lifetime on the ORIGINAL device and be redeemable every time the user
+    migrates to a new device from that same install (e.g. buying a new
+    phone again later), not a single-use token.
+    """
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="restore_credentials")
+    # WebAuthn credential ID, base64url-encoded - the client sends this back
+    # unprompted on every authentication attempt, so it must be looked up
+    # without already knowing which user is signing in (that's the whole
+    # "zero tap, no login form shown" point).
+    credential_id = models.CharField(max_length=255, unique=True, db_index=True)
+    # COSE-encoded public key, base64url - used to verify the signed
+    # assertion on every redemption; the matching private key never leaves
+    # the user's device (stored via Android's own Credential Manager / E2E
+    # encrypted backup, never seen by this backend).
+    public_key = models.TextField()
+    # WebAuthn clone-detection counter - verify_authentication_response()
+    # rejects any assertion whose counter doesn't strictly increase,
+    # catching a cloned authenticator/private key.
+    sign_count = models.PositiveBigIntegerField(default=0)
+    # The device_id that was active when this credential was registered -
+    # bookkeeping only (which old device this restore key represents
+    # continuity from); redemption always upserts a fresh Device row for
+    # whichever device_id actually presents the credential.
+    origin_device_id = models.CharField(max_length=128, blank=True, default="")
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    revoke_reason = models.CharField(max_length=120, blank=True, default="")
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user", "revoked_at"]),
+        ]
+
+
 class E2EDeviceKey(BaseEntity):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="e2ee_devices")
     device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name="e2ee_keys")

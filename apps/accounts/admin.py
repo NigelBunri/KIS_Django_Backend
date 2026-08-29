@@ -12,6 +12,7 @@ from .models import (
     Subscription,
     Session,
     Device,
+    RestoreCredential,
     UsageQuota,
     AuditLog,
     ApiToken,
@@ -242,6 +243,41 @@ class DeviceAdmin(admin.ModelAdmin):
             updated += 1
         self.message_user(request, f"Revoked {updated} devices")
     revoke_devices.short_description = 'Revoke selected devices'
+
+
+@admin.register(RestoreCredential)
+class RestoreCredentialAdmin(admin.ModelAdmin):
+    list_display = (
+        'user_email',
+        'credential_id',
+        'origin_device_id',
+        'sign_count',
+        'last_used_at',
+        'revoked_at',
+    )
+    search_fields = ('user__email', 'user__phone', 'credential_id', 'origin_device_id')
+    list_filter = ('revoked_at',)
+    readonly_fields = (
+        'created_at',
+        'updated_at',
+        'credential_id',
+        'public_key',
+        'sign_count',
+        'last_used_at',
+    )
+    actions = ['revoke_restore_credentials']
+
+    def user_email(self, obj):
+        return obj.user.email if obj.user else None
+
+    def revoke_restore_credentials(self, request, queryset):
+        now = timezone.now()
+        updated = queryset.filter(revoked_at__isnull=True).update(
+            revoked_at=now, revoke_reason='admin_revoke', updated_at=now,
+        )
+        self.message_user(request, f"Revoked {updated} restore credentials")
+    revoke_restore_credentials.short_description = 'Revoke selected restore credentials'
+
 
 @admin.register(UsageQuota)
 class UsageQuotaAdmin(admin.ModelAdmin):

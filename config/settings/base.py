@@ -493,6 +493,21 @@ MEDIA_ROOT = BASE_DIR / "media"
 SITE_URL = os.environ.get("SITE_URL", _dev_host_url(port=DEV_SERVER_PORT)).rstrip("/")
 API_BASE_URL = os.environ.get("API_BASE_URL", SITE_URL)
 
+# WebAuthn relying party config, used by apps/accounts/webauthn_restore.py for
+# Android's Restore Credentials (Zero-Tap Sign-In) registration/authentication.
+# WEBAUTHN_RP_ID must be a bare domain (no scheme/port) that the Android app's
+# Digital Asset Links (public/.well-known/assetlinks.json on this same domain,
+# served by the marketing site repo) declares ownership of via autoVerify App
+# Links - see AndroidManifest.xml's intent-filter for android:host="kis.app",
+# which is where this default comes from. Override via env if that ever
+# changes; getting this wrong means the OS silently refuses to associate the
+# app with the credential (Credential Manager fails closed, not with an
+# obvious error), so double check against the live assetlinks.json if this
+# override is ever used.
+WEBAUTHN_RP_ID = os.environ.get("WEBAUTHN_RP_ID", "kis.app").strip()
+WEBAUTHN_RP_NAME = os.environ.get("WEBAUTHN_RP_NAME", "KIS").strip()
+WEBAUTHN_ORIGIN = os.environ.get("WEBAUTHN_ORIGIN", f"https://{WEBAUTHN_RP_ID}").strip()
+
 OBJECT_STORAGE_PROVIDER = os.environ.get("OBJECT_STORAGE_PROVIDER", "").strip().lower()
 if OBJECT_STORAGE_PROVIDER == "supabase":
     STORAGES = {

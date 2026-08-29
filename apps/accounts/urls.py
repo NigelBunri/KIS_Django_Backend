@@ -2,6 +2,12 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from .views_internal import NotificationPreferencesInternalView
+from .webauthn_restore import (
+    RestoreCredentialRegistrationOptionsView,
+    RestoreCredentialRegisterView,
+    RestoreCredentialAuthenticationOptionsView,
+    RestoreCredentialAuthenticateView,
+)
 from .views import (
     CheckContact,
     EducationViewSet,
@@ -99,6 +105,29 @@ urlpatterns = [
     path("auth/2fa/disable/", TwoFactorDisableView.as_view(), name="auth-2fa-disable"),
     path("auth/2fa/status/", TwoFactorStatusView.as_view(), name="auth-2fa-status"),
     path("auth/otp/status/", OTPStatusView.as_view(), name="auth-otp-status"),
+    # Android Restore Credentials (Zero-Tap Sign-In / device migration) —
+    # registration happens on an already-authenticated device, authentication
+    # happens with no session at all on a brand-new device.
+    path(
+        "auth/restore-credentials/registration-options/",
+        RestoreCredentialRegistrationOptionsView.as_view(),
+        name="auth-restore-credential-registration-options",
+    ),
+    path(
+        "auth/restore-credentials/register/",
+        RestoreCredentialRegisterView.as_view(),
+        name="auth-restore-credential-register",
+    ),
+    path(
+        "auth/restore-credentials/authentication-options/",
+        RestoreCredentialAuthenticationOptionsView.as_view(),
+        name="auth-restore-credential-authentication-options",
+    ),
+    path(
+        "auth/restore-credentials/authenticate/",
+        RestoreCredentialAuthenticateView.as_view(),
+        name="auth-restore-credential-authenticate",
+    ),
     path("auth/e2ee/keys/", E2EERegisterKeysView.as_view(), name="auth-e2ee-keys"),
     path("auth/e2ee/keys/<uuid:user_id>/", E2EEFetchBundleView.as_view(), name="auth-e2ee-keys-user"),
     path("auth/e2ee/keys/<uuid:user_id>/devices/", E2EEFetchDeviceBundlesView.as_view(), name="auth-e2ee-keys-user-devices"),
