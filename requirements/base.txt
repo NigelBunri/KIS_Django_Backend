@@ -73,6 +73,7 @@ tzdata==2025.2
 uritemplate==4.2.0
 urllib3==2.5.0
 vine==5.1.0
+webauthn==2.7.1
 wcwidth==0.2.14
 whitenoise==6.12.0
 
