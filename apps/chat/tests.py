@@ -16,6 +16,8 @@ from .models import (
     ConversationType,
 )
 from .services import get_or_create_direct_conversation
+from apps.channels.models import Channel
+from apps.partners.models import Partner, PartnerChannelPermissionOverwrite
 
 
 def _signed_internal_headers(method: str, path: str, body=None, secret: str = "test-internal-token"):
@@ -312,3 +314,63 @@ class ConversationUnreadContractTests(APITestCase):
             ).count(),
             1,
         )
+
+
+class MentionEveryonePolicyCheckTests(APITestCase):
+    """policy-check is the hook Nest calls (djangoConversationClient.policyCheck
+    in messages.ts) before persisting every message — it already enforced DLP
+    and legal-hold, but "@everyone"/"@here" mentions in a partner channel had
+    no gate at all regardless of PartnerChannelPermissionOverwrite rows."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(phone="+2348000000101", country="NG", password="pass1234")
+        self.member = User.objects.create_user(phone="+2348000000102", country="NG", password="pass1234")
+        self.partner = Partner.objects.create(owner=self.owner, name="Mention Partner", slug="mention-partner")
+        conversation = Conversation.objects.create(type=ConversationType.CHANNEL, created_by=self.owner)
+        self.channel = Channel.objects.create(
+            partner=self.partner,
+            name="general",
+            slug="general",
+            owner=self.owner,
+            conversation=conversation,
+        )
+        self.url = f"/api/v1/conversations/{conversation.id}/policy-check/"
+
+    def _post(self, user, text):
+        with patch.dict(
+            os.environ,
+            {"DJANGO_INTERNAL_TOKEN": "test-internal-token", "INTERNAL_SIGNATURE_REQUIRED": "0"},
+        ):
+            return self.client.post(
+                self.url,
+                {"action": "send", "userId": str(user.id), "text": text},
+                format="json",
+                HTTP_X_INTERNAL_AUTH="test-internal-token",
+            )
+
+    def test_plain_member_blocked_from_mentioning_everyone(self):
+        response = self._post(self.member, "hey @everyone check this out")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["reason"], "mention_everyone_not_allowed")
+
+    def test_owner_can_mention_everyone(self):
+        response = self._post(self.owner, "hey @everyone check this out")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["allowed"])
+
+    def test_member_with_channel_overwrite_can_mention_everyone(self):
+        PartnerChannelPermissionOverwrite.objects.create(
+            partner=self.partner,
+            channel=self.channel,
+            subject_type=PartnerChannelPermissionOverwrite.SubjectType.MEMBER,
+            user=self.member,
+            allow_permissions=[PartnerChannelPermissionOverwrite.PermissionCode.MENTION_EVERYONE],
+        )
+        response = self._post(self.member, "hey @everyone check this out")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["allowed"])
+
+    def test_message_without_mention_is_unaffected(self):
+        response = self._post(self.member, "hey team check this out")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["allowed"])

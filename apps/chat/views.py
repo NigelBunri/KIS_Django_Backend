@@ -47,7 +47,12 @@ from apps.notifications.realtime import notify_main_tab_badges_updated
 
 from apps.accounts.models import User
 from apps.partners.models import Partner
-from apps.partners.services import ensure_partner_policy, evaluate_partner_dlp, log_partner_audit
+from apps.partners.services import (
+    ensure_partner_policy,
+    evaluate_partner_dlp,
+    log_partner_audit,
+    partner_user_can_mention_everyone,
+)
 from apps.partners.services import dispatch_partner_webhooks
 from apps.groups.models import Group, GroupMembership, GroupRole
 from apps.channels.models import Channel
@@ -1051,6 +1056,19 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 request=request,
             )
             return Response({"allowed": False, "reason": "legal_hold"}, status=403)
+
+        if action == "send" and re.search(r"(?<!\w)@(everyone|here)\b", text or "", re.IGNORECASE):
+            channel = Channel.objects.filter(conversation_id=conversation.id).select_related("category").first()
+            if channel:
+                try:
+                    sender = User.objects.get(pk=user_id) if user_id else None
+                except User.DoesNotExist:
+                    sender = None
+                if not partner_user_can_mention_everyone(channel, sender):
+                    return Response(
+                        {"allowed": False, "reason": "mention_everyone_not_allowed"},
+                        status=403,
+                    )
 
         dlp = evaluate_partner_dlp(partner, text or "")
         if dlp["blocked"]:

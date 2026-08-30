@@ -2239,8 +2239,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     def server_categories(self, request, pk=None):
         partner = self.get_object()
         if request.method == "POST":
-            if not self._user_can_manage_partner(partner, request.user):
-                raise PermissionDenied("Not allowed to manage server categories.")
+            self._require_permission(partner, request.user, "partner.categories.manage")
             serializer = PartnerServerCategorySerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
             category = serializer.save(partner=partner)
@@ -2259,8 +2258,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def server_category_detail(self, request, pk=None, category_id=None):
         partner = self.get_object()
-        if not self._user_can_manage_partner(partner, request.user):
-            raise PermissionDenied("Not allowed to manage server categories.")
+        self._require_permission(partner, request.user, "partner.categories.manage")
         category = PartnerServerCategory.objects.filter(id=category_id, partner=partner).first()
         if not category:
             return Response({"detail": "Category not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -3549,8 +3547,6 @@ class PartnerViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path=r"members/(?P<member_user_id>[^/.]+)/moderate")
     def moderate_member(self, request, pk=None, member_user_id=None):
         partner = self.get_object()
-        if not self._user_can_manage_partner(partner, request.user):
-            raise PermissionDenied("Not allowed to moderate members.")
         membership = PartnerMembership.objects.filter(partner=partner, user_id=member_user_id).first()
         if not membership:
             return Response({"detail": "Partner membership not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -3569,6 +3565,16 @@ class PartnerViewSet(viewsets.ModelViewSet):
             PartnerModerationAction.ActionType.UNBAN,
         }:
             raise ValidationError({"action": "Unsupported moderation action."})
+
+        # kick/ban are grantable to a custom role independent of the coarse
+        # owner/admin/manager check (e.g. a "Moderator" role) — mute/timeout
+        # stay manager-tier-only, matching PartnerRolesPanel.tsx's catalog.
+        if action_type == PartnerModerationAction.ActionType.KICK:
+            self._require_permission(partner, request.user, "partner.members.kick")
+        elif action_type in {PartnerModerationAction.ActionType.BAN, PartnerModerationAction.ActionType.UNBAN}:
+            self._require_permission(partner, request.user, "partner.members.ban")
+        elif not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to moderate members.")
 
         if expires_at:
             expires_at = parse_datetime(str(expires_at))

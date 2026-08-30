@@ -187,6 +187,9 @@ def ensure_default_partner_roles(partner: Partner) -> None:
             "partner.access.view",
             "partner.settings.manage",
             "partner.settings.view",
+            "partner.members.kick",
+            "partner.members.ban",
+            "partner.categories.manage",
         ]),
         ("Admin", [
             "partner.policy.edit",
@@ -203,6 +206,9 @@ def ensure_default_partner_roles(partner: Partner) -> None:
             "partner.access.view",
             "partner.settings.manage",
             "partner.settings.view",
+            "partner.members.kick",
+            "partner.members.ban",
+            "partner.categories.manage",
         ]),
         ("Manager", [
             "partner.roles.view",
@@ -397,10 +403,12 @@ def get_partner_user_roles(partner: Partner, user: Optional[User]) -> Set[str]:
 PARTNER_CHANNEL_PERMISSION_VIEW = PartnerChannelPermissionOverwrite.PermissionCode.VIEW_CHANNEL
 PARTNER_CHANNEL_PERMISSION_SEND = PartnerChannelPermissionOverwrite.PermissionCode.SEND_MESSAGES
 PARTNER_CHANNEL_PERMISSION_MANAGE = PartnerChannelPermissionOverwrite.PermissionCode.MANAGE_CHANNEL
+PARTNER_CHANNEL_PERMISSION_MENTION_EVERYONE = PartnerChannelPermissionOverwrite.PermissionCode.MENTION_EVERYONE
 PARTNER_CHANNEL_PERMISSION_CODES = {
     PARTNER_CHANNEL_PERMISSION_VIEW,
     PARTNER_CHANNEL_PERMISSION_SEND,
     PARTNER_CHANNEL_PERMISSION_MANAGE,
+    PARTNER_CHANNEL_PERMISSION_MENTION_EVERYONE,
 }
 
 
@@ -536,6 +544,12 @@ def partner_user_can_send_channel(channel, user: Optional[User]) -> bool:
     if not getattr(channel, "partner_id", None):
         return True
     return PARTNER_CHANNEL_PERMISSION_SEND in resolve_partner_channel_permissions(channel, user)
+
+
+def partner_user_can_mention_everyone(channel, user: Optional[User]) -> bool:
+    if not getattr(channel, "partner_id", None):
+        return True
+    return PARTNER_CHANNEL_PERMISSION_MENTION_EVERYONE in resolve_partner_channel_permissions(channel, user)
 
 
 def partner_user_can_manage_channel(channel, user: Optional[User]) -> bool:

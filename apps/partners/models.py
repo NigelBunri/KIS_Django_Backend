@@ -1182,14 +1182,14 @@ class PartnerChannelPermissionOverwrite(models.Model):
         MEMBER = "member", "Member"
 
     class PermissionCode(models.TextChoices):
+        # Only genuinely per-channel concepts belong here. Partner-wide
+        # actions (kick/ban members, manage roles/categories/webhooks) are
+        # granted via PartnerRole.permissions codenames instead (see
+        # apps.partners.services.user_has_partner_permission) — a channel
+        # can't meaningfully "allow kicking members" independent of others.
         VIEW_CHANNEL = "view_channel", "View channel"
         SEND_MESSAGES = "send_messages", "Send messages"
         MANAGE_CHANNEL = "manage_channel", "Manage channel"
-        MANAGE_CATEGORIES = "manage_categories", "Manage categories"
-        MANAGE_ROLES = "manage_roles", "Manage roles"
-        KICK_MEMBERS = "kick_members", "Kick members"
-        BAN_MEMBERS = "ban_members", "Ban members"
-        MANAGE_WEBHOOKS = "manage_webhooks", "Manage webhooks"
         MENTION_EVERYONE = "mention_everyone", "Mention @everyone"
 
     partner = models.ForeignKey(

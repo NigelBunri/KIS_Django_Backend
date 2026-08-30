@@ -1304,6 +1304,76 @@ class PartnerRoleDetailApiTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
+class PartnerFineGrainedPermissionTests(TestCase):
+    """kick/ban/category-management used to only ever check the coarse
+    owner/admin/manager role, so a custom "Moderator" role granted via
+    PartnerRolesPanel.tsx's permission catalog (partner.members.kick,
+    partner.members.ban, partner.categories.manage) had zero effect —
+    a plain member given that custom role still got 403."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670008001", country="CM", password="pass1234")
+        self.moderator = User.objects.create_user(phone="+237670008002", country="CM", password="pass1234")
+        self.target = User.objects.create_user(phone="+237670008003", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Fine-grained Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(
+            owner=self.owner, name="Fine-grained Partner", slug="fine-grained-partner", main_conversation=conversation,
+        )
+        PartnerMembership.objects.create(partner=self.partner, user=self.moderator, role="member", status=PartnerMembershipStatus.MEMBER)
+        PartnerMembership.objects.create(partner=self.partner, user=self.target, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def _grant(self, user, *codenames):
+        role = PartnerRole.objects.create(partner=self.partner, name="Custom", permissions=list(codenames))
+        PartnerRoleAssignment.objects.create(partner=self.partner, role=role, user=user, scope_type="global")
+
+    def _moderate_url(self):
+        return f"/api/v1/partners/{self.partner.id}/members/{self.target.id}/moderate/"
+
+    def test_plain_member_cannot_kick(self):
+        self.client.force_authenticate(self.moderator)
+        response = self.client.post(self._moderate_url(), {"action": "kick"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_member_with_kick_permission_can_kick(self):
+        self._grant(self.moderator, "partner.members.kick")
+        self.client.force_authenticate(self.moderator)
+        response = self.client.post(self._moderate_url(), {"action": "kick"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_member_with_kick_permission_cannot_ban(self):
+        self._grant(self.moderator, "partner.members.kick")
+        self.client.force_authenticate(self.moderator)
+        response = self.client.post(self._moderate_url(), {"action": "ban"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_member_with_ban_permission_can_ban(self):
+        self._grant(self.moderator, "partner.members.ban")
+        self.client.force_authenticate(self.moderator)
+        response = self.client.post(self._moderate_url(), {"action": "ban"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_plain_member_cannot_create_category(self):
+        self.client.force_authenticate(self.moderator)
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/server-categories/", {"name": "General"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_member_with_categories_permission_can_create_category(self):
+        self._grant(self.moderator, "partner.categories.manage")
+        self.client.force_authenticate(self.moderator)
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/server-categories/",
+            {"name": "General", "slug": "general"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+
 class PartnerListSerializerCanManageTests(TestCase):
     """Regression coverage for PartnerListSerializer.can_manage, added so
     the "connect this shop/institution to a partner" picker (which filters
