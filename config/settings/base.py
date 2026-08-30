@@ -506,6 +506,18 @@ API_BASE_URL = os.environ.get("API_BASE_URL", SITE_URL)
 # override is ever used.
 WEBAUTHN_RP_ID = os.environ.get("WEBAUTHN_RP_ID", "kis.app").strip()
 WEBAUTHN_RP_NAME = os.environ.get("WEBAUTHN_RP_NAME", "KIS").strip()
+
+# Temporary, explicitly-requested exception: the GO (General Overseer)
+# identity is exempt from device-binding entirely while this is enabled —
+# no QR-link requirement at login (see password_login_requires_qr in
+# apps/accounts/views.py) and no live-Device-row requirement on subsequent
+# API calls (see validate_device_bound_token in apps/accounts/jwt_auth.py).
+# Every other account is unaffected. Set to "0" to restore normal
+# device-binding enforcement for GO too — no redeploy needed, just this
+# env var.
+GO_DEVICE_BINDING_EXEMPT = str(os.environ.get("GO_DEVICE_BINDING_EXEMPT", "1")).strip().lower() in {
+    "1", "true", "yes", "on",
+}
 WEBAUTHN_ORIGIN = os.environ.get("WEBAUTHN_ORIGIN", f"https://{WEBAUTHN_RP_ID}").strip()
 
 OBJECT_STORAGE_PROVIDER = os.environ.get("OBJECT_STORAGE_PROVIDER", "").strip().lower()
