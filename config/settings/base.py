@@ -593,6 +593,11 @@ REST_FRAMEWORK = {
         # leaked, not per-end-user limiting (Nest already rate-limits the
         # RN-facing playback-url endpoint per user).
         "chat_voice_sign": _env_throttle_rate("THROTTLE_CHAT_VOICE_SIGN", dev_default="6000/min", prod_default="1200/min"),
+        # Trusted-internal Nest->Django video-upload processing webhook —
+        # same keyed-by-IP posture as chat_voice_sign above (AllowAny +
+        # internal-token auth, no request.user); one call per confirmed
+        # video upload, so this only needs to absorb real upload volume.
+        "broadcast_process_video_upload": _env_throttle_rate("THROTTLE_BROADCAST_PROCESS_VIDEO_UPLOAD", dev_default="6000/min", prod_default="600/min"),
         # Public, unauthenticated payment-status check (the kingdomimpact
         # ventures.org/payments/complete redirect landing page polls this
         # after a Flutterwave checkout) - keyed by IP since there's no

@@ -1,5 +1,6 @@
 from django.urls import path
 
+from .views_internal import ProcessBroadcastVideoUploadView
 from .views import (
     BroadcastFeedView,
     ChannelContentChaptersView,
@@ -308,6 +309,13 @@ urlpatterns = [
     path("broadcasts/videos/", BroadcastVideoListView.as_view(), name="broadcast-videos"),
     path("broadcasts/videos/upload/", BroadcastVideoUploadView.as_view(), name="broadcast-video-upload"),
     path("broadcasts/upload/", BroadcastVideoUploadView.as_view(), name="broadcast-upload-legacy"),
+    # Trusted-internal only (apps.chat.internal_auth) — Nest calls this after
+    # confirming a direct-to-S3 video upload landed. See views_internal.py.
+    path(
+        "broadcasts/internal/process-video-upload/",
+        ProcessBroadcastVideoUploadView.as_view(),
+        name="broadcast-internal-process-video-upload",
+    ),
     path("broadcasts/videos/<uuid:video_id>/stream/", BroadcastVideoStreamView.as_view(), name="video-stream"),
     path("broadcasts/lessons/", BroadcastLessonListView.as_view(), name="broadcast-lessons"),
     path(
