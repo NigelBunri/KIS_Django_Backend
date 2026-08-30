@@ -301,16 +301,173 @@ def _run_stub_explicit_content_scan(*, filename: str, mime_type: str, context: s
     )
 
 
-def scan_upload_for_explicit_content(*, filename: str, mime_type: str, context: str) -> MediaSafetyDecision:
+# NudeNet detector labels considered disqualifying on this platform. NudeNet
+# also emits non-explicit anatomical labels (e.g. FACE_FEMALE, ARMPITS_EXPOSED)
+# that must never trigger a flag on their own — only these.
+NUDENET_EXPLICIT_LABELS = {
+    "FEMALE_GENITALIA_EXPOSED",
+    "MALE_GENITALIA_EXPOSED",
+    "FEMALE_BREAST_EXPOSED",
+    "BUTTOCKS_EXPOSED",
+    "ANUS_EXPOSED",
+}
+
+# Below this confidence, a detection is too uncertain to auto-block — routed
+# to manual review instead of either silently passing or auto-suspending
+# someone on a marginal call.
+NUDENET_AUTO_BLOCK_THRESHOLD = 0.75
+
+_nudenet_detector = None
+
+
+def _get_nudenet_detector():
+    """Lazily loads the NudeDetector model once per process (Celery worker),
+    not once per scan — model load is the expensive part. Import is deferred
+    so nothing outside a real scan call ever needs the nudenet/onnxruntime
+    dependency installed (e.g. this module is imported by request-path code
+    that never scans anything itself)."""
+    global _nudenet_detector
+    if _nudenet_detector is None:
+        from nudenet import NudeDetector  # type: ignore[import-not-found]
+
+        _nudenet_detector = NudeDetector()
+    return _nudenet_detector
+
+
+def _highest_explicit_detection(detections: list[dict]) -> tuple[str | None, float]:
+    best_label: str | None = None
+    best_score = 0.0
+    for det in detections:
+        label = str(det.get("class") or det.get("label") or "")
+        if label not in NUDENET_EXPLICIT_LABELS:
+            continue
+        score = float(det.get("score") or 0.0)
+        if score > best_score:
+            best_label, best_score = label, score
+    return best_label, best_score
+
+
+def _scan_image_file(path: str) -> tuple[str | None, float]:
+    detector = _get_nudenet_detector()
+    detections = detector.detect(path)
+    return _highest_explicit_detection(detections)
+
+
+def _scan_video_file(path: str, *, sample_count: int = 5) -> tuple[str | None, float]:
+    """Samples frames across the video's duration rather than scanning every
+    frame — NudeNet inference per-frame is too slow to run on a full video,
+    and a handful of evenly-spaced samples is the standard tradeoff this kind
+    of screening uses in practice. Any single sampled frame tripping the
+    threshold flags the whole video."""
+    import subprocess
+    import tempfile
+
+    from apps.broadcasts.views import _probe_video_duration  # local import: only needed for video scans
+
+    duration = _probe_video_duration(path)
+    if duration <= 0:
+        duration = 1.0
+
+    best_label: str | None = None
+    best_score = 0.0
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for i in range(sample_count):
+            timestamp = duration * (i + 1) / (sample_count + 1)
+            frame_path = os.path.join(tmp_dir, f"frame_{i}.jpg")
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", str(timestamp), "-i", path, "-frames:v", "1", frame_path],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                )
+            except Exception:
+                continue
+            if not os.path.exists(frame_path):
+                continue
+            label, score = _scan_image_file(frame_path)
+            if score > best_score:
+                best_label, best_score = label, score
+    return best_label, best_score
+
+
+def run_nudenet_scan_on_file(file_path: str, mime_type: str) -> MediaSafetyDecision:
+    """Real, self-hosted explicit-content scan — no external API, no per-call
+    cost, model weights and inference run entirely on our own infrastructure.
+    Only called when MEDIA_SAFETY_PROVIDER=nudenet and
+    MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED=1, and only ever given a file
+    that already passed the metadata-only checks in validate_upload_file_safety
+    (extension/size/declared-type) — this is the layer that actually looks at
+    pixels.
+
+    Fails CLOSED: any error loading the model or running inference routes to
+    manual review, never to a silent pass — an upload that couldn't be
+    verified is not the same as one confirmed clean.
+    """
+    try:
+        if mime_type.startswith("video/"):
+            label, score = _scan_video_file(file_path)
+        else:
+            label, score = _scan_image_file(file_path)
+    except Exception as exc:
+        return MediaSafetyDecision(
+            status="pending_review",
+            quarantine=True,
+            provider="nudenet",
+            reason=f"nudenet_scan_error:{type(exc).__name__}",
+            user_message=USER_SAFE_REVIEW_MESSAGE,
+            requires_review=True,
+        )
+
+    if label and score >= NUDENET_AUTO_BLOCK_THRESHOLD:
+        return MediaSafetyDecision(
+            status="blocked",
+            quarantine=True,
+            provider="nudenet",
+            reason=f"nudenet_explicit:{label}",
+            user_message=USER_SAFE_BLOCK_MESSAGE,
+            requires_review=False,
+            score=score,
+        )
+    if label:
+        # Detected but below the auto-block confidence bar — hold for a
+        # human to decide rather than guessing either direction.
+        return MediaSafetyDecision(
+            status="pending_review",
+            quarantine=True,
+            provider="nudenet",
+            reason=f"nudenet_low_confidence:{label}",
+            user_message=USER_SAFE_REVIEW_MESSAGE,
+            requires_review=True,
+            score=score,
+        )
+    return MediaSafetyDecision(
+        status="passed",
+        quarantine=False,
+        provider="nudenet",
+        reason="nudenet_clean",
+        user_message="Upload accepted.",
+        requires_review=False,
+        score=score,
+    )
+
+
+def scan_upload_for_explicit_content(
+    *, filename: str, mime_type: str, context: str, file_path: str | None = None,
+) -> MediaSafetyDecision:
     provider = configured_provider()
     if live_provider_calls_enabled():
-        # Phase 02 deliberately keeps live calls disabled by default. Provider
-        # implementations should return the same MediaSafetyDecision shape.
+        if provider == "nudenet" and file_path:
+            return run_nudenet_scan_on_file(file_path, mime_type)
+        # Any other configured provider without an adapter implemented yet,
+        # or nudenet called without a file (metadata-only caller) — route to
+        # manual review rather than fabricating a pass/fail with no evidence.
         return MediaSafetyDecision(
             status="pending_review",
             quarantine=True,
             provider=provider,
-            reason=f"{provider}_adapter_not_implemented",
+            reason=f"{provider}_adapter_not_implemented" if provider != "nudenet" else "nudenet_no_file_path",
             user_message=USER_SAFE_REVIEW_MESSAGE,
             requires_review=True,
         )

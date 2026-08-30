@@ -13,7 +13,7 @@ from .views import (
     MediaAssetSignedUrlView,
     MediaUploadCancelView,
 )
-from .views_internal import ChatVoicePlaybackSignView
+from .views_internal import ChatVoicePlaybackSignView, ScanUploadedObjectView
 
 router = DefaultRouter()
 router.register(r"media/assets", MediaAssetViewSet, basename="asset")
@@ -71,6 +71,14 @@ urlpatterns = [
         "media/internal/chat-voice/sign/",
         ChatVoicePlaybackSignView.as_view(),
         name="media-internal-chat-voice-sign",
+    ),
+    # Trusted-internal only (apps.chat.internal_auth) — Nest calls this
+    # after confirming ANY direct-to-S3 upload, to enqueue the async
+    # explicit-content scan. See apps/media/views_internal.py.
+    path(
+        "media/internal/scan-upload/",
+        ScanUploadedObjectView.as_view(),
+        name="media-internal-scan-upload",
     ),
     # Some app builds and server-side signed URLs omit the trailing slash on the
     # /download action.  Redirect them permanently so the token is still usable.

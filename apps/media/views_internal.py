@@ -59,3 +59,51 @@ class ChatVoicePlaybackSignView(APIView):
 
         result = sign_chat_voice_asset(asset, expected_object_key=object_key or None)
         return Response(result)
+
+
+class ScanUploadedObjectView(APIView):
+    """POST /api/v1/media/internal/scan-upload/
+
+    Called by Nest right after confirming ANY direct-to-S3 upload (see
+    UploadIntentService.confirm() on the Nest side — every context, not
+    just broadcast video). Enqueues the async explicit-content scan and
+    returns immediately; this deliberately does NOT wait for the scan to
+    finish, so it never adds latency to the upload confirm response the
+    end user is waiting on. See apps/media/tasks.py's
+    scan_uploaded_object_task for what actually runs the model.
+
+    Body: {"objectKey", "mimeType", "originalFilename", "sizeBytes",
+           "context", "userId"}
+    """
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "media_scan_upload"
+
+    def post(self, request):
+        require_internal_auth(request)
+
+        object_key = str(request.data.get("objectKey") or "").strip()
+        mime_type = str(request.data.get("mimeType") or "").strip()
+        original_filename = str(request.data.get("originalFilename") or "upload").strip()
+        context = str(request.data.get("context") or "general").strip()
+        user_id = str(request.data.get("userId") or "").strip() or None
+        try:
+            size_bytes = int(request.data.get("sizeBytes") or 0)
+        except (TypeError, ValueError):
+            size_bytes = 0
+
+        if not object_key:
+            raise ValidationError({"objectKey": "This field is required."})
+
+        from .tasks import scan_uploaded_object_task
+
+        scan_uploaded_object_task.delay(
+            object_key=object_key,
+            mime_type=mime_type,
+            original_filename=original_filename,
+            size_bytes=size_bytes,
+            context=context,
+            owner_id=user_id,
+        )
+        return Response({"ok": True}, status=202)

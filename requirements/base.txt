@@ -39,7 +39,9 @@ inflection==0.5.1
 jsonschema==4.25.1
 jsonschema-specifications==2025.9.1
 kombu==5.5.4
+nudenet==3.4.2
 numpy==2.3.4
+onnxruntime==1.29.0
 openapi==2.0.0
 packaging==25.0
 phonenumbers==9.0.18

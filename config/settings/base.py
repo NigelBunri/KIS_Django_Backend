@@ -598,6 +598,9 @@ REST_FRAMEWORK = {
         # internal-token auth, no request.user); one call per confirmed
         # video upload, so this only needs to absorb real upload volume.
         "broadcast_process_video_upload": _env_throttle_rate("THROTTLE_BROADCAST_PROCESS_VIDEO_UPLOAD", dev_default="6000/min", prod_default="600/min"),
+        # Trusted-internal Nest->Django scan-trigger — fires once per
+        # confirmed upload app-wide (every context), so needs real headroom.
+        "media_scan_upload": _env_throttle_rate("THROTTLE_MEDIA_SCAN_UPLOAD", dev_default="6000/min", prod_default="2000/min"),
         # Public, unauthenticated payment-status check (the kingdomimpact
         # ventures.org/payments/complete redirect landing page polls this
         # after a Flutterwave checkout) - keyed by IP since there's no
