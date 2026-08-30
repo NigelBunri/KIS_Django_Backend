@@ -591,6 +591,10 @@ REST_FRAMEWORK = {
         "register": _env_throttle_rate("THROTTLE_REGISTER", dev_default="6000/min", prod_default="20/min"),
         "otp": _env_throttle_rate("THROTTLE_OTP", dev_default="6000/min", prod_default="20/min"),
         "password_reset": _env_throttle_rate("THROTTLE_PASSWORD_RESET", dev_default="6000/min", prod_default="20/min"),
+        # Public (no-app-required) account-deletion request — password-gated
+        # but AllowAny/IP-keyed like login, so it needs the same brute-force
+        # ceiling.
+        "account_deletion": _env_throttle_rate("THROTTLE_ACCOUNT_DELETION", dev_default="6000/min", prod_default="20/min"),
         # QR/pairing-code device-link and account-recovery endpoints - these
         # accept a bearer secret (QR token, pairing code, or recovery token)
         # with AllowAny/no prior session, so the generic anon/user rate

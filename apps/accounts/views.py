@@ -3996,3 +3996,64 @@ class AccountDeletionView(APIView):
 
         user.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PublicAccountDeletionRequestView(APIView):
+    """
+    POST /api/v1/auth/account/delete-request/
+    Body: { "phone": str, "password": str, "confirm": "DELETE" }
+
+    Google Play / Apple review both require a way to request account and
+    data deletion that doesn't depend on having the app installed (a user
+    who's uninstalled KIS still needs a path). This is that path — served
+    behind the public page at /delete-account/.
+
+    Deliberately password-gated rather than a bare "submit your phone
+    number" form: an unauthenticated request naming an arbitrary phone
+    number would otherwise let anyone delete anyone else's account. Reuses
+    LoginSerializer's own phone-normalization + authenticate() so this has
+    the exact same credential-verification guarantee as a real login, not
+    a weaker reimplementation.
+    """
+    authentication_classes = []
+    permission_classes = (AllowAny,)
+    throttle_scope = "account_deletion"
+
+    def post(self, request):
+        confirm = str(request.data.get("confirm", "")).strip().upper()
+        if confirm != "DELETE":
+            return Response(
+                {"detail": "Type DELETE to confirm this action."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        login_data = {
+            "phone": request.data.get("phone", ""),
+            "password": request.data.get("password", ""),
+            "device_id": "public-deletion-request",
+        }
+        serializer = LoginSerializer(data=login_data, context={"request": request})
+        if not serializer.is_valid():
+            record_failed_auth(request, identifier=login_data["phone"], reason="account_deletion_request")
+            return Response(
+                {"detail": "Invalid phone number or password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = serializer.validated_data["user"]
+        # actor=None, not actor=user: AdminAuditEntry.actor is a PROTECT FK,
+        # so logging this with the about-to-be-deleted user as actor would
+        # create a row that then blocks user.delete() below.
+        log_security_event(
+            None,
+            "security.account.public_deletion_request",
+            request=request,
+            severity="warning",
+            deleted_user_id=str(user.id),
+            deleted_user_phone=user.phone,
+        )
+        user.delete()
+        return Response(
+            {"detail": "Your account and associated data have been deleted."},
+            status=status.HTTP_200_OK,
+        )

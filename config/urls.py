@@ -90,6 +90,139 @@ DocsSwaggerView = SpectacularSwaggerView if settings.DEBUG else StaffOnlySpectac
 DocsRedocView = SpectacularRedocView if settings.DEBUG else StaffOnlySpectacularRedocView
 
 
+DELETE_ACCOUNT_PAGE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Delete Your KIS Account</title>
+<style>
+  :root { color-scheme: light; --bg:#faf8f3; --card:#fff; --border:#e7e0d2; --text:#241f16; --subtext:#574f3f; --primary:#9a6a1f; --danger:#b3261e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; line-height:1.6; }
+  .wrap { max-width:520px; margin:0 auto; padding:32px 20px 80px; }
+  h1 { font-size:1.5rem; margin:0 0 8px; }
+  .lead { color:var(--subtext); font-size:0.95rem; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; }
+  .card h2 { font-size:1rem; margin:0 0 10px; }
+  .card ul { margin:0 0 16px; padding-left:1.2em; color:var(--subtext); font-size:0.9rem; }
+  label { display:block; font-size:0.85rem; font-weight:600; margin:14px 0 4px; }
+  input[type=text], input[type=password], input[type=tel] {
+    width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:8px; font-size:0.95rem;
+  }
+  .checkbox-row { display:flex; align-items:flex-start; gap:8px; margin-top:16px; }
+  .checkbox-row input { margin-top:3px; }
+  .checkbox-row label { margin:0; font-weight:400; font-size:0.88rem; color:var(--subtext); }
+  button { margin-top:20px; width:100%; padding:12px; border:none; border-radius:8px; background:var(--danger); color:#fff; font-size:1rem; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:0.6; cursor:not-allowed; }
+  .msg { margin-top:16px; padding:12px; border-radius:8px; font-size:0.9rem; display:none; }
+  .msg.success { display:block; background:#e8f3e8; color:#1e5c1e; border:1px solid #b7d9b7; }
+  .msg.error { display:block; background:#fcebea; color:var(--danger); border:1px solid #f0bcb8; }
+  footer { margin-top:32px; text-align:center; color:var(--subtext); font-size:0.82rem; }
+  footer a { color:var(--primary); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Delete Your KIS Account</h1>
+  <p class="lead">Use this page to permanently delete your Kingdom Impact Social (KIS) account and its associated data — no need to have the app installed.</p>
+
+  <div class="card">
+    <h2>What gets deleted</h2>
+    <ul>
+      <li>Your profile, account credentials, and settings</li>
+      <li>Messages, testimonies, posts, and media you've uploaded</li>
+      <li>Marketplace listings, health module data, and Family Hub profiles you own</li>
+      <li>This action is immediate and cannot be undone</li>
+    </ul>
+    <p style="color:var(--subtext);font-size:0.85rem;margin:0 0 4px;">
+      Prefer to do this from the app instead? Open KIS &rarr; Settings &rarr; Privacy &amp; Compliance &rarr; Delete All My Data.
+    </p>
+
+    <form id="delete-form">
+      <label for="phone">Phone number (the one you sign in with)</label>
+      <input type="tel" id="phone" name="phone" placeholder="+2376XXXXXXXX" required />
+
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required />
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="confirm-check" required />
+        <label for="confirm-check">I understand this permanently deletes my account and data, and cannot be undone.</label>
+      </div>
+
+      <button type="submit" id="submit-btn">Delete my account</button>
+      <div class="msg" id="result-msg"></div>
+    </form>
+  </div>
+
+  <footer>
+    Questions? <a href="mailto:nigle.bah@gmail.com">nigle.bah@gmail.com</a> &middot;
+    <a href="/privacy/">Privacy Policy</a>
+  </footer>
+</div>
+
+<script>
+(function () {
+  var form = document.getElementById('delete-form');
+  var btn = document.getElementById('submit-btn');
+  var msg = document.getElementById('result-msg');
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var phone = document.getElementById('phone').value.trim();
+    var password = document.getElementById('password').value;
+    var confirmed = document.getElementById('confirm-check').checked;
+
+    if (!confirmed) return;
+    if (!window.confirm('This will permanently delete your KIS account and all associated data. This cannot be undone. Continue?')) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Deleting…';
+    msg.className = 'msg';
+    msg.textContent = '';
+
+    fetch('/api/v1/auth/account/delete-request/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: phone, password: password, confirm: 'DELETE' }),
+    })
+      .then(function (res) {
+        return res.json().then(function (data) { return { ok: res.ok, data: data }; });
+      })
+      .then(function (result) {
+        if (result.ok) {
+          msg.className = 'msg success';
+          msg.textContent = result.data.detail || 'Your account has been deleted.';
+          form.reset();
+          btn.style.display = 'none';
+        } else {
+          msg.className = 'msg error';
+          msg.textContent = (result.data && result.data.detail) || 'Something went wrong. Please try again.';
+          btn.disabled = false;
+          btn.textContent = 'Delete my account';
+        }
+      })
+      .catch(function () {
+        msg.className = 'msg error';
+        msg.textContent = 'Network error. Please try again.';
+        btn.disabled = false;
+        btn.textContent = 'Delete my account';
+      });
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def delete_account_page(request):
+    from django.http import HttpResponse
+
+    return HttpResponse(DELETE_ACCOUNT_PAGE_HTML, content_type="text/html")
+
+
 @api_view(['GET'])
 @drf_permission_classes([DRFIsAuthenticated])
 def ice_servers(request):
@@ -105,6 +238,7 @@ def ice_servers(request):
 urlpatterns = [
     path("", health_check, name="root"),
     path("health/", health_check, name="health-check"),
+    path("delete-account/", delete_account_page, name="delete-account-page"),
     path("api/v1/calls/ice-servers/", ice_servers, name="calls-ice-servers"),
     path("admin/", admin.site.urls),
     path("control/admin/", include("admin_control.urls")),
