@@ -14,6 +14,7 @@ class Channel(models.Model):
         TEXT = "text", "Text"
         ANNOUNCEMENT = "announcement", "Announcement"
         PRIVATE = "private", "Private"
+        VOICE = "voice", "Voice"
 
     """
     Channel entity (broadcast-like or topic-based stream).
