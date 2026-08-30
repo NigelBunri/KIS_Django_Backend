@@ -403,10 +403,12 @@ class PartnerCreateSerializer(PartnerImageUrlSerializerMixin, serializers.ModelS
         from apps.partners.services import (
             ensure_partner_policy,
             ensure_default_partner_roles,
+            ensure_partner_subscription,
             apply_partner_policy,
         )
         ensure_partner_policy(partner)
         ensure_default_partner_roles(partner)
+        ensure_partner_subscription(partner)
         apply_partner_policy(partner)
         PartnerOrganizationProfile.objects.get_or_create(
             partner=partner,

@@ -9,7 +9,7 @@ from django.db.models import Count
 from django.db.models.functions import TruncDate
 
 from apps.accounts.models import AccountTier, User
-from apps.accounts.tiers import get_aggregated_tier_features, normalize_limit_value
+from apps.accounts.tiers import get_aggregated_tier_features, get_user_tier, normalize_limit_value
 from apps.partners.models import (
     Partner,
     PartnerPolicy,
@@ -36,6 +36,7 @@ from apps.partners.models import (
     PartnerOrganizationAppAccessLog,
     PartnerChannelPermissionOverwrite,
     PartnerModerationAction,
+    PartnerSubscription,
 )
 import json
 import hmac
@@ -89,8 +90,25 @@ def create_partner_with_main_conversation(
         owner=owner,
         main_conversation=main_conversation,
     )
+    ensure_partner_subscription(partner)
 
     return partner
+
+
+def ensure_partner_subscription(partner: Partner) -> PartnerSubscription:
+    """
+    Bootstraps a new Partner's workspace-level plan at creation time,
+    defaulting to whatever the owner's OWN personal tier currently is —
+    a reasonable starting point ("your org starts where your plan is"),
+    not an ongoing link. From this point on the two are independent (see
+    PartnerSubscription's docstring): upgrading/downgrading the owner's
+    personal plan later has no effect on this row, and vice versa.
+    """
+    existing = PartnerSubscription.objects.filter(partner=partner).first()
+    if existing:
+        return existing
+    owner_tier = get_user_tier(partner.owner)
+    return PartnerSubscription.objects.create(partner=partner, tier=owner_tier)
 
 
 def ensure_partner_policy(partner: Partner) -> PartnerPolicy:

@@ -89,6 +89,83 @@ class Partner(models.Model):
         return self.deactivation_source == Partner.DeactivationSource.SYSTEM and not self.is_active
 
 
+class PartnerSubscription(models.Model):
+    """
+    Workspace-level plan for this Partner — deliberately separate from the
+    owner's personal apps.accounts.models.Subscription. Before this model
+    existed, every partner-scoped feature gate (webhooks, automation,
+    integrations, insight/analytics, access control) checked the REQUESTING
+    USER's own personal tier (see apps/partners/tiers.py's
+    require_partner_feature, and the views.py call sites it replaced) — so
+    two bugs at once: (1) an org's capabilities silently changed if its
+    owner's personal subscription lapsed or changed, with no connection to
+    the organization's own activity or plan, and (2) a manager/admin acting
+    on behalf of the org was gated by THEIR OWN personal tier rather than
+    the org's, so the same organization effectively had a different feature
+    set depending on which staff member happened to be logged in.
+
+    Mirrors apps.accounts.models.Subscription's shape closely (status
+    vocabulary, started_at/ends_at/cancel_at_period_end/grace_ends_at) so
+    the two systems stay easy to reason about side by side, but is
+    intentionally its own table rather than a nullable-partner column
+    bolted onto Subscription — Subscription is billing-critical and widely
+    queried assuming a non-null user; widening it to double as the
+    workspace-billing entity would have meant auditing every existing call
+    site for a partner-shaped row it never expected to see instead of
+    building a narrow, independently-reasoned-about model.
+
+    Real payment/checkout integration for workspace plans (Stripe or
+    otherwise) is intentionally out of scope here — this lays the
+    structural foundation (a workspace has ITS OWN tier, independent of any
+    one person) so that a following pass wiring up checkout doesn't also
+    have to re-litigate the ownership question.
+    """
+
+    STATUS_ACTIVE = "active"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_EXPIRED = "expired"
+    STATUS_SUPERSEDED = "superseded"
+    STATUS_REFUNDED = "refunded"
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_CANCELLED, "Cancelled"),
+        (STATUS_EXPIRED, "Expired"),
+        (STATUS_SUPERSEDED, "Superseded"),
+        (STATUS_REFUNDED, "Refunded"),
+    ]
+
+    partner = models.OneToOneField(
+        Partner,
+        on_delete=models.CASCADE,
+        related_name="subscription",
+    )
+    tier = models.ForeignKey(
+        "accounts.AccountTier",
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="partner_subscriptions",
+    )
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
+    started_at = models.DateTimeField(default=timezone.now)
+    ends_at = models.DateTimeField(null=True, blank=True)
+    cancel_at_period_end = models.BooleanField(default=False)
+    canceled_at = models.DateTimeField(null=True, blank=True)
+    grace_ends_at = models.DateTimeField(null=True, blank=True)
+    pending_tier = models.ForeignKey(
+        "accounts.AccountTier",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="pending_partner_subscriptions",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        tier_name = self.tier.name if self.tier_id else "no tier"
+        return f"{self.partner.slug} ({tier_name}, {self.status})"
+
+
 def _default_join_methods():
     return [
         "application",

@@ -31,6 +31,7 @@ from apps.partners.models import (
     PartnerOrganizationProfile,
     PartnerPost,
     PartnerRole,
+    PartnerSubscription,
     PartnerWebhook,
     PartnerWebhookDelivery,
 )
@@ -106,6 +107,15 @@ class PartnerApiTests(TestCase):
             name="Member",
             defaults={"permissions": [], "is_default": True},
         )
+        # Mirrors production's ensure_partner_subscription (called from the
+        # real create-partner paths, which this raw-ORM test helper
+        # bypasses) — otherwise the org has no workspace-level plan at all,
+        # and every partner-tier-gated feature this test suite exercises
+        # (team seats, job_posting, webhooks, etc.) would 403 regardless of
+        # what tier the owner's personal Subscription is set to.
+        from apps.partners.services import ensure_partner_subscription
+
+        ensure_partner_subscription(partner)
         return partner
 
     def _detail_url(self, partner: Partner, suffix: str = "") -> str:
@@ -678,9 +688,18 @@ class PartnerPostModerationEnforcementApiTests(TestCase):
 
 class PartnerJobPostingTierGateApiTests(TestCase):
     """jobs/update_job only ever checked _user_can_manage_partner — any
-    manager/admin/owner could post jobs regardless of their own account's
-    tier. Also covers the field-drop bug where job creation silently
-    ignored location/is_remote/job_type/salary/tags."""
+    manager/admin/owner could post jobs regardless of ANY tier at all.
+    Also covers the field-drop bug where job creation silently ignored
+    location/is_remote/job_type/salary/tags.
+
+    job_posting is gated by the PARTNER's own workspace-level
+    PartnerSubscription (apps/partners/tiers.py), not by whichever staff
+    member happens to be making the request — see PartnerSubscription's
+    docstring for why request.user's personal tier was the wrong thing to
+    check here. business_pro_manager deliberately has a lower PERSONAL
+    tier than the org's own plan, specifically to prove the org's plan is
+    what's being checked, not theirs.
+    """
 
     def setUp(self):
         self.client = APIClient()
@@ -696,10 +715,14 @@ class PartnerJobPostingTierGateApiTests(TestCase):
             partner=self.partner, user=self.business_pro_manager, role="manager", status=PartnerMembershipStatus.MEMBER,
         )
 
-        partner_tier = AccountTier.objects.filter(name__iexact="Partner").first()
-        Subscription.objects.create(user=self.owner, tier=partner_tier, status="active")
-        business_pro_tier = AccountTier.objects.filter(name__iexact="Business Pro").first()
-        Subscription.objects.create(user=self.business_pro_manager, tier=business_pro_tier, status="active")
+        self.partner_tier = AccountTier.objects.filter(name__iexact="Partner").first()
+        self.business_pro_tier = AccountTier.objects.filter(name__iexact="Business Pro").first()
+        # The ORG's plan — this is what job_posting actually checks now.
+        PartnerSubscription.objects.create(partner=self.partner, tier=self.partner_tier, status="active")
+        # Personal tiers, deliberately mismatched from the org's plan to
+        # prove personal tier is irrelevant to this gate.
+        Subscription.objects.create(user=self.owner, tier=self.business_pro_tier, status="active")
+        Subscription.objects.create(user=self.business_pro_manager, tier=self.business_pro_tier, status="active")
 
     def _url(self, suffix=""):
         return f"/api/v1/partners/{self.partner.id}/jobs/{suffix}"
@@ -727,23 +750,39 @@ class PartnerJobPostingTierGateApiTests(TestCase):
         self.assertEqual(job.salary_currency, "XAF")
         self.assertEqual(job.tags, ["ministry", "youth"])
 
-    def test_manager_below_partner_tier_cannot_create_job(self):
+    def test_manager_with_lower_personal_tier_can_still_create_job_when_org_has_partner_tier(self):
+        # The manager's own personal Subscription is Business Pro (below
+        # Partner) — must not matter, since the gate checks the ORG's plan.
         self.client.force_authenticate(self.business_pro_manager)
 
-        response = self.client.post(self._url(), {"title": "Should be blocked"}, format="json")
+        response = self.client.post(self._url(), {"title": "Youth Pastor"}, format="json")
 
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
-        self.assertFalse(PartnerJobPost.objects.filter(partner=self.partner).exists())
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(PartnerJobPost.objects.filter(partner=self.partner, title="Youth Pastor").exists())
 
-    def test_manager_below_partner_tier_cannot_update_job(self):
+    def test_manager_with_lower_personal_tier_can_still_update_job_when_org_has_partner_tier(self):
         job = PartnerJobPost.objects.create(partner=self.partner, title="Existing role")
         self.client.force_authenticate(self.business_pro_manager)
 
         response = self.client.patch(self._url(f"{job.id}/"), {"title": "Renamed"}, format="json")
 
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         job.refresh_from_db()
-        self.assertEqual(job.title, "Existing role")
+        self.assertEqual(job.title, "Renamed")
+
+    def test_owner_cannot_create_job_when_the_org_itself_lacks_the_required_tier(self):
+        # Flip it around: give the OWNER a personal Partner-tier
+        # subscription, but downgrade the ORG's own plan below job_posting.
+        # Must still be blocked — personal tier grants nothing here.
+        self.partner.subscription.tier = self.business_pro_tier
+        self.partner.subscription.save(update_fields=["tier"])
+        Subscription.objects.filter(user=self.owner).update(tier=self.partner_tier)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(self._url(), {"title": "Should be blocked"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertFalse(PartnerJobPost.objects.filter(partner=self.partner, title="Should be blocked").exists())
 
     def test_update_job_persists_full_field_set(self):
         job = PartnerJobPost.objects.create(partner=self.partner, title="Existing role")
@@ -852,6 +891,57 @@ class PartnerMemberRoleUpdateApiTests(TestCase):
         self.assertTrue(
             PartnerAuditEvent.objects.filter(partner=self.partner, action="partner.member.role_changed").exists()
         )
+
+
+class PartnerMemberDirectoryPaginationApiTests(TestCase):
+    """GET /partners/{id}/members/ used to load EVERY membership and EVERY
+    PartnerRoleAssignment for the whole org into memory on every request —
+    no LIMIT, no pagination — and PATCH /members/{user_id}/ rebuilt that
+    same full, unbounded directory just to return the one row it changed.
+    Both would only get slower, not fail outright, on a small test
+    org — the bug only shows up at real scale, which is exactly why it
+    needs an explicit regression test rather than "existing tests still
+    pass"."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670004001", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Big Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Big Partner", slug="big-partner", main_conversation=conversation)
+        self.members = []
+        for i in range(30):
+            user = User.objects.create_user(phone=f"+23767000{5000 + i}", country="CM", password="pass1234")
+            PartnerMembership.objects.create(partner=self.partner, user=user, role="member", status=PartnerMembershipStatus.MEMBER)
+            self.members.append(user)
+
+    def test_members_endpoint_returns_a_paginated_envelope_not_the_full_list(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/members/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        # A paginated response — meta.count reflects the true total (30
+        # members + the owner's own membership, if any) while "results"
+        # holds only one bounded page, never all of them in one payload.
+        self.assertIn("meta", response.data)
+        self.assertIn("results", response.data)
+        self.assertLess(len(response.data["results"]), 31)
+        self.assertGreaterEqual(response.data["meta"]["count"], 30)
+
+    def test_second_page_returns_different_members_than_the_first(self):
+        self.client.force_authenticate(self.owner)
+
+        page1 = self.client.get(f"/api/v1/partners/{self.partner.id}/members/?page=1&page_size=10")
+        page2 = self.client.get(f"/api/v1/partners/{self.partner.id}/members/?page=2&page_size=10")
+
+        ids_page1 = {row["user_id"] for row in page1.data["results"]}
+        ids_page2 = {row["user_id"] for row in page2.data["results"]}
+        self.assertEqual(len(ids_page1), 10)
+        self.assertEqual(len(ids_page2), 10)
+        self.assertTrue(ids_page1.isdisjoint(ids_page2))
 
 
 class PartnerApplicationReviewApiTests(TestCase):

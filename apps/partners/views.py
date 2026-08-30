@@ -119,6 +119,7 @@ from apps.partners.seed import KCAN_PARTNER_SLUG, LEGACY_DEFAULT_PARTNER_SLUGS
 from apps.partners.permissions import is_kcan_admin, IsKCANAdmin, PartnerScopedPermission
 from apps.moderation.models import UserBlock
 from apps.accounts.feature_gate import require_feature
+from .tiers import require_partner_feature, get_partner_tier_features
 from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
 from apps.partners.services import (
     ensure_partner_policy,
@@ -419,8 +420,12 @@ class PartnerViewSet(viewsets.ModelViewSet):
             return
         raise PermissionDenied("You do not have permission to perform this action.")
 
-    def _require_partner_feature(self, user, key: str, message: str | None = None) -> None:
-        require_feature(user, key, message)
+    def _require_partner_feature(self, partner: Partner, key: str, message: str | None = None) -> None:
+        # Gated by the ORGANIZATION's own workspace-level plan, not
+        # whichever staff member happens to be making this request — see
+        # PartnerSubscription's docstring for why this used to be
+        # request.user's personal tier and why that was wrong.
+        require_partner_feature(partner, key, message)
 
     def _ensure_conversation_member(self, partner: Partner, user, base_role: str) -> None:
         if not partner.main_conversation_id:
@@ -550,41 +555,66 @@ class PartnerViewSet(viewsets.ModelViewSet):
             progress.save(update_fields=changed_fields)
         return progress
 
-    def _member_directory_payload(self, partner: Partner):
-        memberships = (
+    def _member_directory_queryset(self, partner: Partner):
+        """Un-evaluated queryset — callers MUST slice/paginate this before
+        iterating (see members() action) rather than materializing it in
+        full. A partner with thousands of members loading every row (plus
+        every PartnerRoleAssignment org-wide) on every directory request —
+        or, worse, on every single member-role PATCH, see
+        _member_directory_entry_for_user below — is exactly the kind of
+        "works today, falls over once real orgs are big" bug this was."""
+        return (
             PartnerMembership.objects.filter(partner=partner)
             .select_related("user", "user__profile")
             .order_by("role", "created_at")
         )
+
+    def _role_names_for_users(self, partner: Partner, user_ids) -> dict:
         role_lookup: dict[int, set[str]] = {}
         assignments = (
-            PartnerRoleAssignment.objects.filter(partner=partner)
-            .select_related("role", "user")
+            PartnerRoleAssignment.objects.filter(partner=partner, user_id__in=list(user_ids))
+            .select_related("role")
             .order_by("role__name")
         )
         for assignment in assignments:
             role_lookup.setdefault(assignment.user_id, set()).add(assignment.role.name)
+        return role_lookup
 
-        entries = []
-        for membership in memberships:
-            user = membership.user
-            profile = getattr(user, "profile", None)
-            entries.append(
-                {
-                    "user_id": str(user.id),
-                    "display_name": getattr(user, "display_name", None),
-                    "username": getattr(user, "username", None),
-                    "avatar_url": getattr(profile, "avatar_url", None) if profile else None,
-                    "membership_status": membership.status,
-                    "membership_role": membership.role,
-                    "role_names": sorted(role_lookup.get(user.id, set())),
-                    "is_muted": membership.is_muted,
-                    "is_banned": membership.is_banned,
-                    "timed_out_until": membership.timed_out_until,
-                    "joined_at": membership.created_at,
-                }
-            )
-        return entries
+    def _member_directory_entry(self, membership: "PartnerMembership", role_lookup: dict) -> dict:
+        user = membership.user
+        profile = getattr(user, "profile", None)
+        return {
+            "user_id": str(user.id),
+            "display_name": getattr(user, "display_name", None),
+            "username": getattr(user, "username", None),
+            "avatar_url": getattr(profile, "avatar_url", None) if profile else None,
+            "membership_status": membership.status,
+            "membership_role": membership.role,
+            "role_names": sorted(role_lookup.get(user.id, set())),
+            "is_muted": membership.is_muted,
+            "is_banned": membership.is_banned,
+            "timed_out_until": membership.timed_out_until,
+            "joined_at": membership.created_at,
+        }
+
+    def _member_directory_entries(self, partner: Partner, memberships) -> list:
+        """`memberships` must already be a bounded slice (a paginated page,
+        or a small explicit list) — role assignments are looked up only for
+        the users actually present in it, never org-wide."""
+        memberships = list(memberships)
+        role_lookup = self._role_names_for_users(partner, (m.user_id for m in memberships))
+        return [self._member_directory_entry(m, role_lookup) for m in memberships]
+
+    def _member_directory_entry_for_user(self, partner: Partner, user_id) -> dict | None:
+        membership = (
+            PartnerMembership.objects.filter(partner=partner, user_id=user_id)
+            .select_related("user", "user__profile")
+            .first()
+        )
+        if not membership:
+            return None
+        role_lookup = self._role_names_for_users(partner, [user_id])
+        return self._member_directory_entry(membership, role_lookup)
 
     def _landing_builder_config(self, partner: Partner) -> dict:
         setting = PartnerSetting.objects.filter(partner=partner, key=LANDING_PAGE_BUILDER_KEY).first()
@@ -1069,7 +1099,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     def integrations(self, request, pk=None):
         partner = self.get_object()
         if request.method == "POST":
-            self._require_partner_feature(request.user, "partner_integrations")
+            self._require_partner_feature(partner, "partner_integrations")
             self._require_permission(partner, request.user, "partner.integrations.manage")
             serializer = PartnerIntegrationSerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
@@ -1084,7 +1114,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
                 request=request,
             )
             return Response(serializer.data, status=status.HTTP_201_CREATED)
-        self._require_partner_feature(request.user, "partner_integrations")
+        self._require_partner_feature(partner, "partner_integrations")
         self._require_permission(partner, request.user, "partner.integrations.view")
         qs = PartnerIntegration.objects.filter(partner=partner).order_by("kind", "provider")
         return Response(PartnerIntegrationSerializer(qs, many=True).data, status=status.HTTP_200_OK)
@@ -1096,7 +1126,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def integrations_update(self, request, pk=None, integration_id=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "partner_integrations")
+        self._require_partner_feature(partner, "partner_integrations")
         self._require_permission(partner, request.user, "partner.integrations.manage")
         integration = PartnerIntegration.objects.filter(
             id=integration_id,
@@ -1122,7 +1152,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     def webhooks(self, request, pk=None):
         partner = self.get_object()
         if request.method == "POST":
-            self._require_partner_feature(request.user, "partner_webhooks")
+            self._require_partner_feature(partner, "partner_webhooks")
             self._require_permission(partner, request.user, "partner.integrations.manage")
             serializer = PartnerWebhookSerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
@@ -1136,7 +1166,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
                 request=request,
             )
             return Response(serializer.data, status=status.HTTP_201_CREATED)
-        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_partner_feature(partner, "partner_webhooks")
         self._require_permission(partner, request.user, "partner.integrations.view")
         qs = PartnerWebhook.objects.filter(partner=partner).order_by("-created_at")
         return Response(PartnerWebhookSerializer(qs, many=True).data, status=status.HTTP_200_OK)
@@ -1148,7 +1178,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def webhooks_update(self, request, pk=None, webhook_id=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_partner_feature(partner, "partner_webhooks")
         self._require_permission(partner, request.user, "partner.integrations.manage")
         webhook = PartnerWebhook.objects.filter(id=webhook_id, partner=partner).first()
         if not webhook:
@@ -1174,7 +1204,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def webhooks_remove(self, request, pk=None, webhook_id=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_partner_feature(partner, "partner_webhooks")
         self._require_permission(partner, request.user, "partner.integrations.manage")
         webhook = PartnerWebhook.objects.filter(id=webhook_id, partner=partner).first()
         if not webhook:
@@ -1197,7 +1227,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def webhook_deliveries(self, request, pk=None, webhook_id=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_partner_feature(partner, "partner_webhooks")
         self._require_permission(partner, request.user, "partner.integrations.view")
         webhook = PartnerWebhook.objects.filter(id=webhook_id, partner=partner).first()
         if not webhook:
@@ -1212,7 +1242,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def webhook_delivery_retry(self, request, pk=None, webhook_id=None, delivery_id=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "partner_webhooks")
+        self._require_partner_feature(partner, "partner_webhooks")
         self._require_permission(partner, request.user, "partner.integrations.manage")
         delivery = PartnerWebhookDelivery.objects.filter(
             id=delivery_id,
@@ -1228,7 +1258,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     def automation_rules(self, request, pk=None):
         partner = self.get_object()
         if request.method == "POST":
-            self._require_partner_feature(request.user, "partner_automation")
+            self._require_partner_feature(partner, "partner_automation")
             self._require_permission(partner, request.user, "partner.automation.manage")
             serializer = PartnerAutomationRuleSerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
@@ -1242,7 +1272,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
                 request=request,
             )
             return Response(serializer.data, status=status.HTTP_201_CREATED)
-        self._require_partner_feature(request.user, "partner_automation")
+        self._require_partner_feature(partner, "partner_automation")
         self._require_permission(partner, request.user, "partner.automation.view")
         qs = PartnerAutomationRule.objects.filter(partner=partner).order_by("-created_at")
         return Response(PartnerAutomationRuleSerializer(qs, many=True).data, status=status.HTTP_200_OK)
@@ -1279,7 +1309,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def automation_rules_remove(self, request, pk=None, rule_id=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "partner_automation")
+        self._require_partner_feature(partner, "partner_automation")
         self._require_permission(partner, request.user, "partner.automation.manage")
         rule = PartnerAutomationRule.objects.filter(id=rule_id, partner=partner).first()
         if not rule:
@@ -1299,14 +1329,15 @@ class PartnerViewSet(viewsets.ModelViewSet):
     def reports_summary(self, request, pk=None):
         partner = self.get_object()
         self._require_permission(partner, request.user, "partner.reports.view")
-        self._require_partner_feature(request.user, "partner_insight")
-        from apps.accounts.tiers import get_user_tier_features
+        self._require_partner_feature(partner, "partner_insight")
 
-        features = get_user_tier_features(request.user)
+        # The ORG's own plan determines what level of analytics its reports
+        # include, not whichever staff member happens to be viewing them.
+        features = get_partner_tier_features(partner)
         can_basic = bool(features.get("analytics_basic") or features.get("analytics_advanced"))
         can_advanced = bool(features.get("analytics_advanced"))
         if not can_basic:
-            raise PermissionDenied("Your tier does not include analytics access.")
+            raise PermissionDenied("This organization's plan does not include analytics access.")
         summary = build_partner_summary(partner)
         if not can_advanced:
             summary.pop("activity_series", None)
@@ -1335,7 +1366,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
 
         partner = self.get_object()
         self._require_permission(partner, request.user, "partner.reports.view")
-        self._require_partner_feature(request.user, "partner_insight")
+        self._require_partner_feature(partner, "partner_insight")
 
         window_days = int(request.query_params.get("days") or 30)
         window_days = min(max(window_days, 1), 365)
@@ -1412,7 +1443,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "post"], url_path="exports")
     def exports(self, request, pk=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "partner_insight")
+        self._require_partner_feature(partner, "partner_insight")
         if request.method == "POST":
             self._require_permission(partner, request.user, "partner.exports.manage")
             kind = request.data.get("kind") or "summary"
@@ -1448,7 +1479,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "post"], url_path="export-schedules")
     def export_schedules(self, request, pk=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "partner_insight")
+        self._require_partner_feature(partner, "partner_insight")
         if request.method == "POST":
             self._require_permission(partner, request.user, "partner.exports.manage")
             serializer = PartnerExportScheduleSerializer(data=request.data)
@@ -1549,7 +1580,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "post"], url_path="access-requests")
     def access_requests(self, request, pk=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "access_control")
+        self._require_partner_feature(partner, "access_control")
         if request.method == "POST":
             self._require_permission(partner, request.user, "partner.access.view")
             serializer = PartnerAccessRequestSerializer(data=request.data)
@@ -1592,7 +1623,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def access_requests_approve(self, request, pk=None, request_id=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "access_control")
+        self._require_partner_feature(partner, "access_control")
         self._require_permission(partner, request.user, "partner.access.manage")
         access_request = PartnerAccessRequest.objects.filter(id=request_id, partner=partner).first()
         if not access_request:
@@ -1647,7 +1678,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def access_requests_reject(self, request, pk=None, request_id=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "access_control")
+        self._require_partner_feature(partner, "access_control")
         self._require_permission(partner, request.user, "partner.access.manage")
         access_request = PartnerAccessRequest.objects.filter(id=request_id, partner=partner).first()
         if not access_request:
@@ -1688,7 +1719,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "post"], url_path="access-reviews")
     def access_reviews(self, request, pk=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "access_control")
+        self._require_partner_feature(partner, "access_control")
         if request.method == "POST":
             self._require_permission(partner, request.user, "partner.access.manage")
             serializer = PartnerAccessReviewSerializer(data=request.data)
@@ -1714,7 +1745,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
     )
     def access_reviews_close(self, request, pk=None, review_id=None):
         partner = self.get_object()
-        self._require_partner_feature(request.user, "access_control")
+        self._require_partner_feature(partner, "access_control")
         self._require_permission(partner, request.user, "partner.access.manage")
         review = PartnerAccessReview.objects.filter(id=review_id, partner=partner).first()
         if not review:
@@ -2899,9 +2930,12 @@ class PartnerViewSet(viewsets.ModelViewSet):
         serializer = PartnerInviteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         requested_role = str(serializer.validated_data.get("membership_role") or "member").strip().lower()
-        if requested_role != "subscriber" and partner.owner_id:
-            owner_features = get_user_tier_features(partner.owner)
-            seat_limit = normalize_limit_value(owner_features.get("team_seats"), default=0)
+        if requested_role != "subscriber":
+            # The ORG's own plan, not whoever happens to own it — same fix
+            # as _require_partner_feature, see PartnerSubscription's
+            # docstring.
+            org_features = get_partner_tier_features(partner)
+            seat_limit = normalize_limit_value(org_features.get("team_seats"), default=0)
             if seat_limit is not None:
                 existing_seat_count = PartnerMembership.objects.filter(
                     partner=partner, status=PartnerMembershipStatus.MEMBER
@@ -2984,9 +3018,21 @@ class PartnerViewSet(viewsets.ModelViewSet):
                 if normalized_role == "subscriber"
                 else PartnerMembershipStatus.MEMBER
             )
-            if status_value == PartnerMembershipStatus.MEMBER and partner.owner_id:
-                owner_features = get_user_tier_features(partner.owner)
-                seat_limit = normalize_limit_value(owner_features.get("team_seats"), default=0)
+            if status_value == PartnerMembershipStatus.MEMBER:
+                # Locks the Partner row itself (not just this invite) so
+                # two people redeeming DIFFERENT invite codes for the SAME
+                # partner at the same moment still serialize against each
+                # other for this check — without it, both could pass
+                # "count < seat_limit" before either's membership row
+                # existed, overshooting the limit. select_for_update()
+                # on invite above only protects concurrent redemptions of
+                # this ONE code.
+                Partner.objects.select_for_update().get(pk=partner.pk)
+                # The ORG's own plan, not the owner's personal one — same
+                # fix as _require_partner_feature, see PartnerSubscription's
+                # docstring.
+                org_features = get_partner_tier_features(partner)
+                seat_limit = normalize_limit_value(org_features.get("team_seats"), default=0)
                 if seat_limit is not None:
                     existing_seat_count = PartnerMembership.objects.filter(
                         partner=partner, status=PartnerMembershipStatus.MEMBER
@@ -3222,7 +3268,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
 
         if not self._user_can_manage_partner(partner, request.user):
             raise PermissionDenied("Not allowed to manage job posts.")
-        self._require_partner_feature(request.user, "job_posting", "Job posting is available on the Partner and Partner Pro plans.")
+        self._require_partner_feature(partner, "job_posting", "Job posting is available on the Partner and Partner Pro plans.")
 
         serializer = PartnerJobPostSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -3249,7 +3295,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
         partner = self.get_object()
         if not self._user_can_manage_partner(partner, request.user):
             raise PermissionDenied("Not allowed to manage job posts.")
-        self._require_partner_feature(request.user, "job_posting", "Job posting is available on the Partner and Partner Pro plans.")
+        self._require_partner_feature(partner, "job_posting", "Job posting is available on the Partner and Partner Pro plans.")
 
         job = PartnerJobPost.objects.filter(partner=partner, id=job_id).first()
         if not job:
@@ -3404,8 +3450,12 @@ class PartnerViewSet(viewsets.ModelViewSet):
         partner = self.get_object()
         if not self._user_can_access_partner(partner, request.user):
             raise PermissionDenied("Not allowed to view members.")
-        payload = self._member_directory_payload(partner)
+        queryset = self._member_directory_queryset(partner)
+        page = self.paginate_queryset(queryset)
+        payload = self._member_directory_entries(partner, page if page is not None else queryset[:100])
         serializer = PartnerMemberDirectoryEntrySerializer(payload, many=True)
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
         return Response({"members": serializer.data}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get"], url_path="moderation-actions")
@@ -3450,8 +3500,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
             metadata={"user_id": str(membership.user_id), "previous_role": previous_role, "new_role": new_role},
             request=request,
         )
-        payload = self._member_directory_payload(partner)
-        entry = next((row for row in payload if row["user_id"] == str(membership.user_id)), None)
+        entry = self._member_directory_entry_for_user(partner, membership.user_id)
         serializer = PartnerMemberDirectoryEntrySerializer(entry) if entry else None
         return Response({"member": serializer.data if serializer else None}, status=status.HTTP_200_OK)
 
