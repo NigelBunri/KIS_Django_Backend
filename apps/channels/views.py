@@ -16,7 +16,9 @@ from apps.channels.serializers import (
 from apps.chat.models import BaseConversationRole, ConversationMember
 from apps.partners.serializers import PartnerChannelPermissionOverwriteSerializer
 from apps.partners.services import (
+    active_partner_member_ids,
     filter_partner_channels_for_user,
+    notify_nest_of_partner_event,
     partner_user_can_access,
     partner_user_can_manage,
     partner_user_can_manage_channel,
@@ -118,6 +120,13 @@ class ChannelViewSet(viewsets.ModelViewSet):
         if partner and community and community.partner_id and community.partner_id != partner.id:
             raise ValidationError({"community": "Community does not belong to the selected partner."})
         serializer.save()  # ChannelCreateSerializer handles owner + conversation
+        if partner:
+            notify_nest_of_partner_event(
+                partner_id=str(partner.id),
+                event="partner.channel_created",
+                user_ids=active_partner_member_ids(partner),
+                data={"channelId": str(serializer.instance.id), "name": serializer.instance.name},
+            )
 
     def perform_update(self, serializer):
         channel = self.get_object()

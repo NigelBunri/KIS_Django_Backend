@@ -142,6 +142,8 @@ from apps.partners.services import (
     get_partner_organization_apps_for_user,
     filter_partner_channels_for_user,
     build_partner_discord_summary,
+    active_partner_member_ids,
+    notify_nest_of_partner_event,
 )
 from apps.verification.constants import VerificationSubjectType
 from apps.verification.models import VerificationCase
@@ -1025,6 +1027,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
                     {"detail": "Unassign this role from all members before deleting it."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            role_name = role.name
             role.delete()
             log_partner_audit(
                 partner=partner,
@@ -1033,6 +1036,12 @@ class PartnerViewSet(viewsets.ModelViewSet):
                 target_type="partner_role",
                 target_id=str(role_id),
                 request=request,
+            )
+            notify_nest_of_partner_event(
+                partner_id=str(partner.id),
+                event="partner.role_deleted",
+                user_ids=active_partner_member_ids(partner),
+                data={"roleId": str(role_id), "roleName": role_name},
             )
             return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1047,6 +1056,12 @@ class PartnerViewSet(viewsets.ModelViewSet):
             target_id=str(role.id),
             metadata={"fields": list((request.data or {}).keys())},
             request=request,
+        )
+        notify_nest_of_partner_event(
+            partner_id=str(partner.id),
+            event="partner.role_updated",
+            user_ids=active_partner_member_ids(partner),
+            data={"roleId": str(role.id), "roleName": role.name},
         )
         return Response(PartnerRoleSerializer(role).data, status=status.HTTP_200_OK)
 
@@ -2243,6 +2258,12 @@ class PartnerViewSet(viewsets.ModelViewSet):
             serializer = PartnerServerCategorySerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
             category = serializer.save(partner=partner)
+            notify_nest_of_partner_event(
+                partner_id=str(partner.id),
+                event="partner.category_created",
+                user_ids=active_partner_member_ids(partner),
+                data={"categoryId": str(category.id), "name": category.name},
+            )
             return Response(PartnerServerCategorySerializer(category).data, status=status.HTTP_201_CREATED)
 
         if not self._user_can_access_partner(partner, request.user):
@@ -3118,6 +3139,12 @@ class PartnerViewSet(viewsets.ModelViewSet):
                 "invite_id": str(invite.id),
             },
         )
+        notify_nest_of_partner_event(
+            partner_id=str(partner.id),
+            event="partner.invite_redeemed",
+            user_ids=active_partner_member_ids(partner),
+            data={"userId": str(request.user.id), "role": normalized_role},
+        )
         run_partner_automation_rules(
             partner=partner,
             event="member.joined",
@@ -3651,6 +3678,16 @@ class PartnerViewSet(viewsets.ModelViewSet):
             metadata={"user_id": str(membership.user_id), "reason": reason},
             request=request,
         )
+        if action_type in {PartnerModerationAction.ActionType.KICK, PartnerModerationAction.ActionType.BAN}:
+            event = "partner.member_kicked" if action_type == PartnerModerationAction.ActionType.KICK else "partner.member_banned"
+            notify_user_ids = set(active_partner_member_ids(partner))
+            notify_user_ids.add(str(membership.user_id))
+            notify_nest_of_partner_event(
+                partner_id=str(partner.id),
+                event=event,
+                user_ids=list(notify_user_ids),
+                data={"targetUserId": str(membership.user_id), "reason": reason},
+            )
         return Response(PartnerModerationActionSerializer(moderation_action).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get"], url_path="links")

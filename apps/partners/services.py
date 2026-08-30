@@ -1370,3 +1370,61 @@ def log_partner_audit(
         user_agent=user_agent[:255],
         metadata=metadata or {},
     )
+
+
+def active_partner_member_ids(partner: Partner) -> list[str]:
+    ids = set(
+        str(uid)
+        for uid in PartnerMembership.objects.filter(
+            partner=partner, status=PartnerMembershipStatus.MEMBER,
+        ).values_list("user_id", flat=True)
+    )
+    ids.add(str(partner.owner_id))
+    return list(ids)
+
+
+def notify_nest_of_partner_event(
+    *,
+    partner_id,
+    event: str,
+    user_ids: list,
+    data: Optional[dict] = None,
+) -> None:
+    """Fire-and-forget push so an open client updates live instead of
+    waiting for the next manual refresh (kick/ban, role change, invite
+    redeemed, channel/category created). Best-effort only — the DB row and
+    PartnerAuditEvent are already the source of truth if this call fails.
+    Mirrors apps.media.tasks._notify_nest_to_quarantine's exact settings/
+    signing pattern, called inline from the request path (not a Celery
+    task) since this is a short, best-effort HTTP call with a tight timeout.
+    """
+    import json
+    import urllib.request
+
+    from django.conf import settings
+
+    from apps.chat.internal_signing import sign_internal_request
+
+    clean_user_ids = [str(uid) for uid in (user_ids or []) if uid]
+    if not clean_user_ids:
+        return
+
+    base = str(getattr(settings, "NEST_INTERNAL_URL", "")).strip().rstrip("/")
+    token = str(getattr(settings, "NEST_INTERNAL_TOKEN", "")).strip()
+    if not base or not token:
+        return
+
+    url = f"{base}/partners/{partner_id}/events"
+    body = {"event": event, "userIds": clean_user_ids, "data": data or {}}
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            **sign_internal_request("POST", url, body, secret=token),
+        }
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            resp.read()
+    except Exception:
+        pass

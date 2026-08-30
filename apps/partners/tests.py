@@ -1374,6 +1374,70 @@ class PartnerFineGrainedPermissionTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
 
+class PartnerRealtimeEventNotificationTests(TestCase):
+    """Kick/ban/role-change/invite-redemption/category-creation used to be
+    silent to any already-open client — the only way to see the change was
+    a manual refresh. These assert the Nest push fires with the right
+    event name and audience, without hitting a real network call."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670009001", country="CM", password="pass1234")
+        self.target = User.objects.create_user(phone="+237670009002", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Realtime Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(
+            owner=self.owner, name="Realtime Partner", slug="realtime-partner", main_conversation=conversation,
+        )
+        PartnerMembership.objects.create(partner=self.partner, user=self.target, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    @patch("apps.partners.views.notify_nest_of_partner_event")
+    def test_kick_notifies_target_and_members(self, mock_notify):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/members/{self.target.id}/moderate/",
+            {"action": "kick"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        mock_notify.assert_called_once()
+        kwargs = mock_notify.call_args.kwargs
+        self.assertEqual(kwargs["event"], "partner.member_kicked")
+        self.assertIn(str(self.target.id), kwargs["user_ids"])
+        self.assertEqual(kwargs["data"]["targetUserId"], str(self.target.id))
+
+    @patch("apps.partners.views.notify_nest_of_partner_event")
+    def test_mute_does_not_trigger_a_realtime_event(self, mock_notify):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/members/{self.target.id}/moderate/",
+            {"action": "mute"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        mock_notify.assert_not_called()
+
+    @patch("apps.partners.views.notify_nest_of_partner_event")
+    def test_category_created_notifies_members(self, mock_notify):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/server-categories/",
+            {"name": "General", "slug": "general"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        mock_notify.assert_called_once()
+        self.assertEqual(mock_notify.call_args.kwargs["event"], "partner.category_created")
+
+
 class PartnerListSerializerCanManageTests(TestCase):
     """Regression coverage for PartnerListSerializer.can_manage, added so
     the "connect this shop/institution to a partner" picker (which filters
