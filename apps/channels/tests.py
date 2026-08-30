@@ -288,3 +288,61 @@ class ChannelServerOrganizationApiTests(TestCase):
         subscribe_response = self.client.post(f"/api/v1/partner-channels/channels/{channel.id}/subscribe/")
         self.assertEqual(subscribe_response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(subscribe_response.data["role"], BaseConversationRole.READONLY)
+
+
+class VoiceChannelTierGateApiTests(TestCase):
+    """Voice channels are a Partner Pro-exclusive differentiator (see
+    apps/accounts/tier_presets.py's "voice_channels" feature flag) — the
+    org's own PartnerSubscription is what's checked, not the requesting
+    staff member's personal tier, matching the existing job_posting gate."""
+
+    def setUp(self):
+        from apps.accounts.models import AccountTier, Subscription
+        from apps.accounts.tiers import ensure_default_account_tiers
+        from apps.partners.models import PartnerSubscription
+
+        self.client = APIClient()
+        ensure_default_account_tiers()
+        self.owner = User.objects.create_user(phone="+237671009001", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Voice Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Voice Partner", slug="voice-partner", main_conversation=conversation)
+        self.partner_pro_tier = AccountTier.objects.filter(name__iexact="Partner Pro").first()
+        self.partner_tier = AccountTier.objects.filter(name__iexact="Partner").first()
+        self.subscription = PartnerSubscription.objects.create(partner=self.partner, tier=self.partner_tier, status="active")
+        # The channel-count cap in ChannelViewSet.perform_create checks the
+        # REQUESTING USER's own personal tier (a separate, pre-existing gate
+        # from the org-level voice_channels feature this test targets) — give
+        # the owner a personal plan with enough headroom so that unrelated
+        # check doesn't shadow the one under test.
+        Subscription.objects.create(user=self.owner, tier=self.partner_pro_tier, status="active")
+
+    def _create_body(self):
+        return {
+            "partner": str(self.partner.id),
+            "name": "Lounge",
+            "slug": "lounge",
+            "channel_type": Channel.ChannelType.VOICE,
+        }
+
+    def test_partner_tier_cannot_create_voice_channel(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post("/api/v1/partner-channels/channels/", self._create_body(), format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_partner_pro_tier_can_create_voice_channel(self):
+        self.subscription.tier = self.partner_pro_tier
+        self.subscription.save(update_fields=["tier"])
+        self.client.force_authenticate(self.owner)
+        response = self.client.post("/api/v1/partner-channels/channels/", self._create_body(), format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["channel_type"], Channel.ChannelType.VOICE)
+
+    def test_partner_tier_can_still_create_text_channel(self):
+        self.client.force_authenticate(self.owner)
+        body = self._create_body()
+        body["channel_type"] = Channel.ChannelType.TEXT
+        response = self.client.post("/api/v1/partner-channels/channels/", body, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)

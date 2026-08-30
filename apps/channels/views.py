@@ -25,6 +25,7 @@ from apps.partners.services import (
     partner_user_can_send_channel,
     partner_user_can_view_channel,
 )
+from apps.partners.tiers import require_partner_feature
 
 
 class ChannelViewSet(viewsets.ModelViewSet):
@@ -119,6 +120,8 @@ class ChannelViewSet(viewsets.ModelViewSet):
         community = serializer.validated_data.get("community")
         if partner and community and community.partner_id and community.partner_id != partner.id:
             raise ValidationError({"community": "Community does not belong to the selected partner."})
+        if partner and serializer.validated_data.get("channel_type") == Channel.ChannelType.VOICE:
+            require_partner_feature(partner, "voice_channels", "This organization's current plan does not include voice channels.")
         serializer.save()  # ChannelCreateSerializer handles owner + conversation
         if partner:
             notify_nest_of_partner_event(
