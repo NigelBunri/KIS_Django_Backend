@@ -1,26 +1,11 @@
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.authentication import JWTAuthentication
-from django.conf import settings
 from django.utils import timezone
 
 from apps.chat.internal_auth import require_internal_auth
 
+from .device_binding_exemptions import is_device_binding_exempt
 from .models import Device, E2EDeviceKey, E2EPreKey
-
-
-def _is_go_device_binding_exempt(user) -> bool:
-    """Temporary, explicitly-requested exception — see
-    settings.GO_DEVICE_BINDING_EXEMPT's own comment for how to reverse
-    this. Local import avoids a module-load-time dependency between
-    apps.accounts and apps.partners."""
-    if not getattr(settings, "GO_DEVICE_BINDING_EXEMPT", False):
-        return False
-    from apps.partners.seed import GO_EMAIL, GO_PHONE
-
-    return (
-        (getattr(user, "email", "") or "").lower() == GO_EMAIL.lower()
-        or getattr(user, "phone", "") == GO_PHONE
-    )
 
 
 def revoke_unapproved_secondary_devices(user) -> int:
@@ -74,7 +59,7 @@ def validate_device_bound_token(user, validated_token, *, header_device_id=None,
     if not token_device_id:
         raise AuthenticationFailed("Device-bound token required")
 
-    if _is_go_device_binding_exempt(user):
+    if is_device_binding_exempt(user):
         # Skip the live-Device-row / token_version checks entirely — the
         # whole point is to let this identity authenticate from a device
         # that was never registered/approved. Still requires a real,

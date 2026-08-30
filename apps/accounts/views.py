@@ -757,16 +757,14 @@ def password_login_requires_qr(user: User, device_id: str) -> bool:
     QR-gate a fresh app login (or vice versa - see web_login's own
     same-platform-only revocation in apps.otp.views).
 
-    Temporary, explicitly-requested exception: the GO identity never needs
-    QR-linking while settings.GO_DEVICE_BINDING_EXEMPT is on (see that
-    setting's own comment for how to reverse this).
+    Temporary, explicitly-requested exception: the GO identity and the
+    dedicated Google Play / Apple App Review test account never need
+    QR-linking while settings.GO_DEVICE_BINDING_EXEMPT is on — see
+    apps.accounts.device_binding_exemptions for how to reverse this.
     """
-    from apps.partners.seed import GO_EMAIL, GO_PHONE
+    from .device_binding_exemptions import is_device_binding_exempt
 
-    if getattr(settings, "GO_DEVICE_BINDING_EXEMPT", False) and (
-        (getattr(user, "email", "") or "").lower() == GO_EMAIL.lower()
-        or getattr(user, "phone", "") == GO_PHONE
-    ):
+    if is_device_binding_exempt(user):
         return False
 
     normalized_device_id = str(device_id or "").strip()
