@@ -238,7 +238,10 @@ def ice_servers(request):
 urlpatterns = [
     path("", health_check, name="root"),
     path("health/", health_check, name="health-check"),
+    # Both forms resolve directly (no redirect) — some URL validators
+    # (e.g. Play Console's Data Safety form) reject a URL that 301s.
     path("delete-account/", delete_account_page, name="delete-account-page"),
+    path("delete-account", delete_account_page, name="delete-account-page-no-slash"),
     path("api/v1/calls/ice-servers/", ice_servers, name="calls-ice-servers"),
     path("admin/", admin.site.urls),
     path("control/admin/", include("admin_control.urls")),
