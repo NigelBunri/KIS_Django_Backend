@@ -16,6 +16,17 @@ PARTNER_SETTINGS_SECTIONS: List[Dict] = [
         ],
     },
     {
+        "key": "team_access",
+        "title": "Team & Access",
+        "description": "Members, roles, moderation, and verification.",
+        "features": [
+            {"key": "team_members", "title": "Members", "description": "View, promote, and manage everyone in this organization.", "access": ["owner", "admin", "manager"]},
+            {"key": "roles_permissions", "title": "Roles & Permissions", "description": "Create custom roles and assign granular permissions.", "access": ["owner", "admin"]},
+            {"key": "moderation_log", "title": "Moderation Log", "description": "History of mutes, timeouts, kicks, and bans.", "access": ["owner", "admin"]},
+            {"key": "verification", "title": "Get Verified", "description": "Request the verified or official partner badge for this organization.", "access": ["owner", "admin"]},
+        ],
+    },
+    {
         "key": "organization_apps",
         "title": "Organization Apps",
         "description": "Manage the custom KIS app, Bible experience, and external integrations for your org.",

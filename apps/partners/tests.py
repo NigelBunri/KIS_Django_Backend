@@ -31,6 +31,7 @@ from apps.partners.models import (
     PartnerOrganizationProfile,
     PartnerPost,
     PartnerRole,
+    PartnerRoleAssignment,
     PartnerSubscription,
     PartnerWebhook,
     PartnerWebhookDelivery,
@@ -1242,6 +1243,65 @@ class PartnerOrganizationLinkApiTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class PartnerRoleDetailApiTests(TestCase):
+    """roles() only ever had create/list — no way to rename a role, change
+    its permissions, or delete it once created without going through
+    Django admin directly."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670007001", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670007002", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Roles Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Roles Partner", slug="roles-partner", main_conversation=conversation)
+        self.role = PartnerRole.objects.create(partner=self.partner, name="Greeter", permissions=["partner.reports.view"])
+
+    def _url(self, role_id):
+        return f"/api/v1/partners/{self.partner.id}/roles/{role_id}/"
+
+    def test_owner_can_rename_role_and_change_permissions(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.patch(
+            self._url(self.role.id),
+            {"name": "Front Desk", "permissions": ["partner.reports.view", "partner.audit.view"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.role.refresh_from_db()
+        self.assertEqual(self.role.name, "Front Desk")
+        self.assertEqual(self.role.permissions, ["partner.reports.view", "partner.audit.view"])
+
+    def test_owner_can_delete_an_unassigned_role(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.delete(self._url(self.role.id))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerRole.objects.filter(id=self.role.id).exists())
+
+    def test_cannot_delete_a_role_that_is_still_assigned(self):
+        PartnerRoleAssignment.objects.create(partner=self.partner, role=self.role, user=self.member, scope_type="global")
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.delete(self._url(self.role.id))
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(PartnerRole.objects.filter(id=self.role.id).exists())
+
+    def test_plain_member_cannot_edit_roles(self):
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+        self.client.force_authenticate(self.member)
+
+        response = self.client.patch(self._url(self.role.id), {"name": "Hacked"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
 class PartnerListSerializerCanManageTests(TestCase):

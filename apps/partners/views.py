@@ -1008,6 +1008,48 @@ class PartnerViewSet(viewsets.ModelViewSet):
         qs = PartnerRole.objects.filter(partner=partner).order_by("name")
         return Response(PartnerRoleSerializer(qs, many=True).data, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["patch", "delete"], url_path=r"roles/(?P<role_id>[^/.]+)")
+    def role_detail(self, request, pk=None, role_id=None):
+        """create/list on roles() above had no update/delete counterpart —
+        once a custom role existed there was no way to rename it, change
+        its permissions, or remove it without going through Django admin."""
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.roles.manage")
+        role = PartnerRole.objects.filter(id=role_id, partner=partner).first()
+        if not role:
+            return Response({"detail": "Role not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == "DELETE":
+            if PartnerRoleAssignment.objects.filter(role=role).exists():
+                return Response(
+                    {"detail": "Unassign this role from all members before deleting it."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            role.delete()
+            log_partner_audit(
+                partner=partner,
+                actor=request.user,
+                action="partner.role.delete",
+                target_type="partner_role",
+                target_id=str(role_id),
+                request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = PartnerRoleSerializer(role, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner,
+            actor=request.user,
+            action="partner.role.update",
+            target_type="partner_role",
+            target_id=str(role.id),
+            metadata={"fields": list((request.data or {}).keys())},
+            request=request,
+        )
+        return Response(PartnerRoleSerializer(role).data, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):
         partner = self.get_object()

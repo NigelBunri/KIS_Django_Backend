@@ -1185,6 +1185,12 @@ class PartnerChannelPermissionOverwrite(models.Model):
         VIEW_CHANNEL = "view_channel", "View channel"
         SEND_MESSAGES = "send_messages", "Send messages"
         MANAGE_CHANNEL = "manage_channel", "Manage channel"
+        MANAGE_CATEGORIES = "manage_categories", "Manage categories"
+        MANAGE_ROLES = "manage_roles", "Manage roles"
+        KICK_MEMBERS = "kick_members", "Kick members"
+        BAN_MEMBERS = "ban_members", "Ban members"
+        MANAGE_WEBHOOKS = "manage_webhooks", "Manage webhooks"
+        MENTION_EVERYONE = "mention_everyone", "Mention @everyone"
 
     partner = models.ForeignKey(
         Partner,
