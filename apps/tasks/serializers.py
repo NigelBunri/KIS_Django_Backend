@@ -71,6 +71,7 @@ class TaskActivityLogSerializer(serializers.ModelSerializer):
 class TaskListSerializer(serializers.ModelSerializer):
     assigned_to = TaskUserSummarySerializer(read_only=True)
     created_by = TaskUserSummarySerializer(read_only=True)
+    channel_name = serializers.CharField(source="channel.name", read_only=True)
     attachment_count = serializers.IntegerField(read_only=True, source="attachments.count")
     comment_count = serializers.IntegerField(read_only=True, source="comments.count")
     is_overdue = serializers.SerializerMethodField()
@@ -78,7 +79,7 @@ class TaskListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Task
         fields = [
-            "id", "partner", "channel", "title", "status", "priority",
+            "id", "partner", "channel", "channel_name", "title", "status", "priority",
             "assigned_to", "created_by", "due_at", "created_at", "updated_at",
             "attachment_count", "comment_count", "is_overdue",
         ]

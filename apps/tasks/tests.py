@@ -378,3 +378,63 @@ class TaskMineAndSummaryApiTests(TasksTestBase):
         self.assertEqual(response.data["counts"]["completed"], 2)
         self.assertEqual(response.data["counts"]["not_started"], 1)
         self.assertEqual(response.data["total"], 3)
+
+
+class PartnerAllTasksApiTests(TasksTestBase):
+    """Task Boards — the admin-only cross-channel task list."""
+
+    def _second_channel(self):
+        conversation = Conversation.objects.create(type=ConversationType.CHANNEL, created_by=self.owner)
+        return Channel.objects.create(
+            partner=self.partner, name="announcements", slug="announcements",
+            owner=self.owner, conversation=conversation,
+        )
+
+    def test_admin_sees_tasks_across_every_channel(self):
+        other_channel = self._second_channel()
+        self._create_task(title="In general", channel=self.channel)
+        self._create_task(title="In announcements", channel=other_channel)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/tasks/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        titles = {t["title"] for t in response.data["tasks"]}
+        self.assertEqual(titles, {"In general", "In announcements"})
+        self.assertEqual(response.data["tasks"][0]["channel_name"], "announcements")
+
+    def test_plain_member_forbidden(self):
+        self._create_task()
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/tasks/")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_status_and_channel_filters(self):
+        other_channel = self._second_channel()
+        self._create_task(title="A", channel=self.channel, status=TaskStatus.COMPLETED)
+        self._create_task(title="B", channel=other_channel, status=TaskStatus.NOT_STARTED)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(
+            f"/api/v1/partners/{self.partner.id}/tasks/",
+            {"status": TaskStatus.COMPLETED, "channel_id": str(self.channel.id)},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["tasks"]), 1)
+        self.assertEqual(response.data["tasks"][0]["title"], "A")
+
+    def test_unassigned_filter(self):
+        self._create_task(title="Assigned", assigned_to=self.member)
+        self._create_task(title="Unassigned", assigned_to=None)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(
+            f"/api/v1/partners/{self.partner.id}/tasks/", {"assigned_to": "unassigned"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["tasks"]), 1)
+        self.assertEqual(response.data["tasks"][0]["title"], "Unassigned")

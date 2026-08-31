@@ -426,6 +426,40 @@ class PartnerMyTasksView(APIView):
         return Response({"tasks": TaskListSerializer(qs, many=True).data}, status=status.HTTP_200_OK)
 
 
+class PartnerAllTasksView(APIView):
+    """GET /api/v1/partners/<partner_id>/tasks/ — the "Task Boards" admin
+    overview: every task across every channel in the organization, not
+    scoped to one channel or to "assigned to me" like the other two list
+    views. Admin-only (same gate as creating/managing tasks) since a
+    regular member has no reason to see tasks outside channels they're in,
+    and this deliberately bypasses per-channel membership filtering to do
+    that — TaskChannelListCreateView is what respects channel membership."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, partner_id):
+        partner = _get_partner_with_feature(partner_id)
+        _require_task_manage(partner, request.user)
+
+        qs = (
+            Task.objects.filter(partner=partner, is_deleted=False)
+            .select_related("assigned_to", "created_by", "channel")
+        )
+        status_filter = request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        channel_filter = request.query_params.get("channel_id")
+        if channel_filter:
+            qs = qs.filter(channel_id=channel_filter)
+        assignee_filter = request.query_params.get("assigned_to")
+        if assignee_filter == "unassigned":
+            qs = qs.filter(assigned_to__isnull=True)
+        elif assignee_filter:
+            qs = qs.filter(assigned_to_id=assignee_filter)
+
+        qs = qs.order_by("-created_at")
+        return Response({"tasks": TaskListSerializer(qs, many=True).data}, status=status.HTTP_200_OK)
+
+
 class PartnerTaskSummaryView(APIView):
     permission_classes = [IsAuthenticated]
 
