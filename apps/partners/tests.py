@@ -1774,3 +1774,76 @@ class PartnerLeadershipApiTests(TestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class PartnerResourceApiTests(TestCase):
+    """Resource Library & Knowledge Base."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670009001", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670009002", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Resource Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Resource Partner", slug="resource-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_owner_can_create_article_resource(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/resources/",
+            {"kind": "article", "title": "Welcome Guide", "category": "onboarding", "body": "Welcome to the team!"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["title"], "Welcome Guide")
+
+    def test_file_resource_requires_asset(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/resources/",
+            {"kind": "file", "title": "Playbook"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_plain_member_cannot_create_resource(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/resources/",
+            {"kind": "article", "title": "X", "body": "Y"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_member_can_list_and_filter_resources(self):
+        from apps.partners.models import PartnerResource
+
+        PartnerResource.objects.create(partner=self.partner, kind="article", title="A", category="onboarding")
+        PartnerResource.objects.create(partner=self.partner, kind="article", title="B", category="policy")
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/resources/", {"category": "onboarding"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["title"], "A")
+
+    def test_owner_can_delete_resource(self):
+        from apps.partners.models import PartnerResource
+
+        resource = PartnerResource.objects.create(partner=self.partner, kind="article", title="A")
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.delete(f"/api/v1/partners/{self.partner.id}/resources/{resource.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerResource.objects.filter(id=resource.id).exists())

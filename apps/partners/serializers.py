@@ -45,6 +45,7 @@ from apps.partners.models import (
     PartnerDepartmentMembership,
     PartnerDepartmentNote,
     PartnerLocation,
+    PartnerResource,
 )
 from apps.chat.models import ConversationType
 from apps.chat.discussion import get_discussion_count
@@ -951,6 +952,66 @@ class PartnerDepartmentNoteSerializer(serializers.ModelSerializer):
         model = PartnerDepartmentNote
         fields = ["id", "department", "category", "title", "body", "created_by", "created_by_name", "created_at", "updated_at"]
         read_only_fields = ["id", "department", "created_by", "created_by_name", "created_at", "updated_at"]
+
+
+class PartnerResourceSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source="created_by.display_name", read_only=True, default=None)
+    file_name = serializers.SerializerMethodField()
+    file_url = serializers.SerializerMethodField()
+    mime_type = serializers.SerializerMethodField()
+    size_bytes = serializers.SerializerMethodField()
+    asset_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+
+    class Meta:
+        model = PartnerResource
+        fields = [
+            "id", "partner", "kind", "title", "category", "body", "asset_id",
+            "file_name", "file_url", "mime_type", "size_bytes",
+            "created_by", "created_by_name", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "partner", "created_by", "created_by_name", "created_at", "updated_at"]
+
+    def get_file_name(self, obj):
+        return obj.asset.original_filename if obj.asset else ""
+
+    def get_file_url(self, obj):
+        return obj.asset.canonical_url if obj.asset else None
+
+    def get_mime_type(self, obj):
+        return obj.asset.mime_type if obj.asset else ""
+
+    def get_size_bytes(self, obj):
+        return obj.asset.bytes if obj.asset else 0
+
+    def validate(self, attrs):
+        kind = attrs.get("kind") or getattr(self.instance, "kind", None)
+        if kind == "file" and not attrs.get("asset_id") and not getattr(self.instance, "asset_id", None):
+            raise serializers.ValidationError({"asset_id": "A file resource needs an uploaded asset."})
+        return attrs
+
+    def create(self, validated_data):
+        from apps.media.models import MediaAsset
+
+        asset_id = validated_data.pop("asset_id", None)
+        asset = None
+        if asset_id:
+            asset = MediaAsset.objects.filter(id=asset_id, owner=self.context["request"].user).first()
+            if not asset:
+                raise serializers.ValidationError({"asset_id": "Unknown or unowned upload."})
+            validated_data["asset"] = asset
+        resource = super().create(validated_data)
+        if asset:
+            # The asset was uploaded (and the "partner_resource" media
+            # purpose's access authorizer registered) before this
+            # PartnerResource row existed, so target_id couldn't be set at
+            # upload time the way apps.tasks' report uploads do — stamp it
+            # on now so the access authorizer can resolve who's allowed to
+            # view it (partner members) rather than falling back to
+            # "only the uploader" forever.
+            asset.target_type = "partners.PartnerResource"
+            asset.target_id = str(resource.id)
+            asset.save(update_fields=["target_type", "target_id"])
+        return resource
 
 
 class PartnerRoleAssignmentSerializer(serializers.ModelSerializer):

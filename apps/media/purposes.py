@@ -355,3 +355,8 @@ register_purpose("task_report", _PurposeSpec(
     target_types=("tasks.Task",), allow_attach=False,
     visibility_class="restricted",
 ))
+register_purpose("partner_resource", _PurposeSpec(
+    context="partners", moderation_context="partners", retention_days=None,
+    target_types=("partners.PartnerResource",), allow_attach=False,
+    visibility_class="restricted",
+))

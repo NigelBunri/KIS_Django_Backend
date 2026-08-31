@@ -1699,3 +1699,34 @@ class PartnerDepartmentNote(models.Model):
         db_table = "partner_department_note"
         ordering = ["-created_at"]
         indexes = [models.Index(fields=["department", "category"])]
+
+
+class PartnerResourceKind(models.TextChoices):
+    FILE = "file", "File"
+    ARTICLE = "article", "Article"
+
+
+class PartnerResource(models.Model):
+    """General Tools > Resource Library + Knowledge Base — one model
+    covering both, since a "resource" is either an uploaded file
+    (playbook, template doc, ...) or a written article, distinguished by
+    `kind`. Files go through the same presigned-S3 pipeline every other
+    upload in this codebase uses (apps.media), rather than a bespoke one."""
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="resources")
+    kind = models.CharField(max_length=16, choices=PartnerResourceKind.choices)
+    title = models.CharField(max_length=200)
+    category = models.CharField(max_length=64, blank=True)
+    body = models.TextField(blank=True)
+    asset = models.ForeignKey(
+        "media.MediaAsset", on_delete=models.SET_NULL, null=True, blank=True, related_name="partner_resources",
+    )
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_resource"
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["partner", "kind"]), models.Index(fields=["partner", "category"])]

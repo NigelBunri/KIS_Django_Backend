@@ -63,6 +63,7 @@ from apps.partners.models import (
     PartnerDepartmentMembership,
     PartnerDepartmentNote,
     PartnerLocation,
+    PartnerResource,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -105,6 +106,7 @@ from apps.partners.serializers import (
     PartnerDepartmentMemberSerializer,
     PartnerDepartmentNoteSerializer,
     PartnerLocationSerializer,
+    PartnerResourceSerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
     PartnerWebhookSerializer,
@@ -1300,6 +1302,46 @@ class PartnerViewSet(viewsets.ModelViewSet):
         if not note:
             return Response({"detail": "Note not found."}, status=status.HTTP_404_NOT_FOUND)
         note.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # ── Resource Library & Knowledge Base ───────────────────────────────
+    @action(detail=True, methods=["get", "post"], url_path="resources")
+    def resources(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.resources.manage")
+            serializer = PartnerResourceSerializer(data=request.data, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            resource = serializer.save(partner=partner, created_by=request.user)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.resource.create",
+                target_type="partner_resource", target_id=str(resource.id),
+                metadata={"title": resource.title, "kind": resource.kind}, request=request,
+            )
+            return Response(PartnerResourceSerializer(resource).data, status=status.HTTP_201_CREATED)
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        qs = PartnerResource.objects.filter(partner=partner).select_related("asset", "created_by")
+        kind = request.query_params.get("kind")
+        if kind:
+            qs = qs.filter(kind=kind)
+        category = request.query_params.get("category")
+        if category:
+            qs = qs.filter(category=category)
+        return Response(PartnerResourceSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["delete"], url_path=r"resources/(?P<resource_id>[^/.]+)")
+    def resource_detail(self, request, pk=None, resource_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.resources.manage")
+        resource = PartnerResource.objects.filter(id=resource_id, partner=partner).first()
+        if not resource:
+            return Response({"detail": "Resource not found."}, status=status.HTTP_404_NOT_FOUND)
+        resource.delete()
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.resource.delete",
+            target_type="partner_resource", target_id=str(resource_id), request=request,
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")

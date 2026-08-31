@@ -344,6 +344,13 @@ UPLOAD_CONTEXTS: dict[str, UploadContextConfig] = {
         max_bytes=_task_report_max_bytes,
         key_prefix="tasks/report",
     ),
+    # Resource Library — same allowed types as task reports (documents,
+    # spreadsheets, images, zips); reused rather than duplicated.
+    "partner_resource": UploadContextConfig(
+        allowed_content_types=_task_report_allowed_content_types,
+        max_bytes=_task_report_max_bytes,
+        key_prefix="partners/resources",
+    ),
 }
 
 
