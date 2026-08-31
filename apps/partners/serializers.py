@@ -43,6 +43,7 @@ from apps.partners.models import (
     default_app_visibility,
     PartnerDepartment,
     PartnerDepartmentMembership,
+    PartnerDepartmentNote,
     PartnerLocation,
 )
 from apps.chat.models import ConversationType
@@ -941,6 +942,15 @@ class PartnerLocationSerializer(serializers.ModelSerializer):
             "notes", "is_primary", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "partner", "created_at", "updated_at"]
+
+
+class PartnerDepartmentNoteSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source="created_by.display_name", read_only=True, default=None)
+
+    class Meta:
+        model = PartnerDepartmentNote
+        fields = ["id", "department", "category", "title", "body", "created_by", "created_by_name", "created_at", "updated_at"]
+        read_only_fields = ["id", "department", "created_by", "created_by_name", "created_at", "updated_at"]
 
 
 class PartnerRoleAssignmentSerializer(serializers.ModelSerializer):

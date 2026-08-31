@@ -1670,3 +1670,32 @@ class PartnerLocation(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.partner_id})"
+
+
+class PartnerDepartmentNoteCategory(models.TextChoices):
+    GENERAL = "general", "General"
+    SUCCESSION = "succession", "Succession planning"
+    GOALS = "goals", "Leadership goals"
+    ONBOARDING = "onboarding", "Onboarding path"
+
+
+class PartnerDepartmentNote(models.Model):
+    """Leadership & Org Tree > org_tree_notes/succession_plan/
+    leadership_goals/onboarding_paths. One lightweight categorized note
+    model covering all four rather than four separate ones — they're all
+    "a leader writes something down about a department" at heart, and
+    none of them need more structure than that yet."""
+
+    id = models.BigAutoField(primary_key=True)
+    department = models.ForeignKey(PartnerDepartment, on_delete=models.CASCADE, related_name="notes")
+    category = models.CharField(max_length=16, choices=PartnerDepartmentNoteCategory.choices, default=PartnerDepartmentNoteCategory.GENERAL)
+    title = models.CharField(max_length=200, blank=True)
+    body = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_department_note"
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["department", "category"])]

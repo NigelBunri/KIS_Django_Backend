@@ -1696,3 +1696,81 @@ class PartnerAnalyticsApiTests(TestCase):
         response = self.client.get(f"/api/v1/partners/{self.partner.id}/analytics/")
 
         self.assertIn(response.status_code, (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND))
+
+
+class PartnerLeadershipApiTests(TestCase):
+    """Leadership & Org Tree — org_tree_view, leadership_directory,
+    reporting_lines, span_of_control, role_alignment, leadership_scorecards,
+    plus department notes (org_tree_notes/succession_plan/leadership_goals/
+    onboarding_paths)."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670008001", country="CM", password="pass1234")
+        self.lead = User.objects.create_user(phone="+237670008002", country="CM", password="pass1234")
+        self.report = User.objects.create_user(phone="+237670008003", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Leadership Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Leadership Partner", slug="leadership-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.lead, role="member", status=PartnerMembershipStatus.MEMBER)
+        PartnerMembership.objects.create(partner=self.partner, user=self.report, role="member", status=PartnerMembershipStatus.MEMBER)
+
+        self.led_department = PartnerDepartment.objects.create(partner=self.partner, name="Youth Ministry", lead=self.lead)
+        PartnerDepartmentMembership.objects.create(department=self.led_department, user=self.report)
+        PartnerDepartment.objects.create(partner=self.partner, name="Unled Department")
+
+    def test_leadership_payload_reflects_departments(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/leadership/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(len(response.data["org_tree"]), 2)
+        self.assertEqual(response.data["leadership_directory"][0]["user_id"], str(self.lead.id))
+        self.assertEqual(response.data["leadership_directory"][0]["direct_reports"], 1)
+        self.assertEqual(response.data["reporting_lines"][0]["user_id"], str(self.report.id))
+        self.assertEqual(response.data["reporting_lines"][0]["reports_to_id"], str(self.lead.id))
+        self.assertEqual(response.data["role_alignment"]["unaligned_departments"][0]["department_name"], "Unled Department")
+        self.assertEqual(response.data["leadership_scorecards"][0]["user_id"], str(self.lead.id))
+        self.assertIn("team_health", response.data["unavailable_metrics"])
+
+    def test_member_can_view_leadership(self):
+        self.client.force_authenticate(self.report)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/leadership/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_owner_can_create_and_delete_department_note(self):
+        self.client.force_authenticate(self.owner)
+
+        create_response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/department-notes/",
+            {"department": self.led_department.id, "category": "succession", "title": "Backup lead", "body": "Consider Jane."},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        note_id = create_response.data["id"]
+
+        list_response = self.client.get(
+            f"/api/v1/partners/{self.partner.id}/department-notes/",
+            {"department_id": self.led_department.id},
+        )
+        self.assertEqual(len(list_response.data), 1)
+        self.assertEqual(list_response.data[0]["category"], "succession")
+
+        delete_response = self.client.delete(f"/api/v1/partners/{self.partner.id}/department-notes/{note_id}/")
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_plain_member_cannot_create_department_note(self):
+        self.client.force_authenticate(self.report)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/department-notes/",
+            {"department": self.led_department.id, "body": "hi"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

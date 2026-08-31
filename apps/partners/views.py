@@ -61,6 +61,7 @@ from apps.partners.models import (
     PartnerOrganizationLinkType,
     PartnerDepartment,
     PartnerDepartmentMembership,
+    PartnerDepartmentNote,
     PartnerLocation,
 )
 from apps.feed_personalization import (
@@ -102,6 +103,7 @@ from apps.partners.serializers import (
     PartnerRoleAssignmentSerializer,
     PartnerDepartmentSerializer,
     PartnerDepartmentMemberSerializer,
+    PartnerDepartmentNoteSerializer,
     PartnerLocationSerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
@@ -1173,6 +1175,132 @@ class PartnerViewSet(viewsets.ModelViewSet):
             metadata={"fields": list((request.data or {}).keys())}, request=request,
         )
         return Response(PartnerLocationSerializer(location).data, status=status.HTTP_200_OK)
+
+    # ── Leadership & Org Tree ────────────────────────────────────────────
+    @action(detail=True, methods=["get"], url_path="leadership")
+    def leadership(self, request, pk=None):
+        """org_tree_view, leadership_directory, reporting_lines,
+        span_of_control, role_alignment, leadership_scorecards — all
+        derived from PartnerDepartment (already real, from Org Setup) plus
+        Task completion for each lead (already real, from apps.tasks).
+        team_health/mentorship_routes/skills_matrix/capacity_planning/
+        cross_team_projects/diversity_dashboard/conflict_resolution/
+        role_requirements/org_announcements have no real data source
+        anywhere in the product yet and are returned as
+        unavailable_metrics rather than faked."""
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+
+        departments = list(
+            PartnerDepartment.objects.filter(partner=partner)
+            .select_related("lead")
+            .prefetch_related("memberships__user")
+        )
+
+        org_tree = []
+        leadership_directory = []
+        reporting_lines = []
+        unaligned_departments = []
+        lead_ids = []
+        for dept in departments:
+            member_rows = [m.user for m in dept.memberships.all()]
+            org_tree.append({
+                "department_id": dept.id, "department_name": dept.name,
+                "lead_id": str(dept.lead_id) if dept.lead_id else None,
+                "lead_name": dept.lead.display_name if dept.lead else None,
+                "member_count": len(member_rows),
+            })
+            if dept.lead:
+                lead_ids.append(dept.lead_id)
+                leadership_directory.append({
+                    "user_id": str(dept.lead_id),
+                    "display_name": dept.lead.display_name or dept.lead.username or "",
+                    "avatar_url": getattr(dept.lead, "avatar_url", None),
+                    "department_name": dept.name,
+                    "direct_reports": len(member_rows),
+                })
+                for member in member_rows:
+                    reporting_lines.append({
+                        "user_id": str(member.id), "display_name": member.display_name or member.username or "",
+                        "reports_to_id": str(dept.lead_id), "reports_to_name": dept.lead.display_name or dept.lead.username or "",
+                        "department_name": dept.name,
+                    })
+            else:
+                unaligned_departments.append({"department_id": dept.id, "department_name": dept.name})
+
+        span_of_control = sorted(leadership_directory, key=lambda row: row["direct_reports"], reverse=True)
+
+        # Leadership Scorecards — each lead's own task completion rate
+        # across the whole org (reusing apps.tasks, not department-scoped
+        # since tasks aren't linked to departments).
+        leadership_scorecards = []
+        if lead_ids:
+            from apps.tasks.models import Task, TaskStatus as TaskStatusChoices
+
+            for lead_id in set(lead_ids):
+                lead_tasks = Task.objects.filter(partner=partner, assigned_to_id=lead_id, is_deleted=False)
+                total = lead_tasks.count()
+                completed = lead_tasks.filter(status=TaskStatusChoices.COMPLETED).count()
+                lead_user = next((d.lead for d in departments if d.lead_id == lead_id), None)
+                leadership_scorecards.append({
+                    "user_id": str(lead_id),
+                    "display_name": (lead_user.display_name or lead_user.username or "") if lead_user else "",
+                    "tasks_assigned": total,
+                    "tasks_completed": completed,
+                    "completion_rate": round(completed / total, 2) if total else None,
+                })
+
+        return Response(
+            {
+                "org_tree": org_tree,
+                "leadership_directory": leadership_directory,
+                "reporting_lines": reporting_lines,
+                "span_of_control": span_of_control,
+                "role_alignment": {"unaligned_departments": unaligned_departments, "total_departments": len(departments)},
+                "leadership_scorecards": leadership_scorecards,
+                "unavailable_metrics": [
+                    "team_health", "mentorship_routes", "skills_matrix", "capacity_planning",
+                    "cross_team_projects", "diversity_dashboard", "conflict_resolution",
+                    "role_requirements", "org_announcements",
+                ],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get", "post"], url_path="department-notes")
+    def department_notes(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.departments.manage")
+            department_id = request.data.get("department")
+            department = PartnerDepartment.objects.filter(id=department_id, partner=partner).first()
+            if not department:
+                raise ValidationError({"department": "Department not found."})
+            serializer = PartnerDepartmentNoteSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            note = serializer.save(department=department, created_by=request.user)
+            return Response(PartnerDepartmentNoteSerializer(note).data, status=status.HTTP_201_CREATED)
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        qs = PartnerDepartmentNote.objects.filter(department__partner=partner).select_related("created_by", "department")
+        department_id = request.query_params.get("department_id")
+        if department_id:
+            qs = qs.filter(department_id=department_id)
+        category = request.query_params.get("category")
+        if category:
+            qs = qs.filter(category=category)
+        return Response(PartnerDepartmentNoteSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["delete"], url_path=r"department-notes/(?P<note_id>[^/.]+)")
+    def department_note_detail(self, request, pk=None, note_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.departments.manage")
+        note = PartnerDepartmentNote.objects.filter(id=note_id, department__partner=partner).first()
+        if not note:
+            return Response({"detail": "Note not found."}, status=status.HTTP_404_NOT_FOUND)
+        note.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):
