@@ -1730,3 +1730,58 @@ class PartnerResource(models.Model):
         db_table = "partner_resource"
         ordering = ["-created_at"]
         indexes = [models.Index(fields=["partner", "kind"]), models.Index(fields=["partner", "category"])]
+
+
+class PartnerCalendarEventVisibility(models.TextChoices):
+    ALL_MEMBERS = "all_members", "All members"
+    ADMINS_ONLY = "admins_only", "Admins only"
+
+
+class PartnerCalendarEvent(models.Model):
+    """General Tools > Events Calendar — org-wide events, distinct from
+    the platform's global/personal apps.events (which is per-user and
+    unrelated to partner membership). Deliberately not built on
+    apps.events since that app's Event.owner_id/permissions model is
+    global-only; this is a much smaller, partner-scoped model matching
+    the convention used for every other Partners feature in this file."""
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="calendar_events")
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    location = models.CharField(max_length=255, blank=True)
+    virtual_url = models.URLField(blank=True)
+    start_at = models.DateTimeField()
+    end_at = models.DateTimeField()
+    visibility = models.CharField(
+        max_length=16, choices=PartnerCalendarEventVisibility.choices, default=PartnerCalendarEventVisibility.ALL_MEMBERS,
+    )
+    department = models.ForeignKey(
+        PartnerDepartment, on_delete=models.SET_NULL, null=True, blank=True, related_name="calendar_events",
+    )
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_calendar_event"
+        ordering = ["start_at"]
+        indexes = [models.Index(fields=["partner", "start_at"])]
+
+
+class PartnerCalendarRsvpStatus(models.TextChoices):
+    GOING = "going", "Going"
+    MAYBE = "maybe", "Maybe"
+    DECLINED = "declined", "Declined"
+
+
+class PartnerCalendarRsvp(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    event = models.ForeignKey(PartnerCalendarEvent, on_delete=models.CASCADE, related_name="rsvps")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="partner_calendar_rsvps")
+    status = models.CharField(max_length=16, choices=PartnerCalendarRsvpStatus.choices, default=PartnerCalendarRsvpStatus.GOING)
+    responded_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_calendar_rsvp"
+        unique_together = [("event", "user")]

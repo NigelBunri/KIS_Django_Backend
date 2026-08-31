@@ -46,6 +46,8 @@ from apps.partners.models import (
     PartnerDepartmentNote,
     PartnerLocation,
     PartnerResource,
+    PartnerCalendarEvent,
+    PartnerCalendarRsvp,
 )
 from apps.chat.models import ConversationType
 from apps.chat.discussion import get_discussion_count
@@ -1012,6 +1014,47 @@ class PartnerResourceSerializer(serializers.ModelSerializer):
             asset.target_id = str(resource.id)
             asset.save(update_fields=["target_type", "target_id"])
         return resource
+
+
+class PartnerCalendarRsvpSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source="user.display_name", read_only=True, default=None)
+
+    class Meta:
+        model = PartnerCalendarRsvp
+        fields = ["id", "event", "user", "user_name", "status", "responded_at"]
+        read_only_fields = ["id", "event", "user", "user_name", "responded_at"]
+
+
+class PartnerCalendarEventSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source="created_by.display_name", read_only=True, default=None)
+    department_name = serializers.CharField(source="department.name", read_only=True, default=None)
+    my_rsvp_status = serializers.SerializerMethodField()
+    rsvp_counts = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PartnerCalendarEvent
+        fields = [
+            "id", "partner", "title", "description", "location", "virtual_url",
+            "start_at", "end_at", "visibility", "department", "department_name",
+            "created_by", "created_by_name", "created_at", "updated_at",
+            "my_rsvp_status", "rsvp_counts",
+        ]
+        read_only_fields = ["id", "partner", "created_by", "created_by_name", "created_at", "updated_at"]
+
+    def get_my_rsvp_status(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or user.is_anonymous:
+            return None
+        rsvp = obj.rsvps.filter(user=user).first()
+        return rsvp.status if rsvp else None
+
+    def get_rsvp_counts(self, obj):
+        counts = {"going": 0, "maybe": 0, "declined": 0}
+        for row in obj.rsvps.all():
+            if row.status in counts:
+                counts[row.status] += 1
+        return counts
 
 
 class PartnerRoleAssignmentSerializer(serializers.ModelSerializer):

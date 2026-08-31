@@ -1847,3 +1847,124 @@ class PartnerResourceApiTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(PartnerResource.objects.filter(id=resource.id).exists())
+
+
+class PartnerCalendarEventApiTests(TestCase):
+    """Events Calendar."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670009101", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670009102", country="CM", password="pass1234")
+        self.other_member = User.objects.create_user(phone="+237670009103", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Calendar Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Calendar Partner", slug="calendar-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+        PartnerMembership.objects.create(partner=self.partner, user=self.other_member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_owner_can_create_event(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/calendar-events/",
+            {
+                "title": "Annual Retreat",
+                "description": "Yearly gathering",
+                "location": "Main Hall",
+                "start_at": "2026-10-01T09:00:00Z",
+                "end_at": "2026-10-01T17:00:00Z",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["title"], "Annual Retreat")
+        self.assertEqual(response.data["rsvp_counts"], {"going": 0, "maybe": 0, "declined": 0})
+
+    def test_plain_member_cannot_create_event(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/calendar-events/",
+            {"title": "X", "start_at": "2026-10-01T09:00:00Z", "end_at": "2026-10-01T10:00:00Z"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admins_only_event_hidden_from_plain_members(self):
+        from apps.partners.models import PartnerCalendarEvent
+
+        PartnerCalendarEvent.objects.create(
+            partner=self.partner, title="Admin sync", visibility="admins_only",
+            start_at="2026-10-01T09:00:00Z", end_at="2026-10-01T10:00:00Z",
+        )
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/calendar-events/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)
+
+        self.client.force_authenticate(self.owner)
+        owner_response = self.client.get(f"/api/v1/partners/{self.partner.id}/calendar-events/")
+        self.assertEqual(len(owner_response.data), 1)
+
+    def test_member_can_rsvp_and_change_status(self):
+        from apps.partners.models import PartnerCalendarEvent, PartnerCalendarRsvp
+
+        event = PartnerCalendarEvent.objects.create(
+            partner=self.partner, title="Potluck", start_at="2026-10-01T09:00:00Z", end_at="2026-10-01T10:00:00Z",
+        )
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/calendar-events/{event.id}/rsvp/",
+            {"status": "going"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(PartnerCalendarRsvp.objects.get(event=event, user=self.member).status, "going")
+
+        response2 = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/calendar-events/{event.id}/rsvp/",
+            {"status": "declined"},
+            format="json",
+        )
+        self.assertEqual(response2.status_code, status.HTTP_200_OK)
+        self.assertEqual(PartnerCalendarRsvp.objects.filter(event=event, user=self.member).count(), 1)
+        self.assertEqual(PartnerCalendarRsvp.objects.get(event=event, user=self.member).status, "declined")
+
+    def test_owner_can_view_attendees_but_member_cannot(self):
+        from apps.partners.models import PartnerCalendarEvent, PartnerCalendarRsvp
+
+        event = PartnerCalendarEvent.objects.create(
+            partner=self.partner, title="Board Meeting", start_at="2026-10-01T09:00:00Z", end_at="2026-10-01T10:00:00Z",
+        )
+        PartnerCalendarRsvp.objects.create(event=event, user=self.member, status="going")
+
+        self.client.force_authenticate(self.member)
+        denied = self.client.get(f"/api/v1/partners/{self.partner.id}/calendar-events/{event.id}/attendees/")
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.owner)
+        allowed = self.client.get(f"/api/v1/partners/{self.partner.id}/calendar-events/{event.id}/attendees/")
+        self.assertEqual(allowed.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(allowed.data), 1)
+        self.assertEqual(allowed.data[0]["status"], "going")
+
+    def test_owner_can_delete_event(self):
+        from apps.partners.models import PartnerCalendarEvent
+
+        event = PartnerCalendarEvent.objects.create(
+            partner=self.partner, title="Cancelled Event", start_at="2026-10-01T09:00:00Z", end_at="2026-10-01T10:00:00Z",
+        )
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.delete(f"/api/v1/partners/{self.partner.id}/calendar-events/{event.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerCalendarEvent.objects.filter(id=event.id).exists())

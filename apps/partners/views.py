@@ -64,6 +64,10 @@ from apps.partners.models import (
     PartnerDepartmentNote,
     PartnerLocation,
     PartnerResource,
+    PartnerCalendarEvent,
+    PartnerCalendarEventVisibility,
+    PartnerCalendarRsvp,
+    PartnerCalendarRsvpStatus,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -107,6 +111,8 @@ from apps.partners.serializers import (
     PartnerDepartmentNoteSerializer,
     PartnerLocationSerializer,
     PartnerResourceSerializer,
+    PartnerCalendarEventSerializer,
+    PartnerCalendarRsvpSerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
     PartnerWebhookSerializer,
@@ -1343,6 +1349,89 @@ class PartnerViewSet(viewsets.ModelViewSet):
             target_type="partner_resource", target_id=str(resource_id), request=request,
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # ── Events Calendar ──────────────────────────────────────────────────
+    @action(detail=True, methods=["get", "post"], url_path="calendar-events")
+    def calendar_events(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.calendar.manage")
+            serializer = PartnerCalendarEventSerializer(data=request.data, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            event = serializer.save(partner=partner, created_by=request.user)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.calendar_event.create",
+                target_type="partner_calendar_event", target_id=str(event.id),
+                metadata={"title": event.title}, request=request,
+            )
+            return Response(
+                PartnerCalendarEventSerializer(event, context={"request": request}).data, status=status.HTTP_201_CREATED,
+            )
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        qs = PartnerCalendarEvent.objects.filter(partner=partner).select_related("created_by", "department").prefetch_related("rsvps")
+        if not self._user_can_manage_partner(partner, request.user):
+            qs = qs.exclude(visibility=PartnerCalendarEventVisibility.ADMINS_ONLY)
+        upcoming_only = request.query_params.get("upcoming")
+        if upcoming_only == "1":
+            qs = qs.filter(end_at__gte=timezone.now())
+        return Response(
+            PartnerCalendarEventSerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"calendar-events/(?P<event_id>[^/.]+)")
+    def calendar_event_detail(self, request, pk=None, event_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.calendar.manage")
+        event = PartnerCalendarEvent.objects.filter(id=event_id, partner=partner).first()
+        if not event:
+            return Response({"detail": "Event not found."}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == "DELETE":
+            event.delete()
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.calendar_event.delete",
+                target_type="partner_calendar_event", target_id=str(event_id), request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = PartnerCalendarEventSerializer(
+            event, data=request.data, partial=True, context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.calendar_event.update",
+            target_type="partner_calendar_event", target_id=str(event.id),
+            metadata={"fields": list((request.data or {}).keys())}, request=request,
+        )
+        return Response(PartnerCalendarEventSerializer(event, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path=r"calendar-events/(?P<event_id>[^/.]+)/rsvp")
+    def calendar_event_rsvp(self, request, pk=None, event_id=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        event = PartnerCalendarEvent.objects.filter(id=event_id, partner=partner).first()
+        if not event:
+            return Response({"detail": "Event not found."}, status=status.HTTP_404_NOT_FOUND)
+        if event.visibility == PartnerCalendarEventVisibility.ADMINS_ONLY and not self._user_can_manage_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to RSVP to this event.")
+        rsvp_status = request.data.get("status")
+        if rsvp_status not in dict(PartnerCalendarRsvpStatus.choices):
+            raise ValidationError({"status": "Invalid RSVP status."})
+        rsvp, _ = PartnerCalendarRsvp.objects.update_or_create(
+            event=event, user=request.user, defaults={"status": rsvp_status},
+        )
+        return Response(PartnerCalendarRsvpSerializer(rsvp).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path=r"calendar-events/(?P<event_id>[^/.]+)/attendees")
+    def calendar_event_attendees(self, request, pk=None, event_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.calendar.manage")
+        event = PartnerCalendarEvent.objects.filter(id=event_id, partner=partner).first()
+        if not event:
+            return Response({"detail": "Event not found."}, status=status.HTTP_404_NOT_FOUND)
+        rsvps = event.rsvps.select_related("user")
+        return Response(PartnerCalendarRsvpSerializer(rsvps, many=True).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):
