@@ -306,6 +306,7 @@ urlpatterns = [
     path("api/v1/", include("apps.referrals.urls")),
     path("api/v1/", include("apps.rewards.urls")),
     path("api/v1/verification/", include("apps.verification.urls", namespace="verification")),
+    path("api/v1/", include("apps.tasks.urls", namespace="tasks")),
     path("api/v1/", include("apps.testimony.urls")),
     path("api/v1/family/", include("apps.family.urls", namespace="family")),
     path("api/v1/", include("apps.government.urls", namespace="government")),

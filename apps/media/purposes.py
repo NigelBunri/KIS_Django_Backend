@@ -345,3 +345,13 @@ register_purpose("testimony_media", _PurposeSpec(
     target_types=("testimony.UserTestimony",), allow_attach=False,
     visibility_class="restricted",
 ))
+
+# Partner task reports (apps.tasks) — an assignee attaches evidence of
+# completed work when submitting a task via TaskSubmitView, which binds the
+# already-confirmed asset directly (same create-with-media shape as status/
+# complaint attachments above), not through the generic attach endpoint.
+register_purpose("task_report", _PurposeSpec(
+    context="tasks", moderation_context="tasks", retention_days=None,
+    target_types=("tasks.Task",), allow_attach=False,
+    visibility_class="restricted",
+))

@@ -190,6 +190,7 @@ def ensure_default_partner_roles(partner: Partner) -> None:
             "partner.members.kick",
             "partner.members.ban",
             "partner.categories.manage",
+            "partner.tasks.manage",
         ]),
         ("Admin", [
             "partner.policy.edit",
@@ -209,6 +210,7 @@ def ensure_default_partner_roles(partner: Partner) -> None:
             "partner.members.kick",
             "partner.members.ban",
             "partner.categories.manage",
+            "partner.tasks.manage",
         ]),
         ("Manager", [
             "partner.roles.view",

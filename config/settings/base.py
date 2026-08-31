@@ -397,6 +397,7 @@ INSTALLED_APPS = [
     "apps.communities.apps.CommunitiesConfig",
     "apps.groups.apps.GroupsConfig",
     "apps.channels.apps.ChannelsConfig",
+    "apps.tasks.apps.TasksConfig",
     "apps.broadcasts.apps.BroadcastsConfig",
     "apps.health_ops.apps.HealthOpsConfig",
     "apps.health_dashboard.apps.HealthDashboardConfig",

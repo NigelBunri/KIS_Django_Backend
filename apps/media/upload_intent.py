@@ -73,6 +73,11 @@ _EXTENSION_BY_CONTENT_TYPE = {
     "application/pdf": "pdf",
     "application/msword": "doc",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/zip": "zip",
+    "text/plain": "txt",
+    "text/csv": "csv",
     "video/mp4": "mp4",
     "video/quicktime": "mov",
     "video/webm": "webm",
@@ -191,6 +196,37 @@ def _testimony_media_max_bytes() -> int:
     return int(getattr(settings, "TESTIMONY_MEDIA_MAX_UPLOAD_BYTES", 2 * 1024 * 1024 * 1024))
 
 
+def _task_report_allowed_content_types() -> set[str]:
+    configured = getattr(settings, "TASK_REPORT_ALLOWED_CONTENT_TYPES", "")
+    values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
+    return values or {
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/zip",
+        "text/plain",
+        "text/csv",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/heic",
+        "image/heif",
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
+        "audio/mp4",
+        "audio/mpeg",
+        "audio/aac",
+        "audio/wav",
+    }
+
+
+def _task_report_max_bytes() -> int:
+    return int(getattr(settings, "TASK_REPORT_MAX_UPLOAD_BYTES", 2 * 1024 * 1024 * 1024))
+
+
 @dataclass(frozen=True)
 class UploadContextConfig:
     allowed_content_types: Callable[[], set[str]]
@@ -294,6 +330,19 @@ UPLOAD_CONTEXTS: dict[str, UploadContextConfig] = {
         allowed_content_types=_testimony_media_allowed_content_types,
         max_bytes=_testimony_media_max_bytes,
         key_prefix="testimony/media",
+    ),
+    # Partner task reports (apps.tasks) — a member attaches evidence of
+    # completed work when submitting an assigned task. Any of the broad
+    # "office document" types the task feature promises (video/audio/pdf/
+    # doc/image). Confirm-only, same shape as status_*/commerce_* above:
+    # no pre-existing target to authorize at initiate time (any partner
+    # member may submit their own assigned task), so the generic confirm
+    # response's `assetId` is passed straight to apps.tasks's own submit
+    # endpoint, which does its own ownership + task-state authorization.
+    "task_report": UploadContextConfig(
+        allowed_content_types=_task_report_allowed_content_types,
+        max_bytes=_task_report_max_bytes,
+        key_prefix="tasks/report",
     ),
 }
 
