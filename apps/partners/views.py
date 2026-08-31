@@ -1585,6 +1585,127 @@ class PartnerViewSet(viewsets.ModelViewSet):
         except Exception:
             revenue_data = {"period_revenue": None, "period_order_count": None}
 
+        # Top Contributors — most active members by posts + comments authored
+        # in the window. Two separate GROUP BY queries merged in Python
+        # rather than one UNION query, since posts and comments are
+        # different tables with no shared FK to aggregate through directly.
+        post_counts = dict(
+            posts_qs.filter(created_at__gte=since)
+            .values_list("author_id")
+            .annotate(n=Count("id"))
+        )
+        comment_counts = dict(
+            PartnerPostComment.objects.filter(post__partner=partner, created_at__gte=since)
+            .values_list("author_id")
+            .annotate(n=Count("id"))
+        )
+        # Sorted set iteration is not deterministic across runs (hash
+        # randomization) — sort the id list itself first so ties break the
+        # same way every time, then break ties in the final sort by
+        # (posts, user_id) rather than just "total" (caught by
+        # test_owner_gets_full_analytics_payload flaking on a 1-1 tie).
+        contributor_ids = sorted(set(post_counts) | set(comment_counts), key=str)
+        contributor_totals = sorted(
+            (
+                {"user_id": uid, "posts": post_counts.get(uid, 0), "comments": comment_counts.get(uid, 0),
+                 "total": post_counts.get(uid, 0) + comment_counts.get(uid, 0)}
+                for uid in contributor_ids if uid
+            ),
+            key=lambda row: (row["total"], row["posts"], str(row["user_id"])), reverse=True,
+        )[:10]
+        from apps.accounts.models import User as AccountUser
+
+        contributor_users = {
+            str(u.id): (u.display_name or u.username or "")
+            for u in AccountUser.objects.filter(id__in=[row["user_id"] for row in contributor_totals])
+        }
+        top_contributors = [
+            {**row, "user_id": str(row["user_id"]), "display_name": contributor_users.get(str(row["user_id"]), "")}
+            for row in contributor_totals
+        ]
+
+        # Content Performance — top posts by reactions + comments this window.
+        top_posts_qs = (
+            posts_qs.filter(created_at__gte=since)
+            .annotate(reaction_count=Count("reactions", distinct=True), comment_count=Count("comments", distinct=True))
+            .order_by("-reaction_count", "-comment_count")[:5]
+        )
+        content_performance = [
+            {
+                "id": str(p.id),
+                "text_preview": p.text_preview,
+                "reactions": p.reaction_count,
+                "comments": p.comment_count,
+                "created_at": p.created_at.isoformat(),
+            }
+            for p in top_posts_qs
+        ]
+
+        # Reaction Trends — emoji breakdown this window, a proxy for sentiment.
+        reaction_breakdown = list(
+            PartnerPostReaction.objects.filter(post__partner=partner, created_at__gte=since)
+            .values("emoji").annotate(n=Count("id")).order_by("-n")[:12]
+        )
+
+        # Growth Funnel — applications by status this window, then active
+        # membership as the funnel's final stage.
+        application_counts = dict(
+            PartnerApplication.objects.filter(partner=partner, created_at__gte=since)
+            .values_list("status").annotate(n=Count("id"))
+        )
+        growth_funnel = {
+            "applied": sum(application_counts.values()),
+            "approved": application_counts.get(PartnerApplicationStatus.APPROVED, 0),
+            "rejected": application_counts.get(PartnerApplicationStatus.REJECTED, 0),
+            "active_members": active_members,
+        }
+
+        # Participation Depth — avg engagement per post this window.
+        participation_depth = round((recent_reactions + recent_comments) / max(recent_posts, 1), 2)
+
+        # Channel Health — task throughput per channel (created vs completed
+        # this window), reusing apps.tasks rather than pulling raw chat
+        # message volume from the Nest/Mongo side, which this service has no
+        # direct read access to.
+        channel_health = []
+        try:
+            from apps.tasks.models import Task, TaskStatus as TaskStatusChoices
+
+            channel_task_counts = (
+                Task.objects.filter(partner=partner, is_deleted=False, created_at__gte=since)
+                .values("channel_id", "channel__name")
+                .annotate(
+                    created=Count("id"),
+                    completed=Count("id", filter=Q(status=TaskStatusChoices.COMPLETED)),
+                )
+                .order_by("-created")[:10]
+            )
+            channel_health = [
+                {
+                    "channel_id": str(row["channel_id"]), "channel_name": row["channel__name"],
+                    "tasks_created": row["created"], "tasks_completed": row["completed"],
+                }
+                for row in channel_task_counts
+            ]
+        except Exception:
+            channel_health = []
+
+        # Weekday Heatmap — total activity (posts+comments+reactions) by day
+        # of week this window, a real substitute for an hour-level heatmap
+        # (which would need timestamp-of-day granularity this window doesn't
+        # warrant computing for every partner on every request).
+        from django.db.models.functions import ExtractWeekDay
+        weekday_totals = {i: 0 for i in range(1, 8)}
+        for qs, _ in (
+            (posts_qs.filter(created_at__gte=since), None),
+            (PartnerPostComment.objects.filter(post__partner=partner, created_at__gte=since), None),
+            (PartnerPostReaction.objects.filter(post__partner=partner, created_at__gte=since), None),
+        ):
+            for row in qs.annotate(wd=ExtractWeekDay("created_at")).values("wd").annotate(n=Count("id")):
+                weekday_totals[row["wd"]] = weekday_totals.get(row["wd"], 0) + row["n"]
+        weekday_labels = {1: "Sun", 2: "Mon", 3: "Tue", 4: "Wed", 5: "Thu", 6: "Fri", 7: "Sat"}
+        community_heatmap = [{"weekday": weekday_labels[i], "total": weekday_totals[i]} for i in range(1, 8)]
+
         return Response(
             {
                 "partner_id": str(partner.id),
@@ -1602,6 +1723,20 @@ class PartnerViewSet(viewsets.ModelViewSet):
                     "period_comments": recent_comments,
                 },
                 "revenue": revenue_data,
+                "top_contributors": top_contributors,
+                "content_performance": content_performance,
+                "reaction_breakdown": reaction_breakdown,
+                "growth_funnel": growth_funnel,
+                "participation_depth": participation_depth,
+                "channel_health": channel_health,
+                "community_heatmap": community_heatmap,
+                # Not yet backed by real data anywhere in the product —
+                # honestly flagged rather than fabricated. See
+                # PartnerAnalyticsPanel.tsx for how these render.
+                "unavailable_metrics": [
+                    "message_velocity", "campaign_tracking", "response_times",
+                    "event_uptake", "resource_downloads", "retention",
+                ],
             },
             status=status.HTTP_200_OK,
         )

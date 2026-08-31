@@ -1634,3 +1634,65 @@ class PartnerLocationApiTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(PartnerLocation.objects.filter(id=location.id).exists())
+
+
+class PartnerAnalyticsApiTests(TestCase):
+    """Analytics & Insights — the /analytics/ action already existed with a
+    basic members/posts/engagement/revenue summary but no frontend ever
+    called it; extended here with top_contributors/content_performance/
+    growth_funnel/participation_depth/channel_health/community_heatmap and
+    given a real panel."""
+
+    def setUp(self):
+        self.client = APIClient()
+        from apps.accounts.tiers import ensure_default_account_tiers
+        ensure_default_account_tiers()
+
+        self.owner = User.objects.create_user(phone="+237670007001", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670007002", country="CM", password="pass1234")
+        self.other_member = User.objects.create_user(phone="+237670007003", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Analytics Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Analytics Partner", slug="analytics-partner", main_conversation=conversation)
+
+        from apps.accounts.models import AccountTier, Subscription
+        partner_tier = AccountTier.objects.filter(name__iexact="Partner").first()
+        PartnerSubscription.objects.create(partner=self.partner, tier=partner_tier, status="active")
+        Subscription.objects.filter(user=self.owner).delete()
+
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+        from apps.partners.models import PartnerPostComment, PartnerPostReaction
+        post = PartnerPost.objects.create(partner=self.partner, author=self.member, text_plain="Hello", text_preview="Hello")
+        PartnerPostComment.objects.create(post=post, author=self.owner, text="Nice!")
+        PartnerPostReaction.objects.create(post=post, user=self.owner, emoji="👍")
+
+    def test_owner_gets_full_analytics_payload(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/analytics/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["top_contributors"][0]["user_id"], str(self.member.id))
+        self.assertEqual(response.data["content_performance"][0]["reactions"], 1)
+        self.assertEqual(response.data["content_performance"][0]["comments"], 1)
+        self.assertEqual(response.data["growth_funnel"]["active_members"], 1)
+        self.assertEqual(len(response.data["community_heatmap"]), 7)
+        self.assertIn("message_velocity", response.data["unavailable_metrics"])
+
+    def test_plain_member_without_reports_permission_forbidden(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/analytics/")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_outsider_forbidden(self):
+        outsider = User.objects.create_user(phone="+237670007099", country="CM", password="pass1234")
+        self.client.force_authenticate(outsider)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/analytics/")
+
+        self.assertIn(response.status_code, (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND))
