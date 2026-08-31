@@ -59,6 +59,9 @@ from apps.partners.models import (
     PartnerModerationAction,
     PartnerOrganizationLink,
     PartnerOrganizationLinkType,
+    PartnerDepartment,
+    PartnerDepartmentMembership,
+    PartnerLocation,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -97,6 +100,9 @@ from apps.partners.serializers import (
     PartnerPolicySerializer,
     PartnerRoleSerializer,
     PartnerRoleAssignmentSerializer,
+    PartnerDepartmentSerializer,
+    PartnerDepartmentMemberSerializer,
+    PartnerLocationSerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
     PartnerWebhookSerializer,
@@ -1064,6 +1070,109 @@ class PartnerViewSet(viewsets.ModelViewSet):
             data={"roleId": str(role.id), "roleName": role.name},
         )
         return Response(PartnerRoleSerializer(role).data, status=status.HTTP_200_OK)
+
+    # ── Departments & Units (Org Setup > units_departments) ────────────────
+    @action(detail=True, methods=["get", "post"], url_path="departments")
+    def departments(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.departments.manage")
+            serializer = PartnerDepartmentSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            department = serializer.save(partner=partner)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.department.create",
+                target_type="partner_department", target_id=str(department.id),
+                metadata={"name": department.name}, request=request,
+            )
+            return Response(PartnerDepartmentSerializer(department).data, status=status.HTTP_201_CREATED)
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        qs = PartnerDepartment.objects.filter(partner=partner).select_related("lead")
+        return Response(PartnerDepartmentSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"departments/(?P<department_id>[^/.]+)")
+    def department_detail(self, request, pk=None, department_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.departments.manage")
+        department = PartnerDepartment.objects.filter(id=department_id, partner=partner).first()
+        if not department:
+            return Response({"detail": "Department not found."}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == "DELETE":
+            department.delete()
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.department.delete",
+                target_type="partner_department", target_id=str(department_id), request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = PartnerDepartmentSerializer(department, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.department.update",
+            target_type="partner_department", target_id=str(department.id),
+            metadata={"fields": list((request.data or {}).keys())}, request=request,
+        )
+        return Response(PartnerDepartmentSerializer(department).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path=r"departments/(?P<department_id>[^/.]+)/members")
+    def department_members(self, request, pk=None, department_id=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        department = PartnerDepartment.objects.filter(id=department_id, partner=partner).first()
+        if not department:
+            return Response({"detail": "Department not found."}, status=status.HTTP_404_NOT_FOUND)
+        memberships = department.memberships.select_related("user")
+        return Response(PartnerDepartmentMemberSerializer(memberships, many=True).data, status=status.HTTP_200_OK)
+
+    # ── Locations & Branches (Org Setup > org_locations) ────────────────────
+    @action(detail=True, methods=["get", "post"], url_path="locations")
+    def locations(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.locations.manage")
+            serializer = PartnerLocationSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            if serializer.validated_data.get("is_primary"):
+                PartnerLocation.objects.filter(partner=partner, is_primary=True).update(is_primary=False)
+            location = serializer.save(partner=partner)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.location.create",
+                target_type="partner_location", target_id=str(location.id),
+                metadata={"name": location.name}, request=request,
+            )
+            return Response(PartnerLocationSerializer(location).data, status=status.HTTP_201_CREATED)
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        qs = PartnerLocation.objects.filter(partner=partner)
+        return Response(PartnerLocationSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"locations/(?P<location_id>[^/.]+)")
+    def location_detail(self, request, pk=None, location_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.locations.manage")
+        location = PartnerLocation.objects.filter(id=location_id, partner=partner).first()
+        if not location:
+            return Response({"detail": "Location not found."}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == "DELETE":
+            location.delete()
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.location.delete",
+                target_type="partner_location", target_id=str(location_id), request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = PartnerLocationSerializer(location, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        if serializer.validated_data.get("is_primary"):
+            PartnerLocation.objects.filter(partner=partner, is_primary=True).exclude(id=location.id).update(is_primary=False)
+        serializer.save()
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.location.update",
+            target_type="partner_location", target_id=str(location.id),
+            metadata={"fields": list((request.data or {}).keys())}, request=request,
+        )
+        return Response(PartnerLocationSerializer(location).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):

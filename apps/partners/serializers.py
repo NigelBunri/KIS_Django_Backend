@@ -41,6 +41,9 @@ from apps.partners.models import (
     PartnerModerationAction,
     PARTNER_ORG_APP_VISIBILITY_ROLES,
     default_app_visibility,
+    PartnerDepartment,
+    PartnerDepartmentMembership,
+    PartnerLocation,
 )
 from apps.chat.models import ConversationType
 from apps.chat.discussion import get_discussion_count
@@ -878,6 +881,64 @@ class PartnerRoleSerializer(serializers.ModelSerializer):
             "is_default",
             "created_at",
             "updated_at",
+        ]
+        read_only_fields = ["id", "partner", "created_at", "updated_at"]
+
+
+class PartnerDepartmentSerializer(serializers.ModelSerializer):
+    lead_name = serializers.CharField(source="lead.display_name", read_only=True, default=None)
+    member_count = serializers.IntegerField(source="memberships.count", read_only=True)
+    member_ids = serializers.ListField(
+        child=serializers.UUIDField(), write_only=True, required=False,
+        help_text="Full replacement of this department's member roster.",
+    )
+
+    class Meta:
+        model = PartnerDepartment
+        fields = [
+            "id", "partner", "name", "description", "lead", "lead_name",
+            "order", "member_count", "member_ids", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "partner", "created_at", "updated_at"]
+
+    def create(self, validated_data):
+        member_ids = validated_data.pop("member_ids", None)
+        department = super().create(validated_data)
+        if member_ids:
+            PartnerDepartmentMembership.objects.bulk_create(
+                [PartnerDepartmentMembership(department=department, user_id=uid) for uid in set(member_ids)],
+                ignore_conflicts=True,
+            )
+        return department
+
+    def update(self, instance, validated_data):
+        member_ids = validated_data.pop("member_ids", None)
+        department = super().update(instance, validated_data)
+        if member_ids is not None:
+            department.memberships.exclude(user_id__in=member_ids).delete()
+            existing = set(department.memberships.values_list("user_id", flat=True))
+            new_ids = set(member_ids) - existing
+            PartnerDepartmentMembership.objects.bulk_create(
+                [PartnerDepartmentMembership(department=department, user_id=uid) for uid in new_ids],
+            )
+        return department
+
+
+class PartnerDepartmentMemberSerializer(serializers.Serializer):
+    user_id = serializers.CharField(source="user.id")
+    display_name = serializers.CharField(source="user.display_name")
+    avatar_url = serializers.SerializerMethodField()
+
+    def get_avatar_url(self, obj):
+        return getattr(obj.user, "avatar_url", None) or getattr(obj.user, "profile_image_url", None)
+
+
+class PartnerLocationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PartnerLocation
+        fields = [
+            "id", "partner", "name", "address", "city", "country", "phone",
+            "notes", "is_primary", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "partner", "created_at", "updated_at"]
 

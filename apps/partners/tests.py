@@ -17,6 +17,9 @@ from apps.partners.models import (
     PartnerApplication,
     PartnerAuditEvent,
     PartnerAutomationRule,
+    PartnerDepartment,
+    PartnerDepartmentMembership,
+    PartnerLocation,
     PartnerIntegration,
     PartnerInvite,
     PartnerJobPost,
@@ -1481,3 +1484,153 @@ class PartnerListSerializerCanManageTests(TestCase):
 
     def test_stranger_cannot_manage(self):
         self.assertFalse(self._can_manage_for(self.stranger))
+
+
+class PartnerDepartmentApiTests(TestCase):
+    """Org Setup > Departments & Units."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670006001", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670006002", country="CM", password="pass1234")
+        self.other_member = User.objects.create_user(phone="+237670006003", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Dept Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Dept Partner", slug="dept-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_owner_can_create_department_with_members(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/departments/",
+            {"name": "Finance", "description": "Money stuff", "member_ids": [str(self.member.id)]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["name"], "Finance")
+        self.assertEqual(response.data["member_count"], 1)
+
+    def test_plain_member_cannot_create_department(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/departments/", {"name": "Finance"}, format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_member_can_list_departments(self):
+        PartnerDepartment.objects.create(partner=self.partner, name="Finance")
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/departments/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+    def test_update_replaces_member_roster(self):
+        department = PartnerDepartment.objects.create(partner=self.partner, name="Finance")
+        PartnerDepartmentMembership.objects.create(department=department, user=self.member)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.patch(
+            f"/api/v1/partners/{self.partner.id}/departments/{department.id}/",
+            {"member_ids": [str(self.other_member.id)]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        member_ids = set(department.memberships.values_list("user_id", flat=True))
+        self.assertEqual(member_ids, {self.other_member.id})
+
+    def test_department_members_endpoint(self):
+        department = PartnerDepartment.objects.create(partner=self.partner, name="Finance")
+        PartnerDepartmentMembership.objects.create(department=department, user=self.member)
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/departments/{department.id}/members/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["user_id"], str(self.member.id))
+
+    def test_owner_can_delete_department(self):
+        department = PartnerDepartment.objects.create(partner=self.partner, name="Finance")
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.delete(f"/api/v1/partners/{self.partner.id}/departments/{department.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerDepartment.objects.filter(id=department.id).exists())
+
+
+class PartnerLocationApiTests(TestCase):
+    """Org Setup > Locations & Branches."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670006101", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670006102", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Loc Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Loc Partner", slug="loc-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_owner_can_create_location(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/locations/",
+            {"name": "HQ", "city": "Douala", "country": "Cameroon", "is_primary": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(response.data["is_primary"])
+
+    def test_plain_member_cannot_create_location(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/locations/", {"name": "HQ"}, format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_only_one_primary_location_at_a_time(self):
+        first = PartnerLocation.objects.create(partner=self.partner, name="HQ", is_primary=True)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/locations/",
+            {"name": "Branch", "is_primary": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        first.refresh_from_db()
+        self.assertFalse(first.is_primary)
+
+    def test_member_can_list_locations(self):
+        PartnerLocation.objects.create(partner=self.partner, name="HQ")
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/locations/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+    def test_owner_can_delete_location(self):
+        location = PartnerLocation.objects.create(partner=self.partner, name="HQ")
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.delete(f"/api/v1/partners/{self.partner.id}/locations/{location.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerLocation.objects.filter(id=location.id).exists())

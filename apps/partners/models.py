@@ -1605,3 +1605,68 @@ class PartnerOrganizationLink(models.Model):
 
     def __str__(self) -> str:
         return f"{self.partner_id} ↔ {self.owner_type}:{self.owner_id}"
+
+
+class PartnerDepartment(models.Model):
+    """Org Setup > Departments & Units. A named group within a partner
+    organization that members can belong to — separate from PartnerRole
+    (which grants permissions) and Channel/Group (which are chat spaces);
+    a department is purely an org-structure grouping, e.g. "Finance" or
+    "Youth Ministry", with an optional lead and member roster."""
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="departments")
+    name = models.CharField(max_length=128)
+    description = models.TextField(blank=True)
+    lead = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_department"
+        unique_together = [("partner", "name")]
+        ordering = ["order", "name"]
+        indexes = [models.Index(fields=["partner"])]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.partner_id})"
+
+
+class PartnerDepartmentMembership(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    department = models.ForeignKey(PartnerDepartment, on_delete=models.CASCADE, related_name="memberships")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="partner_department_memberships")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "partner_department_membership"
+        unique_together = [("department", "user")]
+
+
+class PartnerLocation(models.Model):
+    """Org Setup > Locations & Branches. A physical location/branch/campus
+    belonging to a partner organization — address + contact info, with one
+    location per partner flaggable as the primary/HQ site."""
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="locations")
+    name = models.CharField(max_length=128)
+    address = models.CharField(max_length=255, blank=True)
+    city = models.CharField(max_length=128, blank=True)
+    country = models.CharField(max_length=128, blank=True)
+    phone = models.CharField(max_length=32, blank=True)
+    notes = models.TextField(blank=True)
+    is_primary = models.BooleanField(default=False)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_location"
+        ordering = ["-is_primary", "name"]
+        indexes = [models.Index(fields=["partner"])]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.partner_id})"
