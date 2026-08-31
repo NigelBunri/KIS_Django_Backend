@@ -121,6 +121,15 @@ class GroupViewSet(viewsets.ModelViewSet):
         from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
 
         user = self.request.user
+        partner = serializer.validated_data.get("partner")
+        if partner:
+            from apps.partners.services import partner_user_can_manage, user_has_partner_permission
+
+            if not (
+                partner_user_can_manage(partner, user)
+                or user_has_partner_permission(partner, user, "partner.groups.manage")
+            ):
+                raise PermissionDenied("Not allowed to create groups for this organization.")
         features = get_user_tier_features(user)
         raw_limit = features.get("groups_per_community", features.get("groups"))
         limit = normalize_limit_value(raw_limit, default=None)

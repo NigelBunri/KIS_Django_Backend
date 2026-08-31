@@ -191,6 +191,8 @@ def ensure_default_partner_roles(partner: Partner) -> None:
             "partner.members.ban",
             "partner.categories.manage",
             "partner.tasks.manage",
+            "partner.channels.manage",
+            "partner.groups.manage",
         ]),
         ("Admin", [
             "partner.policy.edit",

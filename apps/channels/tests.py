@@ -143,6 +143,40 @@ class ChannelServerOrganizationApiTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("category", response.data)
 
+    def test_plain_member_cannot_create_partner_channel(self):
+        self.client.force_authenticate(self.member)
+        response = self.client.post(
+            "/api/v1/partner-channels/channels/",
+            {
+                "partner": str(self.partner.id),
+                "name": "General",
+                "slug": "general",
+                "channel_type": Channel.ChannelType.TEXT,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(Channel.objects.filter(partner=self.partner, slug="general").exists())
+
+    def test_member_with_channels_manage_permission_can_create_partner_channel(self):
+        role = self._create_role("Channel Manager", ["partner.channels.manage"])
+        from apps.partners.models import PartnerRoleAssignment
+
+        PartnerRoleAssignment.objects.create(partner=self.partner, user=self.member, role=role)
+
+        self.client.force_authenticate(self.member)
+        response = self.client.post(
+            "/api/v1/partner-channels/channels/",
+            {
+                "partner": str(self.partner.id),
+                "name": "General",
+                "slug": "general",
+                "channel_type": Channel.ChannelType.TEXT,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
     def test_partner_filtered_channel_list_is_ordered_by_category_and_channel_order(self):
         staff = PartnerServerCategory.objects.create(
             partner=self.partner,

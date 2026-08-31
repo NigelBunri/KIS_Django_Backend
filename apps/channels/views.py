@@ -24,6 +24,7 @@ from apps.partners.services import (
     partner_user_can_manage_channel,
     partner_user_can_send_channel,
     partner_user_can_view_channel,
+    user_has_partner_permission,
 )
 from apps.partners.tiers import require_partner_feature
 
@@ -115,7 +116,10 @@ class ChannelViewSet(viewsets.ModelViewSet):
             if count >= limit:
                 raise ValidationError({"detail": "Channel limit reached for your plan."})
         partner = serializer.validated_data.get("partner")
-        if partner and not partner_user_can_manage(partner, user):
+        if partner and not (
+            partner_user_can_manage(partner, user)
+            or user_has_partner_permission(partner, user, "partner.channels.manage")
+        ):
             raise PermissionDenied("Not allowed to create partner channels.")
         community = serializer.validated_data.get("community")
         if partner and community and community.partner_id and community.partner_id != partner.id:
