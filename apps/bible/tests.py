@@ -24,8 +24,14 @@ from apps.bible.models import (
     BibleReadingPlanEvent,
     BiblePublishStatus,
     BibleCourse,
+    BibleCourseEnrollment,
+    BibleCourseTrack,
+    BibleCourseTrackItem,
+    BibleCourseTrackAssignment,
+    BibleCourseTrackProgress,
     BibleDailyPassage,
     BibleLesson,
+    BibleLessonProgress,
     BibleMeditationPost,
     ReadingHistory,
     BibleTranslation,
@@ -36,7 +42,7 @@ from apps.bible.models import (
 )
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
 from apps.notifications.models import Notification
-from apps.partners.models import Partner
+from apps.partners.models import Partner, PartnerDepartment, PartnerDepartmentMembership
 
 
 class BibleTranslationRegistryTests(TestCase):
@@ -395,3 +401,133 @@ class BibleTranslationRegistryTests(TestCase):
         self.assertEqual(notification.context_data.get("source"), "bible")
         self.assertEqual(notification.context_data.get("badge_source"), "bible")
         self.assertEqual(notification.context_data.get("target_id"), str(event.id))
+
+
+class BibleCourseTrackApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = self._create_user("owner", "+237670020001")
+        self.member = self._create_user("member", "+237670020002")
+        self.other_member = self._create_user("othermember", "+237670020003")
+        self.partner = Partner.objects.create(slug="track-partner", name="Track Partner", owner=self.owner)
+        self.course_a = BibleCourse.objects.create(partner=self.partner, title="Foundations", published=True)
+        self.course_b = BibleCourse.objects.create(partner=self.partner, title="Leadership 101", published=True)
+        self.lesson_a1 = BibleLesson.objects.create(course=self.course_a, title="A1", order=1)
+        self.lesson_a2 = BibleLesson.objects.create(course=self.course_a, title="A2", order=2)
+        self.lesson_b1 = BibleLesson.objects.create(course=self.course_b, title="B1", order=1)
+        self.track = BibleCourseTrack.objects.create(partner=self.partner, title="New Leader Path")
+        BibleCourseTrackItem.objects.create(track=self.track, course=self.course_a, order=1)
+        BibleCourseTrackItem.objects.create(track=self.track, course=self.course_b, order=2)
+
+    def _create_user(self, username: str, phone: str) -> User:
+        return User.objects.create_user(
+            phone=phone,
+            country="CM",
+            password="pass1234",
+            email=f"{username}@example.com",
+            username=username,
+            display_name=username.title(),
+            phone_country_code="+237",
+            phone_number=phone[-9:],
+        )
+
+    def test_non_admin_cannot_assign_track(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/bible/course-tracks/{self.track.id}/assign/",
+            {"user_ids": [str(self.member.id)]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(BibleCourseTrackAssignment.objects.filter(track=self.track, user=self.member).exists())
+
+    def test_owner_can_assign_track_to_specific_users(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/bible/course-tracks/{self.track.id}/assign/",
+            {"user_ids": [str(self.member.id)]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        assignment = BibleCourseTrackAssignment.objects.get(track=self.track, user=self.member)
+        self.assertEqual(assignment.assigned_by, self.owner)
+
+    def test_owner_can_assign_track_to_entire_department(self):
+        department = PartnerDepartment.objects.create(partner=self.partner, name="Youth Ministry")
+        PartnerDepartmentMembership.objects.create(department=department, user=self.member)
+        PartnerDepartmentMembership.objects.create(department=department, user=self.other_member)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/bible/course-tracks/{self.track.id}/assign/",
+            {"department": department.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(BibleCourseTrackAssignment.objects.filter(track=self.track).count(), 2)
+        assignment = BibleCourseTrackAssignment.objects.get(track=self.track, user=self.member)
+        self.assertEqual(assignment.department, department)
+
+    def test_track_progress_is_derived_from_constituent_course_progress(self):
+        BibleCourseTrackAssignment.objects.create(track=self.track, user=self.member, assigned_by=self.owner)
+        BibleCourseEnrollment.objects.create(user=self.member, course=self.course_a)
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            "/api/v1/bible/lesson-progress/",
+            {"lesson": self.lesson_a1.id, "completed": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        progress = BibleCourseTrackProgress.objects.get(track=self.track, user=self.member)
+        self.assertEqual(progress.status, "in_progress")
+        self.assertEqual(progress.progress_percent, 25)
+
+        self.client.post(
+            "/api/v1/bible/lesson-progress/",
+            {"lesson": self.lesson_a2.id, "completed": True},
+            format="json",
+        )
+        BibleCourseEnrollment.objects.create(user=self.member, course=self.course_b)
+        self.client.post(
+            "/api/v1/bible/lesson-progress/",
+            {"lesson": self.lesson_b1.id, "completed": True},
+            format="json",
+        )
+
+        progress.refresh_from_db()
+        self.assertEqual(progress.status, "completed")
+        self.assertEqual(progress.progress_percent, 100)
+        self.assertIsNotNone(progress.completed_at)
+
+    def test_track_roster_visible_to_admin_only(self):
+        BibleCourseTrackAssignment.objects.create(track=self.track, user=self.member, assigned_by=self.owner)
+
+        self.client.force_authenticate(self.member)
+        denied = self.client.get(f"/api/v1/bible/course-tracks/{self.track.id}/roster/")
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.owner)
+        allowed = self.client.get(f"/api/v1/bible/course-tracks/{self.track.id}/roster/")
+        self.assertEqual(allowed.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(allowed.data), 1)
+        self.assertEqual(allowed.data[0]["user_id"], self.member.id)
+
+    def test_mine_filter_returns_only_assigned_tracks(self):
+        other_track = BibleCourseTrack.objects.create(partner=self.partner, title="Unrelated Track")
+        BibleCourseTrackAssignment.objects.create(track=self.track, user=self.member, assigned_by=self.owner)
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get("/api/v1/bible/course-tracks/", {"mine": "1"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data.get("results", response.data) if isinstance(response.data, dict) else response.data
+        track_ids = [row["id"] for row in results]
+        self.assertIn(self.track.id, track_ids)
+        self.assertNotIn(other_track.id, track_ids)

@@ -47,6 +47,8 @@ from .views import (
     BibleLessonCommentViewSet,
     BibleCourseTrackViewSet,
     BibleCourseTrackItemViewSet,
+    BibleCourseTrackAssignmentViewSet,
+    BibleCourseTrackProgressViewSet,
     BibleCoursePrerequisiteViewSet,
     BibleQuizViewSet,
     BibleQuizQuestionViewSet,
@@ -93,6 +95,8 @@ router.register("bible/course-comments", BibleCourseCommentViewSet, basename="bi
 router.register("bible/lesson-comments", BibleLessonCommentViewSet, basename="bible-lesson-comments")
 router.register("bible/course-tracks", BibleCourseTrackViewSet, basename="bible-course-tracks")
 router.register("bible/course-track-items", BibleCourseTrackItemViewSet, basename="bible-course-track-items")
+router.register("bible/course-track-assignments", BibleCourseTrackAssignmentViewSet, basename="bible-course-track-assignments")
+router.register("bible/course-track-progress", BibleCourseTrackProgressViewSet, basename="bible-course-track-progress")
 router.register("bible/course-prerequisites", BibleCoursePrerequisiteViewSet, basename="bible-course-prerequisites")
 router.register("bible/quizzes", BibleQuizViewSet, basename="bible-quizzes")
 router.register("bible/quiz-questions", BibleQuizQuestionViewSet, basename="bible-quiz-questions")

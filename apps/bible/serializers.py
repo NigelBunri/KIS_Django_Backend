@@ -44,6 +44,8 @@ from .models import (
     BibleCourseShare,
     BibleCourseTrack,
     BibleCourseTrackItem,
+    BibleCourseTrackAssignment,
+    BibleCourseTrackProgress,
     BibleCoursePrerequisite,
     BibleQuiz,
     BibleQuizQuestion,
@@ -518,17 +520,124 @@ class BibleCourseModuleSerializer(serializers.ModelSerializer):
 
 
 class BibleCourseTrackItemSerializer(serializers.ModelSerializer):
+    course_title = serializers.CharField(source="course.title", read_only=True)
+    course_cover_image = serializers.CharField(source="course.cover_image", read_only=True)
+    course_duration_minutes = serializers.IntegerField(source="course.duration_minutes", read_only=True)
+    course_progress_percent = serializers.SerializerMethodField()
+    course_enrollment_status = serializers.SerializerMethodField()
+
     class Meta:
         model = BibleCourseTrackItem
-        fields = ["id", "track", "course", "order"]
+        fields = [
+            "id",
+            "track",
+            "course",
+            "order",
+            "course_title",
+            "course_cover_image",
+            "course_duration_minutes",
+            "course_progress_percent",
+            "course_enrollment_status",
+        ]
+
+    def _viewer_enrollment(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or user.is_anonymous:
+            return None
+        return BibleCourseEnrollment.objects.filter(user=user, course_id=obj.course_id).first()
+
+    def get_course_progress_percent(self, obj):
+        enrollment = self._viewer_enrollment(obj)
+        return enrollment.progress_percent if enrollment else 0
+
+    def get_course_enrollment_status(self, obj):
+        enrollment = self._viewer_enrollment(obj)
+        return enrollment.status if enrollment else None
+
+
+class BibleCourseTrackAssignmentSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source="user.display_name", read_only=True)
+    assigned_by_name = serializers.CharField(source="assigned_by.display_name", read_only=True, default="")
+    department_name = serializers.CharField(source="department.name", read_only=True, allow_null=True, default="")
+
+    class Meta:
+        model = BibleCourseTrackAssignment
+        fields = [
+            "id",
+            "track",
+            "user",
+            "user_name",
+            "department",
+            "department_name",
+            "assigned_by",
+            "assigned_by_name",
+            "assigned_at",
+        ]
+        read_only_fields = ["assigned_by", "assigned_at"]
+
+
+class BibleCourseTrackProgressSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source="user.display_name", read_only=True)
+
+    class Meta:
+        model = BibleCourseTrackProgress
+        fields = ["id", "track", "user", "user_name", "status", "progress_percent", "completed_at", "updated_at"]
+        read_only_fields = fields
 
 
 class BibleCourseTrackSerializer(serializers.ModelSerializer):
     items = BibleCourseTrackItemSerializer(many=True, read_only=True)
+    item_count = serializers.SerializerMethodField()
+    assignment_count = serializers.SerializerMethodField()
+    is_assigned = serializers.SerializerMethodField()
+    my_status = serializers.SerializerMethodField()
+    my_progress_percent = serializers.SerializerMethodField()
 
     class Meta:
         model = BibleCourseTrack
-        fields = ["id", "partner", "title", "description", "is_published", "created_at", "items"]
+        fields = [
+            "id",
+            "partner",
+            "title",
+            "description",
+            "is_published",
+            "created_at",
+            "items",
+            "item_count",
+            "assignment_count",
+            "is_assigned",
+            "my_status",
+            "my_progress_percent",
+        ]
+
+    def get_item_count(self, obj):
+        return obj.items.count()
+
+    def get_assignment_count(self, obj):
+        return obj.assignments.count()
+
+    def _my_progress(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or user.is_anonymous:
+            return None
+        return obj.progress_records.filter(user=user).first()
+
+    def get_is_assigned(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or user.is_anonymous:
+            return False
+        return obj.assignments.filter(user=user).exists()
+
+    def get_my_status(self, obj):
+        progress = self._my_progress(obj)
+        return progress.status if progress else "not_started"
+
+    def get_my_progress_percent(self, obj):
+        progress = self._my_progress(obj)
+        return progress.progress_percent if progress else 0
 
 
 class BibleCoursePrerequisiteSerializer(serializers.ModelSerializer):

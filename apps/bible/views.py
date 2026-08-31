@@ -59,6 +59,8 @@ from .models import (
     BibleCourseShare,
     BibleCourseTrack,
     BibleCourseTrackItem,
+    BibleCourseTrackAssignment,
+    BibleCourseTrackProgress,
     BibleCoursePrerequisite,
     BibleQuiz,
     BibleQuizQuestion,
@@ -120,6 +122,8 @@ from .serializers import (
     BibleCourseShareSerializer,
     BibleCourseTrackSerializer,
     BibleCourseTrackItemSerializer,
+    BibleCourseTrackAssignmentSerializer,
+    BibleCourseTrackProgressSerializer,
     BibleCoursePrerequisiteSerializer,
     BibleQuizSerializer,
     BibleQuizQuestionSerializer,
@@ -146,7 +150,13 @@ from .certificates import build_certificate_pdf, ensure_certificate_file, build_
 from .importers import scan_bible_translation_registry
 from .reader import PassageReferenceError, parse_passage_reference
 from .local_reader import build_local_kjv_reader_payload
-from apps.partners.models import Partner, PartnerMembership, PartnerMembershipStatus, PartnerOrganizationProfile
+from apps.partners.models import (
+    Partner,
+    PartnerMembership,
+    PartnerMembershipStatus,
+    PartnerOrganizationProfile,
+    PartnerDepartmentMembership,
+)
 from apps.partners.seed import KCAN_PARTNER_NAME, KCAN_PARTNER_SLUG, LEGACY_DEFAULT_PARTNER_SLUGS
 from apps.chat.models import ConversationMember, BaseConversationRole
 from apps.billing.services import record_ledger, get_credit_account
@@ -1414,6 +1424,8 @@ class BibleCourseTrackViewSet(viewsets.ModelViewSet):
         qs = BibleCourseTrack.objects.all()
         if partner_id:
             qs = qs.filter(partner_id=partner_id)
+        if self.request.query_params.get("mine") == "1":
+            qs = qs.filter(assignments__user=self.request.user).distinct()
         return qs.order_by("-created_at")
 
     def perform_create(self, serializer):
@@ -1422,6 +1434,67 @@ class BibleCourseTrackViewSet(viewsets.ModelViewSet):
         if partner and not can_manage_partner_courses(self.request.user, partner):
             raise PermissionDenied("You do not have permission to manage this track.")
         serializer.save(partner=partner)
+
+    @action(detail=True, methods=["post"], url_path="assign")
+    def assign(self, request, pk=None):
+        track = self.get_object()
+        if track.partner and not can_manage_partner_courses(request.user, track.partner):
+            raise PermissionDenied("You do not have permission to manage this track.")
+        user_ids = {str(uid) for uid in (request.data.get("user_ids") or [])}
+        department_id = request.data.get("department")
+        if department_id:
+            dept_user_ids = PartnerDepartmentMembership.objects.filter(
+                department_id=department_id
+            ).values_list("user_id", flat=True)
+            user_ids.update(str(uid) for uid in dept_user_ids)
+        if not user_ids:
+            return Response({"detail": "No users specified."}, status=status.HTTP_400_BAD_REQUEST)
+        assignments = []
+        for uid in user_ids:
+            assignment, _ = BibleCourseTrackAssignment.objects.get_or_create(
+                track=track,
+                user_id=uid,
+                defaults={"assigned_by": request.user, "department_id": department_id or None},
+            )
+            assignments.append(assignment)
+        serializer = BibleCourseTrackAssignmentSerializer(assignments, many=True)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="unassign")
+    def unassign(self, request, pk=None):
+        track = self.get_object()
+        if track.partner and not can_manage_partner_courses(request.user, track.partner):
+            raise PermissionDenied("You do not have permission to manage this track.")
+        user_id = request.data.get("user_id")
+        if not user_id:
+            return Response({"detail": "user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        BibleCourseTrackAssignment.objects.filter(track=track, user_id=user_id).delete()
+        BibleCourseTrackProgress.objects.filter(track=track, user_id=user_id).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["get"], url_path="roster")
+    def roster(self, request, pk=None):
+        track = self.get_object()
+        if track.partner and not can_manage_partner_courses(request.user, track.partner):
+            raise PermissionDenied("You do not have permission to view this track's roster.")
+        assignments = track.assignments.select_related("user", "department").all()
+        progress_by_user = {p.user_id: p for p in track.progress_records.all()}
+        payload = []
+        for assignment in assignments:
+            record = progress_by_user.get(assignment.user_id)
+            payload.append(
+                {
+                    "user_id": assignment.user_id,
+                    "user_name": assignment.user.display_name or assignment.user.email,
+                    "department_id": assignment.department_id,
+                    "department_name": assignment.department.name if assignment.department else None,
+                    "assigned_at": assignment.assigned_at,
+                    "status": record.status if record else "not_started",
+                    "progress_percent": record.progress_percent if record else 0,
+                    "completed_at": record.completed_at if record else None,
+                }
+            )
+        return Response(payload, status=status.HTTP_200_OK)
 
 
 class BibleCourseTrackItemViewSet(viewsets.ModelViewSet):
@@ -1440,6 +1513,41 @@ class BibleCourseTrackItemViewSet(viewsets.ModelViewSet):
         if track and track.partner and not can_manage_partner_courses(self.request.user, track.partner):
             raise PermissionDenied("You do not have permission to manage this track.")
         serializer.save()
+
+
+class BibleCourseTrackAssignmentViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    serializer_class = BibleCourseTrackAssignmentSerializer
+
+    def get_queryset(self):
+        track_id = self.request.query_params.get("track")
+        qs = BibleCourseTrackAssignment.objects.select_related("user", "department")
+        if track_id:
+            qs = qs.filter(track_id=track_id)
+        else:
+            qs = qs.filter(user=self.request.user)
+        return qs
+
+    def perform_create(self, serializer):
+        track = serializer.validated_data.get("track")
+        if track and track.partner and not can_manage_partner_courses(self.request.user, track.partner):
+            raise PermissionDenied("You do not have permission to manage this track.")
+        serializer.save(assigned_by=self.request.user)
+
+
+class BibleCourseTrackProgressViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated]
+    serializer_class = BibleCourseTrackProgressSerializer
+
+    def get_queryset(self):
+        track_id = self.request.query_params.get("track")
+        qs = BibleCourseTrackProgress.objects.select_related("user")
+        if track_id:
+            track = BibleCourseTrack.objects.filter(id=track_id).first()
+            if track and track.partner and can_manage_partner_courses(self.request.user, track.partner):
+                return qs.filter(track_id=track_id)
+            return qs.filter(track_id=track_id, user=self.request.user)
+        return qs.filter(user=self.request.user)
 
 
 class BibleCoursePrerequisiteViewSet(viewsets.ModelViewSet):
@@ -1972,9 +2080,8 @@ class BibleCourseEnrollmentViewSet(viewsets.ModelViewSet):
         enrollment = self.get_object()
         enrollment.status = "completed"
         enrollment.progress_percent = 100
-        if not enrollment.completed_at:
-            enrollment.completed_at = timezone.now()
-        enrollment.save(update_fields=["status", "progress_percent", "completed_at"])
+        enrollment.save(update_fields=["status", "progress_percent"])
+        _recompute_track_progress(request.user, enrollment.course)
         return Response(BibleCourseEnrollmentSerializer(enrollment).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="purchase")
@@ -2111,6 +2218,39 @@ def _update_course_progress(course: BibleCourse, user):
                     share_token=secrets.token_hex(24),
                 )
         enrollment.save(update_fields=["progress_percent", "status"])
+    _recompute_track_progress(user, course)
+
+
+def _recompute_track_progress(user, course: BibleCourse):
+    tracks = BibleCourseTrack.objects.filter(items__course=course).distinct()
+    for track in tracks:
+        items = list(track.items.all())
+        if not items:
+            continue
+        total_percent = 0
+        completed_items = 0
+        for item in items:
+            enrollment = BibleCourseEnrollment.objects.filter(user=user, course_id=item.course_id).first()
+            item_percent = enrollment.progress_percent if enrollment else 0
+            total_percent += item_percent
+            if enrollment and enrollment.status == "completed":
+                completed_items += 1
+        avg_percent = int(total_percent / len(items))
+        if completed_items == len(items):
+            track_status = "completed"
+        elif total_percent > 0:
+            track_status = "in_progress"
+        else:
+            track_status = "not_started"
+        progress, _ = BibleCourseTrackProgress.objects.get_or_create(track=track, user=user)
+        progress.progress_percent = avg_percent
+        progress.status = track_status
+        if track_status == "completed":
+            if not progress.completed_at:
+                progress.completed_at = timezone.now()
+        else:
+            progress.completed_at = None
+        progress.save(update_fields=["progress_percent", "status", "completed_at", "updated_at"])
 
 
 class BibleLessonReactionView(APIView):

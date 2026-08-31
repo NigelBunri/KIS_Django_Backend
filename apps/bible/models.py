@@ -690,6 +690,40 @@ class BibleCourseTrackItem(models.Model):
         unique_together = ("track", "order")
 
 
+class BibleCourseTrackAssignment(models.Model):
+    track = models.ForeignKey(BibleCourseTrack, on_delete=models.CASCADE, related_name="assignments")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="course_track_assignments")
+    department = models.ForeignKey(
+        "partners.PartnerDepartment", on_delete=models.SET_NULL, null=True, blank=True, related_name="course_track_assignments"
+    )
+    assigned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("track", "user")
+        ordering = ["-assigned_at"]
+
+
+class BibleCourseTrackProgress(models.Model):
+    STATUS_CHOICES = (
+        ("not_started", "Not started"),
+        ("in_progress", "In progress"),
+        ("completed", "Completed"),
+    )
+
+    track = models.ForeignKey(BibleCourseTrack, on_delete=models.CASCADE, related_name="progress_records")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="course_track_progress")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="not_started")
+    progress_percent = models.PositiveIntegerField(default=0)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("track", "user")
+
+
 class BibleCoursePrerequisite(models.Model):
     course = models.ForeignKey(BibleCourse, on_delete=models.CASCADE, related_name="prerequisites")
     required_course = models.ForeignKey(BibleCourse, on_delete=models.CASCADE, related_name="required_for")

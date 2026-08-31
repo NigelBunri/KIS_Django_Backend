@@ -36,6 +36,10 @@ from .models import (
     BibleLesson,
     BibleCourseEnrollment,
     BibleLessonProgress,
+    BibleCourseTrack,
+    BibleCourseTrackItem,
+    BibleCourseTrackAssignment,
+    BibleCourseTrackProgress,
 )
 
 admin.site.register(BibleTranslation)
@@ -73,3 +77,7 @@ admin.site.register(BibleCourseModule)
 admin.site.register(BibleLesson)
 admin.site.register(BibleCourseEnrollment)
 admin.site.register(BibleLessonProgress)
+admin.site.register(BibleCourseTrack)
+admin.site.register(BibleCourseTrackItem)
+admin.site.register(BibleCourseTrackAssignment)
+admin.site.register(BibleCourseTrackProgress)
