@@ -12,6 +12,8 @@ class PartnersConfig(AppConfig):
         from .seed import ensure_kis_partner
         from . import signals  # noqa: F401
         from .media_hooks import register as register_media_hooks
+        from .scheduler import register_scheduled_post_sweep
 
         ensure_kis_partner()
         register_media_hooks()
+        register_scheduled_post_sweep()

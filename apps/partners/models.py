@@ -491,6 +491,11 @@ class PartnerFeatureFlag(models.Model):
         ]
 
 
+class PartnerPostStatus(models.TextChoices):
+    PUBLISHED = "published", "Published"
+    SCHEDULED = "scheduled", "Scheduled"
+
+
 class PartnerPost(models.Model):
     """
     Lightweight feed posts for a Partner's general feed page.
@@ -525,6 +530,8 @@ class PartnerPost(models.Model):
     event = models.JSONField(default=dict, blank=True)
     link = models.URLField(blank=True)
     is_broadcast = models.BooleanField(default=False)
+    status = models.CharField(max_length=16, choices=PartnerPostStatus.choices, default=PartnerPostStatus.PUBLISHED)
+    scheduled_for = models.DateTimeField(null=True, blank=True, db_index=True)
     comment_conversation = models.ForeignKey(
         Conversation,
         null=True,
@@ -540,6 +547,7 @@ class PartnerPost(models.Model):
         db_table = "partner_post"
         indexes = [
             models.Index(fields=["partner", "created_at"]),
+            models.Index(fields=["status", "scheduled_for"]),
         ]
 
 

@@ -18,6 +18,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from apps.partners.models import (
     Partner,
     PartnerPost,
+    PartnerPostStatus,
     PartnerPostComment,
     PartnerPostReaction,
     PartnerFeatureFlag,
@@ -4343,21 +4344,33 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
         if membership.timed_out_until and membership.timed_out_until > now:
             raise PermissionDenied("You are temporarily timed out in this partner organization.")
 
+    def _user_can_manage(self, partner: Partner, user) -> bool:
+        role = self._member_role(partner, user)
+        return partner.owner_id == user.id or role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN)
+
     def get_queryset(self):
         user = self.request.user
         blocked_ids = UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
+        # Scheduled announcements never appear in the feed except to their
+        # own author — the Broadcast Center's queue view (a dedicated
+        # action below) is where admins review/publish/cancel them.
+        visible_status = models.Q(status=PartnerPostStatus.PUBLISHED) | models.Q(
+            status=PartnerPostStatus.SCHEDULED, author=user,
+        )
         partner_id = self.request.query_params.get("partner")
         if partner_id:
             partner = Partner.objects.filter(id=partner_id).first()
             if not partner or not self._user_can_access_partner(partner, user):
                 return PartnerPost.objects.none()
-            return (
+            qs = (
                 PartnerPost.objects
                 .select_related("partner", "author")
                 .filter(partner=partner, is_deleted=False)
                 .exclude(author_id__in=blocked_ids)
-                .order_by("-created_at")
             )
+            if not self._user_can_manage(partner, user):
+                qs = qs.filter(visible_status)
+            return qs.order_by("-created_at")
 
         accessible_partners = Partner.objects.filter(
             models.Q(owner=user)
@@ -4377,6 +4390,7 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
             PartnerPost.objects
             .select_related("partner", "author")
             .filter(partner__in=accessible_partners, is_deleted=False)
+            .filter(visible_status)
             .exclude(author_id__in=blocked_ids)
             .order_by("-created_at")
         )
@@ -4432,6 +4446,8 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
         if not partner or not self._user_can_access_partner(partner, self.request.user):
             raise PermissionDenied("Not allowed to post to this partner.")
         self._ensure_can_engage(partner, self.request.user)
+        if self.request.data.get("scheduled_for") and not self._user_can_manage(partner, self.request.user):
+            raise PermissionDenied("Only owners/admins can schedule an announcement.")
         dlp = evaluate_partner_dlp(partner, self.request.data.get("text", "") or "")
         if dlp["blocked"]:
             raise ValidationError({"detail": "Message blocked by DLP policy."})
@@ -4613,6 +4629,56 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_207_MULTI_STATUS,
             )
         return Response({"detail": "Post broadcasted.", "is_broadcast": True, "published": True}, status=status.HTTP_200_OK)
+
+    # ── Broadcast Center & Announcement Scheduler ───────────────────────
+    @action(detail=False, methods=["get"], url_path="queue")
+    def queue(self, request):
+        partner_id = request.query_params.get("partner")
+        if not partner_id:
+            raise ValidationError({"partner": "This field is required."})
+        partner = Partner.objects.filter(id=partner_id).first()
+        if not partner or not self._user_can_manage(partner, request.user):
+            raise PermissionDenied("Not allowed to view the announcement queue.")
+        qs = PartnerPost.objects.filter(
+            partner=partner, status=PartnerPostStatus.SCHEDULED, is_deleted=False,
+        ).select_related("author").order_by("scheduled_for")
+        return Response(PartnerPostSerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="publish-now")
+    def publish_now(self, request, pk=None):
+        post = PartnerPost.objects.filter(id=pk, is_deleted=False).select_related("partner").first()
+        if not post:
+            return Response({"detail": "Post not found."}, status=status.HTTP_404_NOT_FOUND)
+        if not self._user_can_manage(post.partner, request.user):
+            raise PermissionDenied("Not allowed to publish this announcement.")
+        if post.status != PartnerPostStatus.SCHEDULED:
+            return Response({"detail": "Post is not scheduled."}, status=status.HTTP_400_BAD_REQUEST)
+        post.status = PartnerPostStatus.PUBLISHED
+        post.scheduled_for = None
+        post.created_at = timezone.now()
+        post.save(update_fields=["status", "scheduled_for", "created_at"])
+        log_partner_audit(
+            partner=post.partner, actor=request.user, action="partner.announcement.publish_now",
+            target_type="partner_post", target_id=str(post.id), request=request,
+        )
+        return Response(PartnerPostSerializer(post, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="cancel-scheduled")
+    def cancel_scheduled(self, request, pk=None):
+        post = PartnerPost.objects.filter(id=pk, is_deleted=False).select_related("partner").first()
+        if not post:
+            return Response({"detail": "Post not found."}, status=status.HTTP_404_NOT_FOUND)
+        is_author = post.author_id == request.user.id
+        if not (is_author or self._user_can_manage(post.partner, request.user)):
+            raise PermissionDenied("Not allowed to cancel this announcement.")
+        if post.status != PartnerPostStatus.SCHEDULED:
+            return Response({"detail": "Post is not scheduled."}, status=status.HTTP_400_BAD_REQUEST)
+        log_partner_audit(
+            partner=post.partner, actor=request.user, action="partner.announcement.cancel",
+            target_type="partner_post", target_id=str(post.id), request=request,
+        )
+        post.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class UserAppShortcutViewSet(viewsets.ViewSet):

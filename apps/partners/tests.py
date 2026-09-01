@@ -1968,3 +1968,132 @@ class PartnerCalendarEventApiTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(PartnerCalendarEvent.objects.filter(id=event.id).exists())
+
+
+class PartnerAnnouncementSchedulingApiTests(TestCase):
+    """Broadcast Center & Announcement Scheduler."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670009201", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670009202", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Broadcast Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        ConversationMember.objects.create(conversation=conversation, user=self.member, base_role=BaseConversationRole.MEMBER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Broadcast Partner", slug="broadcast-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_owner_can_schedule_an_announcement(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            "/api/v1/partners/posts/",
+            {
+                "partner": str(self.partner.id),
+                "text_plain": "We're closed next week",
+                "scheduled_for": "2026-12-01T09:00:00Z",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        post = PartnerPost.objects.get(id=response.data["id"])
+        self.assertEqual(post.status, "scheduled")
+        self.assertIsNotNone(post.scheduled_for)
+
+    def test_plain_member_cannot_schedule_an_announcement(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            "/api/v1/partners/posts/",
+            {"partner": str(self.partner.id), "text_plain": "X", "scheduled_for": "2026-12-01T09:00:00Z"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_scheduling_in_the_past_is_rejected(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            "/api/v1/partners/posts/",
+            {"partner": str(self.partner.id), "text_plain": "X", "scheduled_for": "2020-01-01T09:00:00Z"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_scheduled_post_hidden_from_feed_and_other_members(self):
+        post = PartnerPost.objects.create(
+            partner=self.partner, author=self.owner, text_plain="Hidden", text_preview="Hidden",
+            status="scheduled", scheduled_for="2026-12-01T09:00:00Z",
+        )
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get(f"/api/v1/partners/posts/?partner={self.partner.id}")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        post_ids = [row["id"] for row in response.data.get("results", response.data)]
+        self.assertNotIn(str(post.id), post_ids)
+
+    def test_owner_can_see_queue_but_member_cannot(self):
+        PartnerPost.objects.create(
+            partner=self.partner, author=self.owner, text_plain="Queued", text_preview="Queued",
+            status="scheduled", scheduled_for="2026-12-01T09:00:00Z",
+        )
+        self.client.force_authenticate(self.member)
+        denied = self.client.get(f"/api/v1/partners/posts/queue/?partner={self.partner.id}")
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.owner)
+        allowed = self.client.get(f"/api/v1/partners/posts/queue/?partner={self.partner.id}")
+        self.assertEqual(allowed.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(allowed.data), 1)
+
+    def test_owner_can_publish_now(self):
+        post = PartnerPost.objects.create(
+            partner=self.partner, author=self.owner, text_plain="Queued", text_preview="Queued",
+            status="scheduled", scheduled_for="2026-12-01T09:00:00Z",
+        )
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(f"/api/v1/partners/posts/{post.id}/publish-now/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        post.refresh_from_db()
+        self.assertEqual(post.status, "published")
+        self.assertIsNone(post.scheduled_for)
+
+    def test_author_can_cancel_own_scheduled_post(self):
+        post = PartnerPost.objects.create(
+            partner=self.partner, author=self.owner, text_plain="Queued", text_preview="Queued",
+            status="scheduled", scheduled_for="2026-12-01T09:00:00Z",
+        )
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(f"/api/v1/partners/posts/{post.id}/cancel-scheduled/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerPost.objects.filter(id=post.id).exists())
+
+    def test_sweep_task_publishes_due_posts(self):
+        from apps.partners.tasks import publish_due_scheduled_posts
+
+        due_post = PartnerPost.objects.create(
+            partner=self.partner, author=self.owner, text_plain="Due", text_preview="Due",
+            status="scheduled", scheduled_for="2020-01-01T09:00:00Z",
+        )
+        future_post = PartnerPost.objects.create(
+            partner=self.partner, author=self.owner, text_plain="Future", text_preview="Future",
+            status="scheduled", scheduled_for="2026-12-01T09:00:00Z",
+        )
+
+        result = publish_due_scheduled_posts()
+
+        self.assertEqual(result["published"], 1)
+        due_post.refresh_from_db()
+        future_post.refresh_from_db()
+        self.assertEqual(due_post.status, "published")
+        self.assertEqual(future_post.status, "scheduled")

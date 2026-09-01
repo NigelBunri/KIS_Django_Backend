@@ -1,5 +1,6 @@
 # apps/partners/serializers.py
 from django.db import models
+from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import serializers
 from apps.media.safety import validate_attachment_metadata_for_safe_messaging
@@ -7,6 +8,7 @@ from apps.media.safety import validate_attachment_metadata_for_safe_messaging
 from apps.partners.models import (
     Partner,
     PartnerPost,
+    PartnerPostStatus,
     PartnerPostComment,
     PartnerPostReaction,
     PartnerJoinConfig,
@@ -464,6 +466,8 @@ class PartnerPostSerializer(serializers.ModelSerializer):
             "event",
             "link",
             "is_broadcast",
+            "status",
+            "scheduled_for",
             "comment_conversation_id",
             "is_deleted",
             "created_at",
@@ -474,6 +478,8 @@ class PartnerPostSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "is_broadcast",
+            "status",
+            "scheduled_for",
             "is_deleted",
             "comment_conversation_id",
             "created_at",
@@ -520,6 +526,7 @@ class PartnerPostSerializer(serializers.ModelSerializer):
 
 class PartnerPostCreateSerializer(serializers.ModelSerializer):
     text = serializers.JSONField(required=False)
+    scheduled_for = serializers.DateTimeField(required=False, allow_null=True)
 
     class Meta:
         model = PartnerPost
@@ -531,17 +538,25 @@ class PartnerPostCreateSerializer(serializers.ModelSerializer):
             "poll",
             "event",
             "link",
+            "scheduled_for",
         ]
 
     def validate(self, attrs):
         attrs = prepare_partner_rich_text_attrs(attrs)
         validate_attachment_metadata_for_safe_messaging(attrs.get("attachments"))
+        scheduled_for = attrs.get("scheduled_for")
+        if scheduled_for and scheduled_for <= timezone.now():
+            raise serializers.ValidationError({"scheduled_for": "Scheduled time must be in the future."})
         return super().validate(attrs)
 
     def create(self, validated_data):
         request = self.context["request"]
         user = request.user
-        return PartnerPost.objects.create(author=user, **validated_data)
+        scheduled_for = validated_data.pop("scheduled_for", None)
+        post_status = PartnerPostStatus.SCHEDULED if scheduled_for else PartnerPostStatus.PUBLISHED
+        return PartnerPost.objects.create(
+            author=user, status=post_status, scheduled_for=scheduled_for, **validated_data,
+        )
 
 
 class PartnerPostCommentSerializer(serializers.ModelSerializer):
