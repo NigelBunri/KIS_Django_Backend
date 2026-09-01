@@ -34,6 +34,8 @@ from admin_control.views import (
     AdminIncidentListView,
     AdminIncidentDetailView,
     AdminIncidentSummaryView,
+    # Child safety
+    AdminUnsupervisedMinorsListView,
     # Partner oversight
     AdminPartnerListView,
     AdminPartnerDetailView,
@@ -84,6 +86,13 @@ urlpatterns = [
     path("incidents/", AdminIncidentListView.as_view(), name="admin-incidents-list"),
     path("incidents/summary/", AdminIncidentSummaryView.as_view(), name="admin-incidents-summary"),
     path("incidents/<str:incident_id>/", AdminIncidentDetailView.as_view(), name="admin-incident-detail"),
+
+    # ── Child safety ──────────────────────────────────────────────────────
+    path(
+        "child-safety/unsupervised-minors/",
+        AdminUnsupervisedMinorsListView.as_view(),
+        name="admin-child-safety-unsupervised-minors",
+    ),
 
     # ── Partner oversight ─────────────────────────────────────────────────
     path("partners/", AdminPartnerListView.as_view(), name="admin-partners-list"),

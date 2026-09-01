@@ -34,6 +34,7 @@ from .incidents import (
     AdminIncidentDetailView,
     AdminIncidentSummaryView,
 )
+from .child_safety import AdminUnsupervisedMinorsListView
 from .partner_oversight import (
     AdminPartnerListView,
     AdminPartnerDetailView,
@@ -76,6 +77,8 @@ __all__ = [
     "AdminIncidentListView",
     "AdminIncidentDetailView",
     "AdminIncidentSummaryView",
+    # Child safety
+    "AdminUnsupervisedMinorsListView",
     # Partner oversight
     "AdminPartnerListView",
     "AdminPartnerDetailView",
