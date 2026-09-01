@@ -20142,7 +20142,13 @@ class ChannelContentRecommendationsView(APIView):
             .annotate(
                 avg_watch_pct=Avg("watch_events__watch_percent"),
                 reaction_count=Count("reactions", distinct=True),
-                comment_count=Count("channel_comments", distinct=True),
+                # ChannelContentComment.content's related_name is "comments",
+                # not "channel_comments" - this annotation raised FieldError
+                # on every single request (caught client-side by the RN
+                # RecommendationsSection's silent .catch(), which is why this
+                # endpoint's brokenness went unnoticed rather than surfacing
+                # as a visible bug report).
+                comment_count=Count("comments", distinct=True),
                 is_subscribed=Case(
                     When(channel_id__in=subscribed_channel_ids, then=Value(1)),
                     default=Value(0),
@@ -20155,26 +20161,59 @@ class ChannelContentRecommendationsView(APIView):
         import math
         candidates = list(base_qs.order_by("-published_at")[:200])
 
-        def score(item):
+        def score_components(item):
             sub_bonus = 3 if item.is_subscribed else 0
             watch_score = float(item.avg_watch_pct or 0) / 33.0
             engagement = int(item.reaction_count or 0) + int(item.comment_count or 0)
             engagement_score = math.log(engagement + 1, 2)
             age_days = max(0, (timezone.now() - item.published_at).days) if item.published_at else 90
             recency_score = max(0, 3 - age_days / 30)  # 3pts if today, 0 if 90d old
-            return sub_bonus + watch_score + engagement_score + recency_score
+            return {
+                "sub_bonus": sub_bonus,
+                "watch_score": watch_score,
+                "engagement": engagement,
+                "engagement_score": engagement_score,
+                "recency_score": recency_score,
+                "age_days": age_days,
+                "total": sub_bonus + watch_score + engagement_score + recency_score,
+            }
 
-        candidates.sort(key=score, reverse=True)
-        subscribed_contents = [c for c in candidates if c.is_subscribed][:20]
-        discovery_contents = [c for c in candidates if not c.is_subscribed][:15]
+        # "Why am I seeing this?" - a plain-language explanation of whichever
+        # real signal actually dominated this item's ranking, computed from
+        # the exact same components score_components() already produces for
+        # sorting (not a separate, potentially-inconsistent explanation).
+        # Previously this scoring was entirely opaque: the score existed
+        # only to sort candidates, then was discarded before the response
+        # was built - a user had no way to know why one video ranked above
+        # another, or that engagement/watch-time signals were involved at all.
+        def recommendation_reason(item, components):
+            if components["sub_bonus"] > 0:
+                return "From a channel you're subscribed to"
+            if components["watch_score"] >= components["engagement_score"] and components["watch_score"] >= components["recency_score"] and components["watch_score"] > 0.5:
+                return "Similar to content you've watched closely"
+            if components["engagement_score"] >= components["recency_score"] and components["engagement"] > 0:
+                return f"Popular right now ({components['engagement']} reaction{'s' if components['engagement'] != 1 else ''}/comments)"
+            if components["age_days"] <= 2:
+                return "Recently published"
+            return "Suggested based on general popularity"
+
+        scored = [(item, score_components(item)) for item in candidates]
+        scored.sort(key=lambda pair: pair[1]["total"], reverse=True)
+        subscribed_pairs = [pair for pair in scored if pair[0].is_subscribed][:20]
+        discovery_pairs = [pair for pair in scored if not pair[0].is_subscribed][:15]
 
         from apps.broadcasts.serializers import ChannelContentListSerializer as _Ser
-        all_items = subscribed_contents + discovery_contents
+        all_pairs = subscribed_pairs + discovery_pairs
+        all_items = [item for item, _components in all_pairs]
+        serialized = _Ser(all_items, many=True, context={"request": request}).data
+        for row, (item, components) in zip(serialized, all_pairs):
+            row["recommendation_reason"] = recommendation_reason(item, components)
+
         return Response({
-            "results": _Ser(all_items, many=True, context={"request": request}).data,
+            "results": serialized,
             "source": "weighted_hybrid",
-            "subscribed_count": len(subscribed_contents),
-            "discovery_count": len(discovery_contents),
+            "subscribed_count": len(subscribed_pairs),
+            "discovery_count": len(discovery_pairs),
         })
 
 
