@@ -84,6 +84,7 @@ from apps.partners.models import (
     PartnerVolunteerShift,
     PartnerVolunteerSignup,
     PartnerVolunteerSignupStatus,
+    PartnerDonation,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -139,6 +140,7 @@ from apps.partners.serializers import (
     PartnerBudgetExpenseSerializer,
     PartnerVolunteerShiftSerializer,
     PartnerVolunteerSignupSerializer,
+    PartnerDonationSerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
     PartnerWebhookSerializer,
@@ -1935,6 +1937,87 @@ class PartnerViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Shift not found."}, status=status.HTTP_404_NOT_FOUND)
         signups = shift.signups.exclude(status=PartnerVolunteerSignupStatus.CANCELLED).select_related("volunteer")
         return Response(PartnerVolunteerSignupSerializer(signups, many=True).data, status=status.HTTP_200_OK)
+
+    # ── Donation Tracking ────────────────────────────────────────────────
+    @action(detail=True, methods=["get", "post"], url_path="donations")
+    def donations(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.donations.manage")
+        if request.method == "POST":
+            serializer = PartnerDonationSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            donation = serializer.save(partner=partner, recorded_by=request.user)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.donation.create",
+                target_type="partner_donation", target_id=str(donation.id),
+                metadata={"amount": str(donation.amount), "receipt_number": donation.receipt_number}, request=request,
+            )
+            return Response(PartnerDonationSerializer(donation).data, status=status.HTTP_201_CREATED)
+        qs = PartnerDonation.objects.filter(partner=partner).select_related("donor", "recorded_by")
+        fund = request.query_params.get("fund")
+        if fund:
+            qs = qs.filter(fund=fund)
+        date_from = request.query_params.get("from")
+        if date_from:
+            qs = qs.filter(received_at__gte=date_from)
+        date_to = request.query_params.get("to")
+        if date_to:
+            qs = qs.filter(received_at__lte=date_to)
+        return Response(PartnerDonationSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"donations/(?P<donation_id>[^/.]+)")
+    def donation_detail(self, request, pk=None, donation_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.donations.manage")
+        donation = PartnerDonation.objects.filter(id=donation_id, partner=partner).first()
+        if not donation:
+            return Response({"detail": "Donation not found."}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == "DELETE":
+            donation.delete()
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.donation.delete",
+                target_type="partner_donation", target_id=str(donation_id), request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = PartnerDonationSerializer(donation, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.donation.update",
+            target_type="partner_donation", target_id=str(donation.id),
+            metadata={"fields": list((request.data or {}).keys())}, request=request,
+        )
+        return Response(PartnerDonationSerializer(donation).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="donations-summary")
+    def donations_summary(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.donations.manage")
+        from django.db.models import Sum, Count
+
+        qs = PartnerDonation.objects.filter(partner=partner)
+        date_from = request.query_params.get("from")
+        if date_from:
+            qs = qs.filter(received_at__gte=date_from)
+        date_to = request.query_params.get("to")
+        if date_to:
+            qs = qs.filter(received_at__lte=date_to)
+        totals = qs.aggregate(total_amount=Sum("amount"), donation_count=Count("id"))
+        by_fund = list(
+            qs.exclude(fund="").values("fund").annotate(total=Sum("amount"), count=Count("id")).order_by("-total"),
+        )
+        by_method = list(
+            qs.values("method").annotate(total=Sum("amount"), count=Count("id")).order_by("-total"),
+        )
+        return Response(
+            {
+                "total_amount": totals["total_amount"] or 0,
+                "donation_count": totals["donation_count"] or 0,
+                "by_fund": by_fund,
+                "by_method": by_method,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):

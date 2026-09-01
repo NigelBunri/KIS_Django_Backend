@@ -2673,3 +2673,101 @@ class PartnerVolunteerRosterApiTests(TestCase):
         self.assertEqual(allowed.status_code, status.HTTP_200_OK)
         self.assertEqual(len(allowed.data), 1)
         self.assertEqual(allowed.data[0]["volunteer"], self.member.id)
+
+
+class PartnerDonationApiTests(TestCase):
+    """Donation Tracking."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670009801", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670009802", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Donation Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Donation Partner", slug="donation-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_owner_can_record_donation_and_receipt_number_is_generated(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/donations/",
+            {"donor_name": "Jane Doe", "amount": "100.00", "method": "cash", "fund": "General Fund"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(response.data["receipt_number"].startswith("DON-"))
+        self.assertEqual(response.data["donor_display_name"], "Jane Doe")
+
+    def test_plain_member_cannot_manage_donations(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/donations/",
+            {"donor_name": "X", "amount": "10.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        listing = self.client.get(f"/api/v1/partners/{self.partner.id}/donations/")
+        self.assertEqual(listing.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_donations_filterable_by_fund_and_date_range(self):
+        from apps.partners.models import PartnerDonation
+
+        PartnerDonation.objects.create(
+            partner=self.partner, donor_name="A", amount="50.00", fund="Missions", received_at="2026-01-15",
+        )
+        PartnerDonation.objects.create(
+            partner=self.partner, donor_name="B", amount="75.00", fund="General Fund", received_at="2026-06-01",
+        )
+        self.client.force_authenticate(self.owner)
+
+        by_fund = self.client.get(f"/api/v1/partners/{self.partner.id}/donations/", {"fund": "Missions"})
+        self.assertEqual(len(by_fund.data), 1)
+        self.assertEqual(by_fund.data[0]["donor_name"], "A")
+
+        by_date = self.client.get(f"/api/v1/partners/{self.partner.id}/donations/", {"from": "2026-05-01"})
+        self.assertEqual(len(by_date.data), 1)
+        self.assertEqual(by_date.data[0]["donor_name"], "B")
+
+    def test_summary_aggregates_by_fund_and_method(self):
+        from apps.partners.models import PartnerDonation
+
+        PartnerDonation.objects.create(
+            partner=self.partner, donor_name="A", amount="50.00", fund="Missions", method="cash", received_at="2026-01-15",
+        )
+        PartnerDonation.objects.create(
+            partner=self.partner, donor_name="B", amount="75.00", fund="Missions", method="check", received_at="2026-01-20",
+        )
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/donations-summary/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(str(response.data["total_amount"]), "125.00")
+        self.assertEqual(response.data["donation_count"], 2)
+        self.assertEqual(response.data["by_fund"][0]["fund"], "Missions")
+        self.assertEqual(str(response.data["by_fund"][0]["total"]), "125.00")
+
+    def test_owner_can_update_and_delete_donation(self):
+        from apps.partners.models import PartnerDonation
+
+        donation = PartnerDonation.objects.create(partner=self.partner, donor_name="A", amount="20.00")
+        self.client.force_authenticate(self.owner)
+
+        update = self.client.patch(
+            f"/api/v1/partners/{self.partner.id}/donations/{donation.id}/",
+            {"notes": "Thank-you letter sent"},
+            format="json",
+        )
+        self.assertEqual(update.status_code, status.HTTP_200_OK, update.data)
+        self.assertEqual(update.data["notes"], "Thank-you letter sent")
+
+        delete = self.client.delete(f"/api/v1/partners/{self.partner.id}/donations/{donation.id}/")
+        self.assertEqual(delete.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerDonation.objects.filter(id=donation.id).exists())

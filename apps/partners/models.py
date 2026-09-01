@@ -2042,3 +2042,52 @@ class PartnerVolunteerSignup(models.Model):
     class Meta:
         db_table = "partner_volunteer_signup"
         unique_together = [("shift", "volunteer")]
+
+
+class PartnerDonationMethod(models.TextChoices):
+    CASH = "cash", "Cash"
+    CHECK = "check", "Check"
+    BANK_TRANSFER = "bank_transfer", "Bank transfer"
+    CARD = "card", "Card"
+    MOBILE_MONEY = "mobile_money", "Mobile money"
+    OTHER = "other", "Other"
+
+
+class PartnerDonation(models.Model):
+    """General Tools > Donation Tracking — a bookkeeping ledger for
+    donations received through any channel, for receipt/reporting
+    purposes. This is NOT a payment processor: it does not move money or
+    integrate with apps.billing (which handles the app's own
+    subscription/wallet payments, an unrelated concern). An admin
+    manually records that a donation was received, exactly like
+    PartnerBudgetExpense records a real-world expense already paid.
+    donor is nullable + donor_name/donor_email are free text because most
+    donors won't be app members (walk-in cash gifts, external checks)."""
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="donations")
+    donor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="partner_donations_made",
+    )
+    donor_name = models.CharField(max_length=200, blank=True)
+    donor_email = models.EmailField(blank=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=10, default="USD")
+    method = models.CharField(max_length=16, choices=PartnerDonationMethod.choices, default=PartnerDonationMethod.OTHER)
+    fund = models.CharField(max_length=120, blank=True, help_text="e.g. 'General Fund', 'Missions', 'Building'.")
+    received_at = models.DateField(default=timezone.localdate)
+    notes = models.TextField(blank=True)
+    receipt_number = models.CharField(max_length=32, unique=True, editable=False)
+    recorded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_donation"
+        ordering = ["-received_at", "-created_at"]
+        indexes = [models.Index(fields=["partner", "received_at"]), models.Index(fields=["partner", "fund"])]
+
+    def save(self, *args, **kwargs):
+        if not self.receipt_number:
+            self.receipt_number = f"DON-{uuid.uuid4().hex[:10].upper()}"
+        super().save(*args, **kwargs)

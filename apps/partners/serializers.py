@@ -62,6 +62,7 @@ from apps.partners.models import (
     PartnerVolunteerShift,
     PartnerVolunteerSignup,
     PartnerVolunteerSignupStatus,
+    PartnerDonation,
 )
 from apps.chat.models import ConversationType
 from apps.chat.discussion import get_discussion_count
@@ -1849,3 +1850,25 @@ class PartnerVolunteerShiftSerializer(serializers.ModelSerializer):
             return None
         signup = obj.signups.filter(volunteer=user).first()
         return signup.status if signup else None
+
+
+class PartnerDonationSerializer(serializers.ModelSerializer):
+    donor_display_name = serializers.SerializerMethodField()
+    recorded_by_name = serializers.CharField(source="recorded_by.display_name", read_only=True, default=None)
+
+    class Meta:
+        model = PartnerDonation
+        fields = [
+            "id", "partner", "donor", "donor_name", "donor_email", "donor_display_name",
+            "amount", "currency", "method", "fund", "received_at", "notes", "receipt_number",
+            "recorded_by", "recorded_by_name", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "partner", "donor_display_name", "receipt_number",
+            "recorded_by", "recorded_by_name", "created_at", "updated_at",
+        ]
+
+    def get_donor_display_name(self, obj):
+        if obj.donor:
+            return obj.donor.display_name or obj.donor.username or obj.donor_name
+        return obj.donor_name or "Anonymous"
