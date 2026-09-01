@@ -832,6 +832,24 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.accounts.tasks.purge_accounts_past_grace_period_task",
         "schedule": 24 * 60 * 60,
     },
+    # cleanup_expired_broadcast_items existed as a real, working function
+    # and management command (apps/broadcasts/management/commands/
+    # purge_expired_broadcasts.py) but was never actually scheduled -
+    # expired BroadcastItem rows accumulated forever unless someone ran
+    # the command by hand.
+    "purge-expired-broadcasts": {
+        "task": "apps.broadcasts.tasks.purge_expired_broadcasts_task",
+        "schedule": 24 * 60 * 60,
+    },
+    # PhoneOTP rows (phone number + attempt count, tied to a hashed but
+    # still purpose-identifying OTP code) had no cleanup of any kind -
+    # every registration/login/reset/email-verify code ever issued stayed
+    # in the table forever, well past the point it serves any purpose
+    # (the code itself is already unusable once expires_at passes).
+    "purge-expired-otp-codes": {
+        "task": "apps.otp.tasks.purge_expired_otp_codes_task",
+        "schedule": 24 * 60 * 60,
+    },
 }
 
 # NEW: media-service URL for background removal microservice

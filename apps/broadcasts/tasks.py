@@ -131,3 +131,14 @@ def sweep_stuck_education_bookings(limit: int = 500):
         elif outcome.get("status") == "failed":
             results["failed"] += 1
     return results
+
+
+@shared_task
+def purge_expired_broadcasts_task():
+    """Thin wrapper so cleanup_expired_broadcast_items - a real, working
+    function with its own management command - is actually scheduled
+    (see CELERY_BEAT_SCHEDULE) instead of only running when someone
+    remembers to invoke the command by hand."""
+    from .services import cleanup_expired_broadcast_items
+
+    return {"deleted": cleanup_expired_broadcast_items()}
