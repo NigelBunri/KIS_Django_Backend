@@ -2479,3 +2479,96 @@ class PartnerSurveyApiTests(TestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class PartnerBudgetApiTests(TestCase):
+    """Budget Tracking."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670009601", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670009602", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Budget Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Budget Partner", slug="budget-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_owner_can_create_budget(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/budgets/",
+            {"name": "Youth Ministry 2026", "allocated_amount": "5000.00", "currency": "USD"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["spent_amount"], 0)
+        self.assertEqual(response.data["percent_used"], 0)
+
+    def test_plain_member_cannot_manage_budgets(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/budgets/",
+            {"name": "X", "allocated_amount": "100.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        listing = self.client.get(f"/api/v1/partners/{self.partner.id}/budgets/")
+        self.assertEqual(listing.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_expenses_reduce_remaining_and_update_percent_used(self):
+        from apps.partners.models import PartnerBudget
+
+        budget = PartnerBudget.objects.create(partner=self.partner, name="Missions Fund", allocated_amount="1000.00")
+        self.client.force_authenticate(self.owner)
+
+        expense_response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/budgets/{budget.id}/expenses/",
+            {"description": "Airfare", "amount": "250.00"},
+            format="json",
+        )
+        self.assertEqual(expense_response.status_code, status.HTTP_201_CREATED, expense_response.data)
+
+        budget_response = self.client.get(f"/api/v1/partners/{self.partner.id}/budgets/")
+        self.assertEqual(budget_response.status_code, status.HTTP_200_OK)
+        entry = budget_response.data[0]
+        self.assertEqual(str(entry["spent_amount"]), "250.00")
+        self.assertEqual(str(entry["remaining_amount"]), "750.00")
+        self.assertEqual(entry["percent_used"], 25.0)
+
+    def test_owner_can_delete_expense_and_budget(self):
+        from apps.partners.models import PartnerBudget, PartnerBudgetExpense
+
+        budget = PartnerBudget.objects.create(partner=self.partner, name="Outreach", allocated_amount="500.00")
+        expense = PartnerBudgetExpense.objects.create(budget=budget, description="Flyers", amount="50.00")
+        self.client.force_authenticate(self.owner)
+
+        delete_expense = self.client.delete(
+            f"/api/v1/partners/{self.partner.id}/budgets/{budget.id}/expenses/{expense.id}/",
+        )
+        self.assertEqual(delete_expense.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerBudgetExpense.objects.filter(id=expense.id).exists())
+
+        delete_budget = self.client.delete(f"/api/v1/partners/{self.partner.id}/budgets/{budget.id}/")
+        self.assertEqual(delete_budget.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerBudget.objects.filter(id=budget.id).exists())
+
+    def test_budgets_filterable_by_department(self):
+        from apps.partners.models import PartnerBudget, PartnerDepartment
+
+        dept = PartnerDepartment.objects.create(partner=self.partner, name="Youth")
+        PartnerBudget.objects.create(partner=self.partner, department=dept, name="Youth budget", allocated_amount="100.00")
+        PartnerBudget.objects.create(partner=self.partner, name="General budget", allocated_amount="200.00")
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/budgets/", {"department": dept.id})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["name"], "Youth budget")

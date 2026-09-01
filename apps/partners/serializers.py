@@ -57,6 +57,8 @@ from apps.partners.models import (
     PartnerSurveyQuestion,
     PartnerSurveyResponse,
     PartnerSurveyAnswer,
+    PartnerBudget,
+    PartnerBudgetExpense,
 )
 from apps.chat.models import ConversationType
 from apps.chat.discussion import get_discussion_count
@@ -1754,3 +1756,48 @@ class PartnerSurveySerializer(serializers.ModelSerializer):
         if not user or user.is_anonymous:
             return False
         return obj.responses.filter(respondent=user).exists()
+
+
+class PartnerBudgetExpenseSerializer(serializers.ModelSerializer):
+    recorded_by_name = serializers.CharField(source="recorded_by.display_name", read_only=True, default=None)
+
+    class Meta:
+        model = PartnerBudgetExpense
+        fields = ["id", "budget", "description", "amount", "spent_at", "recorded_by", "recorded_by_name", "created_at"]
+        read_only_fields = ["id", "budget", "recorded_by", "recorded_by_name", "created_at"]
+
+
+class PartnerBudgetSerializer(serializers.ModelSerializer):
+    department_name = serializers.CharField(source="department.name", read_only=True, default=None)
+    created_by_name = serializers.CharField(source="created_by.display_name", read_only=True, default=None)
+    spent_amount = serializers.SerializerMethodField()
+    remaining_amount = serializers.SerializerMethodField()
+    percent_used = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PartnerBudget
+        fields = [
+            "id", "partner", "department", "department_name", "name", "allocated_amount", "currency",
+            "period_start", "period_end", "created_by", "created_by_name", "created_at", "updated_at",
+            "spent_amount", "remaining_amount", "percent_used",
+        ]
+        read_only_fields = [
+            "id", "partner", "department_name", "created_by", "created_by_name", "created_at", "updated_at",
+            "spent_amount", "remaining_amount", "percent_used",
+        ]
+
+    def _total_spent(self, obj):
+        from django.db.models import Sum
+
+        return obj.expenses.aggregate(total=Sum("amount"))["total"] or 0
+
+    def get_spent_amount(self, obj):
+        return self._total_spent(obj)
+
+    def get_remaining_amount(self, obj):
+        return obj.allocated_amount - self._total_spent(obj)
+
+    def get_percent_used(self, obj):
+        if not obj.allocated_amount:
+            return 0
+        return round(float(self._total_spent(obj)) / float(obj.allocated_amount) * 100, 1)

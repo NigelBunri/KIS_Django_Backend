@@ -79,6 +79,8 @@ from apps.partners.models import (
     PartnerSurveyQuestionType,
     PartnerSurveyResponse,
     PartnerSurveyAnswer,
+    PartnerBudget,
+    PartnerBudgetExpense,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -130,6 +132,8 @@ from apps.partners.serializers import (
     PartnerSurveySerializer,
     PartnerSurveyQuestionSerializer,
     PartnerSurveyResponseSerializer,
+    PartnerBudgetSerializer,
+    PartnerBudgetExpenseSerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
     PartnerWebhookSerializer,
@@ -1755,6 +1759,85 @@ class PartnerViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+    # ── Budget Tracking ──────────────────────────────────────────────────
+    @action(detail=True, methods=["get", "post"], url_path="budgets")
+    def budgets(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.budgets.manage")
+        if request.method == "POST":
+            serializer = PartnerBudgetSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            budget = serializer.save(partner=partner, created_by=request.user)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.budget.create",
+                target_type="partner_budget", target_id=str(budget.id),
+                metadata={"name": budget.name}, request=request,
+            )
+            return Response(PartnerBudgetSerializer(budget).data, status=status.HTTP_201_CREATED)
+        qs = PartnerBudget.objects.filter(partner=partner).select_related("department", "created_by")
+        department_id = request.query_params.get("department")
+        if department_id:
+            qs = qs.filter(department_id=department_id)
+        return Response(PartnerBudgetSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"budgets/(?P<budget_id>[^/.]+)")
+    def budget_detail(self, request, pk=None, budget_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.budgets.manage")
+        budget = PartnerBudget.objects.filter(id=budget_id, partner=partner).first()
+        if not budget:
+            return Response({"detail": "Budget not found."}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == "DELETE":
+            budget.delete()
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.budget.delete",
+                target_type="partner_budget", target_id=str(budget_id), request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = PartnerBudgetSerializer(budget, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.budget.update",
+            target_type="partner_budget", target_id=str(budget.id),
+            metadata={"fields": list((request.data or {}).keys())}, request=request,
+        )
+        return Response(PartnerBudgetSerializer(budget).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path=r"budgets/(?P<budget_id>[^/.]+)/expenses")
+    def budget_expenses(self, request, pk=None, budget_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.budgets.manage")
+        budget = PartnerBudget.objects.filter(id=budget_id, partner=partner).first()
+        if not budget:
+            return Response({"detail": "Budget not found."}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == "POST":
+            serializer = PartnerBudgetExpenseSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            expense = serializer.save(budget=budget, recorded_by=request.user)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.budget_expense.create",
+                target_type="partner_budget_expense", target_id=str(expense.id),
+                metadata={"amount": str(expense.amount)}, request=request,
+            )
+            return Response(PartnerBudgetExpenseSerializer(expense).data, status=status.HTTP_201_CREATED)
+        qs = budget.expenses.select_related("recorded_by")
+        return Response(PartnerBudgetExpenseSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["delete"], url_path=r"budgets/(?P<budget_id>[^/.]+)/expenses/(?P<expense_id>[^/.]+)")
+    def budget_expense_detail(self, request, pk=None, budget_id=None, expense_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.budgets.manage")
+        expense = PartnerBudgetExpense.objects.filter(id=expense_id, budget_id=budget_id, budget__partner=partner).first()
+        if not expense:
+            return Response({"detail": "Expense not found."}, status=status.HTTP_404_NOT_FOUND)
+        expense.delete()
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.budget_expense.delete",
+            target_type="partner_budget_expense", target_id=str(expense_id), request=request,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):

@@ -1962,3 +1962,44 @@ class PartnerSurveyAnswer(models.Model):
         db_table = "partner_survey_answer"
         unique_together = [("response", "question")]
         indexes = [models.Index(fields=["question"])]
+
+
+class PartnerBudget(models.Model):
+    """General Tools > Budget Tracking — an allocation for a department
+    (or the partner as a whole, if department is left unset) tracked
+    against real recorded expenses (PartnerBudgetExpense), not a
+    projection or accounting-system integration."""
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="budgets")
+    department = models.ForeignKey(
+        PartnerDepartment, on_delete=models.SET_NULL, null=True, blank=True, related_name="budgets",
+    )
+    name = models.CharField(max_length=200)
+    allocated_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=10, default="USD")
+    period_start = models.DateField(null=True, blank=True)
+    period_end = models.DateField(null=True, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_budget"
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["partner", "department"])]
+
+
+class PartnerBudgetExpense(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    budget = models.ForeignKey(PartnerBudget, on_delete=models.CASCADE, related_name="expenses")
+    description = models.CharField(max_length=255)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    spent_at = models.DateField(default=timezone.localdate)
+    recorded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "partner_budget_expense"
+        ordering = ["-spent_at"]
+        indexes = [models.Index(fields=["budget", "spent_at"])]
