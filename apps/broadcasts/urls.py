@@ -37,6 +37,7 @@ from .views import (
     PublicRobotsPolicyView,
     PublicSitemapPlanView,
     ChannelContentReactView,
+    ChannelContentPollView,
     ChannelContentSaveView,
     ChannelContentShareView,
     ChannelContentViewEventView,
@@ -44,6 +45,7 @@ from .views import (
     ChannelContentCommentModerationView,
     ChannelCommentReactView,
     ChannelCommentPinView,
+    ChannelCommentRepliesView,
     WatchHistoryView,
     WatchHistorySettingsView,
     ChannelContentClipView,
@@ -182,6 +184,7 @@ from .views import (
     UserContentPlaylistDetailView,
     UserContentPlaylistItemListView,
     UserContentPlaylistItemDetailView,
+    PublicUserPlaylistView,
     LiveStreamCameraListView,
     LiveStreamCameraDetailView,
     LiveStreamSwitchCameraView,
@@ -228,6 +231,7 @@ from .views import (
     ChannelContentQueueReorderView,
     BroadcastChannelVerifyView,
     BroadcastSearchView,
+    BroadcastSearchSuggestView,
     ChannelCommentPinByContentView,
     ChannelTrailerFeaturedView,
     ChannelAnalyticsImpressionsCTRView,
@@ -270,6 +274,7 @@ urlpatterns = [
     path("broadcasts/channel-contents/<uuid:content_id>/assets/", ChannelContentAssetUploadView.as_view(), name="broadcast-channel-content-assets"),
     path("broadcasts/channel-contents/<uuid:content_id>/embed-token/", ChannelContentEmbedTokenView.as_view(), name="broadcast-channel-content-embed-token"),
     path("broadcasts/channel-contents/<uuid:content_id>/react/", ChannelContentReactView.as_view(), name="broadcast-channel-content-react"),
+    path("broadcasts/channel-contents/<uuid:content_id>/poll/", ChannelContentPollView.as_view(), name="broadcast-channel-content-poll"),
     path("broadcasts/channel-contents/<uuid:content_id>/save/", ChannelContentSaveView.as_view(), name="broadcast-channel-content-save"),
     path("broadcasts/channel-contents/<uuid:content_id>/share/", ChannelContentShareView.as_view(), name="broadcast-channel-content-share"),
     path("broadcasts/channel-contents/<uuid:content_id>/view/", ChannelContentViewEventView.as_view(), name="broadcast-channel-content-view"),
@@ -278,6 +283,7 @@ urlpatterns = [
     path("broadcasts/channel-comments/<uuid:comment_id>/moderate/", ChannelContentCommentModerationView.as_view(), name="broadcast-channel-comment-moderate"),
     path("broadcasts/channel-comments/<uuid:comment_id>/react/", ChannelCommentReactView.as_view(), name="broadcast-channel-comment-react"),
     path("broadcasts/channel-comments/<uuid:comment_id>/pin/", ChannelCommentPinView.as_view(), name="broadcast-channel-comment-pin"),
+    path("broadcasts/channel-comments/<uuid:comment_id>/replies/", ChannelCommentRepliesView.as_view(), name="broadcast-channel-comment-replies"),
     path("broadcasts/channel-contents/<uuid:content_id>/clip/", ChannelContentClipView.as_view(), name="broadcast-channel-content-clip"),
     path("broadcasts/watch-history/", WatchHistoryView.as_view(), name="broadcast-watch-history"),
     path("broadcasts/channel-moderation/<uuid:record_id>/action/", ChannelModerationActionView.as_view(), name="broadcast-channel-moderation-action"),
@@ -806,6 +812,7 @@ urlpatterns = [
     path("broadcasts/user-playlists/<uuid:playlist_id>/", UserContentPlaylistDetailView.as_view(), name="broadcast-user-playlist-detail"),
     path("broadcasts/user-playlists/<uuid:playlist_id>/items/", UserContentPlaylistItemListView.as_view(), name="broadcast-user-playlist-items"),
     path("broadcasts/user-playlists/<uuid:playlist_id>/items/<int:item_id>/", UserContentPlaylistItemDetailView.as_view(), name="broadcast-user-playlist-item-detail"),
+    path("broadcasts/user-playlists/<uuid:playlist_id>/public/", PublicUserPlaylistView.as_view(), name="broadcast-user-playlist-public"),
     # Live stream cameras
     path("broadcasts/live-streams/<uuid:stream_id>/cameras/", LiveStreamCameraListView.as_view(), name="broadcast-live-stream-cameras"),
     path("broadcasts/live-streams/<uuid:stream_id>/cameras/<uuid:camera_id>/", LiveStreamCameraDetailView.as_view(), name="broadcast-live-stream-camera-detail"),
@@ -885,6 +892,7 @@ urlpatterns = [
     path("broadcasts/channels/<uuid:channel_id>/verify/", BroadcastChannelVerifyView.as_view(), name="broadcast-channel-verify"),
     # Search
     path("broadcasts/search/", BroadcastSearchView.as_view(), name="broadcast-search"),
+    path("broadcasts/search/suggest/", BroadcastSearchSuggestView.as_view(), name="broadcast-search-suggest"),
     # Comment pin (content-scoped)
     path("broadcasts/channel-contents/<uuid:content_id>/comments/<uuid:comment_id>/pin/", ChannelCommentPinByContentView.as_view(), name="broadcast-comment-pin"),
     # Channel trailer / featured

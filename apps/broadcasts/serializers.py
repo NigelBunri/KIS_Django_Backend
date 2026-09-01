@@ -414,6 +414,7 @@ class BroadcastPlaylistSerializer(serializers.ModelSerializer):
             "description",
             "visibility",
             "sort_order",
+            "shuffle_enabled",
             "metadata",
             "created_at",
             "updated_at",

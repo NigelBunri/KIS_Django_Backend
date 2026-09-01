@@ -608,6 +608,26 @@ class ChannelCommentReaction(models.Model):
         ]
 
 
+class ChannelContentPollVote(models.Model):
+    # ChannelContentType.POLL has existed as a content_type choice with no
+    # structured poll data model behind it - poll options live in the
+    # existing ChannelContent.metadata JSONField
+    # ({"poll": {"question": str, "options": [str, ...]}}), already
+    # writable via ChannelContentDetailView.patch with no new write path
+    # needed. This is only the missing piece: per-user vote tracking,
+    # mirroring ChannelLivePollVote (the live-stream-only poll system)
+    # exactly, one vote per user per content item.
+    id = models.BigAutoField(primary_key=True)
+    content = models.ForeignKey(ChannelContent, on_delete=models.CASCADE, related_name="poll_votes")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="channel_content_poll_votes")
+    option_index = models.PositiveSmallIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "channel_content_poll_vote"
+        unique_together = [("content", "user")]
+
+
 class ChannelContentClip(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     content = models.ForeignKey(ChannelContent, on_delete=models.CASCADE, related_name="clips")

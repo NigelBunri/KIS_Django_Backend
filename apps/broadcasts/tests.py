@@ -23,6 +23,7 @@ from apps.broadcasts.models import (
     BroadcastChannelRole,
     BroadcastChannelSubscription,
     BroadcastPlaylist,
+    BroadcastPlaylistItem,
     ChannelContent,
     ChannelContentAsset,
     ChannelContentEmbed,
@@ -41,6 +42,7 @@ from apps.broadcasts.models import (
     BroadcastSourceType,
     BroadcastVideo,
     UserContentPlaylist,
+    UserContentPlaylistItem,
     EducationCourseModuleItemType,
     EducationEnrollmentStatus,
     EducationInstitution,
@@ -1386,6 +1388,238 @@ class UserContentPlaylistApiTests(APITestCase):
                 title='Watch later',
             ).exists()
         )
+
+
+class KISTubePlatformScaleApiTests(APITestCase):
+    """Covers the KISTube-platform-scale backend additions: channel
+    playlist item GET (previously missing entirely), shuffle_enabled
+    exposure (previously dropped by the serializer), user playlist item
+    reorder + hydration, public user-playlist sharing, comment-replies
+    fetch, search sort/suggest, and community poll voting."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5557900001', username='kt_owner', password='secret', country='NG')
+        self.viewer = User.objects.create_user(phone='5557900002', username='kt_viewer', password='secret', country='NG')
+        self.other = User.objects.create_user(phone='5557900003', username='kt_other', password='secret', country='NG')
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            handle='kt-channel', display_name='KT Channel', is_public=True,
+        )
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.owner, role=BroadcastChannelRole.Role.OWNER)
+        self.content_a = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='First video',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+        self.content_b = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Second video',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+
+    # ── Channel playlist item GET ───────────────────────────────────────
+    def test_channel_playlist_items_get_requires_no_auth_when_public(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='Public list', visibility=BroadcastPlaylist.Visibility.PUBLIC)
+        BroadcastPlaylistItem.objects.create(playlist=playlist, content=self.content_a, sort_order=0)
+
+        response = self.client.get(f'/api/v1/broadcasts/playlists/{playlist.id}/items/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['playlist']['title'], 'Public list')
+
+    def test_channel_playlist_items_get_404s_for_private_non_manager(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='Private list', visibility=BroadcastPlaylist.Visibility.PRIVATE)
+        self.client.force_authenticate(user=self.other)
+
+        response = self.client.get(f'/api/v1/broadcasts/playlists/{playlist.id}/items/')
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_channel_playlist_items_get_visible_to_manager_when_private(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='Private list', visibility=BroadcastPlaylist.Visibility.PRIVATE)
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.get(f'/api/v1/broadcasts/playlists/{playlist.id}/items/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    # ── shuffle_enabled serialization ───────────────────────────────────
+    def test_shuffle_enabled_is_serialized(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='Shuffled', shuffle_enabled=True)
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.get(f'/api/v1/broadcasts/channels/{self.channel.id}/playlists/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        row = next(r for r in response.data['results'] if r['id'] == str(playlist.id))
+        self.assertTrue(row['shuffle_enabled'])
+
+    # ── User playlist item reorder + hydration ──────────────────────────
+    def test_user_playlist_item_reorder(self):
+        self.client.force_authenticate(user=self.viewer)
+        playlist = UserContentPlaylist.objects.create(user=self.viewer, title='My mix')
+        item_a = UserContentPlaylistItem.objects.create(playlist=playlist, content=self.content_a, sort_order=0)
+        item_b = UserContentPlaylistItem.objects.create(playlist=playlist, content=self.content_b, sort_order=1)
+
+        response = self.client.patch(
+            f'/api/v1/broadcasts/user-playlists/{playlist.id}/items/',
+            {'order': [item_b.id, item_a.id]},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        item_a.refresh_from_db()
+        item_b.refresh_from_db()
+        self.assertEqual(item_b.sort_order, 0)
+        self.assertEqual(item_a.sort_order, 1)
+
+    def test_user_playlist_items_list_is_hydrated(self):
+        self.client.force_authenticate(user=self.viewer)
+        playlist = UserContentPlaylist.objects.create(user=self.viewer, title='My mix')
+        UserContentPlaylistItem.objects.create(playlist=playlist, content=self.content_a, sort_order=0)
+
+        response = self.client.get(f'/api/v1/broadcasts/user-playlists/{playlist.id}/items/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['results'][0]['content']['title'], 'First video')
+
+    # ── Public user playlist sharing ────────────────────────────────────
+    def test_public_user_playlist_is_readable_by_anyone(self):
+        playlist = UserContentPlaylist.objects.create(user=self.viewer, title='Shared mix', visibility=UserContentPlaylist.Visibility.PUBLIC)
+        UserContentPlaylistItem.objects.create(playlist=playlist, content=self.content_a, sort_order=0)
+
+        response = self.client.get(f'/api/v1/broadcasts/user-playlists/{playlist.id}/public/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['title'], 'Shared mix')
+        self.assertEqual(len(response.data['results']), 1)
+
+    def test_private_user_playlist_is_not_readable_by_anyone(self):
+        playlist = UserContentPlaylist.objects.create(user=self.viewer, title='Secret mix', visibility=UserContentPlaylist.Visibility.PRIVATE)
+
+        response = self.client.get(f'/api/v1/broadcasts/user-playlists/{playlist.id}/public/')
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # ── Comment replies fetch ───────────────────────────────────────────
+    def test_comment_replies_are_fetchable(self):
+        parent = ChannelContentComment.objects.create(content=self.content_a, user=self.viewer, body='Top level')
+        ChannelContentComment.objects.create(content=self.content_a, user=self.other, body='A reply', parent=parent)
+
+        response = self.client.get(f'/api/v1/broadcasts/channel-comments/{parent.id}/replies/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['results'][0]['body'], 'A reply')
+
+    # ── Search sort + suggest ───────────────────────────────────────────
+    def test_search_sort_by_views(self):
+        self.content_a.stats = {'views': 5}
+        self.content_a.save(update_fields=['stats'])
+        self.content_b.stats = {'views': 50}
+        self.content_b.save(update_fields=['stats'])
+
+        response = self.client.get('/api/v1/broadcasts/search/?sort=views')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        titles = [r['title'] for r in response.data['results']]
+        self.assertEqual(titles.index('Second video'), 0)
+
+    def test_search_suggest_returns_matching_channel_and_content(self):
+        response = self.client.get('/api/v1/broadcasts/search/suggest/?q=kt-chan')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        handles = {c['handle'] for c in response.data['channels']}
+        self.assertIn('kt-channel', handles)
+
+    def test_search_suggest_short_query_returns_empty(self):
+        response = self.client.get('/api/v1/broadcasts/search/suggest/?q=a')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {'channels': [], 'contents': []})
+
+    # ── Community poll voting ───────────────────────────────────────────
+    def _create_poll_content(self):
+        return ChannelContent.objects.create(
+            channel=self.channel, content_type='poll', title='Which service?',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            metadata={'poll': {'question': 'Which service?', 'options': ['Sunday AM', 'Sunday PM']}},
+        )
+
+    def test_poll_vote_and_results(self):
+        poll_content = self._create_poll_content()
+        self.client.force_authenticate(user=self.viewer)
+
+        vote_response = self.client.post(f'/api/v1/broadcasts/channel-contents/{poll_content.id}/poll/', {'option_index': 1}, format='json')
+
+        self.assertEqual(vote_response.status_code, status.HTTP_200_OK, vote_response.data)
+        self.assertEqual(vote_response.data['my_vote'], 1)
+        self.assertEqual(vote_response.data['options'][1]['votes'], 1)
+        self.assertEqual(vote_response.data['total_votes'], 1)
+
+    def test_poll_vote_is_idempotent_per_user(self):
+        poll_content = self._create_poll_content()
+        self.client.force_authenticate(user=self.viewer)
+        self.client.post(f'/api/v1/broadcasts/channel-contents/{poll_content.id}/poll/', {'option_index': 0}, format='json')
+
+        response = self.client.post(f'/api/v1/broadcasts/channel-contents/{poll_content.id}/poll/', {'option_index': 1}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['total_votes'], 1)
+        self.assertEqual(response.data['options'][1]['votes'], 1)
+        self.assertEqual(response.data['options'][0]['votes'], 0)
+
+    def test_poll_vote_requires_authentication(self):
+        poll_content = self._create_poll_content()
+
+        response = self.client.post(f'/api/v1/broadcasts/channel-contents/{poll_content.id}/poll/', {'option_index': 0}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_poll_endpoint_404s_for_non_poll_content(self):
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/poll/')
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # ── Anonymous-viewer read access on player-feature endpoints ───────
+    def test_watch_segments_get_is_anonymous_safe(self):
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/watch-segments/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_watch_segments_post_still_requires_authentication(self):
+        response = self.client.post(f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/watch-segments/', {'segments': []}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_audio_tracks_get_is_anonymous_safe(self):
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/audio-tracks/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_geo_restriction_get_is_anonymous_safe(self):
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/geo-restriction/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_transcript_get_is_anonymous_safe(self):
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/transcript/')
+        self.assertIn(response.status_code, (status.HTTP_200_OK, status.HTTP_404_NOT_FOUND))
+
+    def test_products_get_is_anonymous_safe(self):
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/products/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_premiere_get_is_anonymous_safe(self):
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/premiere/')
+        self.assertIn(response.status_code, (status.HTTP_200_OK, status.HTTP_404_NOT_FOUND))
+
+    # ── Seeded categories ────────────────────────────────────────────────
+    def test_categories_are_seeded(self):
+        response = self.client.get('/api/v1/broadcasts/categories/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        names = {c['name'] for c in response.data}
+        self.assertIn('Education', names)
 
 
 @override_settings(

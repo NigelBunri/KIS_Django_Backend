@@ -114,6 +114,7 @@ from apps.broadcasts.models import (
     ChannelContentComment,
     ChannelCommentReaction,
     ChannelContentReaction,
+    ChannelContentPollVote,
     ChannelContentSave,
     ChannelContentClip,
     ChannelContentChapter,
@@ -15924,6 +15925,62 @@ class ChannelContentReactView(APIView):
         return Response({"reacted": False, "deleted": bool(deleted), "engagement_counts": _channel_content_counts(ChannelContent(id=content.id, stats=stats))})
 
 
+class ChannelContentPollView(APIView):
+    """Poll results + vote for content_type="poll" ChannelContent items.
+    Poll question/options live in content.metadata["poll"] (already
+    writable via ChannelContentDetailView.patch - see
+    ChannelContentPollVote's model comment); this view only adds the
+    missing piece, per-user vote tracking and result tallying."""
+
+    permission_classes = [AllowAny]
+
+    def _poll_config(self, content):
+        poll = (content.metadata or {}).get("poll") if isinstance(content.metadata, dict) else None
+        if not isinstance(poll, dict) or not isinstance(poll.get("options"), list) or not poll["options"]:
+            raise Http404
+        return poll
+
+    def get(self, request, content_id):
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        poll = self._poll_config(content)
+        options = poll["options"]
+        counts = [0] * len(options)
+        for row in ChannelContentPollVote.objects.filter(content=content).values_list("option_index", flat=True):
+            if 0 <= row < len(counts):
+                counts[row] += 1
+        my_vote = None
+        if getattr(request.user, "is_authenticated", False):
+            existing = ChannelContentPollVote.objects.filter(content=content, user=request.user).first()
+            my_vote = existing.option_index if existing else None
+        return Response({
+            "question": poll.get("question", ""),
+            "options": [{"index": i, "label": str(label), "votes": counts[i]} for i, label in enumerate(options)],
+            "total_votes": sum(counts),
+            "my_vote": my_vote,
+        })
+
+    def post(self, request, content_id):
+        if not getattr(request.user, "is_authenticated", False):
+            return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
+        content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        poll = self._poll_config(content)
+        option_index = request.data.get("option_index")
+        try:
+            option_index = int(option_index)
+        except (TypeError, ValueError):
+            raise ValidationError({"option_index": "Must be an integer."})
+        if not (0 <= option_index < len(poll["options"])):
+            raise ValidationError({"option_index": "Out of range for this poll."})
+        ChannelContentPollVote.objects.update_or_create(
+            content=content, user=request.user, defaults={"option_index": option_index},
+        )
+        return self.get(request, content_id)
+
+
 class ChannelContentSaveView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -19966,7 +20023,14 @@ class ChannelContentWatchEventView(APIView):
 
 # ─── Watch Segment Heatmap ────────────────────────────────────────────────────
 class ChannelContentWatchSegmentView(APIView):
-    permission_classes = [IsAuthenticated]
+    # GET (the "most replayed" heatmap) needs to work for anonymous
+    # viewers - only POST (which has no manual role check of its own,
+    # unlike most other content-detail views below) stays gated to signed-
+    # in users, to avoid a fully open anonymous-write endpoint.
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [AllowAny()]
+        return [IsAuthenticated()]
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
@@ -19997,7 +20061,10 @@ class ChannelContentWatchSegmentView(APIView):
 
 # ─── Audio Tracks ─────────────────────────────────────────────────────────────
 class ChannelContentAudioTracksView(APIView):
-    permission_classes = [IsAuthenticated]
+    # Read-only player feature every viewer needs, including anonymous ones
+    # - POST already enforces its own channel-editor role check below, so
+    # AllowAny at the class level doesn't weaken write access.
+    permission_classes = [AllowAny]
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
@@ -20021,7 +20088,9 @@ class ChannelContentAudioTracksView(APIView):
 
 # ─── Geo-restrictions ─────────────────────────────────────────────────────────
 class ChannelContentGeoRestrictionView(APIView):
-    permission_classes = [IsAuthenticated]
+    # Anonymous viewers need to see "unavailable in your region" too - PUT
+    # already enforces its own owner/staff role check below.
+    permission_classes = [AllowAny]
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
@@ -20045,7 +20114,9 @@ class ChannelContentGeoRestrictionView(APIView):
 
 # ─── Premiere ─────────────────────────────────────────────────────────────────
 class ChannelContentPremiereView(APIView):
-    permission_classes = [IsAuthenticated]
+    # Anonymous viewers need the "Premieres in Xh" countdown too - POST
+    # already enforces its own owner/staff role check below.
+    permission_classes = [AllowAny]
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
@@ -20161,7 +20232,16 @@ class ChannelLiveStreamGuestActionView(APIView):
 
 # ─── Transcripts / Auto-captions ──────────────────────────────────────────────
 class ChannelContentTranscriptView(APIView):
-    permission_classes = [IsAuthenticated]
+    # GET (the "Show transcript" panel) needs to work for anonymous
+    # viewers. POST stays gated - its auto-transcription branch has no
+    # manual role check of its own (any signed-in user can currently
+    # trigger a transcription job; that's pre-existing behavior, not
+    # something to widen to anonymous callers, since transcription is a
+    # billed/rate-limited provider call).
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [AllowAny()]
+        return [IsAuthenticated()]
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
@@ -20477,7 +20557,9 @@ def _generate_chapter_suggestions(text: str, duration_seconds: int) -> list:
 
 # ─── Product Tagging ──────────────────────────────────────────────────────────
 class ChannelContentProductsView(APIView):
-    permission_classes = [IsAuthenticated]
+    # Shopping-tag markers need to render for anonymous viewers too - POST
+    # already enforces its own channel-editor role check below.
+    permission_classes = [AllowAny]
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
