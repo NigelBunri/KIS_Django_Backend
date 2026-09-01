@@ -60,6 +60,63 @@ class SuspiciousActivityFlag(models.Model):
     class Meta:
         ordering = ["-created_at"]
 
+class SecurityIncident(models.Model):
+    """
+    ENGINEERING RECOMMENDATION, not a claim of regulatory compliance by
+    itself: this is the record-keeping/workflow tool an incident-response
+    process needs (log an incident, track its status, note whether
+    regulatory notification is owed and when it was sent) - it doesn't by
+    itself satisfy any jurisdiction's breach-notification deadline (e.g.
+    NDPA/GDPR's ~72-hour windows), which is a legal/process obligation on
+    the humans using this tool, not something software can discharge on
+    its own. Before this, no incident-tracking of any kind existed
+    anywhere in the codebase.
+    """
+
+    class Severity(models.TextChoices):
+        LOW = "low", "Low"
+        MEDIUM = "medium", "Medium"
+        HIGH = "high", "High"
+        CRITICAL = "critical", "Critical"
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        INVESTIGATING = "investigating", "Investigating"
+        CONTAINED = "contained", "Contained"
+        RESOLVED = "resolved", "Resolved"
+        CLOSED = "closed", "Closed"
+
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True, default="")
+    severity = models.CharField(max_length=16, choices=Severity.choices, default=Severity.MEDIUM)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True)
+    reported_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reported_security_incidents",
+    )
+    discovered_at = models.DateTimeField()
+    # Best-effort scoping for a breach-notification assessment - who might
+    # need to be told, and about what. Neither field being populated is
+    # itself a legal judgment; it's the input a human uses to make one.
+    affected_user_count = models.PositiveIntegerField(null=True, blank=True)
+    data_categories_affected = models.JSONField(default=list, blank=True)
+    regulatory_notification_required = models.BooleanField(null=True, blank=True)
+    regulatory_notification_sent_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolution_summary = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "severity"]),
+        ]
+
+
 class AdminUserActivity(AdminAction):
     """Persisted stream of admin control requests."""
 

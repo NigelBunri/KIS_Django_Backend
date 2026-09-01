@@ -30,6 +30,10 @@ from admin_control.views import (
     AdminContentQueueSummaryView,
     AdminContentActionView,
     AdminContentTrendView,
+    # Incident response
+    AdminIncidentListView,
+    AdminIncidentDetailView,
+    AdminIncidentSummaryView,
     # Partner oversight
     AdminPartnerListView,
     AdminPartnerDetailView,
@@ -75,6 +79,11 @@ urlpatterns = [
     path("content/summary/", AdminContentQueueSummaryView.as_view(), name="admin-content-summary"),
     path("content/trends/", AdminContentTrendView.as_view(), name="admin-content-trends"),
     path("content/flags/<str:flag_id>/action/", AdminContentActionView.as_view(), name="admin-content-action"),
+
+    # ── Incident response ─────────────────────────────────────────────────
+    path("incidents/", AdminIncidentListView.as_view(), name="admin-incidents-list"),
+    path("incidents/summary/", AdminIncidentSummaryView.as_view(), name="admin-incidents-summary"),
+    path("incidents/<str:incident_id>/", AdminIncidentDetailView.as_view(), name="admin-incident-detail"),
 
     # ── Partner oversight ─────────────────────────────────────────────────
     path("partners/", AdminPartnerListView.as_view(), name="admin-partners-list"),

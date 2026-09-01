@@ -7,6 +7,11 @@ from .audit import (
     SuspiciousActivityFlagSerializer,
 )
 from .dashboard import DashboardSummarySerializer
+from .incidents import (
+    SecurityIncidentCreateSerializer,
+    SecurityIncidentSerializer,
+    SecurityIncidentUpdateSerializer,
+)
 from .registry import ModelRegistrySerializer
 from .roles import (
     AdminRoleAssignmentSerializer,
@@ -24,4 +29,7 @@ __all__ = [
     "AdminRolePermissionSerializer",
     "AdminRoleAssignmentSerializer",
     "AuditActionSerializer",
+    "SecurityIncidentSerializer",
+    "SecurityIncidentCreateSerializer",
+    "SecurityIncidentUpdateSerializer",
 ]
