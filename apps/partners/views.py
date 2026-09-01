@@ -73,6 +73,12 @@ from apps.partners.models import (
     SupportTicketStatus,
     SupportTicketReply,
     PartnerPostTemplate,
+    PartnerSurvey,
+    PartnerSurveyStatus,
+    PartnerSurveyQuestion,
+    PartnerSurveyQuestionType,
+    PartnerSurveyResponse,
+    PartnerSurveyAnswer,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -121,6 +127,9 @@ from apps.partners.serializers import (
     SupportTicketSerializer,
     SupportTicketReplySerializer,
     PartnerPostTemplateSerializer,
+    PartnerSurveySerializer,
+    PartnerSurveyQuestionSerializer,
+    PartnerSurveyResponseSerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
     PartnerWebhookSerializer,
@@ -1596,6 +1605,156 @@ class PartnerViewSet(viewsets.ModelViewSet):
             metadata={"fields": list((request.data or {}).keys())}, request=request,
         )
         return Response(PartnerPostTemplateSerializer(template).data, status=status.HTTP_200_OK)
+
+    # ── Feedback Hub & Surveys ───────────────────────────────────────────
+    def _create_survey_questions(self, survey, questions_data):
+        for index, question_data in enumerate(questions_data):
+            PartnerSurveyQuestion.objects.create(
+                survey=survey,
+                text=question_data.get("text", ""),
+                question_type=question_data.get("question_type", PartnerSurveyQuestionType.TEXT),
+                options=question_data.get("options", []),
+                required=question_data.get("required", True),
+                order=question_data.get("order", index),
+            )
+
+    @action(detail=True, methods=["get", "post"], url_path="surveys")
+    def surveys(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.surveys.manage")
+            serializer = PartnerSurveySerializer(data=request.data, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            survey = serializer.save(partner=partner, created_by=request.user)
+            self._create_survey_questions(survey, request.data.get("questions") or [])
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.survey.create",
+                target_type="partner_survey", target_id=str(survey.id),
+                metadata={"title": survey.title}, request=request,
+            )
+            return Response(PartnerSurveySerializer(survey, context={"request": request}).data, status=status.HTTP_201_CREATED)
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        qs = PartnerSurvey.objects.filter(partner=partner).prefetch_related("questions", "responses")
+        if not self._user_can_manage_partner(partner, request.user):
+            qs = qs.filter(status=PartnerSurveyStatus.OPEN)
+        return Response(PartnerSurveySerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "patch", "delete"], url_path=r"surveys/(?P<survey_id>[^/.]+)")
+    def survey_detail(self, request, pk=None, survey_id=None):
+        partner = self.get_object()
+        survey = PartnerSurvey.objects.filter(id=survey_id, partner=partner).prefetch_related("questions", "responses").first()
+        if not survey:
+            return Response({"detail": "Survey not found."}, status=status.HTTP_404_NOT_FOUND)
+        is_admin = self._user_can_manage_partner(partner, request.user)
+        if request.method == "GET":
+            if not is_admin and survey.status != PartnerSurveyStatus.OPEN:
+                raise PermissionDenied("This survey is not currently open.")
+            return Response(PartnerSurveySerializer(survey, context={"request": request}).data, status=status.HTTP_200_OK)
+        if not is_admin:
+            raise PermissionDenied("Not allowed to manage this survey.")
+        if request.method == "DELETE":
+            survey.delete()
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.survey.delete",
+                target_type="partner_survey", target_id=str(survey_id), request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = PartnerSurveySerializer(survey, data=request.data, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        if "questions" in request.data:
+            survey.questions.all().delete()
+            self._create_survey_questions(survey, request.data.get("questions") or [])
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.survey.update",
+            target_type="partner_survey", target_id=str(survey.id),
+            metadata={"fields": list((request.data or {}).keys())}, request=request,
+        )
+        survey.refresh_from_db()
+        return Response(PartnerSurveySerializer(survey, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path=r"surveys/(?P<survey_id>[^/.]+)/respond")
+    def survey_respond(self, request, pk=None, survey_id=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to respond to this survey.")
+        survey = PartnerSurvey.objects.filter(id=survey_id, partner=partner).prefetch_related("questions").first()
+        if not survey:
+            return Response({"detail": "Survey not found."}, status=status.HTTP_404_NOT_FOUND)
+        if survey.status != PartnerSurveyStatus.OPEN:
+            return Response({"detail": "This survey is not currently open."}, status=status.HTTP_400_BAD_REQUEST)
+        if PartnerSurveyResponse.objects.filter(survey=survey, respondent=request.user).exists():
+            return Response({"detail": "You have already responded to this survey."}, status=status.HTTP_400_BAD_REQUEST)
+        answers_payload = request.data.get("answers") or []
+        answers_by_question = {str(a.get("question")): a.get("value") for a in answers_payload}
+        for question in survey.questions.all():
+            if question.required and str(question.id) not in answers_by_question:
+                raise ValidationError({"answers": f"Question '{question.text}' is required."})
+        survey_response = PartnerSurveyResponse.objects.create(survey=survey, respondent=request.user)
+        for question in survey.questions.all():
+            value = answers_by_question.get(str(question.id))
+            if value is None:
+                continue
+            PartnerSurveyAnswer.objects.create(response=survey_response, question=question, value=value)
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.survey.respond",
+            target_type="partner_survey", target_id=str(survey.id), request=request,
+        )
+        return Response(
+            PartnerSurveyResponseSerializer(survey_response).data, status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["get"], url_path=r"surveys/(?P<survey_id>[^/.]+)/results")
+    def survey_results(self, request, pk=None, survey_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.surveys.manage")
+        survey = PartnerSurvey.objects.filter(id=survey_id, partner=partner).prefetch_related("questions", "responses__answers").first()
+        if not survey:
+            return Response({"detail": "Survey not found."}, status=status.HTTP_404_NOT_FOUND)
+        results = []
+        for question in survey.questions.all():
+            answers = PartnerSurveyAnswer.objects.filter(question=question).select_related("response")
+            entry = {
+                "question_id": question.id,
+                "text": question.text,
+                "question_type": question.question_type,
+                "response_count": answers.count(),
+            }
+            if question.question_type == PartnerSurveyQuestionType.SINGLE_CHOICE:
+                counts: dict = {}
+                for answer in answers:
+                    choice_id = (answer.value or {}).get("choice_id")
+                    if choice_id:
+                        counts[choice_id] = counts.get(choice_id, 0) + 1
+                entry["choice_counts"] = counts
+            elif question.question_type == PartnerSurveyQuestionType.MULTIPLE_CHOICE:
+                counts = {}
+                for answer in answers:
+                    for choice_id in (answer.value or {}).get("choice_ids", []):
+                        counts[choice_id] = counts.get(choice_id, 0) + 1
+                entry["choice_counts"] = counts
+            elif question.question_type == PartnerSurveyQuestionType.RATING:
+                values = [
+                    v for a in answers
+                    if (v := (a.value or {}).get("value")) is not None
+                ]
+                entry["average_rating"] = round(sum(values) / len(values), 2) if values else None
+                entry["rating_count"] = len(values)
+            else:
+                entry["text_answers"] = [
+                    (a.value or {}).get("text", "") for a in answers if (a.value or {}).get("text")
+                ]
+            results.append(entry)
+        return Response(
+            {
+                "survey_id": survey.id,
+                "title": survey.title,
+                "total_responses": survey.responses.count(),
+                "questions": results,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):

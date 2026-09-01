@@ -1879,3 +1879,86 @@ class PartnerPostTemplate(models.Model):
         db_table = "partner_post_template"
         ordering = ["title"]
         indexes = [models.Index(fields=["partner"])]
+
+
+class PartnerSurveyStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    OPEN = "open", "Open"
+    CLOSED = "closed", "Closed"
+
+
+class PartnerSurveyQuestionType(models.TextChoices):
+    SINGLE_CHOICE = "single_choice", "Single choice"
+    MULTIPLE_CHOICE = "multiple_choice", "Multiple choice"
+    RATING = "rating", "Rating (1-5)"
+    TEXT = "text", "Open text"
+
+
+class PartnerSurvey(models.Model):
+    """General Tools > Feedback Hub + Surveys — one model covering both
+    catalog keys, same rationale as SupportTicket unifying support_inbox
+    and helpdesk: a structured-feedback survey IS a poll, there's no real
+    product distinction. Deliberately not built on apps.surveys, a global
+    social/gamified poll system (owner_id-only "ownership", no partner
+    FK, no membership-aware permissions) — see SupportTicket/
+    PartnerCalendarEvent docstrings for the same reasoning applied here."""
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="surveys")
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=16, choices=PartnerSurveyStatus.choices, default=PartnerSurveyStatus.DRAFT)
+    is_anonymous = models.BooleanField(default=False)
+    closes_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_survey"
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["partner", "status"])]
+
+
+class PartnerSurveyQuestion(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    survey = models.ForeignKey(PartnerSurvey, on_delete=models.CASCADE, related_name="questions")
+    text = models.CharField(max_length=500)
+    question_type = models.CharField(max_length=20, choices=PartnerSurveyQuestionType.choices)
+    options = models.JSONField(
+        default=list, blank=True,
+        help_text="For single_choice/multiple_choice: [{'id': 'opt1', 'label': 'Yes'}, ...].",
+    )
+    required = models.BooleanField(default=True)
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "partner_survey_question"
+        ordering = ["order"]
+        indexes = [models.Index(fields=["survey", "order"])]
+
+
+class PartnerSurveyResponse(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    survey = models.ForeignKey(PartnerSurvey, on_delete=models.CASCADE, related_name="responses")
+    respondent = models.ForeignKey(User, on_delete=models.CASCADE, related_name="partner_survey_responses")
+    submitted_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "partner_survey_response"
+        unique_together = [("survey", "respondent")]
+
+
+class PartnerSurveyAnswer(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    response = models.ForeignKey(PartnerSurveyResponse, on_delete=models.CASCADE, related_name="answers")
+    question = models.ForeignKey(PartnerSurveyQuestion, on_delete=models.CASCADE, related_name="answers")
+    value = models.JSONField(
+        help_text="Shape depends on question_type: {'choice_id': 'opt1'} | "
+        "{'choice_ids': ['opt1','opt2']} | {'value': 4} | {'text': '...'}.",
+    )
+
+    class Meta:
+        db_table = "partner_survey_answer"
+        unique_together = [("response", "question")]
+        indexes = [models.Index(fields=["question"])]

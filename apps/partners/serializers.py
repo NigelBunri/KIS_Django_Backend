@@ -53,6 +53,10 @@ from apps.partners.models import (
     SupportTicket,
     SupportTicketReply,
     PartnerPostTemplate,
+    PartnerSurvey,
+    PartnerSurveyQuestion,
+    PartnerSurveyResponse,
+    PartnerSurveyAnswer,
 )
 from apps.chat.models import ConversationType
 from apps.chat.discussion import get_discussion_count
@@ -1693,3 +1697,60 @@ class PartnerPostTemplateSerializer(serializers.ModelSerializer):
         model = PartnerPostTemplate
         fields = ["id", "partner", "title", "body", "created_by", "created_by_name", "created_at", "updated_at"]
         read_only_fields = ["id", "partner", "created_by", "created_by_name", "created_at", "updated_at"]
+
+
+class PartnerSurveyQuestionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PartnerSurveyQuestion
+        fields = ["id", "survey", "text", "question_type", "options", "required", "order"]
+        read_only_fields = ["id", "survey"]
+
+
+class PartnerSurveyAnswerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PartnerSurveyAnswer
+        fields = ["id", "response", "question", "value"]
+        read_only_fields = ["id", "response"]
+
+
+class PartnerSurveyResponseSerializer(serializers.ModelSerializer):
+    respondent_name = serializers.CharField(source="respondent.display_name", read_only=True, default=None)
+    answers = PartnerSurveyAnswerSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = PartnerSurveyResponse
+        fields = ["id", "survey", "respondent", "respondent_name", "submitted_at", "answers"]
+        read_only_fields = fields
+
+
+class PartnerSurveySerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source="created_by.display_name", read_only=True, default=None)
+    questions = PartnerSurveyQuestionSerializer(many=True, read_only=True)
+    question_count = serializers.SerializerMethodField()
+    response_count = serializers.SerializerMethodField()
+    has_responded = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PartnerSurvey
+        fields = [
+            "id", "partner", "title", "description", "status", "is_anonymous", "closes_at",
+            "created_by", "created_by_name", "created_at", "updated_at",
+            "questions", "question_count", "response_count", "has_responded",
+        ]
+        read_only_fields = [
+            "id", "partner", "created_by", "created_by_name", "created_at", "updated_at",
+            "questions", "question_count", "response_count", "has_responded",
+        ]
+
+    def get_question_count(self, obj):
+        return obj.questions.count()
+
+    def get_response_count(self, obj):
+        return obj.responses.count()
+
+    def get_has_responded(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or user.is_anonymous:
+            return False
+        return obj.responses.filter(respondent=user).exists()
