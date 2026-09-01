@@ -2572,3 +2572,104 @@ class PartnerBudgetApiTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["name"], "Youth budget")
+
+
+class PartnerVolunteerRosterApiTests(TestCase):
+    """Volunteer Roster."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670009701", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670009702", country="CM", password="pass1234")
+        self.other_member = User.objects.create_user(phone="+237670009703", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Volunteer Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Volunteer Partner", slug="volunteer-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+        PartnerMembership.objects.create(partner=self.partner, user=self.other_member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_owner_can_create_shift(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/volunteer-shifts/",
+            {
+                "title": "Sunday setup crew",
+                "location": "Main Hall",
+                "starts_at": "2026-10-01T07:00:00Z",
+                "ends_at": "2026-10-01T09:00:00Z",
+                "slots_total": 2,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["slots_remaining"], 2)
+
+    def test_plain_member_cannot_create_shift(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/volunteer-shifts/",
+            {"title": "X", "starts_at": "2026-10-01T07:00:00Z", "ends_at": "2026-10-01T09:00:00Z"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_member_can_sign_up_and_cancel(self):
+        from apps.partners.models import PartnerVolunteerShift
+
+        shift = PartnerVolunteerShift.objects.create(
+            partner=self.partner, title="Cleanup", starts_at="2026-10-01T07:00:00Z", ends_at="2026-10-01T09:00:00Z", slots_total=2,
+        )
+        self.client.force_authenticate(self.member)
+
+        signup = self.client.post(f"/api/v1/partners/{self.partner.id}/volunteer-shifts/{shift.id}/signup/", {}, format="json")
+        self.assertEqual(signup.status_code, status.HTTP_201_CREATED, signup.data)
+        self.assertEqual(signup.data["status"], "signed_up")
+
+        again = self.client.post(f"/api/v1/partners/{self.partner.id}/volunteer-shifts/{shift.id}/signup/", {}, format="json")
+        self.assertEqual(again.status_code, status.HTTP_400_BAD_REQUEST)
+
+        cancel = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/volunteer-shifts/{shift.id}/signup/", {"action": "cancel"}, format="json",
+        )
+        self.assertEqual(cancel.status_code, status.HTTP_200_OK)
+
+        resignup = self.client.post(f"/api/v1/partners/{self.partner.id}/volunteer-shifts/{shift.id}/signup/", {}, format="json")
+        self.assertEqual(resignup.status_code, status.HTTP_201_CREATED)
+
+    def test_shift_rejects_signup_when_full(self):
+        from apps.partners.models import PartnerVolunteerShift
+
+        shift = PartnerVolunteerShift.objects.create(
+            partner=self.partner, title="Small crew", starts_at="2026-10-01T07:00:00Z", ends_at="2026-10-01T09:00:00Z", slots_total=1,
+        )
+        self.client.force_authenticate(self.member)
+        self.client.post(f"/api/v1/partners/{self.partner.id}/volunteer-shifts/{shift.id}/signup/", {}, format="json")
+
+        self.client.force_authenticate(self.other_member)
+        response = self.client.post(f"/api/v1/partners/{self.partner.id}/volunteer-shifts/{shift.id}/signup/", {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_owner_can_view_roster_but_member_cannot(self):
+        from apps.partners.models import PartnerVolunteerShift
+
+        shift = PartnerVolunteerShift.objects.create(
+            partner=self.partner, title="Ushers", starts_at="2026-10-01T07:00:00Z", ends_at="2026-10-01T09:00:00Z", slots_total=5,
+        )
+        self.client.force_authenticate(self.member)
+        self.client.post(f"/api/v1/partners/{self.partner.id}/volunteer-shifts/{shift.id}/signup/", {}, format="json")
+
+        denied = self.client.get(f"/api/v1/partners/{self.partner.id}/volunteer-shifts/{shift.id}/roster/")
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.owner)
+        allowed = self.client.get(f"/api/v1/partners/{self.partner.id}/volunteer-shifts/{shift.id}/roster/")
+        self.assertEqual(allowed.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(allowed.data), 1)
+        self.assertEqual(allowed.data[0]["volunteer"], self.member.id)

@@ -59,6 +59,9 @@ from apps.partners.models import (
     PartnerSurveyAnswer,
     PartnerBudget,
     PartnerBudgetExpense,
+    PartnerVolunteerShift,
+    PartnerVolunteerSignup,
+    PartnerVolunteerSignupStatus,
 )
 from apps.chat.models import ConversationType
 from apps.chat.discussion import get_discussion_count
@@ -1801,3 +1804,48 @@ class PartnerBudgetSerializer(serializers.ModelSerializer):
         if not obj.allocated_amount:
             return 0
         return round(float(self._total_spent(obj)) / float(obj.allocated_amount) * 100, 1)
+
+
+class PartnerVolunteerSignupSerializer(serializers.ModelSerializer):
+    volunteer_name = serializers.CharField(source="volunteer.display_name", read_only=True, default=None)
+
+    class Meta:
+        model = PartnerVolunteerSignup
+        fields = ["id", "shift", "volunteer", "volunteer_name", "status", "signed_up_at"]
+        read_only_fields = ["id", "shift", "volunteer", "volunteer_name", "signed_up_at"]
+
+
+class PartnerVolunteerShiftSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source="created_by.display_name", read_only=True, default=None)
+    signup_count = serializers.SerializerMethodField()
+    slots_remaining = serializers.SerializerMethodField()
+    my_status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PartnerVolunteerShift
+        fields = [
+            "id", "partner", "title", "description", "location", "starts_at", "ends_at", "slots_total",
+            "created_by", "created_by_name", "created_at", "updated_at",
+            "signup_count", "slots_remaining", "my_status",
+        ]
+        read_only_fields = [
+            "id", "partner", "created_by", "created_by_name", "created_at", "updated_at",
+            "signup_count", "slots_remaining", "my_status",
+        ]
+
+    def _active_signups(self, obj):
+        return obj.signups.exclude(status=PartnerVolunteerSignupStatus.CANCELLED)
+
+    def get_signup_count(self, obj):
+        return self._active_signups(obj).count()
+
+    def get_slots_remaining(self, obj):
+        return max(obj.slots_total - self._active_signups(obj).count(), 0)
+
+    def get_my_status(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or user.is_anonymous:
+            return None
+        signup = obj.signups.filter(volunteer=user).first()
+        return signup.status if signup else None

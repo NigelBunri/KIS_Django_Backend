@@ -81,6 +81,9 @@ from apps.partners.models import (
     PartnerSurveyAnswer,
     PartnerBudget,
     PartnerBudgetExpense,
+    PartnerVolunteerShift,
+    PartnerVolunteerSignup,
+    PartnerVolunteerSignupStatus,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -134,6 +137,8 @@ from apps.partners.serializers import (
     PartnerSurveyResponseSerializer,
     PartnerBudgetSerializer,
     PartnerBudgetExpenseSerializer,
+    PartnerVolunteerShiftSerializer,
+    PartnerVolunteerSignupSerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
     PartnerWebhookSerializer,
@@ -1838,6 +1843,98 @@ class PartnerViewSet(viewsets.ModelViewSet):
             target_type="partner_budget_expense", target_id=str(expense_id), request=request,
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # ── Volunteer Roster ─────────────────────────────────────────────────
+    @action(detail=True, methods=["get", "post"], url_path="volunteer-shifts")
+    def volunteer_shifts(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            self._require_permission(partner, request.user, "partner.volunteers.manage")
+            serializer = PartnerVolunteerShiftSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            shift = serializer.save(partner=partner, created_by=request.user)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.volunteer_shift.create",
+                target_type="partner_volunteer_shift", target_id=str(shift.id),
+                metadata={"title": shift.title}, request=request,
+            )
+            return Response(PartnerVolunteerShiftSerializer(shift, context={"request": request}).data, status=status.HTTP_201_CREATED)
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        qs = PartnerVolunteerShift.objects.filter(partner=partner).prefetch_related("signups")
+        upcoming_only = request.query_params.get("upcoming")
+        if upcoming_only == "1":
+            qs = qs.filter(ends_at__gte=timezone.now())
+        return Response(PartnerVolunteerShiftSerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"volunteer-shifts/(?P<shift_id>[^/.]+)")
+    def volunteer_shift_detail(self, request, pk=None, shift_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.volunteers.manage")
+        shift = PartnerVolunteerShift.objects.filter(id=shift_id, partner=partner).first()
+        if not shift:
+            return Response({"detail": "Shift not found."}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == "DELETE":
+            shift.delete()
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.volunteer_shift.delete",
+                target_type="partner_volunteer_shift", target_id=str(shift_id), request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = PartnerVolunteerShiftSerializer(shift, data=request.data, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.volunteer_shift.update",
+            target_type="partner_volunteer_shift", target_id=str(shift.id),
+            metadata={"fields": list((request.data or {}).keys())}, request=request,
+        )
+        return Response(PartnerVolunteerShiftSerializer(shift, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path=r"volunteer-shifts/(?P<shift_id>[^/.]+)/signup")
+    def volunteer_shift_signup(self, request, pk=None, shift_id=None):
+        partner = self.get_object()
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to sign up for this shift.")
+        shift = PartnerVolunteerShift.objects.filter(id=shift_id, partner=partner).first()
+        if not shift:
+            return Response({"detail": "Shift not found."}, status=status.HTTP_404_NOT_FOUND)
+        action_type = request.data.get("action", "signup")
+        if action_type == "cancel":
+            PartnerVolunteerSignup.objects.filter(shift=shift, volunteer=request.user).update(
+                status=PartnerVolunteerSignupStatus.CANCELLED,
+            )
+            return Response(
+                {"detail": "Signup cancelled.", "my_status": PartnerVolunteerSignupStatus.CANCELLED}, status=status.HTTP_200_OK,
+            )
+        existing = PartnerVolunteerSignup.objects.filter(shift=shift, volunteer=request.user).first()
+        if existing and existing.status != PartnerVolunteerSignupStatus.CANCELLED:
+            return Response({"detail": "Already signed up."}, status=status.HTTP_400_BAD_REQUEST)
+        active_count = shift.signups.exclude(status=PartnerVolunteerSignupStatus.CANCELLED).count()
+        if active_count >= shift.slots_total:
+            return Response({"detail": "This shift is full."}, status=status.HTTP_400_BAD_REQUEST)
+        if existing:
+            existing.status = PartnerVolunteerSignupStatus.SIGNED_UP
+            existing.signed_up_at = timezone.now()
+            existing.save(update_fields=["status", "signed_up_at"])
+            signup = existing
+        else:
+            signup = PartnerVolunteerSignup.objects.create(shift=shift, volunteer=request.user)
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.volunteer_shift.signup",
+            target_type="partner_volunteer_shift", target_id=str(shift.id), request=request,
+        )
+        return Response(PartnerVolunteerSignupSerializer(signup).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"], url_path=r"volunteer-shifts/(?P<shift_id>[^/.]+)/roster")
+    def volunteer_shift_roster(self, request, pk=None, shift_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.volunteers.manage")
+        shift = PartnerVolunteerShift.objects.filter(id=shift_id, partner=partner).first()
+        if not shift:
+            return Response({"detail": "Shift not found."}, status=status.HTTP_404_NOT_FOUND)
+        signups = shift.signups.exclude(status=PartnerVolunteerSignupStatus.CANCELLED).select_related("volunteer")
+        return Response(PartnerVolunteerSignupSerializer(signups, many=True).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):

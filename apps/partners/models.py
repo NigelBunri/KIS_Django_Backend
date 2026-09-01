@@ -2003,3 +2003,42 @@ class PartnerBudgetExpense(models.Model):
         db_table = "partner_budget_expense"
         ordering = ["-spent_at"]
         indexes = [models.Index(fields=["budget", "spent_at"])]
+
+
+class PartnerVolunteerSignupStatus(models.TextChoices):
+    SIGNED_UP = "signed_up", "Signed up"
+    CONFIRMED = "confirmed", "Confirmed"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class PartnerVolunteerShift(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="volunteer_shifts")
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    location = models.CharField(max_length=255, blank=True)
+    starts_at = models.DateTimeField()
+    ends_at = models.DateTimeField()
+    slots_total = models.PositiveIntegerField(default=1)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_volunteer_shift"
+        ordering = ["starts_at"]
+        indexes = [models.Index(fields=["partner", "starts_at"])]
+
+
+class PartnerVolunteerSignup(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    shift = models.ForeignKey(PartnerVolunteerShift, on_delete=models.CASCADE, related_name="signups")
+    volunteer = models.ForeignKey(User, on_delete=models.CASCADE, related_name="partner_volunteer_signups")
+    status = models.CharField(
+        max_length=16, choices=PartnerVolunteerSignupStatus.choices, default=PartnerVolunteerSignupStatus.SIGNED_UP,
+    )
+    signed_up_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "partner_volunteer_signup"
+        unique_together = [("shift", "volunteer")]
