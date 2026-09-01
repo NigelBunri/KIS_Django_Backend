@@ -16,6 +16,7 @@ from rest_framework import status
 from .models import AccountTier, Subscription, User, Device
 from .tiers import ensure_default_account_tiers
 from .views import issue_tokens_for_user
+from admin_control.roles import AdminRole, AdminRoleAssignment, AdminRolePermission
 
 # ──────────────────────────────────────────────
 # Shared helpers
@@ -877,6 +878,15 @@ class AdminToolsTests(TestCase):
         self.superuser.is_staff = True
         self.superuser.is_superuser = True
         self.superuser.save(update_fields=["is_staff", "is_superuser"])
+        # Django's is_staff/is_superuser flags are deliberately NOT trusted by
+        # admin_control's own IsAdminControlUser permission (see
+        # admin_control/permissions/base.py + AdminAccessService.has_permission) -
+        # every admin_control-gated action requires an explicit, audited
+        # AdminRoleAssignment, so grant one here rather than relying on the
+        # Django flags alone.
+        admin_role = AdminRole.objects.create(name="qa-suspend-role")
+        AdminRolePermission.objects.create(role=admin_role, app_label="*", permissions=["users.moderate"])
+        AdminRoleAssignment.objects.create(user=self.superuser, role=admin_role, is_active=True)
         self.client_reg = auth_client(self.regular)
         self.client_su = auth_client(self.superuser, device_id=DEVICE_B)
 
