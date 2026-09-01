@@ -72,6 +72,7 @@ from apps.partners.models import (
     SupportTicket,
     SupportTicketStatus,
     SupportTicketReply,
+    PartnerPostTemplate,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -119,6 +120,7 @@ from apps.partners.serializers import (
     PartnerCalendarRsvpSerializer,
     SupportTicketSerializer,
     SupportTicketReplySerializer,
+    PartnerPostTemplateSerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
     PartnerWebhookSerializer,
@@ -1552,6 +1554,48 @@ class PartnerViewSet(viewsets.ModelViewSet):
             status__in=[SupportTicketStatus.RESOLVED, SupportTicketStatus.CLOSED],
         ).count()
         return Response({"counts": counts, "unassigned": unassigned, "total": qs.count()}, status=status.HTTP_200_OK)
+
+    # ── Post Templates ───────────────────────────────────────────────────
+    @action(detail=True, methods=["get", "post"], url_path="post-templates")
+    def post_templates(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.templates.manage")
+        if request.method == "POST":
+            serializer = PartnerPostTemplateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            template = serializer.save(partner=partner, created_by=request.user)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.post_template.create",
+                target_type="partner_post_template", target_id=str(template.id),
+                metadata={"title": template.title}, request=request,
+            )
+            return Response(PartnerPostTemplateSerializer(template).data, status=status.HTTP_201_CREATED)
+        qs = PartnerPostTemplate.objects.filter(partner=partner).select_related("created_by")
+        return Response(PartnerPostTemplateSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"post-templates/(?P<template_id>[^/.]+)")
+    def post_template_detail(self, request, pk=None, template_id=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.templates.manage")
+        template = PartnerPostTemplate.objects.filter(id=template_id, partner=partner).first()
+        if not template:
+            return Response({"detail": "Template not found."}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == "DELETE":
+            template.delete()
+            log_partner_audit(
+                partner=partner, actor=request.user, action="partner.post_template.delete",
+                target_type="partner_post_template", target_id=str(template_id), request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = PartnerPostTemplateSerializer(template, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        log_partner_audit(
+            partner=partner, actor=request.user, action="partner.post_template.update",
+            target_type="partner_post_template", target_id=str(template.id),
+            metadata={"fields": list((request.data or {}).keys())}, request=request,
+        )
+        return Response(PartnerPostTemplateSerializer(template).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):

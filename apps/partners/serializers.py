@@ -52,6 +52,7 @@ from apps.partners.models import (
     PartnerCalendarRsvp,
     SupportTicket,
     SupportTicketReply,
+    PartnerPostTemplate,
 )
 from apps.chat.models import ConversationType
 from apps.chat.discussion import get_discussion_count
@@ -1683,3 +1684,12 @@ class SupportTicketSerializer(serializers.ModelSerializer):
 
     def get_reply_count(self, obj):
         return obj.replies.filter(is_internal_note=False).count()
+
+
+class PartnerPostTemplateSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source="created_by.display_name", read_only=True, default=None)
+
+    class Meta:
+        model = PartnerPostTemplate
+        fields = ["id", "partner", "title", "body", "created_by", "created_by_name", "created_at", "updated_at"]
+        read_only_fields = ["id", "partner", "created_by", "created_by_name", "created_at", "updated_at"]

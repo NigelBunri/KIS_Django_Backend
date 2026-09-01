@@ -2248,3 +2248,65 @@ class PartnerSupportTicketApiTests(TestCase):
         self.assertEqual(allowed.data["total"], 2)
         self.assertEqual(allowed.data["counts"]["open"], 1)
         self.assertEqual(allowed.data["counts"]["resolved"], 1)
+
+
+class PartnerPostTemplateApiTests(TestCase):
+    """Post Templates."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670009401", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670009402", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Templates Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Templates Partner", slug="templates-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_owner_can_create_template(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/post-templates/",
+            {"title": "Office closed", "body": "Our office will be closed on {date} for {reason}."},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["title"], "Office closed")
+
+    def test_plain_member_cannot_manage_templates(self):
+        self.client.force_authenticate(self.member)
+
+        create = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/post-templates/",
+            {"title": "X", "body": "Y"},
+            format="json",
+        )
+        self.assertEqual(create.status_code, status.HTTP_403_FORBIDDEN)
+
+        listing = self.client.get(f"/api/v1/partners/{self.partner.id}/post-templates/")
+        self.assertEqual(listing.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_owner_can_list_update_and_delete_template(self):
+        from apps.partners.models import PartnerPostTemplate
+
+        template = PartnerPostTemplate.objects.create(partner=self.partner, title="Welcome", body="Hi there!")
+        self.client.force_authenticate(self.owner)
+
+        listing = self.client.get(f"/api/v1/partners/{self.partner.id}/post-templates/")
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(listing.data), 1)
+
+        update = self.client.patch(
+            f"/api/v1/partners/{self.partner.id}/post-templates/{template.id}/",
+            {"body": "Hi there, welcome aboard!"},
+            format="json",
+        )
+        self.assertEqual(update.status_code, status.HTTP_200_OK, update.data)
+        self.assertEqual(update.data["body"], "Hi there, welcome aboard!")
+
+        delete = self.client.delete(f"/api/v1/partners/{self.partner.id}/post-templates/{template.id}/")
+        self.assertEqual(delete.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PartnerPostTemplate.objects.filter(id=template.id).exists())

@@ -1860,3 +1860,22 @@ class SupportTicketReply(models.Model):
         db_table = "partner_support_ticket_reply"
         ordering = ["created_at"]
         indexes = [models.Index(fields=["ticket", "created_at"])]
+
+
+class PartnerPostTemplate(models.Model):
+    """General Tools > Templates — reusable canned text admins can pull
+    into the feed/broadcast composer instead of retyping common
+    announcements (closures, welcome messages, event reminders, ...)."""
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="post_templates")
+    title = models.CharField(max_length=120)
+    body = models.TextField()
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_post_template"
+        ordering = ["title"]
+        indexes = [models.Index(fields=["partner"])]
