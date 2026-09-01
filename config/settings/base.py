@@ -687,6 +687,28 @@ API_TOKEN_DEFAULT_EXPIRES_DAYS = int(os.environ.get("API_TOKEN_DEFAULT_EXPIRES_D
 # runs via the daily "purge-accounts-past-grace-period" Celery beat task.
 ACCOUNT_DELETION_GRACE_DAYS = int(os.environ.get("ACCOUNT_DELETION_GRACE_DAYS", 30))
 
+# Responsible-engagement daily limit on PASSIVE broadcast-feed scrolling
+# only (apps.accounts.responsible_feed, enforced in
+# apps.broadcasts.views.BroadcastFeedView.get - deliberately does not gate
+# messaging, calls, the user's own profile, settings, or any other
+# intentional navigation). Server-authoritative: usage is reconstructed
+# from the gap between successive heartbeat request timestamps as
+# measured by the server's own clock, not anything the client reports, so
+# it survives a manipulated device clock, an app reinstall, or a logout/
+# login (see DailyFeedUsage/FeedEngagementState in apps/accounts/models.py).
+RESPONSIBLE_FEED_DAILY_LIMIT_SECONDS = int(
+    os.environ.get("RESPONSIBLE_FEED_DAILY_LIMIT_SECONDS", 2 * 60 * 60)
+)
+# Caps how much elapsed time a single heartbeat can credit - without this,
+# one heartbeat sent after the app sat backgrounded for hours (or a client
+# that simply stops sending heartbeats for a while) would silently credit
+# that entire gap as "active feed viewing." Should comfortably exceed the
+# client's real heartbeat interval (expected ~15-30s) with slack for
+# network delay, not approach it.
+RESPONSIBLE_FEED_MAX_HEARTBEAT_GAP_SECONDS = int(
+    os.environ.get("RESPONSIBLE_FEED_MAX_HEARTBEAT_GAP_SECONDS", 90)
+)
+
 # Caching (e.g., Redis) - used by quota enforcement and feature flags
 CACHES = {
     "default": {

@@ -116,6 +116,7 @@ from .serializers import (
 )
 from .feature_gate import require_feature
 from .family_accessibility import serialize_family_accessibility_preferences, update_family_accessibility_preferences
+from .responsible_feed import get_today_feed_status, record_feed_heartbeat
 from .tiers import ensure_default_account_tiers, get_user_tier_features, public_account_tiers_qs
 from apps.partners.models import Partner, PartnerApplication, PartnerJobPost
 from apps.partners.serializers import PartnerListSerializer, PartnerApplicationDetailSerializer, PartnerJobPostSerializer
@@ -2194,6 +2195,32 @@ class FamilyAccessibilityPreferencesView(APIView):
             raise DRFValidationError({"detail": "Preference updates must be an object."})
         payload = request.data.get("preferences") if isinstance(request.data.get("preferences"), dict) else request.data
         return Response(update_family_accessibility_preferences(request.user, payload), status=status.HTTP_200_OK)
+
+
+class FeedHeartbeatView(APIView):
+    """
+    POST /api/v1/engagement/feed-heartbeat/
+    Called by the client roughly every 15-30s while the passive broadcast
+    feed is actively on-screen. See apps.accounts.responsible_feed.
+    record_feed_heartbeat's docstring - the request body is intentionally
+    not read for any elapsed-time value; only the fact that a request
+    arrived now, per the server's own clock, matters.
+    """
+    authentication_classes = JWT_AUTH
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        return Response(record_feed_heartbeat(request.user), status=status.HTTP_200_OK)
+
+
+class FeedStatusView(APIView):
+    """GET /api/v1/engagement/feed-status/ - today's passive-feed usage
+    against the daily limit, without recording a heartbeat."""
+    authentication_classes = JWT_AUTH
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        return Response(get_today_feed_status(request.user), status=status.HTTP_200_OK)
 
 
 @extend_schema_view(

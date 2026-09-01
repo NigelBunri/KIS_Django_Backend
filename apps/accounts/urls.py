@@ -26,6 +26,8 @@ from .views import (
     E2EEFetchBundleView,
     E2EEFetchDeviceBundlesView,
     FamilyAccessibilityPreferencesView,
+    FeedHeartbeatView,
+    FeedStatusView,
     DeviceSessionsView,
     DeviceSessionDetailView,
     DeviceBoundTokenRefreshView,
@@ -144,6 +146,8 @@ urlpatterns = [
     path("auth/devices/<str:device_id>/rename/", DeviceRenameView.as_view(), name="device-rename"),
     path("auth/devices/<str:device_id>/", DeviceSessionDetailView.as_view(), name="auth-device-detail"),
     path("profile-preferences/family-accessibility/", FamilyAccessibilityPreferencesView.as_view(), name="family-accessibility-preferences"),
+    path("engagement/feed-heartbeat/", FeedHeartbeatView.as_view(), name="engagement-feed-heartbeat"),
+    path("engagement/feed-status/", FeedStatusView.as_view(), name="engagement-feed-status"),
     # Trusted-internal only (apps.chat.internal_auth) — Nest calls this to
     # check a user's chat/call notification preferences before sending a
     # push. See apps/accounts/views_internal.py.

@@ -52,6 +52,7 @@ from apps.communities.models import (
 )
 from apps.accounts.models import Profile, User
 from apps.accounts.feature_gate import require_feature
+from apps.accounts.responsible_feed import get_today_feed_status
 from apps.accounts.tiers import get_platform_commission_pct, get_user_tier_features, normalize_limit_value
 from apps.commerce.constants import KIS_COIN_CODE
 from apps.commerce.models import Product, ShopService, ShopTeamMember, ServiceBooking
@@ -7364,6 +7365,22 @@ class BroadcastFeedView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        # Server-authoritative responsible-engagement limit (2h/day
+        # default) - this is the one place it's actually enforced; the
+        # heartbeat/status endpoints (apps.accounts.responsible_feed) are
+        # just the ledger the client polls to know when it's coming.
+        # Empty results + a limit_reached flag rather than an error status,
+        # so any client that doesn't understand this yet still degrades to
+        # "no more posts" instead of breaking. Deliberately only this
+        # endpoint - messaging, calls, the user's own profile, and settings
+        # are untouched.
+        feed_status = get_today_feed_status(request.user)
+        if feed_status["limit_reached"]:
+            return Response(
+                {"results": [], "count": 0, "next": None, "previous": None, "feed_limit": feed_status},
+                status=status.HTTP_200_OK,
+            )
+
         cleaned = cleanup_expired_broadcast_items()
         if cleaned:
             logger.info("Purged %d expired broadcast items before listing the feed.", cleaned)
