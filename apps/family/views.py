@@ -292,6 +292,23 @@ class SOSAlertView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        # SECURITY: unlike every other family endpoint in this file (see
+        # get_queryset() on FamilyAccountViewSet/FamilyEventViewSet, which
+        # all scope to Q(admin_user=user) | Q(members__user=user)), this view
+        # previously had no check that request.user belongs to this family
+        # at all - any authenticated user could fire a real-looking SOS
+        # alert at an arbitrary family's parents/guardians. Returning the
+        # same 404 for "not found" and "not a member" also avoids letting
+        # this endpoint be used to enumerate valid family ids.
+        is_member = family.admin_user_id == request.user.id or FamilyMember.objects.filter(
+            family=family, user=request.user,
+        ).exists()
+        if not is_member:
+            return Response(
+                {"detail": "Family not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
         parents = FamilyMember.objects.filter(
             family=family,
             role__in=["parent", "guardian"],

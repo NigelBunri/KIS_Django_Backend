@@ -217,3 +217,46 @@ class ParentalControlPermissionTests(FamilyPermissionTestsBase):
         res = self.client.get(PARENTAL_CONTROLS_URL)
 
         self.assertEqual(res.status_code, 200)
+
+
+SOS_URL = "/api/v1/family/sos/"
+
+
+class SOSAlertPermissionTests(FamilyPermissionTestsBase):
+    """
+    SOSAlertView previously had no check that the caller belongs to the
+    named family at all - any authenticated user could fire a real-looking
+    SOS alert at an arbitrary family's parents/guardians by supplying its
+    family_id. See the SECURITY comment in views.py.
+    """
+
+    def test_a_stranger_cannot_trigger_an_sos_alert_for_a_family_they_are_not_in(self):
+        stranger = User.objects.create_user(phone="+2348600000008", password="pw123456", country="NG")
+        self.client.force_authenticate(stranger)
+
+        res = self.client.post(SOS_URL, {"family_id": str(self.family.id), "message": "help"}, format="json")
+
+        self.assertEqual(res.status_code, 404)
+
+    def test_a_family_member_can_trigger_an_sos_alert_for_their_own_family(self):
+        self.client.force_authenticate(self.child)
+
+        res = self.client.post(SOS_URL, {"family_id": str(self.family.id), "message": "help"}, format="json")
+
+        self.assertEqual(res.status_code, 200)
+
+    def test_the_family_admin_can_trigger_an_sos_alert_even_without_a_membership_row(self):
+        self.client.force_authenticate(self.admin)
+
+        res = self.client.post(SOS_URL, {"family_id": str(self.family.id), "message": "help"}, format="json")
+
+        self.assertEqual(res.status_code, 200)
+
+    def test_a_nonexistent_family_id_returns_the_same_404_as_not_a_member(self):
+        self.client.force_authenticate(self.child)
+
+        res = self.client.post(
+            SOS_URL, {"family_id": "00000000-0000-0000-0000-000000000000", "message": "help"}, format="json",
+        )
+
+        self.assertEqual(res.status_code, 404)

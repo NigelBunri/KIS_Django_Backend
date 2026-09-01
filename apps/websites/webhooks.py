@@ -16,6 +16,8 @@ import secrets
 
 import requests
 
+from common.url_safety import is_safe_external_url
+
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT_SECONDS = 4
@@ -36,6 +38,18 @@ def fire_webhook_event(website, event_type: str, payload: dict) -> None:
 
 
 def _send_one(webhook, event_type: str, payload: dict) -> None:
+    # SSRF guard: target_url is set by the website owner via a self-service
+    # form, but the fetch itself runs from the KIS backend, which can reach
+    # internal-only hosts a website owner has no business reaching (other
+    # internal services, the cloud metadata endpoint, etc). Skip delivery
+    # rather than raise, matching this function's existing "never block the
+    # triggering request" contract.
+    if not is_safe_external_url(webhook.target_url):
+        logger.info(
+            "Website webhook delivery skipped for %s (%s): target_url is not an allowed external address",
+            webhook.id, event_type,
+        )
+        return
     body = json.dumps({"event": event_type, "website_id": str(webhook.website_id), "data": payload}).encode()
     signature = _sign(webhook.secret, body)
     try:

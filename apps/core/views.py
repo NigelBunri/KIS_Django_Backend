@@ -27,6 +27,7 @@ from .interoperability import export_patient_fhir_bundle, import_patient_fhir_bu
 
 from apps.notifications import services as notification_services
 from .ai_assistance_safety import ai_assistance_safety_policy
+from common.url_safety import is_safe_external_url
 from .monetization_safety import monetization_without_legal_risk_summary
 from .performance_offline import performance_offline_policy
 from .platform_dashboards import unified_platform_dashboard_summary
@@ -2659,6 +2660,13 @@ class LinkPreviewView(APIView):
         url = request.query_params.get("url", "").strip()
         if not url:
             return Response({"detail": "url param is required."}, status=status.HTTP_400_BAD_REQUEST)
+        # SSRF guard: this endpoint makes a server-side GET to whatever URL
+        # the (authenticated) caller supplies. Without restricting it to
+        # public internet hosts, any authenticated user could use it to probe
+        # or read from internal-only services and the cloud metadata
+        # endpoint (169.254.169.254).
+        if not is_safe_external_url(url):
+            return Response({"detail": "url is not allowed."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             import requests as _requests

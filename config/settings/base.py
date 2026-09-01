@@ -591,6 +591,12 @@ REST_FRAMEWORK = {
         "login": _env_throttle_rate("THROTTLE_LOGIN", dev_default="6000/min", prod_default="30/min"),
         "register": _env_throttle_rate("THROTTLE_REGISTER", dev_default="6000/min", prod_default="20/min"),
         "otp": _env_throttle_rate("THROTTLE_OTP", dev_default="6000/min", prod_default="20/min"),
+        # UserViewSet.check-status is AllowAny/unauthenticated (a device
+        # needs it before it has a session) and takes a raw phone number,
+        # returning whether it's registered plus account status/verification
+        # - an enumeration + PII-leak vector, so it gets the same brute-force
+        # ceiling as login/otp rather than the generic anon rate.
+        "user_check_status": _env_throttle_rate("THROTTLE_USER_CHECK_STATUS", dev_default="6000/min", prod_default="20/min"),
         "password_reset": _env_throttle_rate("THROTTLE_PASSWORD_RESET", dev_default="6000/min", prod_default="20/min"),
         # Public (no-app-required) account-deletion request — password-gated
         # but AllowAny/IP-keyed like login, so it needs the same brute-force

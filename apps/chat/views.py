@@ -563,7 +563,15 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='block_chat')
     def block_chat(self, request, pk=None):
-        conversation = Conversation.objects.get(pk=pk)
+        # SECURITY: use self.get_object() (scoped to the requesting user's
+        # own memberships via get_queryset()), not a bare Conversation.get -
+        # the latter let ANY authenticated user lock ANY other pair's DM by
+        # guessing/reusing a conversation id, regardless of membership. The
+        # explicit membership check below is defense in depth, matching the
+        # pattern used by the sibling archive/pin/mute actions.
+        conversation = self.get_object()
+        if not user_is_active_member(request.user, conversation):
+            return Response({"detail": "You are not a member of this conversation."}, status=403)
         if conversation.type != ConversationType.DIRECT:
             return Response({"detail": "Not a direct conversation"}, status=400)
         conversation.is_locked = True

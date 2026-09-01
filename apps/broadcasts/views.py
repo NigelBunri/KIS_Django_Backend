@@ -16029,6 +16029,27 @@ class ChannelContentCommentsView(APIView):
         return Response(data, status=status.HTTP_201_CREATED)
 
 
+class ChannelCommentRepliesView(APIView):
+    """`ChannelContentCommentSerializer` has always exposed a `reply_count`
+    per top-level comment, but there was no endpoint that actually returned
+    those replies - the list view hard-filters `parent__isnull=True`, and
+    replies were only ever visible transiently in a reply's own POST
+    response. This closes that gap."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, comment_id):
+        parent = get_object_or_404(ChannelContentComment.objects.select_related("content"), id=comment_id, is_deleted=False)
+        if not _user_can_view_content(request.user, parent.content):
+            raise Http404
+        rows = (
+            ChannelContentComment.objects.select_related("user")
+            .filter(parent=parent, is_deleted=False)
+            .order_by("created_at")[:200]
+        )
+        return Response({"results": ChannelContentCommentSerializer(rows, many=True, context={"request": request}).data})
+
+
 class BroadcastChannelReportView(APIView):
     permission_classes = [AllowAny]
 
@@ -16509,7 +16530,24 @@ class BroadcastChannelAnalyticsView(APIView):
 
 
 class BroadcastPlaylistItemView(APIView):
-    permission_classes = [IsAuthenticated]
+    # GET must stay AllowAny - a channel playlist's own listing endpoint
+    # (BroadcastPlaylistListCreateView.get) is already public for
+    # PUBLIC-visibility playlists, but there was no way to fetch what's
+    # actually inside one once you had its id. Same visibility rule as
+    # that list view: PUBLIC playlists are readable by anyone, anything
+    # else requires channel-manage rights.
+    permission_classes = [AllowAny]
+
+    def get(self, request, playlist_id):
+        playlist = get_object_or_404(BroadcastPlaylist.objects.select_related("channel"), id=playlist_id)
+        can_manage = _user_can_manage_channel(request.user, playlist.channel)
+        if playlist.visibility != BroadcastPlaylist.Visibility.PUBLIC and not can_manage:
+            raise Http404
+        items = playlist.items.select_related("content", "content__channel").order_by("sort_order", "-added_at")
+        return Response({
+            "playlist": BroadcastPlaylistSerializer(playlist, context={"request": request}).data,
+            "results": BroadcastPlaylistItemSerializer(items, many=True, context={"request": request}).data,
+        })
 
     def post(self, request, playlist_id):
         playlist = get_object_or_404(BroadcastPlaylist.objects.select_related("channel"), id=playlist_id)
@@ -18920,12 +18958,46 @@ class UserContentPlaylistDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class PublicUserPlaylistView(APIView):
+    """Read-only view of a single user playlist for anyone but the owner.
+    UserContentPlaylist has carried a `visibility` field (public/unlisted/
+    private) since it was added, but every existing view hard-scopes
+    `user=request.user` - meaning visibility was written but never actually
+    read for access control, so "share my playlist" was impossible despite
+    the schema already modeling it. This is the missing read path: PUBLIC
+    and UNLISTED playlists are viewable by their id (unlisted = not listed
+    anywhere, but the direct link works, matching the model's own naming);
+    PRIVATE stays inaccessible to everyone but the owner (owner reads via
+    UserContentPlaylistDetailView, unaffected by this view existing)."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, playlist_id):
+        playlist = get_object_or_404(UserContentPlaylist, id=playlist_id)
+        if playlist.visibility == UserContentPlaylist.Visibility.PRIVATE:
+            raise Http404
+        items = playlist.items.select_related("content", "content__channel").order_by("sort_order", "-added_at")
+        return Response({
+            "id": str(playlist.id),
+            "title": playlist.title,
+            "description": playlist.description,
+            "visibility": playlist.visibility,
+            "item_count": items.count(),
+            "results": [
+                ChannelContentListSerializer(item.content, context={"request": request}).data
+                for item in items if item.content_id
+            ],
+            "created_at": playlist.created_at.isoformat(),
+            "updated_at": playlist.updated_at.isoformat(),
+        })
+
+
 class UserContentPlaylistItemListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, playlist_id):
         playlist = get_object_or_404(UserContentPlaylist, id=playlist_id, user=request.user)
-        items = playlist.items.select_related("content").order_by("sort_order", "-added_at")
+        items = playlist.items.select_related("content", "content__channel").order_by("sort_order", "-added_at")
         return Response({
             "results": [
                 {
@@ -18933,10 +19005,27 @@ class UserContentPlaylistItemListView(APIView):
                     "content_id": str(item.content_id),
                     "sort_order": item.sort_order,
                     "added_at": item.added_at.isoformat(),
+                    # Hydrated inline so callers (e.g. the Saved/watch-later
+                    # page) don't have to fetch each content item
+                    # individually - this list previously only carried
+                    # content_id, forcing an N+1 client-side hydration pass.
+                    "content": ChannelContentListSerializer(item.content, context={"request": request}).data if item.content_id else None,
                 }
                 for item in items
             ]
         })
+
+    def patch(self, request, playlist_id):
+        """Reorder items. Body: {"order": ["item_id_1", "item_id_2", ...]}
+        Mirrors BroadcastPlaylistItemView.patch's reorder branch (channel
+        playlists) - user playlists had create/read/delete but no reorder."""
+        playlist = get_object_or_404(UserContentPlaylist, id=playlist_id, user=request.user)
+        order = request.data.get("order", [])
+        if not isinstance(order, list):
+            raise ValidationError({"order": "Must be a list of item IDs."})
+        for idx, item_id in enumerate(order):
+            UserContentPlaylistItem.objects.filter(playlist=playlist, id=item_id).update(sort_order=idx)
+        return Response({"reordered": True})
 
     def post(self, request, playlist_id):
         playlist = get_object_or_404(UserContentPlaylist, id=playlist_id, user=request.user)
@@ -20754,9 +20843,17 @@ class BroadcastSearchView(APIView):
         if date_to:
             qs = qs.filter(published_at__date__lte=date_to)
 
-        # view_count/reaction_count live inside ChannelContent.stats JSON;
-        # for non-date sorts we fall back to published_at to keep the query simple.
-        qs = qs.order_by("-published_at")
+        # `sort` used to be read but never applied - every value silently
+        # fell through to -published_at. view_count lives inside
+        # ChannelContent.stats (a JSONField), same key used by
+        # BroadcastChannelContentListCreateView's working sort=top, so the
+        # ordering expression is copied from there rather than invented.
+        if sort == "views":
+            qs = qs.order_by("-stats__views", "-published_at")
+        elif sort == "oldest":
+            qs = qs.order_by("published_at")
+        else:
+            qs = qs.order_by("-published_at")
 
         page = max(1, int(request.query_params.get("page", 1)))
         page_size = 24
@@ -20771,6 +20868,38 @@ class BroadcastSearchView(APIView):
             "page": page,
             "page_size": page_size,
             "results": data,
+        })
+
+
+class BroadcastSearchSuggestView(APIView):
+    """Lightweight query-as-you-type suggestions. No autocomplete endpoint
+    existed anywhere in apps.broadcasts before this - plain icontains
+    prefix-ish matching against channel handle/display_name and content
+    title, capped small since this fires on every keystroke."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        q = request.query_params.get("q", "").strip()
+        if len(q) < 2:
+            return Response({"channels": [], "contents": []})
+
+        channels = (
+            BroadcastChannel.objects.filter(
+                is_public=True, is_deleted=False,
+            )
+            .filter(Q(display_name__icontains=q) | Q(handle__icontains=q))
+            .order_by("-subscriber_count")[:5]
+        )
+        contents = (
+            ChannelContent.objects.filter(
+                status="published", visibility="public", is_deleted=False, title__icontains=q,
+            )
+            .order_by("-published_at")[:5]
+        )
+        return Response({
+            "channels": [{"id": str(c.id), "handle": c.handle, "display_name": c.display_name} for c in channels],
+            "contents": [{"id": str(c.id), "title": c.title} for c in contents],
         })
 
 

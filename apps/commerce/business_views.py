@@ -19,7 +19,7 @@ from django.utils import timezone
 
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -349,9 +349,15 @@ class CoWorkingSpaceViewSet(viewsets.ModelViewSet):
         return CoWorkingSpace.objects.all()
 
     def get_permissions(self):
+        # CoWorkingSpace has no owner/created_by field - it's a curated
+        # directory, not user-submitted listings - so there is no notion of
+        # "your own" space to scope a self-service update/delete to. Without
+        # this, IsAuthenticated alone let ANY authenticated user modify or
+        # delete ANY other business's listing (full BOLA on write actions).
+        # Listing/detail views stay public; writes are restricted to staff.
         if self.action in ("list", "retrieve"):
             return [AllowAny()]
-        return [IsAuthenticated()]
+        return [IsAdminUser()]
 
 
 # ---------------------------------------------------------------------------

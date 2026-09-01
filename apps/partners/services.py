@@ -42,6 +42,7 @@ import json
 import hmac
 import hashlib
 import urllib.request
+from common.url_safety import is_safe_external_url
 from apps.chat.models import (
     Conversation,
     ConversationType,
@@ -913,6 +914,16 @@ def dispatch_partner_webhooks(
             delivery.error_message = "Event not subscribed."
             delivery.save(update_fields=["status", "error_message", "updated_at"])
             continue
+        # SSRF guard: hook.url is partner-supplied but fetched by the KIS
+        # backend itself, which can reach internal-only hosts a partner has
+        # no business reaching (other internal services, cloud metadata
+        # endpoint, etc). Fail this delivery like any other unreachable
+        # target rather than raise.
+        if not is_safe_external_url(hook.url):
+            delivery.status = PartnerWebhookDeliveryStatus.FAILED
+            delivery.error_message = "Webhook URL is not an allowed external address."
+            delivery.save(update_fields=["status", "error_message", "updated_at"])
+            continue
         body = {
             "event": event,
             "partner_id": str(partner.id),
@@ -978,6 +989,11 @@ def retry_partner_webhook_delivery(delivery: PartnerWebhookDelivery) -> bool:
     if not hook.is_active:
         delivery.status = PartnerWebhookDeliveryStatus.FAILED
         delivery.error_message = "Webhook inactive."
+        delivery.save(update_fields=["status", "error_message", "updated_at"])
+        return False
+    if not is_safe_external_url(hook.url):
+        delivery.status = PartnerWebhookDeliveryStatus.FAILED
+        delivery.error_message = "Webhook URL is not an allowed external address."
         delivery.save(update_fields=["status", "error_message", "updated_at"])
         return False
     body = {

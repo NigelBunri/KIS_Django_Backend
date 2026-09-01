@@ -1738,6 +1738,8 @@ class UserViewSet(viewsets.ModelViewSet):
     # override; IsAdminControlUser isn't in permission_classes for any
     # other action on this ViewSet, so the default here is never consulted.
     required_permission = None
+    # Same story - only check_status overrides this, via its own @action.
+    throttle_scope = None
     # email deliberately excluded from search_fields - searching by name is
     # the legitimate "find someone" feature this endpoint supports (see
     # apps.accounts.tests_qa_full.ProfileDiscoverabilityTests.test_users_search);
@@ -1746,6 +1748,15 @@ class UserViewSet(viewsets.ModelViewSet):
     # issue PublicUserSerializer already closes.
     search_fields = ["display_name", "username"]
     ordering_fields = ["created_at", "trust_score"]
+
+    def get_throttles(self):
+        # check_status is AllowAny/unauthenticated and does an unthrottled
+        # phone -> {id, status, is_active, verification} lookup by default
+        # (only the generic anon rate applies) - give it the same
+        # brute-force-resistant scope as login/otp/password_reset instead.
+        if self.action == "check_status":
+            self.throttle_scope = "user_check_status"
+        return super().get_throttles()
 
     def get_serializer_class(self):
         if self.action == "list" and not getattr(self.request.user, "is_staff", False):
@@ -1928,29 +1939,39 @@ class UserViewSet(viewsets.ModelViewSet):
         url_path="check-status",
         permission_classes=[AllowAny],
         authentication_classes=[],
+        # throttle_scope is NOT set here - DRF's ViewSetMixin.as_view()
+        # rejects any @action kwarg that isn't already a class attribute on
+        # the ViewSet (same constraint the required_permission comment above
+        # documents for the suspend action), and UserViewSet has no
+        # class-level throttle_scope. get_throttles() below sets
+        # self.throttle_scope for this action instead, which achieves the
+        # same rate limit without tripping that check.
     )
     def check_status(self, request):
+        # SECURITY: stays AllowAny/unauthenticated deliberately - a device
+        # needs this before it has a session at all (e.g. deciding whether to
+        # show a login or registration form for a phone number). But it used
+        # to be unthrottled (throttle_scope was defined in settings but never
+        # actually applied here) and returned phone/status/is_active/the full
+        # verification blob for any phone number a caller supplied - an
+        # unlimited anonymous phone-number-to-account-existence oracle
+        # (reconnaissance for phishing/account-takeover targeting). It also
+        # had a correctness bug: when the caller WAS authenticated, it
+        # silently ignored the `phone` param and returned the caller's own
+        # record instead of looking up the requested number. Now: throttled
+        # to the same ceiling as login/register/otp, always looks up the
+        # requested phone, and returns only the one field every real caller
+        # (see HealthInstitutionMembersScreen.tsx's fallback chain) actually
+        # uses - no phone/status/is_active/verification echoed back.
         phone = (request.query_params.get("phone") or "").strip()
-        user = request.user if getattr(request.user, "is_authenticated", False) else None
-        if not user and phone:
-            user = User.objects.filter(phone=phone).first()
+        if not phone:
+            return Response({"success": False, "message": "phone is required"}, status=400)
+        user = User.objects.filter(phone=phone).first()
 
         if not user:
             return Response({"success": False, "message": "user not found"}, status=404)
 
-        return Response(
-            {
-                "success": True,
-                "user": {
-                    "id": user.id,
-                    "phone": user.phone,
-                    "status": user.status,
-                    "is_active": user.is_active,
-                    "verification": user.verification,
-                },
-            },
-            status=200,
-        )
+        return Response({"success": True, "user": {"id": user.id}}, status=200)
 @extend_schema_view(
     list=extend_schema(summary="List profiles"),
     retrieve=extend_schema(summary="Retrieve profile"),
@@ -4132,6 +4153,12 @@ class AccountDeletionView(APIView):
     """
     authentication_classes = JWT_AUTH
     permission_classes = (IsAuthenticated,)
+    # Without this, only the generic per-user rate (3000/min prod) applied -
+    # ~150x looser than every sibling password-verification endpoint below
+    # (account reactivation, public deletion request), letting a holder of a
+    # stolen/leaked access token brute-force the account password here even
+    # without knowing it.
+    throttle_scope = "account_deletion"
 
     def delete(self, request):
         password = str(request.data.get("password", "")).strip()
