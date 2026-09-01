@@ -123,6 +123,8 @@ from apps.partners.serializers import PartnerListSerializer, PartnerApplicationD
 from apps.commerce.models import LoyaltyPoint
 from apps.billing.models import WalletAccount, CreditAccount
 from apps.billing.services import credits_to_cents
+from admin_control.audit.logging import AuditLogger
+from admin_control.permissions import IsAdminControlUser
 
 PROFILE_FIELD_ORDER = [
     "avatar",
@@ -1730,6 +1732,12 @@ class UserViewSet(viewsets.ModelViewSet):
     permission_classes = (IsSelfOrStaffForUserWrites,)
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["tier", "status"]
+    # Must exist as a class attribute (DRF's ViewSet.as_view() rejects any
+    # @action kwarg that isn't already a known attribute on the class) -
+    # only the suspend action actually sets/uses this via its own @action
+    # override; IsAdminControlUser isn't in permission_classes for any
+    # other action on this ViewSet, so the default here is never consulted.
+    required_permission = None
     # email deliberately excluded from search_fields - searching by name is
     # the legitimate "find someone" feature this endpoint supports (see
     # apps.accounts.tests_qa_full.ProfileDiscoverabilityTests.test_users_search);
@@ -1798,24 +1806,44 @@ class UserViewSet(viewsets.ModelViewSet):
         score = user.recalc_trust_score()
         return Response({"trust_score": score})
 
-    @action(detail=True, methods=["post"], permission_classes=[IsAdminUser], authentication_classes=JWT_AUTH, url_path="suspend")
+    @action(
+        detail=True,
+        methods=["post"],
+        # Previously plain IsAdminUser — ANY is_staff account, regardless
+        # of admin_control role assignment, could suspend any user. Every
+        # other admin action in this codebase (see AdminUserBanView,
+        # admin_control/views/user_management.py) is gated through
+        # admin_control's actual granular RBAC instead. required_permission
+        # here is an "extra kwarg" DRF applies as an instance attribute
+        # only while dispatching THIS action (same mechanism already used
+        # for the permission_classes override above), so it doesn't affect
+        # any other action on this ViewSet.
+        permission_classes=[IsAuthenticated, IsAdminControlUser],
+        required_permission="users.moderate",
+        authentication_classes=JWT_AUTH,
+        url_path="suspend",
+    )
     def suspend(self, request, pk=None):
         target = self.get_object()
         reason = str(request.data.get("reason") or "Admin suspension")[:255]
         target.status = "suspended"
         target.save(update_fields=["status"])
-        try:
-            from apps.moderation.models import AuditLog
-            AuditLog.objects.create(
-                actor_id=request.user.id,
-                action="admin.user.suspend",
-                target_type="USER",
-                target_id=target.id,
-                metadata={"reason": reason},
-                ip_address=request.META.get("REMOTE_ADDR"),
-            )
-        except Exception:
-            pass
+        # Previously wrote to apps.moderation.AuditLog wrapped in a bare
+        # except: pass that silently dropped the record on any failure -
+        # and even on success, that log isn't what AuditTrailView (the
+        # actual admin-facing audit review screen, admin_control/views/
+        # audit.py) reads. AuditLogger.log() is what AdminUserBanView uses
+        # for the identical action, so suspending a user via either
+        # endpoint now shows up in the one place staff actually look.
+        AuditLogger.log(
+            actor=request.user,
+            action_type="user.suspended",
+            target_app="accounts",
+            target_model="User",
+            target_pk=str(target.id),
+            severity="warning",
+            metadata={"reason": reason},
+        )
         return Response({"detail": "User suspended", "status": target.status})
 
     @action(
