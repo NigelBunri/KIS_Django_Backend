@@ -985,9 +985,17 @@ class RevenueAccount(BaseEntity):
     routing_info = models.JSONField(default=dict, blank=True)
 
 class GDPRRequest(BaseEntity):
+    # type: "account_deletion" (so far the only type actually created — see
+    # apps/accounts/views.py schedule_account_deletion()). status:
+    # "pending" -> "completed" (purged by the daily sweep) or "cancelled"
+    # (user reactivated within the grace window).
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="gdpr_requests")
     type = models.CharField(max_length=100)
     status = models.CharField(max_length=100)
+    # When the grace-period purge is allowed to run (account_deletion only).
+    # Null for request types that don't have a grace period.
+    scheduled_for = models.DateTimeField(null=True, blank=True, db_index=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
 
 class ImpactLedger(BaseEntity):
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="impact_ledgers")

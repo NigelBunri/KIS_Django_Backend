@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     FlagViewSet,
     ModerationActionViewSet,
+    ModerationAppealViewSet,
     AuditLogViewSet,
     UserReputationViewSet,
     ModerationRuleViewSet,
@@ -15,6 +16,7 @@ from django.urls import path
 
 router = DefaultRouter()
 router.register(r"flags", FlagViewSet, basename="flags")
+router.register(r"appeals", ModerationAppealViewSet, basename="moderation-appeals")
 router.register(r"actions", ModerationActionViewSet, basename="moderation-actions")
 router.register(r"audit-logs", AuditLogViewSet, basename="audit-logs")
 router.register(r"user-reputation", UserReputationViewSet, basename="user-reputation")

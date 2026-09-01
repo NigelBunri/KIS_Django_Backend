@@ -40,9 +40,89 @@ class Flag(BaseEntity):
     resolved_at = models.DateTimeField(null=True, blank=True)
 
 
+class ChatMessageReport(BaseEntity):
+    """
+    A user report against a NestJS chat message. Chat messages live
+    entirely in Nest's Mongo (message._id is a Mongo ObjectId, not a UUID),
+    so this can't reuse Flag.target_id (a strict UUIDField) the way every
+    other report type does - conversation_id/message_id are plain strings
+    instead. Created via apps.chat.views_introspect.ChatMessageReportView,
+    called by Nest's ModerationController.report() right after it writes
+    its own local MessageReport - previously that Mongo write was the only
+    place a chat report was recorded, so it never reached this app's staff
+    queue (StaffModerationOperationsQueueView) at all; a GO/staff moderator
+    reviewing reports had no way to see a chat message had been reported.
+    """
+    STATUS = [("PENDING", "Pending"), ("REVIEWED", "Reviewed"), ("ACTIONED", "Actioned"), ("DISMISSED", "Dismissed")]
+
+    conversation_id = models.CharField(max_length=64, db_index=True)
+    message_id = models.CharField(max_length=64, db_index=True)
+    reported_by_id = models.UUIDField()
+    reason = models.CharField(max_length=64, blank=True, default="")
+    note = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=16, choices=STATUS, default="PENDING")
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        unique_together = [("conversation_id", "message_id", "reported_by_id")]
+
+
+class ModerationAppeal(BaseEntity):
+    """
+    A user's contest of a moderation decision made against them. No appeal
+    mechanism existed anywhere in the system before this - a warned/
+    suspended user, a creator whose content was taken down, or an uploader
+    whose media was blocked had no way to ask for a human to reconsider.
+
+    target_type/target_id point at the ORIGINAL decision record (a Flag,
+    MediaSafetyScan, or ChannelModerationRecord row - all real Django
+    UUIDs, unlike Flag.target_id's cross-service ambiguity), not at the
+    underlying content. See apps.moderation.services.decide_appeal for who
+    is allowed to appeal each target_type and what "overturned" actually
+    does - deliberately NOT every target_type supports appeal yet (chat
+    message reports don't record who sent the reported message, so there's
+    no way to verify an appellant is the affected party - rejected with a
+    clear error rather than silently allowing anyone to appeal).
+    """
+    TARGET_TYPES = [
+        ("flag", "Flag"),
+        ("media_safety_scan", "Media safety scan"),
+        ("channel_moderation_record", "Channel moderation record"),
+        ("chat_message_report", "Chat message report"),
+    ]
+    STATUS = [
+        ("PENDING", "Pending"),
+        ("UNDER_REVIEW", "Under review"),
+        ("UPHELD", "Upheld"),
+        ("OVERTURNED", "Overturned"),
+    ]
+
+    target_type = models.CharField(max_length=32, choices=TARGET_TYPES)
+    target_id = models.UUIDField()
+    appellant_id = models.UUIDField()
+    reason = models.TextField()
+    status = models.CharField(max_length=16, choices=STATUS, default="PENDING")
+    decided_by_id = models.UUIDField(null=True, blank=True)
+    decision_notes = models.TextField(blank=True, default="")
+    decided_at = models.DateTimeField(null=True, blank=True)
+    # Honest record of whether overturning this appeal actually undid the
+    # original consequence (restored content, lifted a suspension) versus
+    # only flipping this row's own status - see decide_appeal. Set at
+    # decision time; never claim a reversal happened if it didn't.
+    reversal_applied = models.BooleanField(default=False)
+
+    class Meta:
+        # A duplicate PENDING appeal for the same decision by the same
+        # person is blocked; a fresh appeal is allowed again once the
+        # first one is actually resolved (status has moved off PENDING).
+        unique_together = [("target_type", "target_id", "appellant_id", "status")]
+
+
 class ModerationAction(BaseEntity):
-    ACTIONS = [("WARN", "Warn"), ("SUSPEND", "Suspend"), ("DELETE", "Delete"), 
-               ("BAN", "Ban"), ("TEMP_RESTRICT", "Temporary Restrict"), ("ESCALATE", "Escalate")]
+    ACTIONS = [("WARN", "Warn"), ("SUSPEND", "Suspend"), ("DELETE", "Delete"),
+               ("BAN", "Ban"), ("TEMP_RESTRICT", "Temporary Restrict"), ("ESCALATE", "Escalate"),
+               ("REINSTATE", "Reinstate")]
 
     flag = models.ForeignKey(Flag, related_name="actions", on_delete=models.CASCADE)
     action = models.CharField(max_length=32, choices=ACTIONS)

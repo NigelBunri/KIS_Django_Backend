@@ -62,6 +62,7 @@ from .views import (
     # Account deletion
     AccountDeletionView,
     PublicAccountDeletionRequestView,
+    AccountReactivationView,
     # GDPR data export
     DataExportView,
 )
@@ -167,6 +168,7 @@ urlpatterns = [
     path("auth/password/change/", PasswordChangeView.as_view(), name="auth-password-change"),
     path("auth/account/", AccountDeletionView.as_view(), name="auth-account-delete"),
     path("auth/account/delete-request/", PublicAccountDeletionRequestView.as_view(), name="auth-account-public-delete-request"),
+    path("auth/account/reactivate/", AccountReactivationView.as_view(), name="auth-account-reactivate"),
     path("auth/data-export/", DataExportView.as_view(), name="auth-data-export"),
 
     path("", include(router.urls)),

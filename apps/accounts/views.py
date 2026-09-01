@@ -85,6 +85,7 @@ from .models import (
     UserContact,
     ApiToken,
     UserConnection,
+    GDPRRequest,
 )
 from .security_events import log_security_event, record_failed_auth, request_meta
 
@@ -3883,10 +3884,51 @@ class DataExportView(APIView):
             except Exception:
                 profile_data = {'id': str(profile.pk)}
 
+        # Widened beyond user+profile to also cover testimonies and
+        # broadcasts the user directly authored - the two other content
+        # types clearly and unambiguously owned by a single user FK.
+        # NOT a claim of full GDPR Art. 20 completeness: chat messages,
+        # channel content, comments, reactions, and moderation history are
+        # still excluded pending a dedicated export pass over those apps.
+        testimonies_data = []
+        try:
+            from apps.testimony.models import UserTestimony
+            testimonies_data = [
+                {
+                    'id': str(t.id),
+                    'category': t.category,
+                    'title': t.title,
+                    'story': t.story,
+                    'is_available': t.is_available,
+                    'created_at': t.created_at.isoformat() if t.created_at else None,
+                }
+                for t in UserTestimony.objects.filter(user=user)
+            ]
+        except Exception:
+            logger.exception("DataExportView: failed to collect testimonies for user %s", user.id)
+
+        broadcasts_data = []
+        try:
+            from apps.broadcasts.models import BroadcastItem
+            broadcasts_data = [
+                {
+                    'id': str(b.id),
+                    'source_type': b.source_type,
+                    'source_id': b.source_id,
+                    'broadcasted_at': b.broadcasted_at.isoformat() if b.broadcasted_at else None,
+                    'expires_at': b.expires_at.isoformat() if b.expires_at else None,
+                }
+                for b in BroadcastItem.objects.filter(broadcasted_by=user, is_deleted=False)
+            ]
+        except Exception:
+            logger.exception("DataExportView: failed to collect broadcasts for user %s", user.id)
+
         return Response({
             'exported_at': timezone.now().isoformat(),
             'user': user_data,
             'profile': profile_data,
+            'testimonies': testimonies_data,
+            'broadcasts': broadcasts_data,
         })
 
 
@@ -3958,14 +4000,80 @@ class PasswordChangeView(APIView):
 
 # ---------------------------------------------------------------------
 # Account Deletion
+#
+# Deletion is a grace-period soft-delete, not an immediate hard delete: the
+# account is deactivated right away (can't log in, stops appearing to other
+# users), but the row itself isn't purged until ACCOUNT_DELETION_GRACE_DAYS
+# later, via the daily purge_accounts_past_grace_period Celery task. A user
+# who changes their mind can reverse it with AccountReactivationView below.
+# Before this, both deletion paths called user.delete() synchronously and
+# irreversibly on a single password check - a typo'd confirmation or a
+# coerced/mistaken request had no recovery path at all.
 # ---------------------------------------------------------------------
+
+def schedule_account_deletion(user, *, request=None, actor=None, source: str) -> GDPRRequest:
+    """
+    Deactivates + soft-deletes `user` and files the GDPRRequest that the
+    daily purge sweep uses to hard-delete them once the grace period ends.
+    Shared by the authenticated and public (logged-out) deletion endpoints
+    so the two don't drift into different actual behaviors.
+    """
+    now = timezone.now()
+    scheduled_for = now + datetime.timedelta(days=settings.ACCOUNT_DELETION_GRACE_DAYS)
+
+    with transaction.atomic():
+        gdpr_request = GDPRRequest.objects.create(
+            user=user,
+            type="account_deletion",
+            status="pending",
+            scheduled_for=scheduled_for,
+        )
+        user.is_active = False
+        user.is_deleted = True
+        user.save(update_fields=["is_active", "is_deleted", "updated_at"])
+
+        # Revoke every device session immediately - a scheduled-for-deletion
+        # account shouldn't stay logged in anywhere during the grace window.
+        for device in Device.objects.select_for_update().filter(user=user, revoked_at__isnull=True):
+            revoke_device_session(user, device, reason="account_deletion_scheduled", request=request)
+
+    log_security_event(
+        actor,
+        "security.account.deletion_scheduled",
+        request=request,
+        severity="warning",
+        user_id=str(user.id),
+        scheduled_for=scheduled_for.isoformat(),
+        source=source,
+    )
+
+    try:
+        from apps.notifications.services import create_notification
+        create_notification(
+            user_id=user.id,
+            type="account.deletion_scheduled",
+            title="Your account is scheduled for deletion",
+            body=(
+                f"We received a request to delete your KIS account. It will be "
+                f"permanently deleted on {scheduled_for.strftime('%Y-%m-%d')}. "
+                f"Log back in with your phone and password before then to cancel."
+            ),
+            context={"scheduled_for": scheduled_for.isoformat()},
+        )
+    except Exception:
+        # Never let a notification failure block the deletion itself.
+        pass
+
+    return gdpr_request
+
 
 class AccountDeletionView(APIView):
     """
     DELETE /api/v1/auth/account/
-    Body: { "password": str }
-    Verifies the password then permanently deletes the user's account.
-    Also blacklists the provided refresh token if the blacklist app is installed.
+    Body: { "password": str, "refresh": str (optional) }
+    Verifies the password, then schedules the account for deletion after
+    the configured grace period (see schedule_account_deletion above)
+    instead of deleting it immediately.
     """
     authentication_classes = JWT_AUTH
     permission_classes = (IsAuthenticated,)
@@ -3985,7 +4093,7 @@ class AccountDeletionView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Optionally blacklist the refresh token before deleting
+        # Optionally blacklist the refresh token before deactivating
         refresh = str(request.data.get("refresh", "")).strip()
         if refresh:
             try:
@@ -3994,8 +4102,81 @@ class AccountDeletionView(APIView):
             except Exception:
                 pass
 
-        user.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        gdpr_request = schedule_account_deletion(user, request=request, actor=user, source="authenticated")
+        return Response(
+            {
+                "detail": "Your account has been deactivated and is scheduled for deletion.",
+                "scheduled_for": gdpr_request.scheduled_for.isoformat(),
+                "grace_period_days": settings.ACCOUNT_DELETION_GRACE_DAYS,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class AccountReactivationView(APIView):
+    """
+    POST /api/v1/auth/account/reactivate/
+    Body: { "phone": str, "password": str }
+
+    Cancels a pending scheduled deletion within its grace period. Deliberately
+    NOT routed through LoginSerializer - that path explicitly rejects
+    is_active=False users (error_code "account_disabled"), which is exactly
+    the state a scheduled-for-deletion account is in, so it can never be used
+    to reach this state. This does its own phone+password check instead,
+    the same credential-verification guarantee, without the is_active gate.
+    """
+    authentication_classes = []
+    permission_classes = (AllowAny,)
+    throttle_scope = "account_deletion"
+
+    def post(self, request):
+        phone = str(request.data.get("phone", "")).strip()
+        password = str(request.data.get("password", "")).strip()
+        if not phone or not password:
+            return Response(
+                {"detail": "Phone number and password are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = User.objects.filter(phone=phone).order_by("id").first()
+        if user is None:
+            user = User.objects.filter(phone_number=phone).order_by("id").first()
+        if user is None or not user.check_password(password):
+            record_failed_auth(request, identifier=phone, reason="account_reactivation")
+            return Response(
+                {"detail": "Invalid phone number or password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        pending = (
+            GDPRRequest.objects.filter(
+                user=user, type="account_deletion", status="pending", scheduled_for__gt=timezone.now(),
+            )
+            .order_by("-created_at")
+            .first()
+        )
+        if pending is None:
+            return Response(
+                {"detail": "This account has no pending deletion to cancel."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            pending.status = "cancelled"
+            pending.completed_at = timezone.now()
+            pending.save(update_fields=["status", "completed_at", "updated_at"])
+            user.is_active = True
+            user.is_deleted = False
+            user.save(update_fields=["is_active", "is_deleted", "updated_at"])
+
+        log_security_event(
+            user,
+            "security.account.deletion_cancelled",
+            request=request,
+            severity="info",
+            user_id=str(user.id),
+        )
+        return Response({"detail": "Account reactivated. Your scheduled deletion has been cancelled."})
 
 
 class PublicAccountDeletionRequestView(APIView):
@@ -4041,9 +4222,10 @@ class PublicAccountDeletionRequestView(APIView):
             )
 
         user = serializer.validated_data["user"]
-        # actor=None, not actor=user: AdminAuditEntry.actor is a PROTECT FK,
-        # so logging this with the about-to-be-deleted user as actor would
-        # create a row that then blocks user.delete() below.
+        # actor=None: this request is unauthenticated (no session tied to
+        # `user` yet exists), and keeping the historical pattern of never
+        # attributing AdminAuditEntry rows to the subject account avoids any
+        # future PROTECT-FK issue if this event type is ever cross-referenced.
         log_security_event(
             None,
             "security.account.public_deletion_request",
@@ -4052,8 +4234,12 @@ class PublicAccountDeletionRequestView(APIView):
             deleted_user_id=str(user.id),
             deleted_user_phone=user.phone,
         )
-        user.delete()
+        gdpr_request = schedule_account_deletion(user, request=request, actor=None, source="public_delete_request")
         return Response(
-            {"detail": "Your account and associated data have been deleted."},
+            {
+                "detail": "Your account has been deactivated and is scheduled for deletion.",
+                "scheduled_for": gdpr_request.scheduled_for.isoformat(),
+                "grace_period_days": settings.ACCOUNT_DELETION_GRACE_DAYS,
+            },
             status=status.HTTP_200_OK,
         )

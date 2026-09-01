@@ -282,3 +282,209 @@ def apply_media_safety_action(scan: MediaSafetyScan, *, action: str, actor, note
 
     return scan
 
+
+class AppealNotSupported(Exception):
+    """Raised when an appeal is attempted against a target_type/state this
+    system doesn't yet know how to safely authorize or reverse."""
+
+
+def authorize_appeal(target_type: str, target_id, appellant_id) -> None:
+    """
+    Verifies `appellant_id` is actually the party a moderation decision was
+    made against, and that the decision has actually been actioned (no
+    appealing something still pending review). Raises AppealNotSupported
+    (→ 400) if the check can't be done at all, or ValueError (→ 400) if it
+    can be done but fails - the view maps these to distinct error messages.
+    """
+    appellant_id = str(appellant_id)
+
+    if target_type == "flag":
+        try:
+            flag = models.Flag.objects.get(id=target_id)
+        except models.Flag.DoesNotExist:
+            raise ValueError("Flag not found.")
+        # Only target_type=USER flags have an unambiguous affected party
+        # (target_id IS the user). A flag against a POST/COMMENT/CHANNEL/
+        # GROUP/STATUS doesn't reliably resolve to a single content owner
+        # across every one of those apps, so appeal isn't offered for
+        # those yet rather than guessing who's allowed to contest it.
+        if flag.target_type != "USER":
+            raise AppealNotSupported("Appeals are only supported for flags against a user account.")
+        if str(flag.target_id) != appellant_id:
+            raise ValueError("You can only appeal a decision made against you.")
+        if flag.status != "ACTIONED":
+            raise ValueError("This decision hasn't been actioned yet, so there's nothing to appeal.")
+        return
+
+    if target_type == "media_safety_scan":
+        try:
+            scan = MediaSafetyScan.objects.get(id=target_id)
+        except MediaSafetyScan.DoesNotExist:
+            raise ValueError("Media safety scan not found.")
+        if str(scan.owner_id) != appellant_id:
+            raise ValueError("You can only appeal a decision made against you.")
+        if scan.status not in {"blocked", "failed"}:
+            raise ValueError("This upload hasn't been blocked, so there's nothing to appeal.")
+        return
+
+    if target_type == "channel_moderation_record":
+        from apps.broadcasts.models import ChannelModerationRecord
+
+        try:
+            record = ChannelModerationRecord.objects.select_related(
+                "content", "comment", "channel"
+            ).get(id=target_id)
+        except ChannelModerationRecord.DoesNotExist:
+            raise ValueError("Channel moderation record not found.")
+        if record.status != "actioned":
+            raise ValueError("This decision hasn't been actioned yet, so there's nothing to appeal.")
+
+        affected_id = None
+        if record.target_type == "comment" and record.comment_id:
+            affected_id = str(record.comment.user_id)
+        elif record.target_type in {"content", "channel"}:
+            channel = record.content.channel if record.content_id else record.channel
+            # Partner-owned channels have no single accountable user to
+            # authorize the appeal as - who on the partner team may appeal
+            # on the org's behalf is a real RBAC question this doesn't
+            # attempt to answer yet.
+            if channel.owner_type == "user" and channel.owner_user_id:
+                affected_id = str(channel.owner_user_id)
+        if affected_id is None:
+            raise AppealNotSupported("Appeals for this content's ownership type aren't supported yet.")
+        if affected_id != appellant_id:
+            raise ValueError("You can only appeal a decision made against you.")
+        return
+
+    if target_type == "chat_message_report":
+        # ChatMessageReport doesn't record who SENT the reported message
+        # (only who reported it) - see the model's docstring. Without that,
+        # there's no way to verify an appellant is the affected party.
+        raise AppealNotSupported("Appeals for chat message reports aren't supported yet.")
+
+    raise AppealNotSupported("Unsupported appeal target type.")
+
+
+def _reverse_strike_for_user(user_id, *, flag=None) -> bool:
+    """
+    Undoes exactly one apply_ai_flag_consequence strike: lifts an
+    auto-suspension if the user is currently suspended, decrements the
+    UserReputation counters that strike incremented, and records a
+    REINSTATE ModerationAction when there's a Flag to attach it to (the FK
+    is required, so a strike with no discoverable Flag - shouldn't happen
+    in practice, but isn't guaranteed - just skips that one record rather
+    than crashing the whole reversal).
+
+    Returns whether a real reversal happened (i.e. the user was actually
+    suspended) - overturning an appeal for a WARN-level strike still
+    decrements the counters below but there's no suspension to lift, so
+    the caller can report that honestly rather than implying a suspension
+    was undone when none existed.
+    """
+    from apps.accounts.models import User  # local import: avoids a
+    # moderation<->accounts import cycle at module load time.
+
+    user = User.objects.filter(id=user_id).first()
+    if user is None:
+        return False
+
+    was_suspended = user.status == "suspended"
+    if was_suspended:
+        user.status = "active"
+        user.is_active = True
+        user.save(update_fields=["status", "is_active"])
+
+    models.UserReputation.objects.filter(user_id=user_id).update(
+        flags_received=F("flags_received") - 1,
+        actions_taken=F("actions_taken") - 1,
+    )
+
+    if flag is not None:
+        models.ModerationAction.objects.create(
+            flag=flag,
+            action="REINSTATE",
+            notes="Reversed via appeal overturn.",
+            performed_by_id=SYSTEM_ACTOR_ID,
+            auto_generated=True,
+        )
+
+    return was_suspended
+
+
+def decide_appeal(appeal: "models.ModerationAppeal", *, decision: str, actor, notes: str = "") -> dict[str, Any]:
+    """
+    Resolves a ModerationAppeal. "uphold" just records the decision.
+    "overturn" additionally attempts a REAL reversal of the original
+    consequence, per target_type:
+      - flag (target_type=USER only - see the view's authorization check):
+        lifts a suspension and undoes the strike via _reverse_strike_for_user.
+      - media_safety_scan: reuses apply_media_safety_action's own "approve"
+        path (restores the MediaAsset to ready), then also reverses any
+        strike that scan's confirmed-violation triggered.
+      - channel_moderation_record: restores the soft-deleted content/
+        comment to public/published - not a full replay of whatever
+        visibility it had before moderation, just the honest default of
+        "visible again."
+      - chat_message_report: status-only. The reported message's content
+        was already destructively scrubbed (Mongo $unset, same as a normal
+        user delete-for-everyone) - there is nothing left to restore, so
+        this never claims reversal_applied=True.
+
+    Returns {"status": ..., "reversal_applied": bool} - the view uses this
+    to fill in ModerationAppeal.status/reversal_applied honestly rather
+    than assuming overturn always means something was actually undone.
+    """
+    now = timezone.now()
+    reversal_applied = False
+
+    if decision == "overturn":
+        if appeal.target_type == "flag":
+            flag = models.Flag.objects.get(id=appeal.target_id)
+            reversal_applied = _reverse_strike_for_user(flag.target_id, flag=flag)
+            flag.status = "DISMISSED"
+            flag.resolved_at = now
+            flag.save(update_fields=["status", "resolved_at", "updated_at"])
+
+        elif appeal.target_type == "media_safety_scan":
+            scan = MediaSafetyScan.objects.get(id=appeal.target_id)
+            apply_media_safety_action(scan, action="approve", actor=actor, notes=notes)
+            related_flag = models.Flag.objects.filter(target_type="POST", target_id=scan.id).first()
+            strike_reversed = _reverse_strike_for_user(scan.owner_id, flag=related_flag)
+            reversal_applied = True  # the scan/asset restoration itself always applies
+            _ = strike_reversed  # counted separately in audit metadata by the caller if needed
+
+        elif appeal.target_type == "channel_moderation_record":
+            from apps.broadcasts.models import ChannelContent, ChannelContentComment, ChannelModerationRecord
+
+            record = ChannelModerationRecord.objects.select_related("content", "comment").get(id=appeal.target_id)
+            if record.comment_id:
+                ChannelContentComment.objects.filter(id=record.comment_id).update(is_deleted=False)
+                reversal_applied = True
+            if record.content_id:
+                ChannelContent.objects.filter(id=record.content_id).update(
+                    is_deleted=False, visibility="public", status="published",
+                )
+                reversal_applied = True
+            record.status = "dismissed"
+            record.action = "keep"
+            record.resolved_at = now
+            record.save(update_fields=["status", "action", "resolved_at", "updated_at"])
+
+        elif appeal.target_type == "chat_message_report":
+            # No sender identity recorded (see ModerationAppeal's docstring)
+            # and the message content is already irreversibly scrubbed -
+            # nothing to restore. Status-only.
+            report = models.ChatMessageReport.objects.get(id=appeal.target_id)
+            report.status = "DISMISSED"
+            report.resolved_at = now
+            report.save(update_fields=["status", "resolved_at", "updated_at"])
+
+    appeal.status = "OVERTURNED" if decision == "overturn" else "UPHELD"
+    appeal.decided_by_id = getattr(actor, "id", actor)
+    appeal.decision_notes = notes[:2000]
+    appeal.decided_at = now
+    appeal.reversal_applied = reversal_applied
+    appeal.save(update_fields=["status", "decided_by_id", "decision_notes", "decided_at", "reversal_applied", "updated_at"])
+
+    return {"status": appeal.status, "reversal_applied": reversal_applied}
+

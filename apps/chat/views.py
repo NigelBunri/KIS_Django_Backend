@@ -46,6 +46,7 @@ from .services import allocate_conversation_seq, get_or_create_direct_conversati
 from apps.notifications.realtime import notify_main_tab_badges_updated
 
 from apps.accounts.models import User
+from apps.moderation.models import UserBlock
 from apps.partners.models import Partner
 from apps.partners.services import (
     ensure_partner_policy,
@@ -390,6 +391,17 @@ class ConversationViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=False)  # do not hard fail; we resolve ourselves
 
         peer_user = _resolve_peer_user(request.user, request.data)
+
+        # Reject at creation rather than letting a DM room get created that
+        # ws_perms will then refuse every send into anyway (see UserBlock
+        # check added there) - avoids a confusing "created fine, then every
+        # send silently fails" UX and a permanently-unusable ghost row.
+        blocked = UserBlock.objects.filter(
+            Q(blocker=request.user, blocked=peer_user)
+            | Q(blocker=peer_user, blocked=request.user)
+        ).exists()
+        if blocked:
+            raise PermissionDenied("You can't start a conversation with this user.")
 
         conversation, created = get_or_create_direct_conversation(
             user_a=request.user,
@@ -967,6 +979,32 @@ class ConversationViewSet(viewsets.ModelViewSet):
             )
 
         if member.is_blocked:
+            return Response({"isMember": True, "isBlocked": True, "role": member.base_role, "scopes": []})
+
+        # Real interpersonal blocking (apps.moderation.UserBlock) was never
+        # actually wired into chat: nothing ever sets member.is_blocked
+        # above, and nothing else in this view - or anywhere in NestJS -
+        # queried UserBlock before this. Nest's assertMember() already
+        # throws whenever this endpoint reports isBlocked=True and is
+        # called before every real-time action (send/edit/delete/typing/
+        # receipts/reactions/calls), so fixing the computation here is
+        # enough to make a block actually take effect across all of them
+        # without touching each handler individually. Scoped to DIRECT
+        # conversations only - blocking someone shouldn't silently pull
+        # you out of a GROUP/CHANNEL/COMMUNITY room you both happen to be
+        # in, only stop new direct engagement between the two of you.
+        is_blocked_by_user = False
+        if conversation.type == ConversationType.DIRECT:
+            other_member = ConversationMember.objects.filter(
+                conversation=conversation, left_at__isnull=True,
+            ).exclude(user_id=user_id).first()
+            if other_member:
+                is_blocked_by_user = UserBlock.objects.filter(
+                    Q(blocker_id=user_id, blocked_id=other_member.user_id)
+                    | Q(blocker_id=other_member.user_id, blocked_id=user_id)
+                ).exists()
+
+        if is_blocked_by_user:
             return Response({"isMember": True, "isBlocked": True, "role": member.base_role, "scopes": []})
 
         can_send = True

@@ -1,4 +1,7 @@
 # moderation/views.py
+import logging
+
+from django.db import IntegrityError, transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework import viewsets, status
@@ -9,7 +12,13 @@ from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from . import models, serializers
-from .services import apply_media_safety_action, record_moderation_audit
+from .services import (
+    AppealNotSupported,
+    apply_media_safety_action,
+    authorize_appeal,
+    decide_appeal,
+    record_moderation_audit,
+)
 
 try:
     from apps.broadcasts.models import ChannelModerationRecord, ChannelContent, ChannelContentComment
@@ -26,6 +35,8 @@ try:
 except Exception:  # pragma: no cover - optional app import guard.
     MediaSafetyScan = None
     MediaSafetyScanSerializer = None
+
+logger = logging.getLogger(__name__)
 
 # -------------------------
 # Moderation Flag Management
@@ -126,6 +137,105 @@ class FlagViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+
+# -------------------------
+# Moderation Appeals
+# -------------------------
+class ModerationAppealViewSet(viewsets.ModelViewSet):
+    """
+    POST creates an appeal against an already-actioned moderation decision
+    (see authorize_appeal for exactly which target_type/state combos are
+    currently supported). GET lists the requesting user's own appeals, or
+    every appeal for staff. Decisions are made via the separate `decide`
+    action below (IsAdminUser), not via a plain PATCH/PUT - resolving an
+    appeal is a distinct, consequential action (see decide_appeal), not a
+    generic field edit.
+    """
+    queryset = models.ModerationAppeal.objects.all()
+    serializer_class = serializers.ModerationAppealSerializer
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        qs = models.ModerationAppeal.objects.all().order_by("-created_at")
+        if not self.request.user.is_staff:
+            qs = qs.filter(appellant_id=self.request.user.id)
+        status_filter = (self.request.query_params.get("status") or "").strip().upper()
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        submit = serializers.ModerationAppealSubmitSerializer(data=request.data)
+        submit.is_valid(raise_exception=True)
+        target_type = submit.validated_data["target_type"]
+        target_id = submit.validated_data["target_id"]
+        reason = submit.validated_data["reason"]
+
+        try:
+            authorize_appeal(target_type, target_id, request.user.id)
+        except AppealNotSupported as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            with transaction.atomic():
+                appeal = models.ModerationAppeal.objects.create(
+                    target_type=target_type,
+                    target_id=target_id,
+                    appellant_id=request.user.id,
+                    reason=reason,
+                )
+        except IntegrityError:
+            return Response(
+                {"detail": "You already have a pending appeal for this decision."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        record_moderation_audit(
+            actor=request.user,
+            action="moderation.appeal.submitted",
+            target_type=target_type.upper(),
+            target_id=target_id,
+            metadata={"appeal_id": str(appeal.id), "reason": reason[:2000]},
+            request=request,
+        )
+        return Response(serializers.ModerationAppealSerializer(appeal).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def decide(self, request, pk=None):
+        if not request.user.is_staff:
+            return Response({"detail": "Moderator access required."}, status=status.HTTP_403_FORBIDDEN)
+
+        appeal = self.get_object()
+        if appeal.status not in {"PENDING", "UNDER_REVIEW"}:
+            return Response(
+                {"detail": f"This appeal was already resolved ({appeal.status})."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        decision_serializer = serializers.ModerationAppealDecisionSerializer(data=request.data)
+        decision_serializer.is_valid(raise_exception=True)
+        decision = decision_serializer.validated_data["action"]
+        notes = decision_serializer.validated_data.get("notes") or ""
+
+        result = decide_appeal(appeal, decision=decision, actor=request.user, notes=notes)
+
+        record_moderation_audit(
+            actor=request.user,
+            action=f"moderation.appeal.{decision}",
+            target_type=appeal.target_type.upper(),
+            target_id=appeal.target_id,
+            metadata={
+                "appeal_id": str(appeal.id),
+                "notes": notes[:2000],
+                "reversal_applied": result["reversal_applied"],
+            },
+            request=request,
+        )
+        return Response(serializers.ModerationAppealSerializer(appeal).data)
 
 
 # -------------------------
@@ -299,6 +409,36 @@ def _staff_queue_flag_rows(limit: int):
     return rows
 
 
+def _staff_queue_chat_message_report_rows(limit: int):
+    rows = []
+    query = models.ChatMessageReport.objects.filter(is_deleted=False).filter(
+        status__in=["PENDING", "REVIEWED"]
+    ).order_by("-created_at")
+    for report in query[:limit]:
+        rows.append(
+            {
+                "kind": "chat_message_report",
+                "id": str(report.id),
+                "target_type": "chat_message",
+                "target_id": report.message_id,
+                "status": report.status,
+                "severity": "MEDIUM",
+                "reason": report.reason or "Message reported by a user.",
+                "source": "USER",
+                "created_at": report.created_at.isoformat(),
+                "context": "chat",
+                "metadata": {
+                    "conversation_id": report.conversation_id,
+                    "message_id": report.message_id,
+                    "reported_by_id": str(report.reported_by_id),
+                    "note": report.note,
+                },
+                "raw": serializers.ChatMessageReportSerializer(report).data,
+            }
+        )
+    return rows
+
+
 def _staff_queue_channel_rows(limit: int):
     if ChannelModerationRecord is None or ChannelModerationRecordSerializer is None:
         return []
@@ -344,6 +484,8 @@ class StaffModerationOperationsQueueView(APIView):
             rows.extend(_staff_queue_media_rows(limit))
         if source in {"all", "channels", "channel"}:
             rows.extend(_staff_queue_channel_rows(limit))
+        if source in {"all", "chat", "chat_messages"}:
+            rows.extend(_staff_queue_chat_message_report_rows(limit))
         rows.sort(key=lambda item: item.get("created_at") or "", reverse=True)
         rows = rows[:limit]
         return Response(
@@ -354,6 +496,7 @@ class StaffModerationOperationsQueueView(APIView):
                     "flags": sum(1 for row in rows if row["kind"] == "flag"),
                     "media_safety": sum(1 for row in rows if row["kind"] == "media_safety_scan"),
                     "channels": sum(1 for row in rows if row["kind"] == "channel_moderation_record"),
+                    "chat_messages": sum(1 for row in rows if row["kind"] == "chat_message_report"),
                 },
             }
         )
@@ -436,5 +579,56 @@ class StaffModerationOperationActionView(APIView):
                 request=request,
             )
             return Response({"ok": True, "target_type": target_type, "result": ChannelModerationRecordSerializer(record).data})
+
+        if target_type == "chat_message_report":
+            report = models.ChatMessageReport.objects.get(id=target_id)
+            if action == "dismiss" or action == "approve":
+                report.status = "DISMISSED"
+                report.resolved_at = timezone.now()
+            elif action == "review":
+                report.status = "REVIEWED"
+                report.reviewed_at = timezone.now()
+            else:
+                # "block" (take the message down) and any other action both
+                # land here as ACTIONED - "block" additionally reaches into
+                # Nest to actually delete the message content; anything
+                # else just records a decision without a content change.
+                report.status = "ACTIONED"
+                report.resolved_at = timezone.now()
+            report.save(update_fields=["status", "reviewed_at", "resolved_at", "updated_at"])
+
+            nest_notified = False
+            if action == "block":
+                from apps.chat.tasks import _post_to_nest
+
+                try:
+                    _post_to_nest(
+                        f"conversations/{report.conversation_id}/messages/{report.message_id}/moderate-delete",
+                        {},
+                    )
+                    nest_notified = True
+                except Exception:
+                    logger.exception(
+                        "Failed to reach Nest to delete reported message conversation=%s message=%s",
+                        report.conversation_id, report.message_id,
+                    )
+
+            record_moderation_audit(
+                actor=request.user,
+                action=f"chat_message_report.staff.{action}",
+                target_type="CHAT_MESSAGE_REPORT",
+                target_id=report.id,
+                metadata={
+                    "report_id": str(report.id),
+                    "conversation_id": report.conversation_id,
+                    "message_id": report.message_id,
+                    "notes": notes[:2000],
+                    "nest_notified": nest_notified,
+                },
+                request=request,
+            )
+            return Response(
+                {"ok": True, "target_type": target_type, "result": serializers.ChatMessageReportSerializer(report).data}
+            )
 
         return Response({"detail": "Unsupported moderation target."}, status=status.HTTP_400_BAD_REQUEST)

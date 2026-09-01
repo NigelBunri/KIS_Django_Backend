@@ -9,6 +9,40 @@ class FlagSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
+class ChatMessageReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.ChatMessageReport
+        fields = "__all__"
+
+
+class ModerationAppealSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.ModerationAppeal
+        fields = "__all__"
+        read_only_fields = (
+            "id", "appellant_id", "status", "decided_by_id", "decision_notes",
+            "decided_at", "reversal_applied", "created_at", "updated_at", "is_deleted",
+        )
+
+
+class ModerationAppealSubmitSerializer(serializers.Serializer):
+    target_type = serializers.ChoiceField(
+        choices=(
+            ("flag", "Flag"),
+            ("media_safety_scan", "Media safety scan"),
+            ("channel_moderation_record", "Channel moderation record"),
+            ("chat_message_report", "Chat message report"),
+        )
+    )
+    target_id = serializers.UUIDField()
+    reason = serializers.CharField(max_length=4000)
+
+
+class ModerationAppealDecisionSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=("uphold", "overturn"))
+    notes = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
 class ModerationActionSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.ModerationAction
@@ -82,6 +116,7 @@ class StaffModerationActionSerializer(serializers.Serializer):
             ("flag", "Flag"),
             ("media_safety_scan", "Media safety scan"),
             ("channel_moderation_record", "Channel moderation record"),
+            ("chat_message_report", "Chat message report"),
         )
     )
     target_id = serializers.UUIDField()

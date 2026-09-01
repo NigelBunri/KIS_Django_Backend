@@ -679,6 +679,14 @@ ENTITLEMENTS_CACHE_TTL = int(os.environ.get("ENTITLEMENTS_CACHE_TTL", 300))  # s
 API_TOKEN_PLAIN_LENGTH = int(os.environ.get("API_TOKEN_PLAIN_LENGTH", 32))  # used by secrets.token_urlsafe(n)
 API_TOKEN_DEFAULT_EXPIRES_DAYS = int(os.environ.get("API_TOKEN_DEFAULT_EXPIRES_DAYS", 30))
 
+# Account deletion is a grace-period soft-delete, not an immediate hard
+# delete (apps/accounts/views.py schedule_account_deletion()) - the account
+# is deactivated immediately but the row (and everything cascading from it)
+# isn't actually purged until this many days later, giving the user a
+# window to reactivate by calling AccountReactivationView. Purge itself
+# runs via the daily "purge-accounts-past-grace-period" Celery beat task.
+ACCOUNT_DELETION_GRACE_DAYS = int(os.environ.get("ACCOUNT_DELETION_GRACE_DAYS", 30))
+
 # Caching (e.g., Redis) - used by quota enforcement and feature flags
 CACHES = {
     "default": {
@@ -814,6 +822,14 @@ CELERY_BEAT_SCHEDULE = {
     # intended cadence (see compile_daily_digests).
     "compile-daily-digests": {
         "task": "apps.notifications.tasks.compile_daily_digests",
+        "schedule": 24 * 60 * 60,
+    },
+    # Hard-deletes accounts whose ACCOUNT_DELETION_GRACE_DAYS window has
+    # elapsed (apps/accounts/tasks.py, apps/accounts/views.py
+    # schedule_account_deletion). Deletion requests only deactivate the
+    # account immediately; this daily sweep is what actually purges it.
+    "purge-accounts-past-grace-period": {
+        "task": "apps.accounts.tasks.purge_accounts_past_grace_period_task",
         "schedule": 24 * 60 * 60,
     },
 }
