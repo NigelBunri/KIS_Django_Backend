@@ -52,6 +52,7 @@ from apps.communities.models import (
 )
 from apps.accounts.models import Profile, User
 from apps.accounts.feature_gate import require_feature
+from common.url_safety import is_safe_external_url
 from apps.accounts.responsible_feed import get_today_feed_status
 from apps.accounts.tiers import get_platform_commission_pct, get_user_tier_features, normalize_limit_value
 from apps.commerce.constants import KIS_COIN_CODE
@@ -15554,6 +15555,23 @@ class ChannelLiveStreamListCreateView(APIView):
 
         merged = provider_payload or dev_payload
         stream_key = f"{channel.id}:{stream_uuid}:{uuid.uuid4()}"
+        # SECURITY: never let client-supplied metadata set/override any key
+        # that server-side code (this view, or the WHIP proxy view below)
+        # trusts as a connection/provider target. `whip_url` in particular is
+        # fetched server-side by ChannelLiveStreamWhipView with no further
+        # checks - letting a client set it to an internal URL (or the cloud
+        # metadata endpoint 169.254.169.254) turned that proxy into an SSRF
+        # primitive. Only the provider integration above (`merged`) may set
+        # these fields.
+        _reserved_live_stream_metadata_keys = {
+            "whip_url", "ingest_url", "stream_key", "provider",
+            "provider_stream_id", "provider_raw", "provider_calls_enabled",
+            "raw_stream_key_returned", "playback_url",
+        }
+        _user_metadata = request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {}
+        _safe_user_metadata = {
+            k: v for k, v in _user_metadata.items() if k not in _reserved_live_stream_metadata_keys
+        }
         live = ChannelLiveStream.objects.create(
             channel=channel,
             title=title[:220],
@@ -15569,7 +15587,7 @@ class ChannelLiveStreamListCreateView(APIView):
                 "provider_calls_enabled": _live_provider_sandbox_enabled(),
                 "raw_stream_key_returned": False,
                 **({"provider_raw": merged.get("raw")} if merged.get("raw") else {}),
-                **(request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {}),
+                **_safe_user_metadata,
             },
             created_by=request.user,
         )
@@ -19344,6 +19362,15 @@ class ChannelLiveStreamWhipView(APIView):
     def post(self, request, stream_id):
         stream = get_object_or_404(ChannelLiveStream, id=stream_id)
         whip_url = (stream.metadata or {}).get("whip_url") or ""
+        if whip_url and not is_safe_external_url(whip_url):
+            # Defense in depth: whip_url can no longer be set by clients (see
+            # the metadata allowlist in ChannelLiveStreamListCreateView), but
+            # this endpoint is unauthenticated (AllowAny, by WHIP protocol
+            # design) and does a raw server-side fetch of whatever URL is
+            # stored here, so it validates independently rather than trusting
+            # that upstream restriction alone.
+            logger.warning("[WHIP] blocked unsafe whip_url for stream %s", stream_id)
+            return Response({"error": "WHIP proxy failed", "detail": "invalid ingest target"}, status=502)
         if whip_url:
             try:
                 sdp_offer = request.body
