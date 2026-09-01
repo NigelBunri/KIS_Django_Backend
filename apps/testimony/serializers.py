@@ -72,9 +72,10 @@ class UserTestimonySerializer(serializers.ModelSerializer):
         fields = ["id", "user", "category", "title", "story", "is_available",
                   "endorsement_count", "media_kind", "resource_name",
                   "resource_mime_type", "safe_resource_url", "resource_attachment",
-                  "created_at"]
+                  "created_at", "expires_at", "expired_at"]
         read_only_fields = ["id", "user", "endorsement_count", "media_kind",
-                             "resource_name", "resource_mime_type", "created_at"]
+                             "resource_name", "resource_mime_type", "created_at",
+                             "expires_at", "expired_at"]
 
     def get_safe_resource_url(self, obj):
         return _resolve_testimony_media_url(obj.resource_url, self.context.get("request"))

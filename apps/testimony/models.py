@@ -1,5 +1,14 @@
+import datetime
+
 from django.db import models
 from django.conf import settings
+from django.utils import timezone
+
+TESTIMONY_LIFETIME_DAYS = 14
+
+
+def _default_testimony_expiry():
+    return timezone.now() + datetime.timedelta(days=TESTIMONY_LIFETIME_DAYS)
 
 CATEGORY_CHOICES = [
     ("health",        "Health & Medical"),
@@ -53,6 +62,19 @@ class UserTestimony(models.Model):
     title = models.CharField(max_length=200)
     story = models.TextField(blank=True, default="")
     is_available = models.BooleanField(default=True, help_text="Willing to be contacted about this")
+    # 14-day expiration: also the field TestimonyListCreateView's public
+    # listing already gates on (is_available=True) - previously this had
+    # no expiry at all, so a testimony stayed publicly listed forever
+    # unless the author manually turned it off. The sweep
+    # (apps.testimony.tasks.expire_stale_testimonies) flips is_available
+    # to False and stamps expired_at once expires_at passes; it does NOT
+    # delete the row (the story/endorsements stay intact - "unbroadcast,
+    # not delete", matching apps.broadcasts.BroadcastItem's own pattern).
+    # Turning is_available back on (TestimonyDetailView.perform_update)
+    # gives it a fresh expires_at, the same way re-broadcasting content
+    # gives it a fresh lifecycle.
+    expires_at = models.DateTimeField(default=_default_testimony_expiry, db_index=True)
+    expired_at = models.DateTimeField(null=True, blank=True)
     endorsement_count = models.PositiveIntegerField(default=0)
     # Optional single attachment — uploaded via the direct-to-S3
     # initiate/confirm/attach flow (apps.media.upload_intent), same pattern

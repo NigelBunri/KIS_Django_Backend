@@ -80,6 +80,21 @@ class TestimonyDetailView(generics.RetrieveUpdateDestroyAPIView):
     def get_queryset(self):
         return models.UserTestimony.objects.filter(user=self.request.user)
 
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        was_unavailable = not instance.is_available
+        becoming_available = serializer.validated_data.get("is_available", instance.is_available)
+        if was_unavailable and becoming_available:
+            # Same "re-broadcast gives a fresh lifecycle" treatment
+            # apps.broadcasts.BroadcastItem gets - re-enabling a testimony
+            # that had expired (or been manually turned off) starts a new
+            # 14-day window rather than leaving the old expires_at in the
+            # past, which would let the very next sweep immediately expire
+            # it again.
+            serializer.save(expires_at=models._default_testimony_expiry(), expired_at=None)
+        else:
+            serializer.save()
+
 
 class EndorseTestimonyView(APIView):
     permission_classes = [IsAuthenticated]

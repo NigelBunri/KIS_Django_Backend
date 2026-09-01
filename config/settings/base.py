@@ -872,6 +872,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.otp.tasks.purge_expired_otp_codes_task",
         "schedule": 24 * 60 * 60,
     },
+    # 14-day testimony expiration (unpublish, not delete) - see
+    # apps.testimony.tasks.expire_stale_testimonies's docstring.
+    "expire-stale-testimonies": {
+        "task": "apps.testimony.tasks.expire_stale_testimonies_task",
+        "schedule": 24 * 60 * 60,
+    },
 }
 
 # NEW: media-service URL for background removal microservice
