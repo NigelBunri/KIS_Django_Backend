@@ -205,6 +205,13 @@ class HealthInstitution(TimeStampedUUIDModel):
     timezone = models.CharField(max_length=64, default="UTC")
     settings = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
+    # Opt-in, not opt-out: this model had no notion of public visibility
+    # at all until KISTube needed a "browse health institutions" page (see
+    # HealthDiscoveryView) — every prior row is an owner/booking-management
+    # record only, never reviewed for public listing. Defaulting to False
+    # means the new public endpoint starts empty rather than surprising
+    # every existing owner by suddenly listing their institution.
+    is_public = models.BooleanField(default=False, db_index=True)
     # Flutterwave subaccount for direct-to-institution payout splitting —
     # patient payment settles straight to the institution's own bank
     # account at the provider level instead of sitting in KIS's balance.

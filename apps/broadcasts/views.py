@@ -15180,6 +15180,36 @@ class BroadcastChannelSubscriptionView(APIView):
         return Response(BroadcastChannelSubscriptionSerializer(subscription, context={"request": request}).data)
 
 
+class MyChannelSubscriptionsView(APIView):
+    """List the signed-in user's subscribed channels. This was the one
+    real gap found while building KISTube's sidebar Subscriptions list:
+    BroadcastChannelSubscribeView/BroadcastChannelSubscriptionView cover
+    subscribing and per-channel notification level, but nothing lists
+    "every channel I'm subscribed to" - the RN app's own Library screen
+    doesn't need this because it filters its already-loaded channel list
+    client-side, which doesn't work for a fresh page load with no prior
+    channel list in memory. Same pagination shape as
+    BroadcastChannelListCreateView.get for consistency."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        query = (
+            BroadcastChannel.objects.filter(
+                is_deleted=False,
+                subscriptions__user=request.user,
+            )
+            .distinct()
+            .order_by("-subscriptions__created_at")
+        )
+        limit = min(max(int(request.query_params.get("limit") or 25), 1), 100)
+        offset = max(int(request.query_params.get("offset") or request.query_params.get("cursor") or 0), 0)
+        rows = list(query[offset : offset + limit + 1])
+        next_offset = offset + limit if len(rows) > limit else None
+        serializer = BroadcastChannelSummarySerializer(rows[:limit], many=True, context={"request": request})
+        return Response({"results": serializer.data, "next_cursor": str(next_offset) if next_offset is not None else None})
+
+
 class BroadcastChannelContentListCreateView(APIView):
     permission_classes = [AllowAny]
 

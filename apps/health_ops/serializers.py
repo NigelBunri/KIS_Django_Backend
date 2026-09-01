@@ -155,6 +155,7 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
             "timezone",
             "settings",
             "is_active",
+            "is_public",
             "payout_account_status",
             "payout_account_name",
             "payout_bank_last4",
@@ -275,6 +276,18 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
             "providerLiveCallsEnabled": False,
             "userSafeMessage": "Health media is checked before it can be used in care workflows.",
         }
+
+
+class HealthInstitutionPublicSerializer(serializers.ModelSerializer):
+    """Minimal public-safe view of a HealthInstitution for the KISTube
+    "browse health institutions" discovery endpoint. Deliberately excludes
+    owner, payout, settings, and verification internals that
+    HealthInstitutionSerializer exposes to institution managers."""
+
+    class Meta:
+        model = HealthInstitution
+        fields = ["id", "name", "slug", "institution_type", "created_at"]
+        read_only_fields = fields
 
 
 class HealthServiceSerializer(serializers.ModelSerializer):

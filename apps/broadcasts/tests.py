@@ -1052,6 +1052,65 @@ class BroadcastChannelApiTests(APITestCase):
         self.assertEqual(content_response.status_code, status.HTTP_403_FORBIDDEN)
 
 
+class MyChannelSubscriptionsApiTests(APITestCase):
+    """KISTube's sidebar Subscriptions list - the one gap found while
+    building it: subscribing to a channel and listing notification level
+    for ONE channel both already existed, but nothing listed every
+    channel a user is subscribed to."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(phone='5557300001', username='sub_list_user', password='secret', country='NG')
+        self.owner = User.objects.create_user(phone='5557300002', username='sub_list_owner', password='secret', country='NG')
+        self.channel_a = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            handle='sub-list-a', display_name='Sub List A', is_public=True,
+        )
+        self.channel_b = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            handle='sub-list-b', display_name='Sub List B', is_public=True,
+        )
+        self.unrelated_channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            handle='sub-list-unrelated', display_name='Not Subscribed', is_public=True,
+        )
+
+    def test_requires_authentication(self):
+        response = self.client.get('/api/v1/broadcasts/my-subscriptions/')
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_lists_only_subscribed_channels(self):
+        BroadcastChannelSubscription.objects.create(channel=self.channel_a, user=self.user)
+        BroadcastChannelSubscription.objects.create(channel=self.channel_b, user=self.user)
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get('/api/v1/broadcasts/my-subscriptions/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        handles = {row['handle'] for row in response.data['results']}
+        self.assertEqual(handles, {'sub-list-a', 'sub-list-b'})
+        self.assertNotIn('sub-list-unrelated', handles)
+
+    def test_most_recently_subscribed_first(self):
+        BroadcastChannelSubscription.objects.create(channel=self.channel_a, user=self.user)
+        BroadcastChannelSubscription.objects.create(channel=self.channel_b, user=self.user)
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get('/api/v1/broadcasts/my-subscriptions/')
+
+        self.assertEqual([row['handle'] for row in response.data['results']], ['sub-list-b', 'sub-list-a'])
+
+    def test_empty_when_no_subscriptions(self):
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get('/api/v1/broadcasts/my-subscriptions/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['results'], [])
+        self.assertIsNone(response.data['next_cursor'])
+
+
 @override_settings(
     KIS_EMBEDS_ENABLED=True,
     KIS_PUBLIC_EMBED_BASE_URL='https://kis.example.com',

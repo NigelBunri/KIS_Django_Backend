@@ -18,7 +18,7 @@ from typing import Any
 
 from rest_framework import status
 from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAdminUser
@@ -112,6 +112,7 @@ from .serializers import (
     EmergencyDispatchStepUpdateSerializer,
     EmergencyDispatchTrackingSerializer,
     HealthInstitutionSerializer,
+    HealthInstitutionPublicSerializer,
     HealthCarePlanSerializer,
     HomeLogisticsEndSerializer,
     HomeLogisticsPayloadSerializer,
@@ -1520,10 +1521,40 @@ class HealthInstitutionDetailView(APIView):
                 institution.timezone = timezone_name[:64]
         if "is_active" in request.data:
             institution.is_active = bool(request.data.get("is_active"))
+        if "is_public" in request.data:
+            institution.is_public = bool(request.data.get("is_public"))
         if isinstance(request.data.get("settings"), dict):
             institution.settings = request.data.get("settings")
         institution.save()
         return Response({"institution": HealthInstitutionSerializer(institution, context={"request": request}).data}, status=status.HTTP_200_OK)
+
+
+class HealthDiscoveryView(APIView):
+    """Public "browse health institutions" listing for KISTube's Health
+    section. Only surfaces institutions their owners explicitly opted into
+    public visibility (is_public=True) — see HealthInstitution.is_public
+    for the opt-in rationale. Uses HealthInstitutionPublicSerializer, not
+    HealthInstitutionSerializer, since this endpoint is AllowAny and must
+    never leak owner/payout/settings internals."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        query = str(request.query_params.get("q") or "").strip()
+        institution_type = str(request.query_params.get("type") or "").strip().lower()
+        qs = HealthInstitution.objects.filter(is_public=True, is_active=True)
+        if query:
+            qs = qs.filter(name__icontains=query)
+        if institution_type in InstitutionType.values:
+            qs = qs.filter(institution_type=institution_type)
+        qs = qs.order_by("-created_at")
+
+        limit = min(max(int(request.query_params.get("limit") or 25), 1), 100)
+        offset = max(int(request.query_params.get("offset") or request.query_params.get("cursor") or 0), 0)
+        rows = list(qs[offset : offset + limit + 1])
+        next_offset = offset + limit if len(rows) > limit else None
+        serializer = HealthInstitutionPublicSerializer(rows[:limit], many=True, context={"request": request})
+        return Response({"results": serializer.data, "next_cursor": str(next_offset) if next_offset is not None else None})
 
 
 class HealthInstitutionPayoutAccountConnectView(APIView):
