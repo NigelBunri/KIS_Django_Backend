@@ -2097,3 +2097,154 @@ class PartnerAnnouncementSchedulingApiTests(TestCase):
         future_post.refresh_from_db()
         self.assertEqual(due_post.status, "published")
         self.assertEqual(future_post.status, "scheduled")
+
+
+class PartnerSupportTicketApiTests(TestCase):
+    """Support Inbox / Helpdesk."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670009301", country="CM", password="pass1234")
+        self.member = User.objects.create_user(phone="+237670009302", country="CM", password="pass1234")
+        self.other_member = User.objects.create_user(phone="+237670009303", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Helpdesk Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        ConversationMember.objects.create(conversation=conversation, user=self.member, base_role=BaseConversationRole.MEMBER)
+        self.partner = Partner.objects.create(owner=self.owner, name="Helpdesk Partner", slug="helpdesk-partner", main_conversation=conversation)
+        PartnerMembership.objects.create(partner=self.partner, user=self.member, role="member", status=PartnerMembershipStatus.MEMBER)
+        PartnerMembership.objects.create(partner=self.partner, user=self.other_member, role="member", status=PartnerMembershipStatus.MEMBER)
+
+    def test_member_can_submit_ticket(self):
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/support-tickets/",
+            {"subject": "Can't access group chat", "description": "Getting an error", "priority": "high"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["status"], "open")
+        self.assertEqual(response.data["priority"], "high")
+
+    def test_member_only_sees_own_tickets_admin_sees_all(self):
+        from apps.partners.models import SupportTicket
+
+        SupportTicket.objects.create(partner=self.partner, requester=self.member, subject="Mine")
+        SupportTicket.objects.create(partner=self.partner, requester=self.other_member, subject="Not mine")
+
+        self.client.force_authenticate(self.member)
+        member_response = self.client.get(f"/api/v1/partners/{self.partner.id}/support-tickets/")
+        self.assertEqual(len(member_response.data), 1)
+        self.assertEqual(member_response.data[0]["subject"], "Mine")
+
+        self.client.force_authenticate(self.owner)
+        owner_response = self.client.get(f"/api/v1/partners/{self.partner.id}/support-tickets/")
+        self.assertEqual(len(owner_response.data), 2)
+
+    def test_member_cannot_view_others_ticket_detail(self):
+        from apps.partners.models import SupportTicket
+
+        ticket = SupportTicket.objects.create(partner=self.partner, requester=self.other_member, subject="Private")
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/support-tickets/{ticket.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_member_cannot_change_ticket_status(self):
+        from apps.partners.models import SupportTicket
+
+        ticket = SupportTicket.objects.create(partner=self.partner, requester=self.member, subject="Mine")
+        self.client.force_authenticate(self.member)
+
+        response = self.client.patch(
+            f"/api/v1/partners/{self.partner.id}/support-tickets/{ticket.id}/",
+            {"status": "resolved"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_owner_can_assign_and_resolve_ticket_and_resolved_at_is_stamped(self):
+        from apps.partners.models import SupportTicket
+
+        ticket = SupportTicket.objects.create(partner=self.partner, requester=self.member, subject="Mine")
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.patch(
+            f"/api/v1/partners/{self.partner.id}/support-tickets/{ticket.id}/",
+            {"status": "resolved", "assignee": str(self.owner.id)},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        ticket.refresh_from_db()
+        self.assertEqual(ticket.status, "resolved")
+        self.assertEqual(ticket.assignee_id, self.owner.id)
+        self.assertIsNotNone(ticket.resolved_at)
+
+    def test_requester_and_admin_can_reply_but_internal_note_hidden_from_requester(self):
+        from apps.partners.models import SupportTicket
+
+        ticket = SupportTicket.objects.create(partner=self.partner, requester=self.member, subject="Mine")
+
+        self.client.force_authenticate(self.member)
+        reply_response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/support-tickets/{ticket.id}/replies/",
+            {"body": "Any update?"},
+            format="json",
+        )
+        self.assertEqual(reply_response.status_code, status.HTTP_201_CREATED, reply_response.data)
+
+        self.client.force_authenticate(self.owner)
+        note_response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/support-tickets/{ticket.id}/replies/",
+            {"body": "Escalating internally", "is_internal_note": True},
+            format="json",
+        )
+        self.assertEqual(note_response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(note_response.data["is_internal_note"])
+
+        self.client.force_authenticate(self.member)
+        member_replies = self.client.get(f"/api/v1/partners/{self.partner.id}/support-tickets/{ticket.id}/replies/")
+        self.assertEqual(len(member_replies.data), 1)
+
+        self.client.force_authenticate(self.owner)
+        owner_replies = self.client.get(f"/api/v1/partners/{self.partner.id}/support-tickets/{ticket.id}/replies/")
+        self.assertEqual(len(owner_replies.data), 2)
+
+    def test_member_cannot_force_internal_note(self):
+        from apps.partners.models import SupportTicket, SupportTicketReply
+
+        ticket = SupportTicket.objects.create(partner=self.partner, requester=self.member, subject="Mine")
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            f"/api/v1/partners/{self.partner.id}/support-tickets/{ticket.id}/replies/",
+            {"body": "Trying to sneak a note", "is_internal_note": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        reply = SupportTicketReply.objects.get(id=response.data["id"])
+        self.assertFalse(reply.is_internal_note)
+
+    def test_owner_can_view_summary_but_member_cannot(self):
+        from apps.partners.models import SupportTicket
+
+        SupportTicket.objects.create(partner=self.partner, requester=self.member, subject="A")
+        SupportTicket.objects.create(partner=self.partner, requester=self.member, subject="B", status="resolved")
+
+        self.client.force_authenticate(self.member)
+        denied = self.client.get(f"/api/v1/partners/{self.partner.id}/support-inbox-summary/")
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.owner)
+        allowed = self.client.get(f"/api/v1/partners/{self.partner.id}/support-inbox-summary/")
+        self.assertEqual(allowed.status_code, status.HTTP_200_OK, allowed.data)
+        self.assertEqual(allowed.data["total"], 2)
+        self.assertEqual(allowed.data["counts"]["open"], 1)
+        self.assertEqual(allowed.data["counts"]["resolved"], 1)

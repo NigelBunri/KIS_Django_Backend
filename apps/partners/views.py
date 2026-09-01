@@ -69,6 +69,9 @@ from apps.partners.models import (
     PartnerCalendarEventVisibility,
     PartnerCalendarRsvp,
     PartnerCalendarRsvpStatus,
+    SupportTicket,
+    SupportTicketStatus,
+    SupportTicketReply,
 )
 from apps.feed_personalization import (
     get_affinity_profile,
@@ -114,6 +117,8 @@ from apps.partners.serializers import (
     PartnerResourceSerializer,
     PartnerCalendarEventSerializer,
     PartnerCalendarRsvpSerializer,
+    SupportTicketSerializer,
+    SupportTicketReplySerializer,
     PartnerAuditEventSerializer,
     PartnerIntegrationSerializer,
     PartnerWebhookSerializer,
@@ -1433,6 +1438,120 @@ class PartnerViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Event not found."}, status=status.HTTP_404_NOT_FOUND)
         rsvps = event.rsvps.select_related("user")
         return Response(PartnerCalendarRsvpSerializer(rsvps, many=True).data, status=status.HTTP_200_OK)
+
+    # ── Support Inbox & Helpdesk ─────────────────────────────────────────
+    @action(detail=True, methods=["get", "post"], url_path="support-tickets")
+    def support_tickets(self, request, pk=None):
+        partner = self.get_object()
+        if request.method == "POST":
+            if not self._user_can_access_partner(partner, request.user):
+                raise PermissionDenied("Not allowed to submit a ticket here.")
+            serializer = SupportTicketSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            ticket = serializer.save(partner=partner, requester=request.user)
+            log_partner_audit(
+                partner=partner, actor=request.user, action="support_ticket.create",
+                target_type="support_ticket", target_id=str(ticket.id),
+                metadata={"subject": ticket.subject}, request=request,
+            )
+            return Response(SupportTicketSerializer(ticket).data, status=status.HTTP_201_CREATED)
+        if not self._user_can_access_partner(partner, request.user):
+            raise PermissionDenied("Not allowed to view this organization.")
+        is_admin = self._user_can_manage_partner(partner, request.user)
+        qs = SupportTicket.objects.filter(partner=partner).select_related("requester", "assignee", "department")
+        if not is_admin:
+            qs = qs.filter(requester=request.user)
+        ticket_status = request.query_params.get("status")
+        if ticket_status:
+            qs = qs.filter(status=ticket_status)
+        assignee_id = request.query_params.get("assignee")
+        if assignee_id:
+            qs = qs.filter(assignee_id=assignee_id)
+        return Response(SupportTicketSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    def _get_accessible_ticket(self, partner, ticket_id, user, *, require_manage=False):
+        ticket = SupportTicket.objects.filter(id=ticket_id, partner=partner).select_related("requester").first()
+        if not ticket:
+            return None, Response({"detail": "Ticket not found."}, status=status.HTTP_404_NOT_FOUND)
+        is_admin = self._user_can_manage_partner(partner, user)
+        if require_manage and not is_admin:
+            raise PermissionDenied("Not allowed to manage this ticket.")
+        if not require_manage and not is_admin and ticket.requester_id != user.id:
+            raise PermissionDenied("Not allowed to view this ticket.")
+        return ticket, None
+
+    @action(detail=True, methods=["get", "patch", "delete"], url_path=r"support-tickets/(?P<ticket_id>[^/.]+)")
+    def support_ticket_detail(self, request, pk=None, ticket_id=None):
+        partner = self.get_object()
+        require_manage = request.method in ("PATCH", "DELETE")
+        ticket, error = self._get_accessible_ticket(partner, ticket_id, request.user, require_manage=require_manage)
+        if error:
+            return error
+        if request.method == "DELETE":
+            ticket.delete()
+            log_partner_audit(
+                partner=partner, actor=request.user, action="support_ticket.delete",
+                target_type="support_ticket", target_id=str(ticket_id), request=request,
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        if request.method == "PATCH":
+            serializer = SupportTicketSerializer(
+                ticket, data=request.data, partial=True,
+            )
+            serializer.is_valid(raise_exception=True)
+            was_open = ticket.status not in (SupportTicketStatus.RESOLVED, SupportTicketStatus.CLOSED)
+            serializer.save()
+            ticket.refresh_from_db()
+            now_closed = ticket.status in (SupportTicketStatus.RESOLVED, SupportTicketStatus.CLOSED)
+            if was_open and now_closed and not ticket.resolved_at:
+                ticket.resolved_at = timezone.now()
+                ticket.save(update_fields=["resolved_at"])
+            elif not now_closed and ticket.resolved_at:
+                ticket.resolved_at = None
+                ticket.save(update_fields=["resolved_at"])
+            log_partner_audit(
+                partner=partner, actor=request.user, action="support_ticket.update",
+                target_type="support_ticket", target_id=str(ticket.id),
+                metadata={"fields": list((request.data or {}).keys())}, request=request,
+            )
+            return Response(SupportTicketSerializer(ticket).data, status=status.HTTP_200_OK)
+        return Response(SupportTicketSerializer(ticket).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path=r"support-tickets/(?P<ticket_id>[^/.]+)/replies")
+    def support_ticket_replies(self, request, pk=None, ticket_id=None):
+        partner = self.get_object()
+        ticket, error = self._get_accessible_ticket(partner, ticket_id, request.user)
+        if error:
+            return error
+        is_admin = self._user_can_manage_partner(partner, request.user)
+        if request.method == "POST":
+            is_internal_note = bool(request.data.get("is_internal_note")) and is_admin
+            body = (request.data.get("body") or "").strip()
+            if not body:
+                raise ValidationError({"body": "This field is required."})
+            reply = SupportTicketReply.objects.create(
+                ticket=ticket, author=request.user, body=body, is_internal_note=is_internal_note,
+            )
+            log_partner_audit(
+                partner=partner, actor=request.user, action="support_ticket.reply",
+                target_type="support_ticket", target_id=str(ticket.id), request=request,
+            )
+            return Response(SupportTicketReplySerializer(reply).data, status=status.HTTP_201_CREATED)
+        qs = ticket.replies.select_related("author")
+        if not is_admin:
+            qs = qs.filter(is_internal_note=False)
+        return Response(SupportTicketReplySerializer(qs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="support-inbox-summary")
+    def support_inbox_summary(self, request, pk=None):
+        partner = self.get_object()
+        self._require_permission(partner, request.user, "partner.support_inbox.manage")
+        qs = SupportTicket.objects.filter(partner=partner)
+        counts = {choice: qs.filter(status=choice).count() for choice in SupportTicketStatus.values}
+        unassigned = qs.filter(assignee__isnull=True).exclude(
+            status__in=[SupportTicketStatus.RESOLVED, SupportTicketStatus.CLOSED],
+        ).count()
+        return Response({"counts": counts, "unassigned": unassigned, "total": qs.count()}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get", "post"], url_path="role-assignments")
     def role_assignments(self, request, pk=None):

@@ -50,6 +50,8 @@ from apps.partners.models import (
     PartnerResource,
     PartnerCalendarEvent,
     PartnerCalendarRsvp,
+    SupportTicket,
+    SupportTicketReply,
 )
 from apps.chat.models import ConversationType
 from apps.chat.discussion import get_discussion_count
@@ -1650,3 +1652,34 @@ class PartnerChannelPermissionOverwriteSerializer(serializers.ModelSerializer):
         if not user:
             return None
         return getattr(user, "display_name", None) or getattr(user, "username", None) or str(user.id)
+
+
+class SupportTicketReplySerializer(serializers.ModelSerializer):
+    author_name = serializers.CharField(source="author.display_name", read_only=True, default=None)
+
+    class Meta:
+        model = SupportTicketReply
+        fields = ["id", "ticket", "author", "author_name", "body", "is_internal_note", "created_at"]
+        read_only_fields = ["id", "ticket", "author", "author_name", "created_at"]
+
+
+class SupportTicketSerializer(serializers.ModelSerializer):
+    requester_name = serializers.CharField(source="requester.display_name", read_only=True, default=None)
+    assignee_name = serializers.CharField(source="assignee.display_name", read_only=True, default=None)
+    department_name = serializers.CharField(source="department.name", read_only=True, default=None)
+    reply_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupportTicket
+        fields = [
+            "id", "partner", "requester", "requester_name", "subject", "description",
+            "status", "priority", "department", "department_name", "assignee", "assignee_name",
+            "reply_count", "resolved_at", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "partner", "requester", "requester_name", "assignee_name", "department_name",
+            "reply_count", "resolved_at", "created_at", "updated_at",
+        ]
+
+    def get_reply_count(self, obj):
+        return obj.replies.filter(is_internal_note=False).count()

@@ -1793,3 +1793,70 @@ class PartnerCalendarRsvp(models.Model):
     class Meta:
         db_table = "partner_calendar_rsvp"
         unique_together = [("event", "user")]
+
+
+class SupportTicketStatus(models.TextChoices):
+    OPEN = "open", "Open"
+    IN_PROGRESS = "in_progress", "In progress"
+    RESOLVED = "resolved", "Resolved"
+    CLOSED = "closed", "Closed"
+
+
+class SupportTicketPriority(models.TextChoices):
+    LOW = "low", "Low"
+    NORMAL = "normal", "Normal"
+    HIGH = "high", "High"
+    URGENT = "urgent", "Urgent"
+
+
+class SupportTicket(models.Model):
+    """General Tools > Support Inbox + Helpdesk — one model covering
+    both catalog keys, since a helpdesk ticket routed to a department IS
+    the support inbox item; there's no meaningful product distinction
+    between the two catalog entries. Named SupportTicket (not Ticket) to
+    avoid confusion with apps.events.Ticket, an unrelated paid-event-seat
+    model. Replies live in SupportTicketReply below rather than routing
+    through apps.chat.Conversation (the pattern PartnerPost uses) — that
+    path requires the separate NestJS/Mongo chat service; a ticket reply
+    thread is simple enough to keep fully in Django/Postgres."""
+
+    id = models.BigAutoField(primary_key=True)
+    partner = models.ForeignKey(Partner, on_delete=models.CASCADE, related_name="support_tickets")
+    requester = models.ForeignKey(User, on_delete=models.CASCADE, related_name="submitted_support_tickets")
+    subject = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=16, choices=SupportTicketStatus.choices, default=SupportTicketStatus.OPEN)
+    priority = models.CharField(max_length=16, choices=SupportTicketPriority.choices, default=SupportTicketPriority.NORMAL)
+    department = models.ForeignKey(
+        PartnerDepartment, on_delete=models.SET_NULL, null=True, blank=True, related_name="tickets",
+    )
+    assignee = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="assigned_support_tickets",
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "partner_support_ticket"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["partner", "status"]),
+            models.Index(fields=["partner", "assignee"]),
+        ]
+
+
+class SupportTicketReply(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    ticket = models.ForeignKey(SupportTicket, on_delete=models.CASCADE, related_name="replies")
+    author = models.ForeignKey(User, on_delete=models.PROTECT, related_name="support_ticket_replies")
+    body = models.TextField()
+    is_internal_note = models.BooleanField(
+        default=False, help_text="Visible to admins/assignees only, hidden from the requester.",
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "partner_support_ticket_reply"
+        ordering = ["created_at"]
+        indexes = [models.Index(fields=["ticket", "created_at"])]
