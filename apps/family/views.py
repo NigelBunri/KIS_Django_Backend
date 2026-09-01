@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -17,6 +18,7 @@ from drf_spectacular.utils import extend_schema, OpenApiParameter
 from .models import (
     FamilyAccount,
     FamilyMember,
+    MemberRole,
     ParentalControl,
     FamilyEvent,
     FamilyPhotoAlbum,
@@ -47,6 +49,25 @@ from .serializers import (
     JoinFamilySerializer,
     SOSAlertSerializer,
 )
+
+# Fields that control who a family member IS and what they can be
+# restricted by - previously get_queryset() only checked "is this user a
+# member of the family," not "is this user the parent/admin," so any
+# member (including one flagged is_minor=True) could PATCH their own or
+# another member's role/is_admin/is_minor, or write ParentalControl
+# (content filter level, allowed contacts, screen time) on anyone in the
+# family via the standard REST API.
+GUARDIAN_ONLY_MEMBER_FIELDS = {"role", "is_admin", "is_minor"}
+
+
+def _user_is_family_guardian(user, family: FamilyAccount) -> bool:
+    if family.admin_user_id == user.id:
+        return True
+    return FamilyMember.objects.filter(
+        family=family, user=user, is_admin=True,
+    ).exists() or FamilyMember.objects.filter(
+        family=family, user=user, role__in=[MemberRole.PARENT, MemberRole.GUARDIAN],
+    ).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -151,8 +172,44 @@ class FamilyMemberViewSet(viewsets.ModelViewSet):
             "family", "user", "added_by"
         )
 
+    def _assert_guardian_for_privileged_write(self, family, validated_data):
+        """
+        Guards the specific fields that grant authority or remove
+        protection - not every field on a FamilyMember. A member editing
+        their own nickname (or adding an ordinary, non-privileged relative
+        to the family tree) is unaffected; only is_admin=True or
+        role in {parent, guardian} - and any change to is_minor - requires
+        the requester to already be a guardian of the family, since those
+        are exactly the fields the previously-missing check let anyone
+        (including a member flagged is_minor=True) rewrite on themselves
+        or anyone else.
+        """
+        touches_privilege = (
+            validated_data.get("is_admin") is True
+            or validated_data.get("role") in (MemberRole.PARENT, MemberRole.GUARDIAN)
+            or "is_minor" in validated_data
+        )
+        if touches_privilege and not _user_is_family_guardian(self.request.user, family):
+            raise PermissionDenied(
+                "Only a family parent/guardian/admin can change role, admin, or minor status."
+            )
+
     def perform_create(self, serializer):
+        family = serializer.validated_data.get("family")
+        self._assert_guardian_for_privileged_write(family, serializer.validated_data)
         serializer.save(added_by=self.request.user)
+
+    def perform_update(self, serializer):
+        member = self.get_object()
+        is_self = member.user_id == self.request.user.id
+        is_guardian = _user_is_family_guardian(self.request.user, member.family)
+        # Editing a DIFFERENT member's row at all requires guardian status,
+        # not just membership - previously get_queryset()'s plain
+        # family-membership check was the only gate.
+        if not is_self and not is_guardian:
+            raise PermissionDenied("Only a family parent/guardian/admin can edit another member.")
+        self._assert_guardian_for_privileged_write(member.family, serializer.validated_data)
+        serializer.save()
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +232,31 @@ class ParentalControlViewSet(viewsets.ModelViewSet):
         return ParentalControl.objects.filter(
             family_member__family__in=family_ids
         ).select_related("family_member")
+
+    # Content filter level, allowed contacts, and screen time are exactly
+    # the settings a minor being restricted by them would be motivated to
+    # weaken - get_queryset() above only checks family membership, so
+    # without this, any member (including the one the controls apply to)
+    # could write these via the standard REST API. Reads stay open to any
+    # family member (matches get_queryset()); only writes require guardian.
+
+    def perform_create(self, serializer):
+        family_member = serializer.validated_data.get("family_member")
+        family = family_member.family if family_member else None
+        if not family or not _user_is_family_guardian(self.request.user, family):
+            raise PermissionDenied("Only a family parent/guardian/admin can set parental controls.")
+        serializer.save()
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if not _user_is_family_guardian(self.request.user, instance.family_member.family):
+            raise PermissionDenied("Only a family parent/guardian/admin can change parental controls.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not _user_is_family_guardian(self.request.user, instance.family_member.family):
+            raise PermissionDenied("Only a family parent/guardian/admin can remove parental controls.")
+        instance.delete()
 
 
 # ---------------------------------------------------------------------------

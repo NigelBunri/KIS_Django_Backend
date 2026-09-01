@@ -537,6 +537,23 @@ class UserSerializer(serializers.ModelSerializer):
                 attrs["phone_country_code"] = None
                 attrs["phone_number"] = None
 
+        # Same self-reported minimum-age check as UserCreateSerializer -
+        # this is the path an EXISTING account (created before this field
+        # existed, or by a not-yet-updated mobile client) uses to add its
+        # date_of_birth after the fact via profile edit.
+        dob = attrs.get("date_of_birth")
+        if dob:
+            today = timezone.now().date()
+            if dob > today:
+                raise serializers.ValidationError({"date_of_birth": "Date of birth cannot be in the future."})
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+            if age < MINIMUM_SIGNUP_AGE:
+                raise serializers.ValidationError(
+                    {"date_of_birth": f"You must be at least {MINIMUM_SIGNUP_AGE} years old to use KIS."}
+                )
+            if age > 130:
+                raise serializers.ValidationError({"date_of_birth": "Please enter a valid date of birth."})
+
         return attrs
 
     def get_verification_summary(self, obj: User) -> dict:
@@ -579,6 +596,13 @@ class PublicUserSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+# Matches the 13+ minimum already stated in the app's Terms & Conditions /
+# Privacy Policy screens (src/screens/TermsAndConditionsScreen.tsx,
+# PrivacyPolicyScreen.tsx) - not a new policy decision, just the first
+# place that text is actually backed by a check.
+MINIMUM_SIGNUP_AGE = 13
+
+
 class UserCreateSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=True, trim_whitespace=False)
     password2 = serializers.CharField(write_only=True, required=True, trim_whitespace=False)
@@ -587,6 +611,12 @@ class UserCreateSerializer(serializers.ModelSerializer):
     phone_country_code = serializers.CharField(required=False, allow_blank=True)
     phone_number = serializers.CharField(required=False, allow_blank=True)
     country = serializers.CharField(required=False, allow_blank=True)
+    # Optional deliberately - the currently-published mobile app doesn't
+    # collect this yet, so requiring it would reject every signup from an
+    # un-updated client (see User.date_of_birth's docstring). A client that
+    # DOES send it gets a real minimum-age check below, even while the
+    # field stays optional overall.
+    date_of_birth = serializers.DateField(required=False, allow_null=True)
 
     class Meta:
         model = User
@@ -598,6 +628,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
             "phone_country_code",
             "phone_number",
             "country",
+            "date_of_birth",
         )
 
     def validate(self, attrs):
@@ -657,6 +688,24 @@ class UserCreateSerializer(serializers.ModelSerializer):
             validate_password(attrs.get("password"))
         except DjangoValidationError as exc:
             raise serializers.ValidationError({"password": list(exc.messages)})
+
+        # Only enforced when a client actually sends a DOB (see the field's
+        # required=False) - matches the 13+ minimum already promised in the
+        # app's own Terms & Conditions / Privacy Policy text, which existed
+        # with nothing behind it before this. Omitting the field entirely
+        # still succeeds, so an un-updated client is unaffected.
+        dob = attrs.get("date_of_birth")
+        if dob:
+            today = timezone.now().date()
+            if dob > today:
+                raise serializers.ValidationError({"date_of_birth": "Date of birth cannot be in the future."})
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+            if age < MINIMUM_SIGNUP_AGE:
+                raise serializers.ValidationError(
+                    {"date_of_birth": f"You must be at least {MINIMUM_SIGNUP_AGE} years old to create a KIS account."}
+                )
+            if age > 130:
+                raise serializers.ValidationError({"date_of_birth": "Please enter a valid date of birth."})
 
         return attrs
 

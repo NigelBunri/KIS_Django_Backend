@@ -221,6 +221,16 @@ class User(AbstractBaseUser, PermissionsMixin, BaseEntity):
     entitlements = models.JSONField(default=dict, blank=True)
     country = models.CharField(max_length=20, default="CM")
 
+    # Self-reported only - there is no ID-based age-assurance provider
+    # integrated (that's a REGULATORY/business decision requiring a paid
+    # third-party vendor, not something this field alone provides).
+    # Optional/nullable deliberately: the currently-published mobile app
+    # does not collect this yet, so making it required would reject every
+    # signup from an un-updated client. See is_minor/is_under_13/age below
+    # for how callers should treat a still-unknown DOB - never assume
+    # "unknown" means "adult".
+    date_of_birth = models.DateField(null=True, blank=True)
+
     # additional meta flags
     email_verified = models.BooleanField(default=False, db_index=True)
     last_login_at = models.DateTimeField(null=True, blank=True, db_index=True)
@@ -248,6 +258,33 @@ class User(AbstractBaseUser, PermissionsMixin, BaseEntity):
 
     def __str__(self) -> str:
         return self.phone or self.email or self.username or f"User {self.pk}"
+
+    # ---------- Age (self-reported date_of_birth only) ----------
+    # Callers must treat None as a real, distinct "we don't know" state -
+    # never fall back to treating an unknown age as an adult (that would
+    # silently disable every minor protection for the majority of existing
+    # accounts, which predate this field and have no DOB on file) or as a
+    # minor (that would needlessly restrict adults who haven't set it yet).
+
+    @property
+    def age(self) -> Optional[int]:
+        if not self.date_of_birth:
+            return None
+        today = timezone.now().date()
+        years = today.year - self.date_of_birth.year
+        if (today.month, today.day) < (self.date_of_birth.month, self.date_of_birth.day):
+            years -= 1
+        return years
+
+    @property
+    def is_minor(self) -> Optional[bool]:
+        age = self.age
+        return None if age is None else age < 18
+
+    @property
+    def is_under_13(self) -> Optional[bool]:
+        age = self.age
+        return None if age is None else age < 13
 
     # ---------- Business logic helpers ----------
     def recalc_trust_score(self) -> float:
