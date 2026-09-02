@@ -78,6 +78,7 @@ from apps.verification.serializers import validate_private_evidence_metadata
 from apps.verification.services import sync_shop_verification_request
 from .serializers import (
     ShopSerializer,
+    PublicShopSerializer,
     ShopVerificationRequestSerializer,
     ProductSerializer,
     ProductImageSerializer,
@@ -714,6 +715,15 @@ class CommerceUploadInitiateView(APIView):
 class ShopViewSet(viewsets.ModelViewSet):
     queryset = Shop.objects.all().order_by('-created_at')
     serializer_class = ShopSerializer
+    # NOTE: deliberately NOT opened to AllowAny like ProductViewSet above -
+    # ShopSerializer is `fields = '__all__'` and Shop carries payout/
+    # financial fields (stripe_account_id, payout_account_name,
+    # payout_bank_last4, flutterwave_subaccount_id). get_queryset's
+    # anonymous-user branch below looks like it wants public reads, but
+    # exposing this serializer publicly would leak those fields to anyone -
+    # a public shop view needs its own minimal serializer first (see
+    # PublicShopSerializer/PublicShopDetailView), not a permission change
+    # on this one.
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -985,7 +995,15 @@ class CommerceDiscoveryView(APIView):
             popular_shops_qs = shop_qs.order_by('-followers_count', '-rating_avg')[:8]
         service_qs = service_qs.order_by('-is_featured', '-created_at')[:8]
         trending_data = ProductSerializer(trending_qs, many=True, context={'request': request}).data
-        shops_data = ShopSerializer(popular_shops_qs, many=True, context={'request': request}).data
+        # SECURITY: was ShopSerializer (fields = '__all__') on a
+        # permissions.IsAuthenticatedOrReadOnly view - anonymous requests
+        # (which is exactly what KISTube's unauthenticated market-discovery
+        # fetcher sends) were receiving every shop's stripe_account_id,
+        # flutterwave_subaccount_id, payout_account_name, payout_bank_last4,
+        # raw owner user id, and team_members in this response. Confirmed
+        # live in production before this fix. PublicShopSerializer is the
+        # same minimal-fields pattern as HealthInstitutionPublicSerializer.
+        shops_data = PublicShopSerializer(popular_shops_qs, many=True, context={'request': request}).data
         return Response({
             'currency': 'USD',
             'payment_provider': _commerce_default_payment_provider(),
@@ -999,6 +1017,27 @@ class CommerceDiscoveryView(APIView):
                 'trusted_shops': shops_data,
                 'service_spotlight': ShopServiceSerializer(service_qs, many=True, context={'request': request}).data,
             },
+        })
+
+
+class PublicShopDetailView(APIView):
+    """Public shop-profile page for KISTube's Market section - the detail
+    page ProductViewSet's now-public retrieve links out to. Uses
+    PublicShopSerializer, never ShopSerializer (see that serializer's
+    docstring and CommerceDiscoveryView's popular_shops fix just above for
+    why: ShopSerializer's fields = '__all__' carries payout/financial
+    fields that must never reach an anonymous request)."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, shop_id):
+        shop = get_object_or_404(Shop, id=shop_id, is_deleted=False, status=Shop.STATUS_ACTIVE)
+        products = Product.objects.filter(shop=shop, is_active=True, is_deleted=False).order_by('-created_at')[:48]
+        services = ShopService.objects.filter(shop=shop, is_active=True, is_deleted=False, status='published').order_by('-is_featured', '-created_at')[:24]
+        return Response({
+            'shop': PublicShopSerializer(shop, context={'request': request}).data,
+            'products': ProductSerializer(products, many=True, context={'request': request}).data,
+            'services': ShopServiceSerializer(services, many=True, context={'request': request}).data,
         })
 
 
@@ -1044,6 +1083,20 @@ class ShopVerificationRequestViewSet(viewsets.ModelViewSet):
 @class_doc_decorator('Products')
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.all().order_by('-created_at')
+
+    def get_permissions(self):
+        # No permission_classes was ever set on this viewset, so it fell
+        # through to DRF's default (IsAuthenticated here) - list/retrieve
+        # are a public marketplace catalog (KISTube's product detail pages
+        # need this for anonymous visitors, same as the discovery endpoint
+        # they already browse from), while every write path already has
+        # its own manual ownership/role check below (perform_create,
+        # get_object's SAFE_METHODS branch) unaffected by loosening reads.
+        # Mirrors the identical fix already made for six broadcasts
+        # player-feature endpoints.
+        if self.request.method in permissions.SAFE_METHODS:
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated()]
     serializer_class = ProductSerializer
 
     def get_queryset(self):

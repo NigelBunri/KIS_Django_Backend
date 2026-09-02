@@ -15,7 +15,7 @@ from unittest.mock import patch
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from apps.billing.direct_payments import create_direct_payment_intent, reconcile_direct_payment_callback
 from apps.billing.models import DirectPaymentAuditEvent, DirectPaymentIntent
@@ -606,6 +606,36 @@ class CommerceAmazonCoreApiTests(APITestCase):
         self.assertEqual(discovery_response.status_code, status.HTTP_200_OK, discovery_response.data)
         self.assertEqual(discovery_response.data['currency'], 'USD')
         self.assertIn('featured_products', discovery_response.data['sections'])
+
+    def test_discovery_popular_shops_hides_payout_and_owner_fields_from_anonymous_requests(self):
+        """Regression test: CommerceDiscoveryView's popular_shops used to
+        serialize with ShopSerializer (fields = '__all__'), so an anonymous
+        request - exactly what KISTube's unauthenticated market-discovery
+        fetcher sends - received every shop's stripe_account_id,
+        flutterwave_subaccount_id, payout_account_name, payout_bank_last4,
+        raw owner user id, and team_members. Confirmed live in production
+        before the fix to PublicShopSerializer."""
+        self.shop.is_verified = True
+        self.shop.stripe_account_id = 'acct_test_should_never_leak'
+        self.shop.payout_account_name = 'Should Not Leak Bank Account'
+        self.shop.payout_bank_last4 = '4242'
+        self.shop.flutterwave_subaccount_id = 'RS_test_should_never_leak'
+        self.shop.save()
+
+        anonymous_client = APIClient()
+        response = anonymous_client.get('/api/v1/commerce/discovery/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        shops = response.data.get('popular_shops') or []
+        self.assertTrue(shops, 'Expected at least one shop in popular_shops for this assertion to be meaningful.')
+        for shop_payload in shops:
+            for leaked_field in (
+                'stripe_account_id', 'stripe_charges_enabled', 'stripe_payouts_enabled',
+                'stripe_details_submitted', 'flutterwave_subaccount_id',
+                'payout_account_name', 'payout_account_status', 'payout_bank_last4',
+                'owner', 'team_members', 'analytics', 'landing_page',
+            ):
+                self.assertNotIn(leaked_field, shop_payload, f'{leaked_field!r} must not appear in public discovery output.')
 
 
 @override_settings(KIS_LEGACY_COMMERCE_WALLET_CHECKOUT_ENABLED=True)

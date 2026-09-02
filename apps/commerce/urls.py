@@ -38,6 +38,11 @@ urlpatterns = [
         name='commerce-discovery',
     ),
     path(
+        'public/shops/<uuid:shop_id>/',
+        views.PublicShopDetailView.as_view(),
+        name='commerce-public-shop-detail',
+    ),
+    path(
         'uploads/initiate/',
         views.CommerceUploadInitiateView.as_view(),
         name='commerce-upload-initiate',

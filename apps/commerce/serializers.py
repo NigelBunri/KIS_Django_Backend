@@ -625,6 +625,29 @@ class LandingVisibilityField(serializers.BooleanField):
             return False
         return bool(getattr(landing_page, self.attr_name, False))
 
+class PublicShopSerializer(serializers.ModelSerializer):
+    """Minimal, deliberately separate from ShopSerializer's `fields =
+    '__all__'` - Shop carries payout/financial fields (stripe_account_id,
+    payout_account_name, payout_bank_last4, flutterwave_subaccount_id)
+    that must never reach an anonymous request. Same pattern as
+    apps.health_ops.HealthInstitutionPublicSerializer. Backs
+    PublicShopDetailView, the only AllowAny read this model gets."""
+
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Shop
+        fields = [
+            "id", "name", "slug", "description", "image_url",
+            "is_verified", "rating_avg", "rating_count", "followers_count",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_image_url(self, obj):
+        return absolutize_backend_media(obj.image_url, request=self.context.get("request"))
+
+
 class ShopSerializer(serializers.ModelSerializer):
     image_file = serializers.ImageField(required=False, allow_null=True)
     image_url = serializers.SerializerMethodField()
