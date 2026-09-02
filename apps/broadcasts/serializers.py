@@ -8,6 +8,7 @@ from rest_framework import serializers
 from apps.broadcasts.media_utils import build_media_url, ensure_local_thumbnail
 from apps.broadcasts.health_engine_policy import is_service_medium_allowed
 from apps.core.money import parse_decimal_amount
+from apps.core.public_web import resolve_stale_media_url
 from common.media_urls import absolutize_backend_media
 
 from .models import (
@@ -224,6 +225,13 @@ class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
     avatar_kind = serializers.SerializerMethodField()
     avatar_display_url = serializers.SerializerMethodField()
     avatar_initials = serializers.SerializerMethodField()
+    # Plain passthrough model fields previously - same frozen-presigned-URL
+    # staleness as ChannelContentAssetSerializer.url (see its comment).
+    # KISTube's ChannelCard/ContentCard/KISTubeShell read avatar_url/
+    # banner_url directly (not avatar_display_url), so this was the
+    # channel-side half of thumbnails/avatars going dead on KISTube.
+    avatar_url = serializers.SerializerMethodField()
+    banner_url = serializers.SerializerMethodField()
 
     class Meta:
         model = BroadcastChannel
@@ -280,6 +288,12 @@ class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
             cached = _resolve_channel_avatar(obj)
             obj._resolved_display_avatar = cached
         return cached
+
+    def get_avatar_url(self, obj: BroadcastChannel) -> str:
+        return resolve_stale_media_url(obj.avatar_url)
+
+    def get_banner_url(self, obj: BroadcastChannel) -> str:
+        return resolve_stale_media_url(obj.banner_url)
 
     def get_avatar_kind(self, obj: BroadcastChannel) -> str:
         return self._cached_avatar(obj)[0]
@@ -423,6 +437,15 @@ class BroadcastPlaylistSerializer(serializers.ModelSerializer):
 
 
 class ChannelContentAssetSerializer(serializers.ModelSerializer):
+    # `url`/`thumbnail_url` are stored as whatever the upload endpoint
+    # returned at upload time - frequently a presigned S3 GET URL frozen
+    # with a ~1hr TTL (see apps.core.public_web.resolve_stale_media_url's
+    # docstring). Plain passthrough fields here meant every asset older
+    # than that TTL 403'd silently the moment its stored URL was reused -
+    # re-signing fresh on every read fixes that without touching storage.
+    url = serializers.SerializerMethodField()
+    thumbnail_url = serializers.SerializerMethodField()
+
     class Meta:
         model = ChannelContentAsset
         fields = [
@@ -443,6 +466,12 @@ class ChannelContentAssetSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    def get_url(self, obj: ChannelContentAsset) -> str:
+        return resolve_stale_media_url(obj.url)
+
+    def get_thumbnail_url(self, obj: ChannelContentAsset) -> str:
+        return resolve_stale_media_url(obj.thumbnail_url)
+
 
 class ChannelContentListSerializer(serializers.ModelSerializer):
     channel = BroadcastChannelSummarySerializer(read_only=True)
@@ -452,6 +481,12 @@ class ChannelContentListSerializer(serializers.ModelSerializer):
     engagement_counts = serializers.SerializerMethodField()
     is_broadcast = serializers.SerializerMethodField()
     broadcast_id = serializers.SerializerMethodField()
+    # Was a plain passthrough model field - see ChannelContentAssetSerializer's
+    # url/thumbnail_url comment just above for why that silently 403s once
+    # the stored presigned URL's TTL elapses. This is the serializer behind
+    # search, related-content, trending/category, and playlist-item rows -
+    # exactly the surfaces KISTube renders thumbnails from.
+    thumbnail_url = serializers.SerializerMethodField()
 
     class Meta:
         model = ChannelContent
@@ -476,6 +511,9 @@ class ChannelContentListSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+    def get_thumbnail_url(self, obj: ChannelContent) -> str:
+        return resolve_stale_media_url(obj.thumbnail_url)
 
     def get_first_asset(self, obj: ChannelContent):
         asset = obj.assets.order_by("sort_order", "created_at").first()
@@ -2752,11 +2790,19 @@ class ChannelContentTranscriptSerializer(serializers.ModelSerializer):
 
 
 class ChannelContentProductSerializer(serializers.ModelSerializer):
+    # See ChannelContentAssetSerializer's url/thumbnail_url comment - same
+    # frozen-presigned-URL staleness, rendered directly as <img src> by
+    # components/kistube/ProductTags.tsx.
+    thumbnail_url = serializers.SerializerMethodField()
+
     class Meta:
         model = ChannelContentProduct
         fields = ["id", "content", "product_id", "product_url", "product_title",
                   "thumbnail_url", "price_display", "timestamp_seconds", "created_at"]
         read_only_fields = ["id", "created_at"]
+
+    def get_thumbnail_url(self, obj: ChannelContentProduct) -> str:
+        return resolve_stale_media_url(obj.thumbnail_url)
 
 
 class ChannelLiveStreamTargetSerializer(serializers.ModelSerializer):

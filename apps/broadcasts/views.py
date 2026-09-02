@@ -14451,8 +14451,26 @@ from apps.core.public_web import (
     public_web_base_url as _public_web_base_url,
     public_indexing_enabled as _public_indexing_enabled,
     safe_public_description as _safe_public_description,
-    safe_public_media_url as _safe_public_media_url,
+    safe_public_media_url as _safe_public_media_url_raw,
+    resolve_stale_media_url as _resolve_stale_media_url,
 )
+
+
+def _safe_public_media_url(value: str) -> str:
+    """Wraps safe_public_media_url with resolve_stale_media_url so every
+    public broadcasts payload (channel avatar/banner, content thumbnail,
+    asset url/thumbnail) re-signs a fresh URL from a frozen presigned one
+    on every read instead of trusting whatever TTL-limited URL was stored
+    at upload time. Same fix apps.websites.kis_content_resolvers already
+    applies when resolving broadcast content into website-builder pages —
+    this file's own public endpoints (what KISTube's unauthenticated
+    lib/kistube-api.ts fetchers hit) had been calling safe_public_media_url
+    alone, which only validates/rejects, never refreshes, so any content
+    older than the presigned URL's ~1hr TTL silently stopped rendering on
+    KISTube specifically (the authenticated app-facing serializers resolve
+    fresh some other way, e.g. ProfileSerializer's default_storage.url()
+    pattern, which is why the app never showed this symptom)."""
+    return _safe_public_media_url_raw(_resolve_stale_media_url(value))
 
 
 def _content_is_public_web_safe(content: ChannelContent) -> bool:
