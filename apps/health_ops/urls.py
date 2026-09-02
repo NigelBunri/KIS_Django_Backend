@@ -27,6 +27,7 @@ from .views import (
     EmergencyDispatchSessionStepUpdateView,
     EmergencyDispatchTrackingView,
     HealthDiscoveryView,
+    PublicHealthInstitutionDetailView,
     HealthInstitutionDetailView,
     HealthCarePlanListCreateView,
     HealthCareSummaryView,
@@ -95,6 +96,7 @@ urlpatterns = [
     path("health-ops/vitals/", HealthVitalReadingListCreateView.as_view(), name="health-ops-vital-list-create"),
     path("health-ops/institutions/", HealthInstitutionListCreateView.as_view(), name="health-ops-institution-list"),
     path("health-ops/discovery/", HealthDiscoveryView.as_view(), name="health-ops-discovery"),
+    path("health-ops/public/institutions/<uuid:institution_id>/", PublicHealthInstitutionDetailView.as_view(), name="health-ops-public-institution-detail"),
     path(
         "health-ops/institutions/<str:institution_id>/",
         HealthInstitutionDetailView.as_view(),

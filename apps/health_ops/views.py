@@ -1557,6 +1557,27 @@ class HealthDiscoveryView(APIView):
         return Response({"results": serializer.data, "next_cursor": str(next_offset) if next_offset is not None else None})
 
 
+class PublicHealthInstitutionDetailView(APIView):
+    """Institution profile page for KISTube's Health section - the detail
+    page HealthDiscoveryView's tiles link out to. Same is_public/is_active
+    opt-in gate as the discovery listing, and the same
+    HealthInstitutionPublicSerializer (never HealthInstitutionSerializer,
+    which exposes owner/payout/settings — see that serializer's
+    docstring). Services use HealthServiceSerializer, which has no
+    sensitive fields (verified: no owner/payout data anywhere in its
+    output)."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, institution_id):
+        institution = get_object_or_404(HealthInstitution, id=institution_id, is_public=True, is_active=True)
+        services = HealthService.objects.filter(institution=institution, is_active=True).order_by("name")
+        return Response({
+            "institution": HealthInstitutionPublicSerializer(institution, context={"request": request}).data,
+            "services": HealthServiceSerializer(services, many=True, context={"request": request}).data,
+        })
+
+
 class HealthInstitutionPayoutAccountConnectView(APIView):
     """Connects the institution's Flutterwave subaccount for direct-to-
     institution settlement splitting — mirrors

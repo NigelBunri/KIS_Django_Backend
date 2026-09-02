@@ -27,7 +27,7 @@ from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
+from rest_framework.permissions import SAFE_METHODS, AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
@@ -2272,6 +2272,29 @@ def _build_broadcast_viewer_state(
     broadcast: EducationInstitutionBroadcast,
     user: User,
 ) -> dict[str, Any]:
+    if not getattr(user, "is_authenticated", False):
+        # AnonymousUser has no real pk - every .filter(user=user) below
+        # would raise ValidationError("'AnonymousUser' is not a valid
+        # UUID") the moment it hit the DB. Needed once
+        # EducationDiscoveryView/EducationContentDetailView opened to
+        # AllowAny for KISTube's anonymous browsing - a signed-out viewer
+        # simply has none of these, and every action needs a sign-in first.
+        return {
+            "membership": None,
+            "enrollment": None,
+            "booking": None,
+            "enrollment_status": None,
+            "booking_status": None,
+            "has_learning_access": False,
+            "can_access_content": False,
+            "payment_required": bool(broadcast.booking_enabled) and bool(broadcast.price_amount),
+            "can_apply_membership": False,
+            "can_enroll": False,
+            "can_book": False,
+            "visibility": broadcast.course.visibility if broadcast.course_id else EducationCourseVisibility.PUBLIC,
+            "access_request_status": None,
+            "can_request_access": False,
+        }
     membership = broadcast.institution.memberships.filter(user=user).first()
     enrollment = broadcast.enrollments.filter(user=user).first()
     booking = broadcast.bookings.filter(user=user).first()
@@ -2608,10 +2631,15 @@ def _build_education_discovery_payload(user: User, request) -> dict[str, Any]:
         )
 
     continue_learning = []
+    # Same AnonymousUser-is-not-a-valid-UUID guard as
+    # _build_broadcast_viewer_state - a signed-out visitor has no
+    # enrollments to continue, by definition.
     active_enrollments = (
         EducationInstitutionEnrollment.objects.select_related("broadcast", "institution", "course", "lesson", "class_session", "event")
         .filter(user=user, status__in=[EducationEnrollmentStatus.ENROLLED, EducationEnrollmentStatus.COMPLETED])
         .order_by("-updated_at")[:20]
+        if getattr(user, "is_authenticated", False)
+        else EducationInstitutionEnrollment.objects.none()
     )
     for enrollment in active_enrollments:
         if not enrollment.broadcast_id:
@@ -3054,10 +3082,15 @@ def _build_public_education_content_detail(
     content_type = _education_discovery_type_for_broadcast(broadcast)
     viewer_state = _build_broadcast_viewer_state(broadcast, request.user)
     course_outline = _build_public_learning_outline(broadcast, request)
+    # Same AnonymousUser-is-not-a-valid-UUID concern as
+    # _build_broadcast_viewer_state's own early-return - this second,
+    # separate enrollment lookup needed the same guard.
     enrollment = (
         broadcast.enrollments.select_related("lesson")
         .filter(user=request.user, status__in=[EducationEnrollmentStatus.ENROLLED, EducationEnrollmentStatus.COMPLETED])
         .first()
+        if request.user.is_authenticated
+        else None
     )
     # Reuse viewer_state's has_learning_access rather than recomputing from
     # enrollment alone — it additionally requires an APPROVED course access
@@ -12119,14 +12152,26 @@ class EducationBroadcastCatalogView(APIView):
 
 
 class EducationDiscoveryView(APIView):
-    permission_classes = [IsAuthenticated]
+    # Was IsAuthenticated - KISTube's Education section needs anonymous
+    # browsing same as Market/Health. _build_education_discovery_payload
+    # already takes request.user defensively (AnonymousUser has
+    # is_authenticated=False and no real pk, never passed into a .filter(
+    # user=...) here without that check) - verified via
+    # test_education_discovery_and_content_detail_work_for_anonymous_requests.
+    permission_classes = [AllowAny]
 
     def get(self, request):
         return Response(_build_education_discovery_payload(request.user, request), status=status.HTTP_200_OK)
 
 
 class EducationContentDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+    # Was IsAuthenticated - _build_public_education_content_detail's own
+    # name/helper-function naming ("_build_public_*" throughout) already
+    # signals this was designed to be anonymous-safe; audited its
+    # institution/course serializers for owner/payout fields (none) before
+    # flipping this. viewer_state/enrollment lookups already filter by
+    # request.user, which degrades safely to "no access" for AnonymousUser.
+    permission_classes = [AllowAny]
 
     def get(self, request, content_id: str):
         broadcast = get_object_or_404(
@@ -12148,7 +12193,13 @@ class EducationContentDetailView(APIView):
 
 
 class EducationContentReviewsView(APIView):
-    permission_classes = [IsAuthenticated]
+    def get_permissions(self):
+        # Reading reviews is public (same reasoning as EducationContentDetailView
+        # just above); posting one still requires auth (checked further via
+        # _require_learning_access_for_content in post() below).
+        if self.request.method in SAFE_METHODS:
+            return [AllowAny()]
+        return [IsAuthenticated()]
 
     def get(self, request, content_id: str):
         broadcast = get_object_or_404(
@@ -12211,7 +12262,11 @@ class EducationContentReviewsView(APIView):
 
 
 class EducationContentQuestionsView(APIView):
-    permission_classes = [IsAuthenticated]
+    def get_permissions(self):
+        # Same get_permissions split as EducationContentReviewsView above.
+        if self.request.method in SAFE_METHODS:
+            return [AllowAny()]
+        return [IsAuthenticated()]
 
     def get(self, request, content_id: str):
         broadcast = get_object_or_404(

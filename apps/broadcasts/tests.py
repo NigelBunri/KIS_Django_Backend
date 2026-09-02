@@ -3251,6 +3251,33 @@ class EducationCourseraCoreTests(APITestCase):
         self.assertIn('trustSummary', item)
         self.assertEqual(item['safetySummary']['status'], 'allowed')
 
+    def test_education_discovery_and_content_detail_work_for_anonymous_requests(self):
+        """Regression test: EducationDiscoveryView/EducationContentDetailView
+        were IsAuthenticated even though their payload builders are all named
+        _build_public_* - KISTube's Education section needs anonymous
+        browsing the same as Market/Health, and this asserts that flip is
+        both reachable (200, not 401) and safe (no payout/financial fields
+        from the institution, which has payout_account_status=ACTIVE and a
+        real flutterwave_subaccount_id set in setUp)."""
+        from rest_framework.test import APIClient
+
+        anonymous_client = APIClient()
+
+        discovery_response = anonymous_client.get('/api/v1/education/discovery/')
+        self.assertEqual(discovery_response.status_code, status.HTTP_200_OK, discovery_response.data)
+        items = [item for section in discovery_response.data['sections'] for item in section['items']]
+        self.assertTrue(items, 'Expected at least one discovery item for this assertion to be meaningful.')
+
+        detail_response = anonymous_client.get(f'/api/v1/education/contents/{self.broadcast.id}/')
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK, detail_response.data)
+
+        for payload in (items[0], detail_response.data, detail_response.data.get('institutionSummary') or {}):
+            for leaked_field in (
+                'flutterwave_subaccount_id', 'payout_account_status', 'payout_account_name',
+                'payout_bank_last4', 'stripe_account_id', 'owner', 'ownerId',
+            ):
+                self.assertNotIn(leaked_field, payload, f'{leaked_field!r} must not appear in public education output.')
+
     def test_discovery_institution_id_filter_returns_only_that_institutions_courses(self):
         other_institution = EducationInstitution.objects.create(
             owner=self.owner,
