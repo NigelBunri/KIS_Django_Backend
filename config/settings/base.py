@@ -539,6 +539,13 @@ elif OBJECT_STORAGE_PROVIDER == "s3":
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Feed personalization tuning
+# Hard cap on how many recent BroadcastItem rows BroadcastFeedView pulls
+# from the database and runs enrichment/ranking over per request, before
+# slicing to the requested page. Without this the query was unbounded -
+# cost scaled with total live content platform-wide instead of page size.
+# Comfortably exceeds realistic pagination depth (at PAGE max of 200 that's
+# 15+ pages) so normal scrolling is unaffected.
+FEED_CANDIDATE_WINDOW_SIZE = int(os.environ.get("FEED_CANDIDATE_WINDOW_SIZE", "3000"))
 FEED_PERSONALIZATION_RATE_LIMIT_SECONDS = int(os.environ.get("FEED_PERSONALIZATION_RATE_LIMIT_SECONDS", "8"))
 FEED_PERSONALIZATION_MIN_WEIGHT = float(os.environ.get("FEED_PERSONALIZATION_MIN_WEIGHT", "0.02"))
 FEED_PERSONALIZATION_GLOBAL_POPULARITY_TTL = int(

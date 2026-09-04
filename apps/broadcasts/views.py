@@ -226,7 +226,6 @@ from apps.broadcasts.models import (
     ChannelContentQueue,
     ChannelContentAutoChapterSuggestion,
 )
-from apps.broadcasts.services import cleanup_expired_broadcast_items
 from apps.broadcasts.health_engine_policy import (
     filter_booking_engine_keys,
     filter_service_medium_pairs,
@@ -7416,9 +7415,16 @@ class BroadcastFeedView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        cleaned = cleanup_expired_broadcast_items()
-        if cleaned:
-            logger.info("Purged %d expired broadcast items before listing the feed.", cleaned)
+        # Expired-item cleanup used to run synchronously here on every single
+        # feed request (a DELETE sweep on the platform's hottest endpoint).
+        # It's now handled exclusively by the daily
+        # "purge-expired-broadcasts" Celery beat task
+        # (apps.broadcasts.tasks.purge_expired_broadcasts_task, see
+        # config/settings/base.py CELERY_BEAT_SCHEDULE). This is safe to
+        # remove from the request path because the queryset below already
+        # filters `expires_at__gt=now` - an unpurged expired row is simply
+        # excluded from results, never shown, regardless of whether the
+        # sweep has run yet.
 
         def _parse_positive_int(value: Any, default: int) -> int:
             try:
@@ -7513,8 +7519,21 @@ class BroadcastFeedView(APIView):
         else:
             broadcast_items_qs = broadcast_items_qs.exclude(source_type=BroadcastSourceType.MARKET_PRODUCT)
 
-
-        broadcast_items = list(broadcast_items_qs.order_by("-broadcasted_at"))
+        # Bound the candidate set fetched from the database before the
+        # per-request enrichment/ranking work below (author lookups,
+        # reaction batching, personalized ranking, sort) runs on it.
+        # Previously this queryset had no LIMIT at all: every unexpired,
+        # non-hidden/muted broadcast item matching the filters above was
+        # pulled into memory and fully processed on *every* feed request,
+        # regardless of `limit`/`offset` - so the cost of loading page 1
+        # scaled with total live content on the platform, not with page
+        # size, and got slower as the platform grew. FEED_CANDIDATE_WINDOW_SIZE
+        # caps that worst case while leaving normal pagination depth
+        # untouched (it comfortably exceeds any realistic scroll session -
+        # at the max page size of 200 that's 15+ pages deep).
+        broadcast_items = list(
+            broadcast_items_qs.order_by("-broadcasted_at")[: settings.FEED_CANDIDATE_WINDOW_SIZE]
+        )
 
         def _absolutize_avatar(value: Any) -> str | None:
             if value is None:
