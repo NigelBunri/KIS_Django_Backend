@@ -14440,12 +14440,50 @@ def _unbroadcast_channel_content_for_feed(content: ChannelContent) -> int:
     return updated
 
 
+def _viewer_satisfies_age_restriction(user, content: ChannelContent) -> bool:
+    """age_restriction/content_rating used to be stored and editable but
+    never actually read by any view-permission check - a video marked 18+
+    was exactly as visible as one marked "none". Policy, deliberately
+    asymmetric between the two tiers:
+
+    - "18+": hard gate. Requires a signed-in viewer with a confirmed adult
+      DOB (user.is_minor is False) - unknown age or a confirmed minor both
+      block. Erring toward blocking unknown viewers is the correct default
+      for genuinely age-restricted material.
+    - "13+": soft gate, COPPA-shaped. Only blocks a *confirmed* under-13
+      viewer (user.is_under_13 is True). Unknown age doesn't block, because
+      the mobile app doesn't collect date_of_birth for most existing
+      accounts yet (see User.date_of_birth's own comment) - treating
+      "unknown" as "blocked" here would lock out nearly every current user
+      from any 13+ content, which is a UX regression this fix isn't meant
+      to cause. The actual protection a 13+ rating exists for (keeping out
+      confirmed under-13 viewers) still works.
+    """
+    restriction = content.age_restriction
+    if restriction == "none" or not restriction:
+        return True
+    if not getattr(user, "is_authenticated", False):
+        return restriction != "18+"
+    if restriction == "18+":
+        return user.is_minor is False
+    if restriction == "13+":
+        return user.is_under_13 is not True
+    return True
+
+
 def _user_can_view_content(user, content: ChannelContent) -> bool:
     if content.is_deleted:
         return False
+    can_manage = _user_can_edit_content(user, content)
     if content.visibility == ChannelContent.Visibility.PUBLIC and content.status == ChannelContent.Status.PUBLISHED:
+        # A channel manager can always see their own published content
+        # regardless of its age rating - same as YouTube Studio letting a
+        # creator preview their own age-restricted upload without an age
+        # check. The gate only applies to everyone else on this public path.
+        if not can_manage and not _viewer_satisfies_age_restriction(user, content):
+            return False
         return content.channel.is_public and not content.channel.is_deleted
-    return _user_can_edit_content(user, content)
+    return can_manage
 
 
 def _safe_channel_handle_from_value(value: object) -> str:

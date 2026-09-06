@@ -1428,6 +1428,87 @@ class ChannelContentViewDedupTests(APITestCase):
         self.assertEqual(int(self.content.stats.get('views') or 0), 2)
 
 
+class ChannelContentAgeRestrictionTests(APITestCase):
+    """age_restriction was stored and editable but never read by any view
+    permission check - a video marked 18+ was exactly as visible as one
+    marked "none". Covers the fix in _viewer_satisfies_age_restriction."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5557400201', username='age_owner', password='secret', country='NG')
+        self.adult = User.objects.create_user(
+            phone='5557400202', username='age_adult', password='secret', country='NG',
+            date_of_birth=timezone.now().date().replace(year=timezone.now().year - 30),
+        )
+        self.minor = User.objects.create_user(
+            phone='5557400203', username='age_minor', password='secret', country='NG',
+            date_of_birth=timezone.now().date().replace(year=timezone.now().year - 15),
+        )
+        self.under_13 = User.objects.create_user(
+            phone='5557400204', username='age_under13', password='secret', country='NG',
+            date_of_birth=timezone.now().date().replace(year=timezone.now().year - 10),
+        )
+        self.unknown_age = User.objects.create_user(phone='5557400205', username='age_unknown', password='secret', country='NG')
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle='age-channel',
+            display_name='Age Channel',
+            is_public=True,
+        )
+
+    def _content(self, age_restriction):
+        return ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='video',
+            title=f'{age_restriction} content',
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.owner,
+            age_restriction=age_restriction,
+        )
+
+    def _can_view(self, user, content):
+        from apps.broadcasts.views import _user_can_view_content
+        return _user_can_view_content(user, content)
+
+    def test_unrestricted_content_visible_to_everyone(self):
+        content = self._content('none')
+        self.assertTrue(self._can_view(self.minor, content))
+        self.assertTrue(self._can_view(self.under_13, content))
+        self.assertTrue(self._can_view(None, content))
+
+    def test_18plus_blocks_minors_and_unknown_age_and_anonymous(self):
+        content = self._content('18+')
+        self.assertTrue(self._can_view(self.adult, content))
+        self.assertFalse(self._can_view(self.minor, content))
+        self.assertFalse(self._can_view(self.unknown_age, content))
+        self.assertFalse(self._can_view(None, content))
+
+    def test_13plus_blocks_only_confirmed_under_13(self):
+        content = self._content('13+')
+        self.assertTrue(self._can_view(self.adult, content))
+        self.assertTrue(self._can_view(self.minor, content))
+        # Unknown age is NOT blocked by 13+ - see the function's own
+        # docstring for why (most existing accounts have no DOB on file).
+        self.assertTrue(self._can_view(self.unknown_age, content))
+        self.assertFalse(self._can_view(self.under_13, content))
+
+    def test_owner_can_always_view_own_age_restricted_content_via_api(self):
+        content = self._content('18+')
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{content.id}/comments/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_18plus_content_returns_404_for_minor_via_api(self):
+        content = self._content('18+')
+        self.client.force_authenticate(user=self.minor)
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{content.id}/comments/')
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
 class UserContentPlaylistApiTests(APITestCase):
     def setUp(self):
         User = get_user_model()
