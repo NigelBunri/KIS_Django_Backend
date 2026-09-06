@@ -34,6 +34,9 @@ from apps.broadcasts.models import (
     ChannelContentSave,
     ChannelModerationRecord,
     ChannelContentType,
+    ChannelContentFingerprint,
+    ChannelFingerprintMatch,
+    ChannelWatchHistory,
     BroadcastFeedProfile,
     BroadcastEngagementEvent,
     BroadcastItem,
@@ -80,6 +83,7 @@ from apps.broadcasts.feed_entry_store import (
     resolve_feed_entry,
 )
 from apps.broadcasts.views import (
+    PERCEPTUAL_MATCH_THRESHOLD,
     _decode_feed_cursor,
     _encode_feed_cursor,
     _validate_feed_media_file,
@@ -1358,6 +1362,263 @@ class ChannelEngagementTests(APITestCase):
         self.assertTrue(ChannelAnalyticsDailyRollup.objects.filter(channel=self.channel, date=timezone.localdate()).exists())
 
 
+class ChannelContentViewDedupTests(APITestCase):
+    """ChannelContentViewEventView used to be a bare AllowAny endpoint that
+    incremented on every single call - trivially inflatable by a script or
+    a refresh loop. Covers the fix: one viewer identity (authenticated
+    user, or anonymous IP+user-agent) only moves the counter once per
+    dedup window, but different viewers still count independently."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5557400101', username='dedup_owner', password='secret', country='NG')
+        self.viewer = User.objects.create_user(phone='5557400102', username='dedup_viewer', password='secret', country='NG')
+        self.other_viewer = User.objects.create_user(phone='5557400103', username='dedup_other', password='secret', country='NG')
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle='dedup-channel',
+            display_name='Dedup Channel',
+            is_public=True,
+        )
+        self.content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='video',
+            title='Dedup content',
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.owner,
+        )
+
+    def _view_url(self):
+        return f'/api/v1/broadcasts/channel-contents/{self.content.id}/view/'
+
+    def test_same_authenticated_viewer_only_counted_once_within_window(self):
+        self.client.force_authenticate(user=self.viewer)
+        first = self.client.post(self._view_url(), {'progress_seconds': 1}, format='json')
+        second = self.client.post(self._view_url(), {'progress_seconds': 5}, format='json')
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.content.refresh_from_db()
+        self.assertEqual(int(self.content.stats.get('views') or 0), 1)
+        # Watch-history progress still updates on the deduped second call -
+        # only the public counter is gated, not resume tracking.
+        history = ChannelWatchHistory.objects.get(content=self.content, user=self.viewer)
+        self.assertEqual(history.progress_seconds, 5)
+
+    def test_different_authenticated_viewers_each_counted(self):
+        self.client.force_authenticate(user=self.viewer)
+        self.client.post(self._view_url(), {}, format='json')
+        self.client.force_authenticate(user=self.other_viewer)
+        self.client.post(self._view_url(), {}, format='json')
+        self.content.refresh_from_db()
+        self.assertEqual(int(self.content.stats.get('views') or 0), 2)
+
+    def test_same_anonymous_identity_only_counted_once(self):
+        first = self.client.post(self._view_url(), {}, format='json', REMOTE_ADDR='203.0.113.10', HTTP_USER_AGENT='pytest-agent/1.0')
+        second = self.client.post(self._view_url(), {}, format='json', REMOTE_ADDR='203.0.113.10', HTTP_USER_AGENT='pytest-agent/1.0')
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.content.refresh_from_db()
+        self.assertEqual(int(self.content.stats.get('views') or 0), 1)
+
+    def test_different_anonymous_ip_counted_separately(self):
+        self.client.post(self._view_url(), {}, format='json', REMOTE_ADDR='203.0.113.10', HTTP_USER_AGENT='pytest-agent/1.0')
+        self.client.post(self._view_url(), {}, format='json', REMOTE_ADDR='198.51.100.20', HTTP_USER_AGENT='pytest-agent/1.0')
+        self.content.refresh_from_db()
+        self.assertEqual(int(self.content.stats.get('views') or 0), 2)
+
+
+class ChannelContentAgeRestrictionTests(APITestCase):
+    """age_restriction was stored and editable but never read by any view
+    permission check - a video marked 18+ was exactly as visible as one
+    marked "none". Covers the fix in _viewer_satisfies_age_restriction."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5557400201', username='age_owner', password='secret', country='NG')
+        self.adult = User.objects.create_user(
+            phone='5557400202', username='age_adult', password='secret', country='NG',
+            date_of_birth=timezone.now().date().replace(year=timezone.now().year - 30),
+        )
+        self.minor = User.objects.create_user(
+            phone='5557400203', username='age_minor', password='secret', country='NG',
+            date_of_birth=timezone.now().date().replace(year=timezone.now().year - 15),
+        )
+        self.under_13 = User.objects.create_user(
+            phone='5557400204', username='age_under13', password='secret', country='NG',
+            date_of_birth=timezone.now().date().replace(year=timezone.now().year - 10),
+        )
+        self.unknown_age = User.objects.create_user(phone='5557400205', username='age_unknown', password='secret', country='NG')
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle='age-channel',
+            display_name='Age Channel',
+            is_public=True,
+        )
+
+    def _content(self, age_restriction):
+        return ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='video',
+            title=f'{age_restriction} content',
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.owner,
+            age_restriction=age_restriction,
+        )
+
+    def _can_view(self, user, content):
+        from apps.broadcasts.views import _user_can_view_content
+        return _user_can_view_content(user, content)
+
+    def test_unrestricted_content_visible_to_everyone(self):
+        content = self._content('none')
+        self.assertTrue(self._can_view(self.minor, content))
+        self.assertTrue(self._can_view(self.under_13, content))
+        self.assertTrue(self._can_view(None, content))
+
+    def test_18plus_blocks_minors_and_unknown_age_and_anonymous(self):
+        content = self._content('18+')
+        self.assertTrue(self._can_view(self.adult, content))
+        self.assertFalse(self._can_view(self.minor, content))
+        self.assertFalse(self._can_view(self.unknown_age, content))
+        self.assertFalse(self._can_view(None, content))
+
+    def test_13plus_blocks_only_confirmed_under_13(self):
+        content = self._content('13+')
+        self.assertTrue(self._can_view(self.adult, content))
+        self.assertTrue(self._can_view(self.minor, content))
+        # Unknown age is NOT blocked by 13+ - see the function's own
+        # docstring for why (most existing accounts have no DOB on file).
+        self.assertTrue(self._can_view(self.unknown_age, content))
+        self.assertFalse(self._can_view(self.under_13, content))
+
+    def test_owner_can_always_view_own_age_restricted_content_via_api(self):
+        content = self._content('18+')
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{content.id}/comments/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_18plus_content_returns_404_for_minor_via_api(self):
+        content = self._content('18+')
+        self.client.force_authenticate(user=self.minor)
+        response = self.client.get(f'/api/v1/broadcasts/channel-contents/{content.id}/comments/')
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class ContentFingerprintTests(APITestCase):
+    """ChannelContentFingerprintView used to accept any client-submitted
+    hash for any algorithm and hardcode similarity_score=1.0 for every
+    "match" regardless of how similar the content actually was. Covers
+    the fix: real Hamming-distance similarity for perceptual matches,
+    exact equality (still correctly 1.0) for sha256, and the
+    server-computes-its-own-perceptual-hash behavior."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5557400301', username='fp_owner', password='secret', country='NG')
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            handle='fp-channel', display_name='Fingerprint Channel', is_public=True,
+        )
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.owner, role=BroadcastChannelRole.Role.OWNER)
+        self.content_a = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Original upload',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+        self.content_b = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Re-upload',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+
+    # ── Pure similarity math ─────────────────────────────────────────────
+    def test_perceptual_similarity_identical_fingerprints_score_1(self):
+        from apps.broadcasts.media_utils import perceptual_fingerprint_similarity
+        fp = "ffffffffffffffff-0000000000000000-a5a5a5a5a5a5a5a5"
+        self.assertEqual(perceptual_fingerprint_similarity(fp, fp), 1.0)
+
+    def test_perceptual_similarity_opposite_bits_score_0(self):
+        from apps.broadcasts.media_utils import perceptual_fingerprint_similarity
+        # 'f' (1111) and '0' (0000) differ in every bit - maximum possible
+        # Hamming distance, so similarity must bottom out at 0.0.
+        self.assertEqual(perceptual_fingerprint_similarity("f" * 16, "0" * 16), 0.0)
+
+    def test_perceptual_similarity_mismatched_frame_count_scores_0(self):
+        from apps.broadcasts.media_utils import perceptual_fingerprint_similarity
+        self.assertEqual(perceptual_fingerprint_similarity("ff-ff-ff", "ff-ff"), 0.0)
+
+    # ── Match recording (the actual bug this fixes) ─────────────────────
+    def test_sha256_exact_match_scores_1(self):
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+        fp_b, _ = _record_fingerprint_and_scan_matches(self.content_b, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+        match = ChannelFingerprintMatch.objects.get(source_fingerprint=fp_b)
+        self.assertEqual(match.similarity_score, 1.0)
+
+    def test_perceptual_near_match_records_real_score_not_hardcoded_one(self):
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+        # One hex nibble differs (single frame, single bit flip within a
+        # 64-bit hash) - close enough to clear PERCEPTUAL_MATCH_THRESHOLD
+        # but must NOT come out as a hardcoded 1.0, which is exactly what
+        # this endpoint did before.
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.PERCEPTUAL, 'a' * 16)
+        fp_b, _ = _record_fingerprint_and_scan_matches(self.content_b, ChannelContentFingerprint.Algorithm.PERCEPTUAL, ('a' * 15) + 'b')
+        match = ChannelFingerprintMatch.objects.get(source_fingerprint=fp_b)
+        self.assertGreaterEqual(match.similarity_score, PERCEPTUAL_MATCH_THRESHOLD)
+        self.assertLess(match.similarity_score, 1.0)
+
+    def test_perceptual_dissimilar_fingerprints_record_no_match(self):
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.PERCEPTUAL, 'f' * 16)
+        fp_b, _ = _record_fingerprint_and_scan_matches(self.content_b, ChannelContentFingerprint.Algorithm.PERCEPTUAL, '0' * 16)
+        self.assertFalse(ChannelFingerprintMatch.objects.filter(source_fingerprint=fp_b).exists())
+
+    # ── API endpoint behavior ────────────────────────────────────────────
+    def test_sha256_submission_via_api_still_works(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/fingerprint/',
+            {'algorithm': 'sha256', 'fingerprint_hash': 'abc123'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_perceptual_submission_without_hash_computes_server_side_or_fails_gracefully(self):
+        # No video asset exists on this content, so server-side computation
+        # can't produce anything - must fail with a clear 400, not accept
+        # a client-submitted hash for its own content (the actual security
+        # fix) and not crash.
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/fingerprint/',
+            {'algorithm': 'perceptual'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_perceptual_submission_ignores_client_submitted_hash(self):
+        # Even if a client tries to submit a perceptual hash directly for
+        # their own content, it must be ignored in favor of server-side
+        # computation (which fails here with no video asset) - never
+        # silently trusted.
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/fingerprint/',
+            {'algorithm': 'perceptual', 'fingerprint_hash': 'f' * 16},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(ChannelContentFingerprint.objects.filter(content=self.content_a, algorithm='perceptual').exists())
+
+
 class UserContentPlaylistApiTests(APITestCase):
     def setUp(self):
         User = get_user_model()
@@ -1526,6 +1787,52 @@ class KISTubePlatformScaleApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         titles = [r['title'] for r in response.data['results']]
         self.assertEqual(titles.index('Second video'), 0)
+
+    # ── Real full-text search (was a plain icontains scan) ──────────────
+    def test_search_matches_title_description_and_tags(self):
+        by_description = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Unrelated title',
+            description='A deep dive into kingdom stewardship principles',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+        by_tag = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Also unrelated',
+            tags=['stewardship', 'finance'],
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+
+        response = self.client.get('/api/v1/broadcasts/search/?q=stewardship')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        ids = {r['id'] for r in response.data['results']}
+        self.assertIn(str(by_description.id), ids)
+        self.assertIn(str(by_tag.id), ids)
+        self.assertNotIn(str(self.content_a.id), ids)
+
+    def test_search_ranks_title_match_above_description_only_match(self):
+        ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Unrelated',
+            description='mentions covenant only in passing',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now() - timedelta(days=1),
+        )
+        title_match = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Covenant explained',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now() - timedelta(days=2),
+        )
+
+        response = self.client.get('/api/v1/broadcasts/search/?q=covenant&sort=relevance')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        ids = [r['id'] for r in response.data['results']]
+        # title_match is published OLDER than the description-only one, so
+        # this only passes if ranking (not recency) actually drove the
+        # ordering - proving `sort=relevance` does more than fall through
+        # to -published_at, the exact bug this fix addresses.
+        self.assertEqual(ids[0], str(title_match.id))
 
     def test_search_suggest_returns_matching_channel_and_content(self):
         response = self.client.get('/api/v1/broadcasts/search/suggest/?q=kt-chan')

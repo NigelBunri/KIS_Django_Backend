@@ -17,6 +17,7 @@ import requests
 
 from django.apps import apps as django_apps
 from django.conf import settings
+from django.core.cache import cache
 from django.core.files.storage import FileSystemStorage, default_storage
 from django.db import IntegrityError, models, transaction
 from django.db.models import Q
@@ -323,8 +324,10 @@ from apps.broadcasts.media_utils import (
     THUMBNAIL_SUBDIRECTORY,
     build_absolute_url,
     build_media_url,
+    compute_video_perceptual_fingerprint,
     ensure_local_thumbnail,
     normalize_media_reference,
+    perceptual_fingerprint_similarity,
 )
 from apps.broadcasts import education_media
 from apps.billing.services import (
@@ -14439,12 +14442,50 @@ def _unbroadcast_channel_content_for_feed(content: ChannelContent) -> int:
     return updated
 
 
+def _viewer_satisfies_age_restriction(user, content: ChannelContent) -> bool:
+    """age_restriction/content_rating used to be stored and editable but
+    never actually read by any view-permission check - a video marked 18+
+    was exactly as visible as one marked "none". Policy, deliberately
+    asymmetric between the two tiers:
+
+    - "18+": hard gate. Requires a signed-in viewer with a confirmed adult
+      DOB (user.is_minor is False) - unknown age or a confirmed minor both
+      block. Erring toward blocking unknown viewers is the correct default
+      for genuinely age-restricted material.
+    - "13+": soft gate, COPPA-shaped. Only blocks a *confirmed* under-13
+      viewer (user.is_under_13 is True). Unknown age doesn't block, because
+      the mobile app doesn't collect date_of_birth for most existing
+      accounts yet (see User.date_of_birth's own comment) - treating
+      "unknown" as "blocked" here would lock out nearly every current user
+      from any 13+ content, which is a UX regression this fix isn't meant
+      to cause. The actual protection a 13+ rating exists for (keeping out
+      confirmed under-13 viewers) still works.
+    """
+    restriction = content.age_restriction
+    if restriction == "none" or not restriction:
+        return True
+    if not getattr(user, "is_authenticated", False):
+        return restriction != "18+"
+    if restriction == "18+":
+        return user.is_minor is False
+    if restriction == "13+":
+        return user.is_under_13 is not True
+    return True
+
+
 def _user_can_view_content(user, content: ChannelContent) -> bool:
     if content.is_deleted:
         return False
+    can_manage = _user_can_edit_content(user, content)
     if content.visibility == ChannelContent.Visibility.PUBLIC and content.status == ChannelContent.Status.PUBLISHED:
+        # A channel manager can always see their own published content
+        # regardless of its age rating - same as YouTube Studio letting a
+        # creator preview their own age-restricted upload without an age
+        # check. The gate only applies to everyone else on this public path.
+        if not can_manage and not _viewer_satisfies_age_restriction(user, content):
+            return False
         return content.channel.is_public and not content.channel.is_deleted
-    return _user_can_edit_content(user, content)
+    return can_manage
 
 
 def _safe_channel_handle_from_value(value: object) -> str:
@@ -14883,6 +14924,40 @@ def _request_ip(request) -> str:
     if forwarded:
         return forwarded.split(",")[0].strip()[:45]
     return str(request.META.get("REMOTE_ADDR") or "")[:45]
+
+
+# How long one viewer's view of one piece of content counts once. Not an
+# attempt to replicate YouTube's actual (undisclosed) view-counting
+# algorithm - just a defensible, documented window that stops the obvious
+# abuse case (a script or a page-refresh loop hammering this endpoint)
+# without needing a person to wait a specific YouTube-internal duration
+# before a genuine re-watch counts again.
+VIEW_DEDUP_WINDOW_SECONDS = 30 * 60
+
+
+def _record_unique_view(request, content: "ChannelContent") -> bool:
+    """Returns True if this request should increment the view counter -
+    i.e. this is the first time this viewer identity has been counted for
+    this content within VIEW_DEDUP_WINDOW_SECONDS. Uses cache.add(), which
+    is an atomic SET-if-not-exists against the configured cache backend
+    (Redis in production via django_redis - see CACHES in
+    config/settings/production.py) - two concurrent requests from the same
+    viewer can't both win a race and double-count, the way a
+    read-then-write check would.
+    """
+    user = getattr(request, "user", None)
+    if getattr(user, "is_authenticated", False):
+        viewer_key = f"user:{user.id}"
+    else:
+        # IP + a hash of the user-agent, not IP alone - a shared IP (NAT,
+        # corporate network, campus wifi) would otherwise let one real
+        # viewer's dedup window block every other viewer behind the same
+        # address for the same content.
+        ua = str(request.META.get("HTTP_USER_AGENT") or "")
+        ua_hash = hashlib.sha256(ua.encode("utf-8")).hexdigest()[:16]
+        viewer_key = f"anon:{_request_ip(request)}:{ua_hash}"
+    cache_key = f"broadcast:view_dedup:{content.id}:{viewer_key}"
+    return cache.add(cache_key, 1, timeout=VIEW_DEDUP_WINDOW_SECONDS)
 
 
 def _channel_audit(request, *, action: str, target_type: str, target_id, metadata: dict | None = None):
@@ -15594,6 +15669,21 @@ class ChannelContentAssetUploadView(APIView):
             validate_attachment_metadata_for_safe_messaging([payload])
             payload = prepare_channel_asset_payload(payload, content_type=content.content_type)
         asset = ChannelContentAsset.objects.create(content=content, **payload)
+        if asset.asset_type in ("video", "short_video") and asset.storage_path:
+            # Best-effort Content ID scan right on upload, not just when a
+            # channel manager happens to visit a fingerprint UI and submit
+            # one manually - see compute_and_scan_perceptual_fingerprint's
+            # own docstring for why this never raises/blocks the asset
+            # response on failure. Runs inline (no Celery worker is
+            # currently deployed in production to hand this off to - see
+            # apps/media/tasks.py's process_job_worker, an existing stub
+            # for exactly that reason), which adds real latency to a video
+            # upload response but is the only way this scan actually runs
+            # today rather than being queued code nothing ever executes.
+            try:
+                compute_and_scan_perceptual_fingerprint(content)
+            except Exception:
+                logger.exception("Content ID scan failed for content=%s asset=%s", content.id, asset.id)
         return Response(ChannelContentAssetSerializer(asset).data, status=status.HTTP_201_CREATED)
 
 
@@ -16125,12 +16215,18 @@ class ChannelContentShareView(APIView):
 
 class ChannelContentViewEventView(APIView):
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "broadcast_view_event"
 
     def post(self, request, content_id):
         content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
         if not _user_can_view_content(request.user, content):
             raise Http404
-        stats = _increment_channel_content_count(content, "views")
+        # Only the public counter is deduped - watch-history progress below
+        # still updates on every call, since resuming/re-watching genuinely
+        # should move your progress forward each time even within the same
+        # dedup window.
+        stats = _increment_channel_content_count(content, "views") if _record_unique_view(request, content) else (content.stats if isinstance(content.stats, dict) else {})
         if getattr(request.user, "is_authenticated", False):
             progress = int(request.data.get("progress_seconds") or request.data.get("progressSeconds") or 0)
             completed = bool(request.data.get("completed", False))
@@ -21015,9 +21111,12 @@ class BroadcastChannelVerifyView(APIView):
 class BroadcastSearchView(APIView):
     """Public full-text search across published channel content."""
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "search"
 
     def get(self, request):
-        from django.db.models import Sum, Count
+        from django.contrib.postgres.search import SearchQuery, SearchRank
+        from django.db.models import F
         q = request.query_params.get("q", "").strip()
         content_type = request.query_params.get("type", "")
         channel_id = request.query_params.get("channel_id", "")
@@ -21031,10 +21130,28 @@ class BroadcastSearchView(APIView):
             is_deleted=False,
         ).select_related("channel")
 
+        # Real Postgres full-text search against search_vector (kept in
+        # sync by signals.py's update_content_search_vector) - this used
+        # to be a plain icontains scan across title/description/tags
+        # despite this view's own docstring claiming full-text search.
+        # websearch, not plain/phrase: accepts the same query syntax
+        # visitors already expect from a search box ("quoted phrases",
+        # -excluded terms, OR).
         if q:
-            qs = qs.filter(
-                Q(title__icontains=q) | Q(description__icontains=q) | Q(tags__icontains=q)
-            )
+            search_query = SearchQuery(q, search_type="websearch")
+            # F(), not the bare string "search_vector" - SearchRank only
+            # treats an argument as "the real stored tsvector column" when
+            # it's an expression (has .resolve_expression()). A plain
+            # string gets silently re-wrapped as SearchVector("search_vector"),
+            # which re-tokenizes the column's own printed text
+            # representation (literally the characters "'coven':3B...")
+            # instead of reading it as a real weighted tsvector - every
+            # row then ranks by matching the same degenerate text pattern,
+            # completely losing the title/description/tags weighting this
+            # was built for. Confirmed via a raw-SQL A/B comparison during
+            # testing: same construction, correct weighted ranks with F(),
+            # identical (wrong) ranks without it.
+            qs = qs.filter(search_vector=search_query).annotate(rank=SearchRank(F("search_vector"), search_query))
         if content_type:
             qs = qs.filter(content_type=content_type)
         if channel_id:
@@ -21044,15 +21161,18 @@ class BroadcastSearchView(APIView):
         if date_to:
             qs = qs.filter(published_at__date__lte=date_to)
 
-        # `sort` used to be read but never applied - every value silently
-        # fell through to -published_at. view_count lives inside
-        # ChannelContent.stats (a JSONField), same key used by
-        # BroadcastChannelContentListCreateView's working sort=top, so the
-        # ordering expression is copied from there rather than invented.
+        # view_count lives inside ChannelContent.stats (a JSONField), same
+        # key used by BroadcastChannelContentListCreateView's working
+        # sort=top, so the ordering expression is copied from there rather
+        # than invented. "relevance" only means something when there's a
+        # query to rank against - with no q, it falls back to recency the
+        # same way it always did.
         if sort == "views":
             qs = qs.order_by("-stats__views", "-published_at")
         elif sort == "oldest":
             qs = qs.order_by("published_at")
+        elif sort == "relevance" and q:
+            qs = qs.order_by("-rank", "-published_at")
         else:
             qs = qs.order_by("-published_at")
 
@@ -21464,6 +21584,66 @@ class ChannelCategoryBrowseView(APIView):
         })
 
 
+# A fingerprint match below this dHash similarity is almost certainly two
+# unrelated videos that happen to share some average brightness/framing at
+# the sampled timestamps, not a real duplicate/re-upload - only scores at
+# or above this are recorded as a ChannelFingerprintMatch at all.
+PERCEPTUAL_MATCH_THRESHOLD = 0.85
+
+
+def _record_fingerprint_and_scan_matches(content, algorithm: str, fingerprint_hash: str):
+    """Stores/updates one content's fingerprint and scans every other
+    existing fingerprint of the same algorithm for a real match - returns
+    (fingerprint, created). SHA256 matches are exact-equality (1.0 is
+    genuinely correct there: a real byte-identical duplicate). PERCEPTUAL
+    matches use real Hamming-distance similarity scoring (see
+    perceptual_fingerprint_similarity) instead of the hardcoded 1.0 this
+    endpoint used to record for every "match" regardless of how similar
+    the videos actually were.
+    """
+    from apps.broadcasts.models import ChannelContentFingerprint, ChannelFingerprintMatch
+
+    fp, created = ChannelContentFingerprint.objects.update_or_create(
+        content=content,
+        algorithm=algorithm,
+        defaults={"fingerprint_hash": fingerprint_hash, "status": ChannelContentFingerprint.Status.INDEXED},
+    )
+
+    candidates = ChannelContentFingerprint.objects.filter(algorithm=algorithm).exclude(content_id=content.id)
+    if algorithm == ChannelContentFingerprint.Algorithm.PERCEPTUAL:
+        for match in candidates:
+            score = perceptual_fingerprint_similarity(fingerprint_hash, match.fingerprint_hash)
+            if score >= PERCEPTUAL_MATCH_THRESHOLD:
+                ChannelFingerprintMatch.objects.update_or_create(
+                    source_fingerprint=fp, matched_fingerprint=match, defaults={"similarity_score": score},
+                )
+    else:
+        for match in candidates.filter(fingerprint_hash=fingerprint_hash):
+            ChannelFingerprintMatch.objects.update_or_create(
+                source_fingerprint=fp, matched_fingerprint=match, defaults={"similarity_score": 1.0},
+            )
+    return fp, created
+
+
+def compute_and_scan_perceptual_fingerprint(content: ChannelContent):
+    """Best-effort automatic Content ID scan, run right after a video
+    asset is attached to `content` - see ChannelContentAssetUploadView.
+    Silently returns None on any failure (no video asset yet, ffmpeg
+    unavailable, frame extraction failed): this is a background
+    enhancement layer, not a required step for publishing to succeed.
+    """
+    from apps.broadcasts.models import ChannelContentFingerprint
+
+    video_asset = content.assets.filter(asset_type__in=["video", "short_video"]).order_by("sort_order", "created_at").first()
+    if not video_asset or not video_asset.storage_path:
+        return None
+    fingerprint_hash = compute_video_perceptual_fingerprint(video_asset.storage_path)
+    if not fingerprint_hash:
+        return None
+    fp, _created = _record_fingerprint_and_scan_matches(content, ChannelContentFingerprint.Algorithm.PERCEPTUAL, fingerprint_hash)
+    return fp
+
+
 class ChannelContentFingerprintView(APIView):
     """List or submit content fingerprints (owner only)."""
     permission_classes = [IsAuthenticated]
@@ -21479,39 +21659,32 @@ class ChannelContentFingerprintView(APIView):
         return Response(ChannelContentFingerprintSerializer(fps, many=True).data)
 
     def post(self, request, content_id):
-        from apps.broadcasts.models import ChannelContentFingerprint, ChannelFingerprintMatch
+        from apps.broadcasts.models import ChannelContentFingerprint
         from apps.broadcasts.serializers import ChannelContentFingerprintSerializer
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
         role = _user_channel_role(request.user, content.channel)
         if role not in ("owner", "staff", "manager"):
             raise PermissionDenied()
         algorithm = request.data.get("algorithm", ChannelContentFingerprint.Algorithm.SHA256)
-        fingerprint_hash = request.data.get("fingerprint_hash", "").strip()
+        fingerprint_hash = str(request.data.get("fingerprint_hash", "")).strip()
+
+        if algorithm == ChannelContentFingerprint.Algorithm.PERCEPTUAL:
+            # A perceptual fingerprint for OUR OWN content is ALWAYS
+            # computed server-side from the actual stored video - any
+            # client-submitted fingerprint_hash for this algorithm is
+            # ignored outright, not just when absent. Accepting one would
+            # let a channel owner submit a fake hash to dodge real
+            # matching entirely, which is exactly the failure mode of this
+            # endpoint's previous exact-hash-only, always-scores-1.0
+            # implementation.
+            fp = compute_and_scan_perceptual_fingerprint(content)
+            if not fp:
+                raise ValidationError({"fingerprint_hash": "Could not compute a fingerprint from this content's video - it may not have a video asset yet, or frame extraction failed."})
+            return Response(ChannelContentFingerprintSerializer(fp).data, status=status.HTTP_200_OK)
+
         if not fingerprint_hash:
             raise ValidationError({"fingerprint_hash": "This field is required."})
-
-        fp, created = ChannelContentFingerprint.objects.get_or_create(
-            content=content,
-            algorithm=algorithm,
-            defaults={"fingerprint_hash": fingerprint_hash, "status": ChannelContentFingerprint.Status.INDEXED},
-        )
-        if not created:
-            fp.fingerprint_hash = fingerprint_hash
-            fp.status = ChannelContentFingerprint.Status.INDEXED
-            fp.save(update_fields=["fingerprint_hash", "status", "updated_at"])
-
-        # Scan for exact matches among other fingerprints with the same algorithm
-        matches = ChannelContentFingerprint.objects.filter(
-            algorithm=algorithm,
-            fingerprint_hash=fingerprint_hash,
-        ).exclude(id=fp.id)
-        for match in matches:
-            ChannelFingerprintMatch.objects.get_or_create(
-                source_fingerprint=fp,
-                matched_fingerprint=match,
-                defaults={"similarity_score": 1.0},
-            )
-
+        fp, created = _record_fingerprint_and_scan_matches(content, algorithm, fingerprint_hash)
         return Response(ChannelContentFingerprintSerializer(fp).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 
