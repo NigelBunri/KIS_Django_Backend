@@ -21094,9 +21094,12 @@ class BroadcastChannelVerifyView(APIView):
 class BroadcastSearchView(APIView):
     """Public full-text search across published channel content."""
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "search"
 
     def get(self, request):
-        from django.db.models import Sum, Count
+        from django.contrib.postgres.search import SearchQuery, SearchRank
+        from django.db.models import F
         q = request.query_params.get("q", "").strip()
         content_type = request.query_params.get("type", "")
         channel_id = request.query_params.get("channel_id", "")
@@ -21110,10 +21113,28 @@ class BroadcastSearchView(APIView):
             is_deleted=False,
         ).select_related("channel")
 
+        # Real Postgres full-text search against search_vector (kept in
+        # sync by signals.py's update_content_search_vector) - this used
+        # to be a plain icontains scan across title/description/tags
+        # despite this view's own docstring claiming full-text search.
+        # websearch, not plain/phrase: accepts the same query syntax
+        # visitors already expect from a search box ("quoted phrases",
+        # -excluded terms, OR).
         if q:
-            qs = qs.filter(
-                Q(title__icontains=q) | Q(description__icontains=q) | Q(tags__icontains=q)
-            )
+            search_query = SearchQuery(q, search_type="websearch")
+            # F(), not the bare string "search_vector" - SearchRank only
+            # treats an argument as "the real stored tsvector column" when
+            # it's an expression (has .resolve_expression()). A plain
+            # string gets silently re-wrapped as SearchVector("search_vector"),
+            # which re-tokenizes the column's own printed text
+            # representation (literally the characters "'coven':3B...")
+            # instead of reading it as a real weighted tsvector - every
+            # row then ranks by matching the same degenerate text pattern,
+            # completely losing the title/description/tags weighting this
+            # was built for. Confirmed via a raw-SQL A/B comparison during
+            # testing: same construction, correct weighted ranks with F(),
+            # identical (wrong) ranks without it.
+            qs = qs.filter(search_vector=search_query).annotate(rank=SearchRank(F("search_vector"), search_query))
         if content_type:
             qs = qs.filter(content_type=content_type)
         if channel_id:
@@ -21123,15 +21144,18 @@ class BroadcastSearchView(APIView):
         if date_to:
             qs = qs.filter(published_at__date__lte=date_to)
 
-        # `sort` used to be read but never applied - every value silently
-        # fell through to -published_at. view_count lives inside
-        # ChannelContent.stats (a JSONField), same key used by
-        # BroadcastChannelContentListCreateView's working sort=top, so the
-        # ordering expression is copied from there rather than invented.
+        # view_count lives inside ChannelContent.stats (a JSONField), same
+        # key used by BroadcastChannelContentListCreateView's working
+        # sort=top, so the ordering expression is copied from there rather
+        # than invented. "relevance" only means something when there's a
+        # query to rank against - with no q, it falls back to recency the
+        # same way it always did.
         if sort == "views":
             qs = qs.order_by("-stats__views", "-published_at")
         elif sort == "oldest":
             qs = qs.order_by("published_at")
+        elif sort == "relevance" and q:
+            qs = qs.order_by("-rank", "-published_at")
         else:
             qs = qs.order_by("-published_at")
 

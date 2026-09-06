@@ -1,6 +1,8 @@
 import uuid
 from datetime import timedelta
 
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVectorField
 from django.db import models
 from django.db.models import Q
 from django.db.models.functions import Lower
@@ -359,6 +361,12 @@ class ChannelContent(models.Model):
     metadata = models.JSONField(default=dict, blank=True)
     tags = models.JSONField(default=list, blank=True, help_text="List of string tags for discovery filtering.")
     comments_disabled = models.BooleanField(default=False)
+    # Kept in sync by signals.py's post_save handler below, not computed at
+    # query time - BroadcastSearchView used to do a plain icontains scan
+    # (its own docstring claimed "full-text search" while doing nothing of
+    # the kind). title carries weight A, description/text_plain weight B,
+    # tags weight C, so a title match ranks above a tags-only match.
+    search_vector = SearchVectorField(null=True, blank=True, editable=False)
     age_restriction = models.CharField(
         max_length=8,
         choices=[("none", "None"), ("13+", "13+"), ("18+", "18+")],
@@ -388,6 +396,7 @@ class ChannelContent(models.Model):
             models.Index(fields=["channel", "status", "published_at"]),
             models.Index(fields=["content_type", "status"]),
             models.Index(fields=["visibility", "is_deleted"]),
+            GinIndex(fields=["search_vector"], name="channel_content_search_gin"),
         ]
 
     def __str__(self):

@@ -1678,6 +1678,52 @@ class KISTubePlatformScaleApiTests(APITestCase):
         titles = [r['title'] for r in response.data['results']]
         self.assertEqual(titles.index('Second video'), 0)
 
+    # ── Real full-text search (was a plain icontains scan) ──────────────
+    def test_search_matches_title_description_and_tags(self):
+        by_description = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Unrelated title',
+            description='A deep dive into kingdom stewardship principles',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+        by_tag = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Also unrelated',
+            tags=['stewardship', 'finance'],
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+
+        response = self.client.get('/api/v1/broadcasts/search/?q=stewardship')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        ids = {r['id'] for r in response.data['results']}
+        self.assertIn(str(by_description.id), ids)
+        self.assertIn(str(by_tag.id), ids)
+        self.assertNotIn(str(self.content_a.id), ids)
+
+    def test_search_ranks_title_match_above_description_only_match(self):
+        ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Unrelated',
+            description='mentions covenant only in passing',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now() - timedelta(days=1),
+        )
+        title_match = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Covenant explained',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now() - timedelta(days=2),
+        )
+
+        response = self.client.get('/api/v1/broadcasts/search/?q=covenant&sort=relevance')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        ids = [r['id'] for r in response.data['results']]
+        # title_match is published OLDER than the description-only one, so
+        # this only passes if ranking (not recency) actually drove the
+        # ordering - proving `sort=relevance` does more than fall through
+        # to -published_at, the exact bug this fix addresses.
+        self.assertEqual(ids[0], str(title_match.id))
+
     def test_search_suggest_returns_matching_channel_and_content(self):
         response = self.client.get('/api/v1/broadcasts/search/suggest/?q=kt-chan')
 

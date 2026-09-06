@@ -1,8 +1,33 @@
+from django.contrib.postgres.search import SearchVector
+from django.db.models import TextField, Value
+from django.db.models.functions import Coalesce
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
 from apps.notifications.services import notify_engagement
-from .models import ChannelContentComment, ChannelContentReaction
+from .models import ChannelContent, ChannelContentComment, ChannelContentReaction
+
+
+@receiver(post_save, sender=ChannelContent)
+def update_content_search_vector(sender, instance, **kwargs):
+    """Keeps search_vector in sync with title/description/text_plain/tags
+    on every save, so BroadcastSearchView's real full-text search (see
+    that view) never goes stale. A plain .update() on this one row, not
+    instance.save() - re-entering save() here would re-trigger this same
+    signal. tags is a JSONField (a list), which SearchVector can't index
+    directly - joined into plain text first.
+    """
+    tags = instance.tags if isinstance(instance.tags, list) else []
+    tags_text = " ".join(str(t) for t in tags)
+    empty_text = Value("", output_field=TextField())
+    ChannelContent.objects.filter(pk=instance.pk).update(
+        search_vector=(
+            SearchVector("title", weight="A")
+            + SearchVector(Coalesce("description", empty_text), weight="B")
+            + SearchVector(Coalesce("text_plain", empty_text), weight="B")
+            + SearchVector(Value(tags_text, output_field=TextField()), weight="C")
+        )
+    )
 
 
 @receiver(post_save, sender=ChannelContentComment)
