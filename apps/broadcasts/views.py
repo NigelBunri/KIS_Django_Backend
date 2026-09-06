@@ -17,6 +17,7 @@ import requests
 
 from django.apps import apps as django_apps
 from django.conf import settings
+from django.core.cache import cache
 from django.core.files.storage import FileSystemStorage, default_storage
 from django.db import IntegrityError, models, transaction
 from django.db.models import Q
@@ -14885,6 +14886,40 @@ def _request_ip(request) -> str:
     return str(request.META.get("REMOTE_ADDR") or "")[:45]
 
 
+# How long one viewer's view of one piece of content counts once. Not an
+# attempt to replicate YouTube's actual (undisclosed) view-counting
+# algorithm - just a defensible, documented window that stops the obvious
+# abuse case (a script or a page-refresh loop hammering this endpoint)
+# without needing a person to wait a specific YouTube-internal duration
+# before a genuine re-watch counts again.
+VIEW_DEDUP_WINDOW_SECONDS = 30 * 60
+
+
+def _record_unique_view(request, content: "ChannelContent") -> bool:
+    """Returns True if this request should increment the view counter -
+    i.e. this is the first time this viewer identity has been counted for
+    this content within VIEW_DEDUP_WINDOW_SECONDS. Uses cache.add(), which
+    is an atomic SET-if-not-exists against the configured cache backend
+    (Redis in production via django_redis - see CACHES in
+    config/settings/production.py) - two concurrent requests from the same
+    viewer can't both win a race and double-count, the way a
+    read-then-write check would.
+    """
+    user = getattr(request, "user", None)
+    if getattr(user, "is_authenticated", False):
+        viewer_key = f"user:{user.id}"
+    else:
+        # IP + a hash of the user-agent, not IP alone - a shared IP (NAT,
+        # corporate network, campus wifi) would otherwise let one real
+        # viewer's dedup window block every other viewer behind the same
+        # address for the same content.
+        ua = str(request.META.get("HTTP_USER_AGENT") or "")
+        ua_hash = hashlib.sha256(ua.encode("utf-8")).hexdigest()[:16]
+        viewer_key = f"anon:{_request_ip(request)}:{ua_hash}"
+    cache_key = f"broadcast:view_dedup:{content.id}:{viewer_key}"
+    return cache.add(cache_key, 1, timeout=VIEW_DEDUP_WINDOW_SECONDS)
+
+
 def _channel_audit(request, *, action: str, target_type: str, target_id, metadata: dict | None = None):
     user = getattr(request, "user", None)
     if not getattr(user, "is_authenticated", False):
@@ -16125,12 +16160,18 @@ class ChannelContentShareView(APIView):
 
 class ChannelContentViewEventView(APIView):
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "broadcast_view_event"
 
     def post(self, request, content_id):
         content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
         if not _user_can_view_content(request.user, content):
             raise Http404
-        stats = _increment_channel_content_count(content, "views")
+        # Only the public counter is deduped - watch-history progress below
+        # still updates on every call, since resuming/re-watching genuinely
+        # should move your progress forward each time even within the same
+        # dedup window.
+        stats = _increment_channel_content_count(content, "views") if _record_unique_view(request, content) else (content.stats if isinstance(content.stats, dict) else {})
         if getattr(request.user, "is_authenticated", False):
             progress = int(request.data.get("progress_seconds") or request.data.get("progressSeconds") or 0)
             completed = bool(request.data.get("completed", False))

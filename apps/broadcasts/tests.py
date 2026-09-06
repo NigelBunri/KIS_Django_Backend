@@ -34,6 +34,7 @@ from apps.broadcasts.models import (
     ChannelContentSave,
     ChannelModerationRecord,
     ChannelContentType,
+    ChannelWatchHistory,
     BroadcastFeedProfile,
     BroadcastEngagementEvent,
     BroadcastItem,
@@ -1356,6 +1357,75 @@ class ChannelEngagementTests(APITestCase):
         self.assertIn('summary', response.data)
         self.assertGreaterEqual(response.data['summary']['views'], 1)
         self.assertTrue(ChannelAnalyticsDailyRollup.objects.filter(channel=self.channel, date=timezone.localdate()).exists())
+
+
+class ChannelContentViewDedupTests(APITestCase):
+    """ChannelContentViewEventView used to be a bare AllowAny endpoint that
+    incremented on every single call - trivially inflatable by a script or
+    a refresh loop. Covers the fix: one viewer identity (authenticated
+    user, or anonymous IP+user-agent) only moves the counter once per
+    dedup window, but different viewers still count independently."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5557400101', username='dedup_owner', password='secret', country='NG')
+        self.viewer = User.objects.create_user(phone='5557400102', username='dedup_viewer', password='secret', country='NG')
+        self.other_viewer = User.objects.create_user(phone='5557400103', username='dedup_other', password='secret', country='NG')
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle='dedup-channel',
+            display_name='Dedup Channel',
+            is_public=True,
+        )
+        self.content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type='video',
+            title='Dedup content',
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+            created_by=self.owner,
+        )
+
+    def _view_url(self):
+        return f'/api/v1/broadcasts/channel-contents/{self.content.id}/view/'
+
+    def test_same_authenticated_viewer_only_counted_once_within_window(self):
+        self.client.force_authenticate(user=self.viewer)
+        first = self.client.post(self._view_url(), {'progress_seconds': 1}, format='json')
+        second = self.client.post(self._view_url(), {'progress_seconds': 5}, format='json')
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.content.refresh_from_db()
+        self.assertEqual(int(self.content.stats.get('views') or 0), 1)
+        # Watch-history progress still updates on the deduped second call -
+        # only the public counter is gated, not resume tracking.
+        history = ChannelWatchHistory.objects.get(content=self.content, user=self.viewer)
+        self.assertEqual(history.progress_seconds, 5)
+
+    def test_different_authenticated_viewers_each_counted(self):
+        self.client.force_authenticate(user=self.viewer)
+        self.client.post(self._view_url(), {}, format='json')
+        self.client.force_authenticate(user=self.other_viewer)
+        self.client.post(self._view_url(), {}, format='json')
+        self.content.refresh_from_db()
+        self.assertEqual(int(self.content.stats.get('views') or 0), 2)
+
+    def test_same_anonymous_identity_only_counted_once(self):
+        first = self.client.post(self._view_url(), {}, format='json', REMOTE_ADDR='203.0.113.10', HTTP_USER_AGENT='pytest-agent/1.0')
+        second = self.client.post(self._view_url(), {}, format='json', REMOTE_ADDR='203.0.113.10', HTTP_USER_AGENT='pytest-agent/1.0')
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.content.refresh_from_db()
+        self.assertEqual(int(self.content.stats.get('views') or 0), 1)
+
+    def test_different_anonymous_ip_counted_separately(self):
+        self.client.post(self._view_url(), {}, format='json', REMOTE_ADDR='203.0.113.10', HTTP_USER_AGENT='pytest-agent/1.0')
+        self.client.post(self._view_url(), {}, format='json', REMOTE_ADDR='198.51.100.20', HTTP_USER_AGENT='pytest-agent/1.0')
+        self.content.refresh_from_db()
+        self.assertEqual(int(self.content.stats.get('views') or 0), 2)
 
 
 class UserContentPlaylistApiTests(APITestCase):

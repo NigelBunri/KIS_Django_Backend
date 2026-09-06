@@ -618,6 +618,12 @@ REST_FRAMEWORK = {
         "device_link": _env_throttle_rate("THROTTLE_DEVICE_LINK", dev_default="6000/min", prod_default="20/min"),
         "upload": _env_throttle_rate("THROTTLE_UPLOAD", dev_default="6000/min", prod_default="300/min"),
         "search": _env_throttle_rate("THROTTLE_SEARCH", dev_default="6000/min", prod_default="600/min"),
+        # ChannelContentViewEventView is AllowAny (anonymous viewers must be
+        # able to register a view) - this is a backstop against a flood from
+        # many different identities (e.g. a botnet), separate from the
+        # per-viewer dedup window in the view itself which stops the more
+        # common single-script-hammering-one-endpoint abuse.
+        "broadcast_view_event": _env_throttle_rate("THROTTLE_BROADCAST_VIEW_EVENT", dev_default="6000/min", prod_default="120/min"),
         "messaging": _env_throttle_rate("THROTTLE_MESSAGING", dev_default="6000/min", prod_default="1200/min"),
         # Trusted-internal Nest->Django chat-voice URL signing. Keyed by IP
         # (AllowAny + internal-token auth means there's no request.user) -
