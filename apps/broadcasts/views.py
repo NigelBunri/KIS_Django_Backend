@@ -324,8 +324,10 @@ from apps.broadcasts.media_utils import (
     THUMBNAIL_SUBDIRECTORY,
     build_absolute_url,
     build_media_url,
+    compute_video_perceptual_fingerprint,
     ensure_local_thumbnail,
     normalize_media_reference,
+    perceptual_fingerprint_similarity,
 )
 from apps.broadcasts import education_media
 from apps.billing.services import (
@@ -15667,6 +15669,21 @@ class ChannelContentAssetUploadView(APIView):
             validate_attachment_metadata_for_safe_messaging([payload])
             payload = prepare_channel_asset_payload(payload, content_type=content.content_type)
         asset = ChannelContentAsset.objects.create(content=content, **payload)
+        if asset.asset_type in ("video", "short_video") and asset.storage_path:
+            # Best-effort Content ID scan right on upload, not just when a
+            # channel manager happens to visit a fingerprint UI and submit
+            # one manually - see compute_and_scan_perceptual_fingerprint's
+            # own docstring for why this never raises/blocks the asset
+            # response on failure. Runs inline (no Celery worker is
+            # currently deployed in production to hand this off to - see
+            # apps/media/tasks.py's process_job_worker, an existing stub
+            # for exactly that reason), which adds real latency to a video
+            # upload response but is the only way this scan actually runs
+            # today rather than being queued code nothing ever executes.
+            try:
+                compute_and_scan_perceptual_fingerprint(content)
+            except Exception:
+                logger.exception("Content ID scan failed for content=%s asset=%s", content.id, asset.id)
         return Response(ChannelContentAssetSerializer(asset).data, status=status.HTTP_201_CREATED)
 
 
@@ -21567,6 +21584,66 @@ class ChannelCategoryBrowseView(APIView):
         })
 
 
+# A fingerprint match below this dHash similarity is almost certainly two
+# unrelated videos that happen to share some average brightness/framing at
+# the sampled timestamps, not a real duplicate/re-upload - only scores at
+# or above this are recorded as a ChannelFingerprintMatch at all.
+PERCEPTUAL_MATCH_THRESHOLD = 0.85
+
+
+def _record_fingerprint_and_scan_matches(content, algorithm: str, fingerprint_hash: str):
+    """Stores/updates one content's fingerprint and scans every other
+    existing fingerprint of the same algorithm for a real match - returns
+    (fingerprint, created). SHA256 matches are exact-equality (1.0 is
+    genuinely correct there: a real byte-identical duplicate). PERCEPTUAL
+    matches use real Hamming-distance similarity scoring (see
+    perceptual_fingerprint_similarity) instead of the hardcoded 1.0 this
+    endpoint used to record for every "match" regardless of how similar
+    the videos actually were.
+    """
+    from apps.broadcasts.models import ChannelContentFingerprint, ChannelFingerprintMatch
+
+    fp, created = ChannelContentFingerprint.objects.update_or_create(
+        content=content,
+        algorithm=algorithm,
+        defaults={"fingerprint_hash": fingerprint_hash, "status": ChannelContentFingerprint.Status.INDEXED},
+    )
+
+    candidates = ChannelContentFingerprint.objects.filter(algorithm=algorithm).exclude(content_id=content.id)
+    if algorithm == ChannelContentFingerprint.Algorithm.PERCEPTUAL:
+        for match in candidates:
+            score = perceptual_fingerprint_similarity(fingerprint_hash, match.fingerprint_hash)
+            if score >= PERCEPTUAL_MATCH_THRESHOLD:
+                ChannelFingerprintMatch.objects.update_or_create(
+                    source_fingerprint=fp, matched_fingerprint=match, defaults={"similarity_score": score},
+                )
+    else:
+        for match in candidates.filter(fingerprint_hash=fingerprint_hash):
+            ChannelFingerprintMatch.objects.update_or_create(
+                source_fingerprint=fp, matched_fingerprint=match, defaults={"similarity_score": 1.0},
+            )
+    return fp, created
+
+
+def compute_and_scan_perceptual_fingerprint(content: ChannelContent):
+    """Best-effort automatic Content ID scan, run right after a video
+    asset is attached to `content` - see ChannelContentAssetUploadView.
+    Silently returns None on any failure (no video asset yet, ffmpeg
+    unavailable, frame extraction failed): this is a background
+    enhancement layer, not a required step for publishing to succeed.
+    """
+    from apps.broadcasts.models import ChannelContentFingerprint
+
+    video_asset = content.assets.filter(asset_type__in=["video", "short_video"]).order_by("sort_order", "created_at").first()
+    if not video_asset or not video_asset.storage_path:
+        return None
+    fingerprint_hash = compute_video_perceptual_fingerprint(video_asset.storage_path)
+    if not fingerprint_hash:
+        return None
+    fp, _created = _record_fingerprint_and_scan_matches(content, ChannelContentFingerprint.Algorithm.PERCEPTUAL, fingerprint_hash)
+    return fp
+
+
 class ChannelContentFingerprintView(APIView):
     """List or submit content fingerprints (owner only)."""
     permission_classes = [IsAuthenticated]
@@ -21582,39 +21659,32 @@ class ChannelContentFingerprintView(APIView):
         return Response(ChannelContentFingerprintSerializer(fps, many=True).data)
 
     def post(self, request, content_id):
-        from apps.broadcasts.models import ChannelContentFingerprint, ChannelFingerprintMatch
+        from apps.broadcasts.models import ChannelContentFingerprint
         from apps.broadcasts.serializers import ChannelContentFingerprintSerializer
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
         role = _user_channel_role(request.user, content.channel)
         if role not in ("owner", "staff", "manager"):
             raise PermissionDenied()
         algorithm = request.data.get("algorithm", ChannelContentFingerprint.Algorithm.SHA256)
-        fingerprint_hash = request.data.get("fingerprint_hash", "").strip()
+        fingerprint_hash = str(request.data.get("fingerprint_hash", "")).strip()
+
+        if algorithm == ChannelContentFingerprint.Algorithm.PERCEPTUAL:
+            # A perceptual fingerprint for OUR OWN content is ALWAYS
+            # computed server-side from the actual stored video - any
+            # client-submitted fingerprint_hash for this algorithm is
+            # ignored outright, not just when absent. Accepting one would
+            # let a channel owner submit a fake hash to dodge real
+            # matching entirely, which is exactly the failure mode of this
+            # endpoint's previous exact-hash-only, always-scores-1.0
+            # implementation.
+            fp = compute_and_scan_perceptual_fingerprint(content)
+            if not fp:
+                raise ValidationError({"fingerprint_hash": "Could not compute a fingerprint from this content's video - it may not have a video asset yet, or frame extraction failed."})
+            return Response(ChannelContentFingerprintSerializer(fp).data, status=status.HTTP_200_OK)
+
         if not fingerprint_hash:
             raise ValidationError({"fingerprint_hash": "This field is required."})
-
-        fp, created = ChannelContentFingerprint.objects.get_or_create(
-            content=content,
-            algorithm=algorithm,
-            defaults={"fingerprint_hash": fingerprint_hash, "status": ChannelContentFingerprint.Status.INDEXED},
-        )
-        if not created:
-            fp.fingerprint_hash = fingerprint_hash
-            fp.status = ChannelContentFingerprint.Status.INDEXED
-            fp.save(update_fields=["fingerprint_hash", "status", "updated_at"])
-
-        # Scan for exact matches among other fingerprints with the same algorithm
-        matches = ChannelContentFingerprint.objects.filter(
-            algorithm=algorithm,
-            fingerprint_hash=fingerprint_hash,
-        ).exclude(id=fp.id)
-        for match in matches:
-            ChannelFingerprintMatch.objects.get_or_create(
-                source_fingerprint=fp,
-                matched_fingerprint=match,
-                defaults={"similarity_score": 1.0},
-            )
-
+        fp, created = _record_fingerprint_and_scan_matches(content, algorithm, fingerprint_hash)
         return Response(ChannelContentFingerprintSerializer(fp).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 

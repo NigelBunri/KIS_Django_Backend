@@ -34,6 +34,8 @@ from apps.broadcasts.models import (
     ChannelContentSave,
     ChannelModerationRecord,
     ChannelContentType,
+    ChannelContentFingerprint,
+    ChannelFingerprintMatch,
     ChannelWatchHistory,
     BroadcastFeedProfile,
     BroadcastEngagementEvent,
@@ -81,6 +83,7 @@ from apps.broadcasts.feed_entry_store import (
     resolve_feed_entry,
 )
 from apps.broadcasts.views import (
+    PERCEPTUAL_MATCH_THRESHOLD,
     _decode_feed_cursor,
     _encode_feed_cursor,
     _validate_feed_media_file,
@@ -1507,6 +1510,113 @@ class ChannelContentAgeRestrictionTests(APITestCase):
         self.client.force_authenticate(user=self.minor)
         response = self.client.get(f'/api/v1/broadcasts/channel-contents/{content.id}/comments/')
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class ContentFingerprintTests(APITestCase):
+    """ChannelContentFingerprintView used to accept any client-submitted
+    hash for any algorithm and hardcode similarity_score=1.0 for every
+    "match" regardless of how similar the content actually was. Covers
+    the fix: real Hamming-distance similarity for perceptual matches,
+    exact equality (still correctly 1.0) for sha256, and the
+    server-computes-its-own-perceptual-hash behavior."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone='5557400301', username='fp_owner', password='secret', country='NG')
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            handle='fp-channel', display_name='Fingerprint Channel', is_public=True,
+        )
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.owner, role=BroadcastChannelRole.Role.OWNER)
+        self.content_a = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Original upload',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+        self.content_b = ChannelContent.objects.create(
+            channel=self.channel, content_type='video', title='Re-upload',
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+
+    # ── Pure similarity math ─────────────────────────────────────────────
+    def test_perceptual_similarity_identical_fingerprints_score_1(self):
+        from apps.broadcasts.media_utils import perceptual_fingerprint_similarity
+        fp = "ffffffffffffffff-0000000000000000-a5a5a5a5a5a5a5a5"
+        self.assertEqual(perceptual_fingerprint_similarity(fp, fp), 1.0)
+
+    def test_perceptual_similarity_opposite_bits_score_0(self):
+        from apps.broadcasts.media_utils import perceptual_fingerprint_similarity
+        # 'f' (1111) and '0' (0000) differ in every bit - maximum possible
+        # Hamming distance, so similarity must bottom out at 0.0.
+        self.assertEqual(perceptual_fingerprint_similarity("f" * 16, "0" * 16), 0.0)
+
+    def test_perceptual_similarity_mismatched_frame_count_scores_0(self):
+        from apps.broadcasts.media_utils import perceptual_fingerprint_similarity
+        self.assertEqual(perceptual_fingerprint_similarity("ff-ff-ff", "ff-ff"), 0.0)
+
+    # ── Match recording (the actual bug this fixes) ─────────────────────
+    def test_sha256_exact_match_scores_1(self):
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+        fp_b, _ = _record_fingerprint_and_scan_matches(self.content_b, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+        match = ChannelFingerprintMatch.objects.get(source_fingerprint=fp_b)
+        self.assertEqual(match.similarity_score, 1.0)
+
+    def test_perceptual_near_match_records_real_score_not_hardcoded_one(self):
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+        # One hex nibble differs (single frame, single bit flip within a
+        # 64-bit hash) - close enough to clear PERCEPTUAL_MATCH_THRESHOLD
+        # but must NOT come out as a hardcoded 1.0, which is exactly what
+        # this endpoint did before.
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.PERCEPTUAL, 'a' * 16)
+        fp_b, _ = _record_fingerprint_and_scan_matches(self.content_b, ChannelContentFingerprint.Algorithm.PERCEPTUAL, ('a' * 15) + 'b')
+        match = ChannelFingerprintMatch.objects.get(source_fingerprint=fp_b)
+        self.assertGreaterEqual(match.similarity_score, PERCEPTUAL_MATCH_THRESHOLD)
+        self.assertLess(match.similarity_score, 1.0)
+
+    def test_perceptual_dissimilar_fingerprints_record_no_match(self):
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.PERCEPTUAL, 'f' * 16)
+        fp_b, _ = _record_fingerprint_and_scan_matches(self.content_b, ChannelContentFingerprint.Algorithm.PERCEPTUAL, '0' * 16)
+        self.assertFalse(ChannelFingerprintMatch.objects.filter(source_fingerprint=fp_b).exists())
+
+    # ── API endpoint behavior ────────────────────────────────────────────
+    def test_sha256_submission_via_api_still_works(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/fingerprint/',
+            {'algorithm': 'sha256', 'fingerprint_hash': 'abc123'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_perceptual_submission_without_hash_computes_server_side_or_fails_gracefully(self):
+        # No video asset exists on this content, so server-side computation
+        # can't produce anything - must fail with a clear 400, not accept
+        # a client-submitted hash for its own content (the actual security
+        # fix) and not crash.
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/fingerprint/',
+            {'algorithm': 'perceptual'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_perceptual_submission_ignores_client_submitted_hash(self):
+        # Even if a client tries to submit a perceptual hash directly for
+        # their own content, it must be ignored in favor of server-side
+        # computation (which fails here with no video asset) - never
+        # silently trusted.
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/fingerprint/',
+            {'algorithm': 'perceptual', 'fingerprint_hash': 'f' * 16},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(ChannelContentFingerprint.objects.filter(content=self.content_a, algorithm='perceptual').exists())
 
 
 class UserContentPlaylistApiTests(APITestCase):
