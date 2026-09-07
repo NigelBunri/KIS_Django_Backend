@@ -43,9 +43,10 @@ from apps.media.safety import (
     user_safe_upload_response,
 )
 
+from .kisvideo_provider import verify_kisvideo_callback_token
 from .media_pipeline import prepare_channel_asset_payload
 from .media_utils import build_media_url, ensure_local_thumbnail
-from .models import BroadcastVideo
+from .models import BroadcastVideo, ChannelContent, ChannelContentAsset
 from .views import LONG_VIDEO_MIN_SECONDS, _probe_video_duration_from_storage
 
 User = get_user_model()
@@ -214,3 +215,105 @@ class ProcessBroadcastVideoUploadView(APIView):
         ).get("metadata", {}).get("pipeline", {})
 
         return Response(payload, status=201)
+
+
+class KisVideoJobCallbackView(APIView):
+    """POST /api/v1/broadcasts/internal/kisvideo-callback/?asset_id=...&token=...
+
+    Called by kisvideo's transcode worker (app/workers/transcode.py::
+    _send_webhook, in the kisvideo repo) when a TranscodeJob finishes —
+    either "ready" (with the finished Asset's playback fields) or "failed".
+    Only fires at all when KIS_VIDEO_SERVICE_ENABLED gated ChannelContent-
+    AssetUploadView actually queued a job for this asset in the first
+    place (see apps/broadcasts/tasks.py::push_asset_to_kisvideo, which sets
+    callback_url=.../kisvideo-callback/?asset_id=<asset.id>&token=<signed>
+    and caller_reference=str(asset.id) at upload-creation time).
+
+    Not gated by apps.chat.internal_auth.require_internal_auth like this
+    module's other views: kisvideo's webhook sender adds no auth header at
+    all (confirmed directly in its source — it only sends Content-Type).
+    Instead, the query-string token is verified against an HMAC of
+    asset_id keyed by KIS_VIDEO_SERVICE_INTERNAL_TOKEN
+    (kisvideo_provider.verify_kisvideo_callback_token) — kisvideo never
+    sees or needs to know this secret verification scheme; it just echoes
+    back the exact callback_url Django handed it, which is what makes the
+    token valid.
+
+    The token only signs asset_id, not the request body — it proves "the
+    caller was handed this exact callback_url by push_asset_to_kisvideo",
+    not "this specific ready/failed payload is authentic". That's enough
+    to stop asset_id from being guessable/enumerable, but NOT enough to
+    stop a second call (a genuine replay, or a forged payload from whoever
+    else obtains a valid callback_url) from overwriting an asset that
+    already reached a terminal state. Closed by the processing_status
+    check below: once an asset is "ready" or "failed", any further
+    callback for it is a no-op, regardless of token validity — the first
+    call to actually resolve the job wins, nothing after it can mutate
+    master_playlist_url/thumbnail_url/etc again.
+    """
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "kisvideo_job_callback"
+
+    def post(self, request):
+        asset_id = str(request.query_params.get("asset_id") or "").strip()
+        token = str(request.query_params.get("token") or "").strip()
+        if not asset_id or not verify_kisvideo_callback_token(asset_id, token):
+            raise ValidationError({"token": "Invalid or missing callback token."})
+
+        try:
+            asset = ChannelContentAsset.objects.select_related("content").get(id=asset_id)
+        except ChannelContentAsset.DoesNotExist:
+            raise NotFound("No matching asset for this callback.")
+
+        if asset.processing_status in ("ready", "failed"):
+            # Already resolved — a second call (genuine retry from kisvideo,
+            # or a replay/forgery using a captured callback_url) cannot
+            # mutate a finalized asset. See the class docstring: the token
+            # only proves the URL is one we minted for this asset, not that
+            # this specific payload is authentic, so this check is the
+            # actual replay/tamper backstop, not the token.
+            return Response({"status": "already_resolved"}, status=200)
+
+        job_status = str(request.data.get("status") or "").strip().lower()
+        content = asset.content
+
+        if job_status == "ready":
+            asset.url = str(request.data.get("master_playlist_url") or "").strip() or asset.url
+            asset.thumbnail_url = str(request.data.get("thumbnail_url") or "").strip() or asset.thumbnail_url
+            duration = request.data.get("duration_seconds")
+            if duration is not None:
+                asset.duration_seconds = int(round(float(duration)))
+            asset.processing_status = "ready"
+            metadata = dict(asset.metadata) if isinstance(asset.metadata, dict) else {}
+            pipeline = dict(metadata.get("pipeline") if isinstance(metadata.get("pipeline"), dict) else {})
+            pipeline["processing_status"] = "ready"
+            pipeline["renditions"] = request.data.get("renditions") or []
+            metadata["pipeline"] = pipeline
+            asset.metadata = metadata
+            asset.save(update_fields=["url", "thumbnail_url", "duration_seconds", "processing_status", "metadata"])
+
+            if not content.thumbnail_url and asset.thumbnail_url:
+                content.thumbnail_url = asset.thumbnail_url
+            if content.status == ChannelContent.Status.PROCESSING:
+                content.status = ChannelContent.Status.PUBLISHED
+            content.save(update_fields=["thumbnail_url", "status"])
+        elif job_status == "failed":
+            error_message = str(request.data.get("error_message") or "").strip()[:2048]
+            asset.processing_status = "failed"
+            metadata = dict(asset.metadata) if isinstance(asset.metadata, dict) else {}
+            pipeline = dict(metadata.get("pipeline") if isinstance(metadata.get("pipeline"), dict) else {})
+            pipeline["processing_status"] = "failed"
+            pipeline["error_message"] = error_message
+            metadata["pipeline"] = pipeline
+            asset.metadata = metadata
+            asset.save(update_fields=["processing_status", "metadata"])
+
+            if content.status == ChannelContent.Status.PROCESSING:
+                content.status = ChannelContent.Status.FAILED
+                content.save(update_fields=["status"])
+        else:
+            raise ValidationError({"status": "Must be 'ready' or 'failed'."})
+
+        return Response({"status": "ok"}, status=200)

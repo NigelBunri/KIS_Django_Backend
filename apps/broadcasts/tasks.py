@@ -142,3 +142,52 @@ def purge_expired_broadcasts_task():
     from .services import cleanup_expired_broadcast_items
 
     return {"deleted": cleanup_expired_broadcast_items()}
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def push_asset_to_kisvideo(self, asset_id: str):
+    """Fires the (potentially slow — reads the full object out of S3 and
+    streams it to kisvideo) tus upload dance in the background, off the
+    request/response path of ChannelContentAssetUploadView. Only called
+    when KIS_VIDEO_SERVICE_ENABLED is on (see that view); a transient
+    network failure retries a few times before giving up and marking the
+    asset failed, rather than leaving it stuck at 'queued' forever."""
+    from django.conf import settings
+
+    from .kisvideo_provider import KisVideoProviderError, KisVideoProvider, sign_kisvideo_callback_token
+    from .models import ChannelContent, ChannelContentAsset
+
+    try:
+        asset = ChannelContentAsset.objects.select_related("content__channel").get(id=asset_id)
+    except ChannelContentAsset.DoesNotExist:
+        return {"status": "missing"}
+
+    channel = asset.content.channel
+    owner_user_id = channel.owner_user_id or channel.owner_id
+
+    callback_base = str(getattr(settings, "API_BASE_URL", "") or "").rstrip("/")
+    token = sign_kisvideo_callback_token(str(asset.id))
+    callback_url = f"{callback_base}/api/v1/broadcasts/internal/kisvideo-callback/?asset_id={asset.id}&token={token}"
+
+    try:
+        KisVideoProvider().create_transcode_job(
+            storage_path=asset.storage_path,
+            filename=asset.storage_path.rsplit("/", 1)[-1] or "upload",
+            content_type=asset.mime_type or "application/octet-stream",
+            owner_user_id=str(owner_user_id),
+            callback_url=callback_url,
+            caller_reference=str(asset.id),
+        )
+    except KisVideoProviderError as exc:
+        try:
+            raise self.retry(exc=exc)
+        except self.MaxRetriesExceededError:
+            asset.processing_status = "failed"
+            asset.save(update_fields=["processing_status"])
+            asset.content.status = ChannelContent.Status.FAILED
+            asset.content.save(update_fields=["status"])
+            return {"status": "failed", "error": str(exc)}
+
+    asset.processing_status = "transcoding"
+    asset.save(update_fields=["processing_status"])
+    return {"status": "submitted"}

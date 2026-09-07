@@ -15684,6 +15684,24 @@ class ChannelContentAssetUploadView(APIView):
                 compute_and_scan_perceptual_fingerprint(content)
             except Exception:
                 logger.exception("Content ID scan failed for content=%s asset=%s", content.id, asset.id)
+            if getattr(settings, "KIS_VIDEO_SERVICE_ENABLED", False):
+                # Off by default (KIS_VIDEO_SERVICE_ENABLED) — kisvideo is a
+                # new self-hosted VOD transcode service, not yet cut over to
+                # in production; live streaming is unaffected either way (see
+                # live_stream_providers.py, untouched). Queued via Celery
+                # (.delay), not run inline like the Content ID scan above,
+                # since pushing a full video file through kisvideo's upload
+                # API can take much longer than a request should block for —
+                # this does mean a real Celery worker must be deployed before
+                # turning the flag on, same pre-existing gap noted on the
+                # inline Content ID scan just above.
+                asset.processing_status = "queued"
+                asset.save(update_fields=["processing_status"])
+                content.status = ChannelContent.Status.PROCESSING
+                content.save(update_fields=["status"])
+                from .tasks import push_asset_to_kisvideo
+
+                push_asset_to_kisvideo.delay(str(asset.id))
         return Response(ChannelContentAssetSerializer(asset).data, status=status.HTTP_201_CREATED)
 
 

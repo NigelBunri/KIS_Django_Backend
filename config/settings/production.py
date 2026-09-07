@@ -52,6 +52,13 @@ _nest_internal_token = os.environ.get("NEST_INTERNAL_TOKEN", "").strip()
 if _nest_internal_token and _is_weak_secret(_nest_internal_token):
     raise ImproperlyConfigured("NEST_INTERNAL_TOKEN must be set to a strong value in production.")
 
+if os.environ.get("KIS_VIDEO_SERVICE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
+    _kisvideo_token = os.environ.get("KIS_VIDEO_SERVICE_INTERNAL_TOKEN", "").strip()
+    if not _kisvideo_token or _is_weak_secret(_kisvideo_token):
+        raise ImproperlyConfigured("KIS_VIDEO_SERVICE_INTERNAL_TOKEN must be set to a strong value when KIS_VIDEO_SERVICE_ENABLED is on.")
+    if not os.environ.get("KIS_VIDEO_SERVICE_BASE_URL", "").strip():
+        raise ImproperlyConfigured("KIS_VIDEO_SERVICE_BASE_URL must be set when KIS_VIDEO_SERVICE_ENABLED is on.")
+
 # Database — must be PostgreSQL in production; SQLite is not supported.
 _db_url = os.environ.get("DATABASE_URL", "").strip()
 if not _db_url:
