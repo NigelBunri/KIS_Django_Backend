@@ -923,6 +923,14 @@ MEDIA_SAFETY_ALLOWED_MIME_PREFIXES = os.environ.get("MEDIA_SAFETY_ALLOWED_MIME_P
 MEDIA_SAFETY_ALLOWED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_ALLOWED_EXTENSIONS", "")
 MEDIA_SAFETY_BLOCKED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_BLOCKED_EXTENSIONS", "")
 
+# Self-hosted NudeNet detection, extracted out of this process into its own
+# service (kis-content-safety). Off by default — with the flag off, the 5
+# call sites that scan uploads behave exactly as they did before this
+# service existed (in-process NudeNet via apps.media.safety, same as today).
+MEDIA_SAFETY_SERVICE_ENABLED = _env_bool("MEDIA_SAFETY_SERVICE_ENABLED", False)
+MEDIA_SAFETY_SERVICE_BASE_URL = os.environ.get("MEDIA_SAFETY_SERVICE_BASE_URL", "").strip().rstrip("/")
+MEDIA_SAFETY_SERVICE_INTERNAL_TOKEN = os.environ.get("MEDIA_SAFETY_SERVICE_INTERNAL_TOKEN", "")
+
 # Direct-to-S3 presigned-PUT upload handshake (apps/media/upload_intent.py).
 # Secure-by-default: a conservative size cap, a short presign lifetime, and
 # an explicit MIME allow-list rather than trusting the client. No bucket

@@ -37,9 +37,10 @@ from apps.channels.models import Channel
 from apps.chat.internal_auth import require_internal_auth
 from apps.media.models import MediaSafetyScan
 from apps.media.safety import (
+    NUDENET_SCAN_QUEUED_REASON,
     hash_upload,
     normalize_upload_context,
-    scan_upload_for_explicit_content,
+    scan_saved_upload_for_explicit_content,
     user_safe_upload_response,
 )
 
@@ -140,7 +141,13 @@ class ProcessBroadcastVideoUploadView(APIView):
 
         normalized_context = normalize_upload_context("broadcast")
         checksum = hash_upload(_ObjectKeyFile(object_key))
-        decision = scan_upload_for_explicit_content(
+        # Previously called scan_upload_for_explicit_content with no
+        # file_path even though the object's existence was already
+        # confirmed above - metadata-only, never a real verdict regardless
+        # of provider config. scan_saved_upload_for_explicit_content is a
+        # no-op behavior change when MEDIA_SAFETY_SERVICE_ENABLED is off.
+        decision = scan_saved_upload_for_explicit_content(
+            storage_path=object_key,
             filename=original_filename,
             mime_type=mime_type,
             context=normalized_context,
@@ -180,6 +187,19 @@ class ProcessBroadcastVideoUploadView(APIView):
         video.video_url = "" if decision.quarantine else build_media_url(None, object_key)
         ensure_local_thumbnail(video)
         video.save(update_fields=["video_url"])
+
+        if decision.reason == NUDENET_SCAN_QUEUED_REASON:
+            from apps.media.tasks import ContentSafetyResolutionTarget, scan_video_and_resolve_task
+
+            safety_scan.result = {
+                **safety_scan.result,
+                "resolution_target": ContentSafetyResolutionTarget.BROADCAST_VIDEO.value,
+                "resolution_id": str(video.id),
+                "storage_path": object_key,
+                "mime_type": mime_type,
+            }
+            safety_scan.save(update_fields=["result"])
+            scan_video_and_resolve_task.delay(scan_id=str(safety_scan.id))
 
         payload = {
             "video_id": str(video.id),

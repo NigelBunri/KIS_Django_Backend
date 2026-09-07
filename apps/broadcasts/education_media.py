@@ -37,7 +37,7 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
 from apps.media import upload_intent
 from apps.media.models import MediaSafetyScan, MediaUploadIntent
-from apps.media.safety import MediaSafetyDecision, scan_upload_for_explicit_content
+from apps.media.safety import MediaSafetyDecision, scan_saved_upload_for_explicit_content
 from apps.media.services import lifecycle
 
 from .models import (
@@ -137,26 +137,36 @@ def resolve_and_scan_education_media(
     institution: EducationInstitution | None,
     media_id,
     expected_context: str,
-) -> tuple[MediaUploadIntent, MediaSafetyDecision]:
+) -> tuple[MediaUploadIntent, MediaSafetyDecision, MediaSafetyScan]:
     """Looks up a confirmed, not-yet-attached MediaUploadIntent owned by
     `user` for the expected context, verifies it was initiated for THIS
     institution (attach-time can be minutes after initiate-time, and a user
     may manage more than one institution), then runs the same explicit-
     content gate status/complaint uploads run. Never trusts a URL, storage
     key, or object id supplied directly by the client — only this opaque
-    `media_id`, resolved server-side."""
+    `media_id`, resolved server-side.
+
+    Returns the created MediaSafetyScan too (previously discarded) - when
+    the decision is queued_for_async_scan_decision() (a video, with
+    MEDIA_SAFETY_SERVICE_ENABLED on), the caller must update this scan's
+    resolution_target/resolution_id once the real target row (e.g.
+    EducationInstitutionMaterial) exists — it doesn't exist yet here — and
+    enqueue apps.media.tasks.scan_video_and_resolve_task. See
+    apps.broadcasts.views's material-creation call sites.
+    """
     intent = upload_intent.resolve_confirmed_intent(
         user=user, media_id=media_id, expected_context=expected_context,
     )
     if institution is not None and intent.target_id and intent.target_id != str(institution.id):
         raise ValidationError({"mediaId": "This media was not uploaded for this institution."})
 
-    decision = scan_upload_for_explicit_content(
+    decision = scan_saved_upload_for_explicit_content(
+        storage_path=intent.object_key,
         filename=intent.original_filename or "education-upload",
         mime_type=intent.content_type or "",
         context="education",
     )
-    MediaSafetyScan.objects.create(
+    scan = MediaSafetyScan.objects.create(
         owner=user if user and user.is_authenticated else None,
         context="education",
         original_name=intent.original_filename or "",
@@ -172,7 +182,7 @@ def resolve_and_scan_education_media(
         result={**decision.as_metadata(), "surface": expected_context},
         upload_id=str(intent.id),
     )
-    return intent, decision
+    return intent, decision, scan
 
 
 def is_blocked(decision: MediaSafetyDecision) -> bool:
