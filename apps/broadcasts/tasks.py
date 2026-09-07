@@ -151,11 +151,22 @@ def push_asset_to_kisvideo(self, asset_id: str):
     request/response path of ChannelContentAssetUploadView. Only called
     when KIS_VIDEO_SERVICE_ENABLED is on (see that view); a transient
     network failure retries a few times before giving up and marking the
-    asset failed, rather than leaving it stuck at 'queued' forever."""
+    asset failed, rather than leaving it stuck at 'queued' forever.
+
+    Re-checks the flag here too, not just at enqueue time: if an operator
+    flips KIS_VIDEO_SERVICE_ENABLED off after a job is already queued in
+    Redis but before a worker picks it up, this is the only place that can
+    still stop it from actually calling out to kisvideo. If that happens,
+    the asset is left exactly as it was (still 'queued') rather than
+    guessed at — see the kisvideo rollback runbook for how to recover it
+    manually."""
     from django.conf import settings
 
     from .kisvideo_provider import KisVideoProviderError, KisVideoProvider, sign_kisvideo_callback_token
     from .models import ChannelContent, ChannelContentAsset
+
+    if not getattr(settings, "KIS_VIDEO_SERVICE_ENABLED", False):
+        return {"status": "skipped_flag_disabled"}
 
     try:
         asset = ChannelContentAsset.objects.select_related("content__channel").get(id=asset_id)
