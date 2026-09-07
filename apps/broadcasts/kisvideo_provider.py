@@ -31,6 +31,7 @@ from typing import Any
 import requests as _requests
 from django.conf import settings
 from django.core.files.storage import default_storage
+from requests.exceptions import RequestException
 
 
 class KisVideoProviderError(Exception):
@@ -107,51 +108,61 @@ class KisVideoProvider:
             raise KisVideoProviderError(f"storage_path does not exist in default_storage: {storage_path}")
         total_bytes = default_storage.size(storage_path)
 
-        create_resp = _requests.post(
-            f"{self.base_url}/uploads",
-            headers=self._headers(
-                {
-                    "Upload-Length": str(total_bytes),
-                    "Upload-Metadata": f"filename {_b64(filename)},filetype {_b64(content_type)}",
-                    "X-Owner-User-Id": str(owner_user_id),
-                    "X-Callback-Url": callback_url,
-                    "X-Caller-Reference": caller_reference,
-                }
-            ),
-            timeout=15,
-        )
-        if not create_resp.ok:
-            raise KisVideoProviderError(
-                f"kisvideo POST /uploads failed ({create_resp.status_code}): {create_resp.text[:500]}"
+        try:
+            create_resp = _requests.post(
+                f"{self.base_url}/uploads",
+                headers=self._headers(
+                    {
+                        "Upload-Length": str(total_bytes),
+                        "Upload-Metadata": f"filename {_b64(filename)},filetype {_b64(content_type)}",
+                        "X-Owner-User-Id": str(owner_user_id),
+                        "X-Callback-Url": callback_url,
+                        "X-Caller-Reference": caller_reference,
+                    }
+                ),
+                timeout=15,
             )
-        location = create_resp.headers.get("Location", "")
-        upload_id = location.rstrip("/").rsplit("/", 1)[-1] if location else ""
-        if not upload_id:
-            raise KisVideoProviderError("kisvideo POST /uploads did not return a Location header.")
-
-        offset = 0
-        with default_storage.open(storage_path, "rb") as remote_file:
-            while offset < total_bytes:
-                chunk = remote_file.read(chunk_size_bytes)
-                if not chunk:
-                    break
-                patch_resp = _requests.patch(
-                    f"{self.base_url}/uploads/{upload_id}",
-                    headers=self._headers(
-                        {
-                            "Upload-Offset": str(offset),
-                            "Content-Type": "application/offset+octet-stream",
-                        }
-                    ),
-                    data=chunk,
-                    timeout=60,
+            if not create_resp.ok:
+                raise KisVideoProviderError(
+                    f"kisvideo POST /uploads failed ({create_resp.status_code}): {create_resp.text[:500]}"
                 )
-                if not patch_resp.ok:
-                    raise KisVideoProviderError(
-                        f"kisvideo PATCH /uploads/{upload_id} failed at offset {offset} "
-                        f"({patch_resp.status_code}): {patch_resp.text[:500]}"
+            location = create_resp.headers.get("Location", "")
+            upload_id = location.rstrip("/").rsplit("/", 1)[-1] if location else ""
+            if not upload_id:
+                raise KisVideoProviderError("kisvideo POST /uploads did not return a Location header.")
+
+            offset = 0
+            with default_storage.open(storage_path, "rb") as remote_file:
+                while offset < total_bytes:
+                    chunk = remote_file.read(chunk_size_bytes)
+                    if not chunk:
+                        break
+                    patch_resp = _requests.patch(
+                        f"{self.base_url}/uploads/{upload_id}",
+                        headers=self._headers(
+                            {
+                                "Upload-Offset": str(offset),
+                                "Content-Type": "application/offset+octet-stream",
+                            }
+                        ),
+                        data=chunk,
+                        timeout=60,
                     )
-                offset += len(chunk)
+                    if not patch_resp.ok:
+                        raise KisVideoProviderError(
+                            f"kisvideo PATCH /uploads/{upload_id} failed at offset {offset} "
+                            f"({patch_resp.status_code}): {patch_resp.text[:500]}"
+                        )
+                    offset += len(chunk)
+        except RequestException as exc:
+            # A raw network failure (timeout, connection reset, DNS blip -
+            # very plausible on a 60s-timeout PATCH loop streaming a full
+            # video) must funnel through KisVideoProviderError like every
+            # other failure mode here, since push_asset_to_kisvideo's
+            # retry/failure handling only catches that one exception type -
+            # an uncaught RequestException would bypass retries entirely
+            # and strand the asset at 'queued' forever.
+            raise KisVideoProviderError(f"kisvideo request failed: {exc}") from exc
 
         if offset != total_bytes:
             raise KisVideoProviderError(

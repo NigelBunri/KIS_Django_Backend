@@ -104,6 +104,51 @@ class KisVideoProviderUploadFlowTests(SimpleTestCase):
             )
 
     @patch("apps.broadcasts.kisvideo_provider.default_storage")
+    @patch("apps.broadcasts.kisvideo_provider._requests")
+    def test_network_failure_on_create_raises_provider_error(self, mock_requests, mock_storage):
+        """A raw requests.exceptions.RequestException (timeout, connection
+        reset, DNS blip) must funnel through KisVideoProviderError like
+        every other failure here — push_asset_to_kisvideo's retry/failure
+        handling only catches that one exception type, so anything else
+        would bypass retries and strand the asset at 'queued' forever."""
+        import requests
+
+        mock_storage.exists.return_value = True
+        mock_storage.size.return_value = 5
+        mock_requests.post.side_effect = requests.exceptions.ConnectionError("connection reset")
+
+        with self.assertRaises(KisVideoProviderError):
+            KisVideoProvider().create_transcode_job(
+                storage_path="videos/x.mp4",
+                filename="x.mp4",
+                content_type="video/mp4",
+                owner_user_id="u1",
+                callback_url="https://django.internal/cb",
+                caller_reference="a1",
+            )
+
+    @patch("apps.broadcasts.kisvideo_provider.default_storage")
+    @patch("apps.broadcasts.kisvideo_provider._requests")
+    def test_network_failure_on_patch_raises_provider_error(self, mock_requests, mock_storage):
+        import requests
+
+        mock_storage.exists.return_value = True
+        mock_storage.size.return_value = 5
+        mock_storage.open.return_value.__enter__.return_value = io.BytesIO(b"hello")
+        mock_requests.post.return_value = MagicMock(ok=True, headers={"Location": "https://kisvideo.internal/uploads/up-1"})
+        mock_requests.patch.side_effect = requests.exceptions.Timeout("read timed out")
+
+        with self.assertRaises(KisVideoProviderError):
+            KisVideoProvider().create_transcode_job(
+                storage_path="videos/x.mp4",
+                filename="x.mp4",
+                content_type="video/mp4",
+                owner_user_id="u1",
+                callback_url="https://django.internal/cb",
+                caller_reference="a1",
+            )
+
+    @patch("apps.broadcasts.kisvideo_provider.default_storage")
     def test_raises_when_storage_path_missing(self, mock_storage):
         mock_storage.exists.return_value = False
         with self.assertRaises(KisVideoProviderError):
