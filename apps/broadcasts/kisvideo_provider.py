@@ -61,6 +61,34 @@ def verify_kisvideo_callback_token(asset_id: str, token: str) -> bool:
     return bool(expected) and hmac.compare_digest(expected, str(token or ""))
 
 
+def verify_kisvideo_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
+    """kisvideo now signs the webhook body itself (X-KisVideo-Signature:
+    sha256=<hex hmac>, see app/workers/transcode.py::_send_webhook /
+    _sign_webhook_body in the kisvideo repo), keyed by this same
+    KIS_VIDEO_SERVICE_INTERNAL_TOKEN. Additive to
+    verify_kisvideo_callback_token above, not a replacement — that token
+    proves the callback_url itself is one Django minted for this asset;
+    this proves the specific payload delivered to it is genuine and
+    untampered, which the URL token alone does not (see
+    KisVideoJobCallbackView's own docstring for the exact gap).
+
+    Verifies against the raw, exact request body bytes — not a
+    re-serialization of request.data — for the same reason the sender
+    signs the literal bytes on the wire: re-encoding could differ in key
+    order/whitespace/float formatting from what was actually transmitted
+    and signed, which would make a genuine payload fail verification.
+    """
+    header = str(signature_header or "").strip()
+    if not header.startswith("sha256="):
+        return False
+    provided_digest = header[len("sha256="):].strip()
+    secret = str(getattr(settings, "KIS_VIDEO_SERVICE_INTERNAL_TOKEN", "") or "")
+    if not secret or not provided_digest:
+        return False
+    expected_digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected_digest, provided_digest)
+
+
 def _b64(value: str) -> str:
     return base64.b64encode(value.encode("utf-8")).decode("ascii")
 

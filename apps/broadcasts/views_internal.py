@@ -44,7 +44,7 @@ from apps.media.safety import (
     user_safe_upload_response,
 )
 
-from .kisvideo_provider import verify_kisvideo_callback_token
+from .kisvideo_provider import verify_kisvideo_callback_token, verify_kisvideo_webhook_signature
 from .media_pipeline import prepare_channel_asset_payload
 from .media_utils import build_media_url, ensure_local_thumbnail
 from .models import BroadcastVideo, ChannelContent, ChannelContentAsset
@@ -282,6 +282,16 @@ class KisVideoJobCallbackView(APIView):
         if not asset_id or not verify_kisvideo_callback_token(asset_id, token):
             raise ValidationError({"token": "Invalid or missing callback token."})
 
+        # Additive check, not a replacement for the token above — see this
+        # class's docstring and verify_kisvideo_webhook_signature's own for
+        # the exact gap this closes (the URL token proves the callback_url
+        # is real; this proves THIS payload is genuine and untampered).
+        # Checked before touching asset.processing_status, same as the
+        # token check above.
+        signature_header = request.headers.get("X-KisVideo-Signature", "")
+        if not verify_kisvideo_webhook_signature(request.body, signature_header):
+            raise ValidationError({"signature": "Invalid or missing webhook signature."})
+
         try:
             asset = ChannelContentAsset.objects.select_related("content").get(id=asset_id)
         except ChannelContentAsset.DoesNotExist:
@@ -300,9 +310,24 @@ class KisVideoJobCallbackView(APIView):
         content = asset.content
 
         if job_status == "ready":
-            asset.url = str(request.data.get("master_playlist_url") or "").strip() or asset.url
-            asset.thumbnail_url = str(request.data.get("thumbnail_url") or "").strip() or asset.thumbnail_url
-            duration = request.data.get("duration_seconds")
+            # kisvideo's real success payload nests these three fields under
+            # "asset" (app/workers/transcode.py's _send_webhook call,
+            # matching GET /jobs/{id}'s own inline AssetSummary shape) —
+            # they were previously read as top-level keys here, which never
+            # matched the real payload: every lookup silently returned None,
+            # so asset.url/thumbnail_url were never actually updated and
+            # duration_seconds was never set, while processing_status still
+            # flipped to "ready" below — a "ready" asset with no real
+            # playback URL. Fixed to read the actual shape. "renditions" is
+            # deliberately NOT part of the webhook payload at all (see
+            # Asset's own model doc comment in the kisvideo repo — GET
+            # /assets/{id} is the intended source for that), so
+            # pipeline["renditions"] below staying empty from this callback
+            # is expected, not a second instance of this same bug.
+            asset_payload = request.data.get("asset") or {}
+            asset.url = str(asset_payload.get("master_playlist_url") or "").strip() or asset.url
+            asset.thumbnail_url = str(asset_payload.get("thumbnail_url") or "").strip() or asset.thumbnail_url
+            duration = asset_payload.get("duration_seconds")
             if duration is not None:
                 asset.duration_seconds = int(round(float(duration)))
             asset.processing_status = "ready"
