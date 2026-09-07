@@ -24,10 +24,12 @@ flip" into "silent failure that looks like a hang."
 - [ ] **A real Celery worker for the Django `broadcasts` queue is running
       and has been confirmed to process a task, not just be deployed.**
       `push_asset_to_kisvideo` is a `@shared_task`; it does nothing until a
-      worker picks it up. As of the most recent infra audit, no Celery
-      worker or beat scheduler runs anywhere in production — this is very
-      likely the actual blocker, not kisvideo itself. Confirm with a
-      throwaway task (`from apps.broadcasts.tasks import
+      worker picks it up. `kis-celery-worker`/`kis-celery-beat` are
+      reported running on the Lightsail host as of this writing, so this
+      may no longer be the blocker an earlier infra audit found it to be —
+      but "reported running" isn't the same as "confirmed processing this
+      app's tasks," so don't skip the check on the strength of that alone.
+      Confirm with a throwaway task (`from apps.broadcasts.tasks import
       purge_expired_broadcasts_task; purge_expired_broadcasts_task.delay()`
       from a shell, then check it actually ran) before trusting anything
       downstream of `.delay()`.
