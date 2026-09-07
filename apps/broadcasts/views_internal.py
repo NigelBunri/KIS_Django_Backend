@@ -341,8 +341,17 @@ class KisVideoJobCallbackView(APIView):
 
             if not content.thumbnail_url and asset.thumbnail_url:
                 content.thumbnail_url = asset.thumbnail_url
+            # Processing finishing does NOT publish the content - only the
+            # explicit ChannelContentPublishView.post does that (sets
+            # status=PUBLISHED, visibility, and published_at together). This
+            # used to jump straight to PUBLISHED here, which left content
+            # live-by-label (inflating published_count, is_broadcast checks,
+            # etc.) with published_at never set and visibility never
+            # touched - a real creator publish action was never taken. Back
+            # to DRAFT so the video is simply ready and waiting on the
+            # creator's own Publish click, same as any other finished draft.
             if content.status == ChannelContent.Status.PROCESSING:
-                content.status = ChannelContent.Status.PUBLISHED
+                content.status = ChannelContent.Status.DRAFT
             content.save(update_fields=["thumbnail_url", "status"])
         elif job_status == "failed":
             error_message = str(request.data.get("error_message") or "").strip()[:2048]

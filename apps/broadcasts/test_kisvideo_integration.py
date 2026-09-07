@@ -382,7 +382,11 @@ class KisVideoJobCallbackViewTests(_ChannelContentTestBase):
         self.assertEqual(self.asset.url, "https://cdn.example.com/master.m3u8")
         self.assertEqual(self.asset.thumbnail_url, "https://cdn.example.com/thumb.jpg")
         self.assertEqual(self.asset.duration_seconds, 42)
-        self.assertEqual(self.content.status, ChannelContent.Status.PUBLISHED)
+        # Processing completing readies the asset but does not publish the
+        # content - only the explicit publish endpoint does that (sets
+        # visibility and published_at together with status).
+        self.assertEqual(self.content.status, ChannelContent.Status.DRAFT)
+        self.assertIsNone(self.content.published_at)
         self.assertEqual(self.content.thumbnail_url, "https://cdn.example.com/thumb.jpg")
 
     def test_failed_callback_marks_asset_and_content_failed(self):
