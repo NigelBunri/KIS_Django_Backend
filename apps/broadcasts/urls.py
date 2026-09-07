@@ -1,6 +1,6 @@
 from django.urls import path
 
-from .views_internal import ProcessBroadcastVideoUploadView
+from .views_internal import KisVideoJobCallbackView, ProcessBroadcastVideoUploadView
 from .views import (
     BroadcastFeedView,
     ChannelContentChaptersView,
@@ -323,6 +323,15 @@ urlpatterns = [
         "broadcasts/internal/process-video-upload/",
         ProcessBroadcastVideoUploadView.as_view(),
         name="broadcast-internal-process-video-upload",
+    ),
+    # kisvideo's transcode-job-completion webhook — see views_internal.py's
+    # KisVideoJobCallbackView docstring for why this isn't gated by
+    # require_internal_auth like the entry above (kisvideo's webhook sender
+    # adds no auth header; the query-string token is verified instead).
+    path(
+        "broadcasts/internal/kisvideo-callback/",
+        KisVideoJobCallbackView.as_view(),
+        name="broadcast-internal-kisvideo-callback",
     ),
     path("broadcasts/videos/<uuid:video_id>/stream/", BroadcastVideoStreamView.as_view(), name="video-stream"),
     path("broadcasts/lessons/", BroadcastLessonListView.as_view(), name="broadcast-lessons"),

@@ -639,6 +639,10 @@ REST_FRAMEWORK = {
         # Trusted-internal Nest->Django scan-trigger — fires once per
         # confirmed upload app-wide (every context), so needs real headroom.
         "media_scan_upload": _env_throttle_rate("THROTTLE_MEDIA_SCAN_UPLOAD", dev_default="6000/min", prod_default="2000/min"),
+        # kisvideo's own job-completion webhook (no per-caller identity to
+        # rate-limit by — it's a single trusted service, gated by the
+        # signed callback token instead, see KisVideoJobCallbackView).
+        "kisvideo_job_callback": _env_throttle_rate("THROTTLE_KISVIDEO_JOB_CALLBACK", dev_default="6000/min", prod_default="600/min"),
         # Public, unauthenticated payment-status check (the kingdomimpact
         # ventures.org/payments/complete redirect landing page polls this
         # after a Flutterwave checkout) - keyed by IP since there's no
@@ -950,6 +954,16 @@ NEST_INTERNAL_TOKEN = os.environ.get(
 
 # When the frontend resolves backend assets, it should reuse the API server's host instead of the chat/Nest host.
 NEST_API_BASE_URL = API_BASE_URL
+
+# kisvideo (self-hosted VOD transcode service, replaces Mux for VOD only —
+# live streaming stays on Mux, see live_stream_providers.py). Defaults to
+# disabled: with KIS_VIDEO_SERVICE_ENABLED False, ChannelContentAssetUploadView
+# never calls out to it and existing production behavior is unchanged.
+KIS_VIDEO_SERVICE_ENABLED = os.environ.get("KIS_VIDEO_SERVICE_ENABLED", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+KIS_VIDEO_SERVICE_BASE_URL = os.environ.get("KIS_VIDEO_SERVICE_BASE_URL", "").strip().rstrip("/")
+KIS_VIDEO_SERVICE_INTERNAL_TOKEN = os.environ.get("KIS_VIDEO_SERVICE_INTERNAL_TOKEN", "")
 
 # Logging - JSON structured output so log aggregators (Datadog, CloudWatch, etc.) can parse fields
 LOGGING = {
