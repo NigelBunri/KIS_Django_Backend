@@ -308,6 +308,19 @@ register_purpose("status_audio", _PurposeSpec(
     target_types=("statuses.StatusItem",), allow_attach=False, visibility_class="restricted",
 ))
 
+# Channel/broadcast content video (creator studio upload). Like status_*
+# above, attachment happens at CREATE time on the owning record - but via
+# apps.broadcasts.views.ChannelContentAssetUploadView (a client-supplied
+# storage_path, not resolve_confirmed_intent/media_id like every other
+# confirm-only purpose here), not the generic attach endpoint either way -
+# allow_attach=False either way. "broadcast" (not "channel") matches the
+# context string apps.broadcasts.views' existing image-attachment flow
+# already uses for the same feature area (_record_upload_safety's default).
+register_purpose("channel_content_video", _PurposeSpec(
+    context="broadcast", moderation_context="broadcast", retention_days=None,
+    target_types=("broadcasts.ChannelContentAsset",), allow_attach=False, visibility_class="restricted",
+))
+
 # Education (Phase 3 of the Education System cleanup project). Like status
 # and complaint attachments, these bind at CREATE/UPDATE time on the owning
 # record (see apps.broadcasts.education_media), not via a later generic

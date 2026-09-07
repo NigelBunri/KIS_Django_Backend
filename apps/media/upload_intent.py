@@ -128,6 +128,21 @@ def _status_video_max_bytes() -> int:
     return int(getattr(settings, "STATUS_VIDEO_MAX_UPLOAD_BYTES", 50 * 1024 * 1024))
 
 
+def _channel_content_video_allowed_content_types() -> set[str]:
+    configured = getattr(settings, "CHANNEL_CONTENT_VIDEO_ALLOWED_CONTENT_TYPES", "")
+    values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
+    return values or {"video/mp4", "video/quicktime", "video/webm", "video/x-m4v"}
+
+
+def _channel_content_video_max_bytes() -> int:
+    # Deliberately NOT reusing status_video's 50MB - that ceiling is sized
+    # for short status/story clips, not real channel/broadcast video
+    # content (the eventual kisvideo transcode target). Mirrors
+    # MEDIA_SAFETY_MAX_UPLOAD_BYTES's own ~2GB default (config/settings/
+    # base.py) as the more appropriate scale for this content type.
+    return int(getattr(settings, "CHANNEL_CONTENT_VIDEO_MAX_UPLOAD_BYTES", 2147483647))
+
+
 def _status_audio_allowed_content_types() -> set[str]:
     configured = getattr(settings, "STATUS_AUDIO_ALLOWED_CONTENT_TYPES", "")
     values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
@@ -300,6 +315,18 @@ UPLOAD_CONTEXTS: dict[str, UploadContextConfig] = {
         allowed_content_types=_status_video_allowed_content_types,
         max_bytes=_status_video_max_bytes,
         key_prefix="status/vid",
+    ),
+    # Confirm-only, like status_video/education_material above - the
+    # channel-content attach step (a client-supplied storage_path passed
+    # to apps.broadcasts.views.ChannelContentAssetUploadView) is separate
+    # and does its own content-ownership check; this context only proves
+    # the S3 object is real and within size/type limits before the client
+    # ever calls that view. See website's app/api/control/channel/uploads/
+    # initiate + confirm proxy routes.
+    "channel_content_video": UploadContextConfig(
+        allowed_content_types=_channel_content_video_allowed_content_types,
+        max_bytes=_channel_content_video_max_bytes,
+        key_prefix="channel/video",
     ),
     "status_audio": UploadContextConfig(
         allowed_content_types=_status_audio_allowed_content_types,
@@ -795,6 +822,7 @@ ATTACH_HANDLERS: dict[str, Callable[[MediaUploadIntent], dict]] = {
     "commerce_complaint_attachment": _confirm_only_media_descriptor,
     "status_image": _confirm_only_media_descriptor,
     "status_video": _confirm_only_media_descriptor,
+    "channel_content_video": _confirm_only_media_descriptor,
     "status_audio": _confirm_only_media_descriptor,
     "education_institution_logo": _confirm_only_media_descriptor,
     "education_module_cover_image": _confirm_only_media_descriptor,
