@@ -112,13 +112,31 @@ def cents_to_usd_compact(amount_cents: int) -> str:
     return format_usd_compact(cents_to_usd(amount_cents))
 
 
-def get_wallet_account(user: User) -> WalletAccount:
-    wallet, _ = WalletAccount.objects.get_or_create(user=user, defaults={"balance_cents": 0, "currency": "USD"})
+def get_wallet_account(user: User, *, for_update: bool = False) -> WalletAccount:
+    """for_update=True must be called inside transaction.atomic() - it
+    takes a real row-level lock (SELECT ... FOR UPDATE) so a second
+    concurrent caller for the SAME user blocks until the first commits,
+    instead of both reading the same stale balance and both passing an
+    insufficient-funds check that only one of them should. Found via a
+    2026-09-07 foundation audit: every wallet-mutating function used to
+    read-check-write with no locking at all, a real double-spend (two
+    concurrent debits from one wallet could both succeed even though the
+    balance only covered one). The plain (non-locking) path stays the
+    default since most callers only ever read the balance for display."""
+    wallet, created = WalletAccount.objects.get_or_create(user=user, defaults={"balance_cents": 0, "currency": "USD"})
+    if for_update and not created:
+        # A freshly created row can't be double-spent (zero balance), so
+        # skip the extra query in that case; an existing row needs the
+        # real lock re-fetched to guarantee this transaction sees (and
+        # blocks on) any concurrent in-flight mutation.
+        wallet = WalletAccount.objects.select_for_update().get(pk=wallet.pk)
     return wallet
 
 
-def get_credit_account(user: User) -> CreditAccount:
-    credits, _ = CreditAccount.objects.get_or_create(user=user, defaults={"credits": 0})
+def get_credit_account(user: User, *, for_update: bool = False) -> CreditAccount:
+    credits, created = CreditAccount.objects.get_or_create(user=user, defaults={"credits": 0})
+    if for_update and not created:
+        credits = CreditAccount.objects.select_for_update().get(pk=credits.pk)
     return credits
 
 
@@ -133,23 +151,33 @@ def record_ledger(
     apply_balance_change: bool = True,
 ) -> WalletLedgerEntry:
     meta = meta or {}
-    wallet = get_wallet_account(user)
-    credit = get_credit_account(user)
-    if apply_balance_change:
-        wallet.balance_cents += amount_cents
-        credit.credits += credits_delta
-        wallet.save(update_fields=["balance_cents", "updated_at"])
-        credit.save(update_fields=["credits", "updated_at"])
-    return WalletLedgerEntry.objects.create(
-        user=user,
-        kind=kind,
-        amount_cents=amount_cents,
-        credits_delta=credits_delta,
-        balance_after_cents=wallet.balance_cents,
-        credits_after=credit.credits,
-        reference=reference,
-        meta=meta,
-    )
+    with transaction.atomic():
+        # for_update=True: this is the shared primitive nearly every
+        # wallet mutation ultimately calls, so locking here closes the
+        # race for any caller that reads-then-writes balance_cents/credits
+        # via this function alone (deposits, admin adjustments, refunds).
+        # Callers that ALSO perform their own insufficient-funds check
+        # before calling this (debit_wallet_balance, lock_wallet_funds_for_
+        # booking, etc.) take their own lock first via the same for_update
+        # path - Postgres row locks are reentrant within one transaction,
+        # so re-acquiring it here is a safe no-op, not a second wait/deadlock.
+        wallet = get_wallet_account(user, for_update=apply_balance_change)
+        credit = get_credit_account(user, for_update=apply_balance_change)
+        if apply_balance_change:
+            wallet.balance_cents += amount_cents
+            credit.credits += credits_delta
+            wallet.save(update_fields=["balance_cents", "updated_at"])
+            credit.save(update_fields=["credits", "updated_at"])
+        return WalletLedgerEntry.objects.create(
+            user=user,
+            kind=kind,
+            amount_cents=amount_cents,
+            credits_delta=credits_delta,
+            balance_after_cents=wallet.balance_cents,
+            credits_after=credit.credits,
+            reference=reference,
+            meta=meta,
+        )
 
 
 def debit_wallet_balance(
@@ -163,17 +191,18 @@ def debit_wallet_balance(
     if amount_cents <= 0:
         raise ValueError("Debit amount must be greater than zero.")
 
-    wallet = get_wallet_account(user)
-    if wallet.balance_cents < amount_cents:
-        raise ValueError("Insufficient wallet balance.")
+    with transaction.atomic():
+        wallet = get_wallet_account(user, for_update=True)
+        if wallet.balance_cents < amount_cents:
+            raise ValueError("Insufficient wallet balance.")
 
-    return record_ledger(
-        user=user,
-        kind=kind,
-        amount_cents=-amount_cents,
-        reference=reference,
-        meta=meta,
-    )
+        return record_ledger(
+            user=user,
+            kind=kind,
+            amount_cents=-amount_cents,
+            reference=reference,
+            meta=meta,
+        )
 
 
 def lock_wallet_funds_for_booking(
@@ -185,31 +214,32 @@ def lock_wallet_funds_for_booking(
 ) -> tuple[WalletLedgerEntry, WalletTransaction]:
     if amount_cents <= 0:
         raise ValueError("Escrow amount must be greater than zero.")
-    wallet = get_wallet_account(user)
-    if wallet.balance_cents < amount_cents:
-        raise ValueError("Insufficient wallet balance.")
-    wallet.balance_cents -= amount_cents
-    wallet.locked_cents += amount_cents
-    wallet.save(update_fields=["balance_cents", "locked_cents", "updated_at"])
-    entry = record_ledger(
-        user=user,
-        kind="purchase",
-        amount_cents=-amount_cents,
-        reference=reference,
-        meta=meta,
-        apply_balance_change=False,
-    )
-    transaction = WalletTransaction.objects.create(
-        user=user,
-        provider="internal",
-        method="service_booking",
-        amount_cents=amount_cents,
-        currency="USD",
-        status="success",
-        tx_ref=reference,
-        meta={"source": "service_booking", **(meta or {})},
-    )
-    return entry, transaction
+    with transaction.atomic():
+        wallet = get_wallet_account(user, for_update=True)
+        if wallet.balance_cents < amount_cents:
+            raise ValueError("Insufficient wallet balance.")
+        wallet.balance_cents -= amount_cents
+        wallet.locked_cents += amount_cents
+        wallet.save(update_fields=["balance_cents", "locked_cents", "updated_at"])
+        entry = record_ledger(
+            user=user,
+            kind="purchase",
+            amount_cents=-amount_cents,
+            reference=reference,
+            meta=meta,
+            apply_balance_change=False,
+        )
+        transaction_row = WalletTransaction.objects.create(
+            user=user,
+            provider="internal",
+            method="service_booking",
+            amount_cents=amount_cents,
+            currency="USD",
+            status="success",
+            tx_ref=reference,
+            meta={"source": "service_booking", **(meta or {})},
+        )
+        return entry, transaction_row
 
 
 def release_locked_booking_funds(
@@ -222,18 +252,19 @@ def release_locked_booking_funds(
 ) -> None:
     if amount_cents <= 0:
         raise ValueError("Release amount must be greater than zero.")
-    payer_wallet = get_wallet_account(payer)
-    if payer_wallet.locked_cents < amount_cents:
-        raise ValueError("Insufficient locked funds.")
-    payer_wallet.locked_cents -= amount_cents
-    payer_wallet.save(update_fields=["locked_cents", "updated_at"])
-    record_ledger(
-        user=provider,
-        kind="service_payout",
-        amount_cents=amount_cents,
-        reference=reference,
-        meta=meta,
-    )
+    with transaction.atomic():
+        payer_wallet = get_wallet_account(payer, for_update=True)
+        if payer_wallet.locked_cents < amount_cents:
+            raise ValueError("Insufficient locked funds.")
+        payer_wallet.locked_cents -= amount_cents
+        payer_wallet.save(update_fields=["locked_cents", "updated_at"])
+        record_ledger(
+            user=provider,
+            kind="service_payout",
+            amount_cents=amount_cents,
+            reference=reference,
+            meta=meta,
+        )
 
 
 def release_locked_booking_funds_split(
@@ -258,32 +289,33 @@ def release_locked_booking_funds_split(
     is feature-flagged off by default."""
     if amount_cents <= 0:
         raise ValueError("Release amount must be greater than zero.")
-    payer_wallet = get_wallet_account(payer)
-    if payer_wallet.locked_cents < amount_cents:
-        raise ValueError("Insufficient locked funds.")
-    commission_cents = int(round(amount_cents * max(0.0, min(100.0, commission_pct)) / 100))
-    provider_cents = amount_cents - commission_cents
-    payer_wallet.locked_cents -= amount_cents
-    payer_wallet.save(update_fields=["locked_cents", "updated_at"])
-    split_meta = {**(meta or {}), "commission_cents": commission_cents, "commission_pct": commission_pct}
-    record_ledger(
-        user=provider,
-        kind="service_payout",
-        amount_cents=provider_cents,
-        reference=reference,
-        meta=split_meta,
-    )
-    platform_user_id = getattr(settings, "EDUCATION_PLATFORM_USER_ID", "") or ""
-    if commission_cents > 0 and platform_user_id:
-        platform_user = User.objects.filter(id=platform_user_id).first()
-        if platform_user:
-            record_ledger(
-                user=platform_user,
-                kind="platform_commission",
-                amount_cents=commission_cents,
-                reference=reference,
-                meta=split_meta,
-            )
+    with transaction.atomic():
+        payer_wallet = get_wallet_account(payer, for_update=True)
+        if payer_wallet.locked_cents < amount_cents:
+            raise ValueError("Insufficient locked funds.")
+        commission_cents = int(round(amount_cents * max(0.0, min(100.0, commission_pct)) / 100))
+        provider_cents = amount_cents - commission_cents
+        payer_wallet.locked_cents -= amount_cents
+        payer_wallet.save(update_fields=["locked_cents", "updated_at"])
+        split_meta = {**(meta or {}), "commission_cents": commission_cents, "commission_pct": commission_pct}
+        record_ledger(
+            user=provider,
+            kind="service_payout",
+            amount_cents=provider_cents,
+            reference=reference,
+            meta=split_meta,
+        )
+        platform_user_id = getattr(settings, "EDUCATION_PLATFORM_USER_ID", "") or ""
+        if commission_cents > 0 and platform_user_id:
+            platform_user = User.objects.filter(id=platform_user_id).first()
+            if platform_user:
+                record_ledger(
+                    user=platform_user,
+                    kind="platform_commission",
+                    amount_cents=commission_cents,
+                    reference=reference,
+                    meta=split_meta,
+                )
 
 
 def refund_locked_booking_funds(
@@ -295,20 +327,21 @@ def refund_locked_booking_funds(
 ) -> None:
     if amount_cents <= 0:
         raise ValueError("Refund amount must be greater than zero.")
-    wallet = get_wallet_account(payer)
-    if wallet.locked_cents < amount_cents:
-        raise ValueError("Insufficient locked funds.")
-    wallet.locked_cents -= amount_cents
-    wallet.balance_cents += amount_cents
-    wallet.save(update_fields=["locked_cents", "balance_cents", "updated_at"])
-    record_ledger(
-        user=payer,
-        kind="refund",
-        amount_cents=amount_cents,
-        reference=reference,
-        meta=meta,
-        apply_balance_change=False,
-    )
+    with transaction.atomic():
+        wallet = get_wallet_account(payer, for_update=True)
+        if wallet.locked_cents < amount_cents:
+            raise ValueError("Insufficient locked funds.")
+        wallet.locked_cents -= amount_cents
+        wallet.balance_cents += amount_cents
+        wallet.save(update_fields=["locked_cents", "balance_cents", "updated_at"])
+        record_ledger(
+            user=payer,
+            kind="refund",
+            amount_cents=amount_cents,
+            reference=reference,
+            meta=meta,
+            apply_balance_change=False,
+        )
 
 
 def convert_cash_to_credits(user: User, amount_cents: int) -> ConversionResult:
@@ -399,7 +432,7 @@ def transfer_balance(
         inbound_reference_value = sender_counterparty.get("phone") or sender_counterparty.get("name") or "sender"
 
         if amount_cents > 0:
-            sender_wallet = get_wallet_account(sender)
+            sender_wallet = get_wallet_account(sender, for_update=True)
             if sender_wallet.balance_cents < amount_cents:
                 raise ValueError("Insufficient wallet balance.")
             record_ledger(
@@ -427,7 +460,7 @@ def transfer_balance(
             outbound = WalletLedgerEntry.objects.filter(user=sender).latest("created_at")
             return outbound, inbound
 
-        sender_credit = get_credit_account(sender)
+        sender_credit = get_credit_account(sender, for_update=True)
         if sender_credit.credits < credits:
             raise ValueError("Insufficient credits.")
         record_ledger(

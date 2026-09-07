@@ -1,5 +1,6 @@
 """Views for managing admin roles and assignments."""
 from rest_framework import status
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -11,6 +12,17 @@ from admin_control.serializers import (
     AdminRolePermissionSerializer,
     AdminRoleSerializer,
 )
+
+# SECURITY: is_super_role/role-assignment are the two direct paths to full
+# admin-panel compromise (a super-admin bypasses every permission check -
+# see AdminAccessService.has_permission), so both must require the ACTOR
+# to already be a super-admin, not just hold the generic roles.manage/
+# roles.assign permission a much less trusted role could plausibly have.
+# Found via a 2026-09-07 foundation audit alongside the CRUD-engine
+# blocklist in crud_engine/operations.py - that fix stops editing an
+# existing role's is_super_role via the generic engine, this fix closes
+# the same escalation via these views' own, intended write paths.
+_SUPER_ROLE_ACTION_MESSAGE = "Only an existing super-admin can create, assign, or activate a super-admin role."
 
 
 class AdminRoleView(APIView):
@@ -24,6 +36,8 @@ class AdminRoleView(APIView):
         return Response(serializer.data)
 
     def post(self, request):
+        if request.data.get("is_super_role") and not AdminAccessService.is_super_admin(request.user):
+            raise PermissionDenied(_SUPER_ROLE_ACTION_MESSAGE)
         serializer = AdminRoleSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         role = serializer.save()
@@ -49,6 +63,10 @@ class AdminRoleAssignmentView(APIView):
         return Response(serializer.data)
 
     def post(self, request):
+        role_id = request.data.get("role")
+        if role_id and AdminRole.objects.filter(pk=role_id, is_super_role=True).exists():
+            if not AdminAccessService.is_super_admin(request.user):
+                raise PermissionDenied(_SUPER_ROLE_ACTION_MESSAGE)
         serializer = AdminRoleAssignmentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -65,6 +83,15 @@ class AdminRoleAssignmentDetailView(APIView):
             assignment = AdminRoleAssignment.objects.select_related("role").get(pk=pk)
         except AdminRoleAssignment.DoesNotExist:
             return Response({"detail": "assignment not found"}, status=status.HTTP_404_NOT_FOUND)
+        # Covers both re-activating an existing super-role assignment
+        # (is_active: true) and re-pointing this assignment at a different,
+        # super role via `role` - either way the resulting live assignment
+        # must not grant super-admin unless the actor already has it.
+        target_role_id = request.data.get("role", assignment.role_id)
+        target_is_active = request.data.get("is_active", assignment.is_active)
+        if target_is_active and AdminRole.objects.filter(pk=target_role_id, is_super_role=True).exists():
+            if not AdminAccessService.is_super_admin(request.user):
+                raise PermissionDenied(_SUPER_ROLE_ACTION_MESSAGE)
         serializer = AdminRoleAssignmentSerializer(assignment, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()

@@ -6,6 +6,40 @@ from django.core.exceptions import FieldDoesNotExist
 from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
 from django.db import models
 from django.db.models import CharField, Model, Q, TextField
+from rest_framework.exceptions import PermissionDenied
+
+
+# SECURITY: this generic "edit any Django model" engine is scoped per-request
+# by whatever app_label the CALLER supplies in the URL (see
+# IsAdminControlUser.has_permission, which reads app_label from
+# resolver_match.kwargs, not a fixed value) - so a narrowly-scoped admin
+# holding nothing more than a "crud.update" permission for app_label=
+# "admin_control" could reach this engine's own RBAC tables and, e.g.,
+# PATCH their own AdminRole row's plain is_super_role BooleanField to true,
+# instantly becoming a full super-admin with no further checks anywhere in
+# the admin panel. Found via a 2026-09-07 foundation audit, verified
+# directly before fixing. Every entry point (list/read, single-instance
+# get/patch/delete, and ModelDataView's bulk hard_delete/soft_delete/restore)
+# funnels through resolve_model()/resolve_instance() below, so blocking
+# there closes all of them at once rather than patching each view
+# separately. Extend this list if another security-critical model is ever
+# added inside an app_label a non-super-admin could otherwise reach.
+_CRUD_ENGINE_BLOCKLIST = {
+    ("admin_control", "adminrole"),
+    ("admin_control", "adminroleassignment"),
+    ("admin_control", "adminrolepermission"),
+    ("auth", "user"),
+    ("auth", "group"),
+    ("auth", "permission"),
+    ("sessions", "session"),
+}
+
+
+def _assert_not_blocklisted(app_label: str, model_name: str) -> None:
+    if (app_label.lower(), model_name.lower()) in _CRUD_ENGINE_BLOCKLIST:
+        raise PermissionDenied(
+            f"{app_label}.{model_name} cannot be accessed through the generic CRUD engine."
+        )
 
 
 def resolve_instance(app_label: str, model_name: str, pk: str):
@@ -88,6 +122,7 @@ def update_instance(instance: models.Model, payload: Dict) -> models.Model:
 
 
 def resolve_model(app_label: str, model_name: str) -> Model:
+    _assert_not_blocklisted(app_label, model_name)
     return apps.get_model(app_label, model_name)
 
 
