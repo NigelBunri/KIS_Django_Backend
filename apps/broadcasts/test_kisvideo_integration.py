@@ -242,6 +242,36 @@ class ChannelContentAssetUploadFlagGatingTests(_ChannelContentTestBase):
         mock_delay.assert_not_called()
 
 
+class PushAssetToKisvideoTaskTests(_ChannelContentTestBase):
+    """Covers the task-level flag re-check: if KIS_VIDEO_SERVICE_ENABLED
+    is flipped off after a job is already enqueued in Redis but before a
+    worker picks it up, this is the only remaining thing that can stop it
+    from calling out to kisvideo — see push_asset_to_kisvideo's docstring
+    and the kisvideo rollback runbook."""
+
+    def setUp(self):
+        super().setUp()
+        self.asset = ChannelContentAsset.objects.create(
+            content=self.content,
+            asset_type="video",
+            storage_path="videos/x.mp4",
+            mime_type="video/mp4",
+            processing_status="queued",
+        )
+
+    @override_settings(KIS_VIDEO_SERVICE_ENABLED=False)
+    def test_skips_and_leaves_asset_untouched_when_flag_off_at_runtime(self):
+        from apps.broadcasts.tasks import push_asset_to_kisvideo
+
+        with patch("apps.broadcasts.kisvideo_provider.KisVideoProvider") as mock_provider_cls:
+            result = push_asset_to_kisvideo(str(self.asset.id))
+
+        self.assertEqual(result, {"status": "skipped_flag_disabled"})
+        mock_provider_cls.assert_not_called()
+        self.asset.refresh_from_db()
+        self.assertEqual(self.asset.processing_status, "queued")
+
+
 class KisVideoJobCallbackViewTests(_ChannelContentTestBase):
     def setUp(self):
         super().setUp()
