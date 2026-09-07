@@ -68,8 +68,10 @@ from apps.notifications.realtime import notify_main_tab_badges_updated
 from apps.partners.models import Partner, PartnerPost, PartnerMembership, PartnerMembershipStatus
 from apps.media.models import MediaSafetyScan
 from apps.media.safety import (
+    NUDENET_SCAN_QUEUED_REASON,
     hash_upload,
     normalize_upload_context,
+    scan_saved_upload_for_explicit_content,
     scan_upload_for_explicit_content,
     user_safe_upload_response,
     validate_attachment_metadata_for_safe_messaging,
@@ -967,10 +969,16 @@ def _normalize_material_kind(value: object, default: str = EducationMaterialKind
 
 def _education_material_media_payload(data, *, user=None, institution=None):
     """Returns (resource_url, resource_name, resource_mime_type, storage_path,
-    metadata, intent). `intent` is the resolved MediaUploadIntent when the
-    client uploaded a real file (resource_attachment.media_id) — the caller
-    must call education_media.bind_education_media(intent=..., ...) once the
-    material row has been saved. `intent` is None for a plain resource_url
+    metadata, intent, scan). `intent` is the resolved MediaUploadIntent when
+    the client uploaded a real file (resource_attachment.media_id) — the
+    caller must call education_media.bind_education_media(intent=..., ...)
+    once the material row has been saved. `scan` is the MediaSafetyScan row
+    (None when there's no attachment) — if `scan.reason` is
+    NUDENET_SCAN_QUEUED_REASON, the caller must also update its
+    resolution_target/resolution_id and enqueue
+    apps.media.tasks.scan_video_and_resolve_task once the material row's id
+    is known (see the two EducationInstitutionMaterialView call sites).
+    `intent` is None for a plain resource_url
     (education materials of kind=link are a pasted external URL, not an
     upload — that field has always been, and remains, free text)."""
     resource_url = str(data.get("resource_url") or "").strip()
@@ -986,6 +994,7 @@ def _education_material_media_payload(data, *, user=None, institution=None):
 
     attachment = data.get("resource_attachment") or data.get("attachment")
     intent = None
+    scan = None
     if isinstance(attachment, dict):
         # A client-asserted `url`/`quarantined`/`scan_status` was previously
         # trusted here at face value — a forged attachment dict could bind
@@ -999,7 +1008,7 @@ def _education_material_media_payload(data, *, user=None, institution=None):
             raise ValidationError({"resource_attachment": "resource_attachment.media_id is required — upload the file first via the education upload endpoints."})
         if user is None:
             raise ValidationError({"resource_attachment": "Material file uploads are not supported in this context."})
-        intent, decision = education_media.resolve_and_scan_education_media(
+        intent, decision, scan = education_media.resolve_and_scan_education_media(
             user=user, institution=institution, media_id=media_id,
             expected_context=education_media.MATERIAL_CONTEXT,
         )
@@ -1010,9 +1019,15 @@ def _education_material_media_payload(data, *, user=None, institution=None):
             "status": decision.status,
             "quarantined": decision.quarantine,
             "requires_review": decision.requires_review,
-            "safety_scan_id": "",
+            "safety_scan_id": str(scan.id),
             "context": "education_material",
         }
+        # is_blocked() is true for the queued-async-scan placeholder too
+        # (quarantine=True/requires_review=True/status=pending_review) -
+        # correct interim behavior: no resource_url and the same "under
+        # review" message until scan_video_and_resolve_task resolves it,
+        # same as a BroadcastVideo/MediaAsset row starts with an empty
+        # url/pending status until then.
         if education_media.is_blocked(decision):
             resource_url = ""
             metadata["blocked_user_message"] = "This learning material is under safety review."
@@ -1020,7 +1035,27 @@ def _education_material_media_payload(data, *, user=None, institution=None):
             resource_url = intent.object_key
     else:
         metadata.setdefault("media_safety", {"status": "metadata_only", "context": "education_material"})
-    return resource_url, resource_name, resource_mime_type, "", metadata, intent
+    return resource_url, resource_name, resource_mime_type, "", metadata, intent, scan
+
+
+def _enqueue_education_material_scan_if_queued(scan, intent, material) -> None:
+    """Shared by both EducationInstitutionMaterialListView.post and
+    EducationInstitutionMaterialDetailView.patch - resolve_and_scan_
+    education_media can't enqueue this itself since the material row
+    doesn't exist yet at that point (see its docstring)."""
+    if scan is None or scan.reason != NUDENET_SCAN_QUEUED_REASON:
+        return
+    from apps.media.tasks import ContentSafetyResolutionTarget, scan_video_and_resolve_task
+
+    scan.result = {
+        **scan.result,
+        "resolution_target": ContentSafetyResolutionTarget.EDUCATION_MATERIAL.value,
+        "resolution_id": str(material.id),
+        "storage_path": intent.object_key,
+        "mime_type": intent.content_type or "",
+    }
+    scan.save(update_fields=["result"])
+    scan_video_and_resolve_task.delay(scan_id=str(scan.id))
 
 
 def _normalize_event_type(value: object, default: str = EducationInstitutionEventType.EVENT) -> str:
@@ -1261,7 +1296,7 @@ def _normalize_education_branding_payload(payload, existing: dict | None = None,
         if media_id:
             if user is None:
                 raise ValidationError({"logo_attachment": "Logo upload is not supported in this context."})
-            intent, decision = education_media.resolve_and_scan_education_media(
+            intent, decision, _logo_scan = education_media.resolve_and_scan_education_media(
                 user=user, institution=institution, media_id=media_id,
                 expected_context=education_media.LOGO_CONTEXT,
             )
@@ -1322,7 +1357,7 @@ def _education_cover_image_from_payload(payload, *, user=None, institution=None)
         if media_id:
             if user is None:
                 raise ValidationError({"cover_image_attachment": "Cover image upload is not supported in this context."})
-            intent, decision = education_media.resolve_and_scan_education_media(
+            intent, decision, _cover_scan = education_media.resolve_and_scan_education_media(
                 user=user, institution=institution, media_id=media_id,
                 expected_context=education_media.COVER_IMAGE_CONTEXT,
             )
@@ -7233,11 +7268,19 @@ def _store_thumbnail_upload(file_obj) -> str:
     return default_storage.save(rel_path, file_obj)
 
 
-def _record_upload_safety(request, file_obj, *, context: str):
+def _record_upload_safety(request, file_obj, *, context: str, storage_path: str):
+    """`storage_path` must already exist in default_storage - callers must
+    save the file BEFORE calling this (previously this ran before the
+    file was saved anywhere, which is exactly why every caller here never
+    got a real NudeNet verdict: scan_upload_for_explicit_content only ever
+    runs the real scan when given a file_path, and there was none to give
+    it). scan_saved_upload_for_explicit_content is a no-op behavior change
+    when MEDIA_SAFETY_SERVICE_ENABLED is off."""
     normalized_context = normalize_upload_context(context)
     validate_upload_file_safety(file_obj, context=normalized_context)
     checksum = hash_upload(file_obj)
-    decision = scan_upload_for_explicit_content(
+    decision = scan_saved_upload_for_explicit_content(
+        storage_path=storage_path,
         filename=getattr(file_obj, "name", "") or "upload",
         mime_type=getattr(file_obj, "content_type", "") or "",
         context=normalized_context,
@@ -9135,7 +9178,14 @@ class BroadcastVideoUploadView(APIView):
         serializer = BroadcastVideoUploadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         file_obj = serializer.validated_data["file"]
-        safety_decision, safety_scan = _record_upload_safety(request, file_obj, context="broadcast")
+        # Store BEFORE scanning - a real content-safety scan needs the file
+        # to already exist somewhere it can read it back from. Previously
+        # scanning ran first with nothing to scan, so this call site never
+        # got a real verdict, only a metadata-only stub result.
+        relative_path, _ = _store_upload(file_obj, user=request.user)
+        safety_decision, safety_scan = _record_upload_safety(
+            request, file_obj, context="broadcast", storage_path=relative_path,
+        )
         title = serializer.validated_data.get("title") or os.path.splitext(file_obj.name or "")[0] or "Broadcast video"
         description = serializer.validated_data.get("description", "")
         thumbnail_url = serializer.validated_data.get("thumbnail_url", "")
@@ -9146,7 +9196,6 @@ class BroadcastVideoUploadView(APIView):
         channel_id = serializer.validated_data.get("channel_id")
         if channel_id:
             channel = Channel.objects.filter(id=channel_id).first()
-        relative_path, _ = _store_upload(file_obj, user=request.user)
         duration = _probe_video_duration_from_storage(relative_path)
         video_type = "short" if duration < LONG_VIDEO_MIN_SECONDS else "video"
         transcript_segments = _sanitize_transcript_segments(serializer.validated_data.get("transcript_segments", []))
@@ -9165,6 +9214,18 @@ class BroadcastVideoUploadView(APIView):
         )
         video.video_url = "" if safety_decision.quarantine else build_media_url(request, relative_path)
         ensure_local_thumbnail(video)
+        if safety_decision.reason == NUDENET_SCAN_QUEUED_REASON:
+            from apps.media.tasks import ContentSafetyResolutionTarget, scan_video_and_resolve_task
+
+            safety_scan.result = {
+                **safety_scan.result,
+                "resolution_target": ContentSafetyResolutionTarget.BROADCAST_VIDEO.value,
+                "resolution_id": str(video.id),
+                "storage_path": relative_path,
+                "mime_type": file_obj.content_type or "",
+            }
+            safety_scan.save(update_fields=["result"])
+            scan_video_and_resolve_task.delay(scan_id=str(safety_scan.id))
         video.save(update_fields=["video_url"])
         payload = BroadcastVideoSerializer(video, context={"request": request}).data
         payload["scan_status"] = safety_decision.status
@@ -11214,7 +11275,7 @@ class EducationInstitutionMaterialListView(APIView):
             class_sessions=class_sessions,
             assessments=assessments,
         )
-        resource_url, resource_name, resource_mime_type, storage_path, material_metadata, resource_intent = _education_material_media_payload(
+        resource_url, resource_name, resource_mime_type, storage_path, material_metadata, resource_intent, resource_scan = _education_material_media_payload(
             request.data, user=request.user, institution=institution,
         )
         cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
@@ -11241,6 +11302,7 @@ class EducationInstitutionMaterialListView(APIView):
             education_media.bind_education_media(
                 intent=resource_intent, target_type="broadcasts.EducationInstitutionMaterial", target_id=str(material.id),
             )
+            _enqueue_education_material_scan_if_queued(resource_scan, resource_intent, material)
         if cover_intent is not None:
             education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionMaterial", target_id=str(material.id))
         _assign_material_link_sets(
@@ -11350,7 +11412,7 @@ class EducationInstitutionMaterialDetailView(APIView):
         if "kind" in request.data:
             material.kind = _normalize_material_kind(request.data.get("kind"), material.kind)
         if any(key in request.data for key in ("resource_url", "resource_name", "resource_mime_type", "storage_path", "resource_attachment", "attachment", "metadata")):
-            resource_url, resource_name, resource_mime_type, storage_path, material_metadata, resource_intent = _education_material_media_payload(
+            resource_url, resource_name, resource_mime_type, storage_path, material_metadata, resource_intent, resource_scan = _education_material_media_payload(
                 request.data, user=request.user, institution=institution,
             )
             if "resource_url" in request.data or "resource_attachment" in request.data or "attachment" in request.data:
@@ -11365,6 +11427,7 @@ class EducationInstitutionMaterialDetailView(APIView):
                 education_media.bind_education_media(
                     intent=resource_intent, target_type="broadcasts.EducationInstitutionMaterial", target_id=str(material.id),
                 )
+                _enqueue_education_material_scan_if_queued(resource_scan, resource_intent, material)
         if "is_downloadable" in request.data:
             material.is_downloadable = _to_bool(request.data.get("is_downloadable"), default=material.is_downloadable)
         if "status" in request.data:
@@ -13761,9 +13824,13 @@ def _build_feed_attachment(request, file_obj):
     if not file_obj:
         return None
     media_type = _validate_feed_media_file(file_obj)
-    safety_decision, safety_scan = _record_upload_safety(request, file_obj, context=request.data.get("context") or "broadcast")
     upload_user = request.user if request and getattr(request, "user", None) else None
+    # Store BEFORE scanning - see _record_upload_safety's docstring for why
+    # this ordering is load-bearing, not cosmetic.
     rel_path, bytes_written = _store_upload(file_obj, user=upload_user)
+    safety_decision, safety_scan = _record_upload_safety(
+        request, file_obj, context=request.data.get("context") or "broadcast", storage_path=rel_path,
+    )
     url = "" if safety_decision.quarantine else (build_media_url(request, rel_path) if request else rel_path)
 
     attachment = {
@@ -13781,7 +13848,12 @@ def _build_feed_attachment(request, file_obj):
         'safety': user_safe_upload_response(safety_decision),
     }
 
-    if media_type == 'video' and request and getattr(request, 'user', None) and not safety_decision.quarantine:
+    # A video row is created whenever the content is clean OR still queued
+    # for the async scan (video_url stays "" either way until resolved) -
+    # any OTHER quarantine reason (blocked, low-confidence-pending-review)
+    # keeps skipping video-row creation entirely, unchanged from before.
+    is_queued_scan = safety_decision.reason == NUDENET_SCAN_QUEUED_REASON
+    if media_type == 'video' and request and getattr(request, 'user', None) and (not safety_decision.quarantine or is_queued_scan):
         video = BroadcastVideo.objects.create(
             title=file_obj.name or 'Broadcast video',
             description='',
@@ -13801,6 +13873,18 @@ def _build_feed_attachment(request, file_obj):
         attachment['video_id'] = str(video.id)
         attachment['duration_seconds'] = video.duration_seconds
         attachment['thumbnail_url'] = video.thumbnail_url or ''
+        if is_queued_scan:
+            from apps.media.tasks import ContentSafetyResolutionTarget, scan_video_and_resolve_task
+
+            safety_scan.result = {
+                **safety_scan.result,
+                "resolution_target": ContentSafetyResolutionTarget.BROADCAST_VIDEO.value,
+                "resolution_id": str(video.id),
+                "storage_path": rel_path,
+                "mime_type": file_obj.content_type or "",
+            }
+            safety_scan.save(update_fields=["result"])
+            scan_video_and_resolve_task.delay(scan_id=str(safety_scan.id))
 
     attachment['processing_status'] = 'pending_review' if safety_decision.requires_review or safety_decision.quarantine else 'ready'
     attachment['pipeline'] = prepare_channel_asset_payload(

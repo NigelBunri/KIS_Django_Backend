@@ -23,9 +23,11 @@ from .serializers import (
 )
 from .permissions import IsOwnerOrReadOnly
 from .safety import (
+    NUDENET_SCAN_QUEUED_REASON,
     explicit_scan_required,
     hash_upload,
     normalize_upload_context,
+    scan_saved_upload_for_explicit_content,
     scan_upload_for_explicit_content,
     user_safe_upload_response,
     validate_upload_file_safety,
@@ -384,13 +386,22 @@ class UploadFileView(APIView):
         filename = get_valid_filename(upload.name or "upload") or "upload"
         checksum = hash_upload(upload) if getattr(settings, "MEDIA_UPLOAD_CHECKSUM_ENABLED", False) else ""
         mime_type = upload.content_type or ""
-        decision = scan_upload_for_explicit_content(filename=filename, mime_type=mime_type, context=context)
         relative_path = f"uploads/{identifier}/{filename}"
         try:
             saved_path = default_storage.save(relative_path, upload)
         except Exception:
             raise APIException("Unable to store this upload right now. Please retry.")
         sanitized_path = saved_path.replace("\\", "/")
+        # Scan AFTER the file is saved, not before - previously this ran
+        # with no file_path at all (metadata-only, never a real verdict
+        # regardless of provider config). scan_saved_upload_for_explicit_
+        # content is a no-op behavior change when MEDIA_SAFETY_SERVICE_
+        # ENABLED is off (routes to the same metadata-only call as before);
+        # with it on, images get scanned for real here, videos get queued
+        # for the async task enqueued further below once media_asset exists.
+        decision = scan_saved_upload_for_explicit_content(
+            storage_path=sanitized_path, filename=filename, mime_type=mime_type, context=context,
+        )
         visibility = str(request.data.get("visibility") or "private").strip().lower()
         is_public_upload = visibility in PUBLIC_VISIBILITY_VALUES
         public_url = _safe_storage_url(sanitized_path) if is_public_upload and not decision.quarantine else ""
@@ -448,6 +459,19 @@ class UploadFileView(APIView):
             create_media_safety_alert_for_scan(safety_scan, actor=request.user, request=request)
         except Exception:
             pass
+
+        if decision.reason == NUDENET_SCAN_QUEUED_REASON:
+            from apps.media.tasks import ContentSafetyResolutionTarget, scan_video_and_resolve_task
+
+            safety_scan.result = {
+                **safety_scan.result,
+                "resolution_target": ContentSafetyResolutionTarget.MEDIA_ASSET.value,
+                "resolution_id": str(media_asset.id),
+                "storage_path": sanitized_path,
+                "mime_type": mime_type,
+            }
+            safety_scan.save(update_fields=["result"])
+            scan_video_and_resolve_task.delay(scan_id=str(safety_scan.id))
 
         signed_download_url = ""
         if not is_public_upload and not decision.quarantine:

@@ -59,6 +59,13 @@ if os.environ.get("KIS_VIDEO_SERVICE_ENABLED", "").strip().lower() in ("1", "tru
     if not os.environ.get("KIS_VIDEO_SERVICE_BASE_URL", "").strip():
         raise ImproperlyConfigured("KIS_VIDEO_SERVICE_BASE_URL must be set when KIS_VIDEO_SERVICE_ENABLED is on.")
 
+if os.environ.get("MEDIA_SAFETY_SERVICE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
+    _content_safety_token = os.environ.get("MEDIA_SAFETY_SERVICE_INTERNAL_TOKEN", "").strip()
+    if not _content_safety_token or _is_weak_secret(_content_safety_token):
+        raise ImproperlyConfigured("MEDIA_SAFETY_SERVICE_INTERNAL_TOKEN must be set to a strong value when MEDIA_SAFETY_SERVICE_ENABLED is on.")
+    if not os.environ.get("MEDIA_SAFETY_SERVICE_BASE_URL", "").strip():
+        raise ImproperlyConfigured("MEDIA_SAFETY_SERVICE_BASE_URL must be set when MEDIA_SAFETY_SERVICE_ENABLED is on.")
+
 # Database — must be PostgreSQL in production; SQLite is not supported.
 _db_url = os.environ.get("DATABASE_URL", "").strip()
 if not _db_url:

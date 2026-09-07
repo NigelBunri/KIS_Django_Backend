@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from django.conf import settings
+from django.core.files.storage import default_storage
 from rest_framework.exceptions import ValidationError
 
 
@@ -317,6 +318,47 @@ NUDENET_EXPLICIT_LABELS = {
 # someone on a marginal call.
 NUDENET_AUTO_BLOCK_THRESHOLD = 0.75
 
+# Distinct from every other "pending_review" reason (nudenet_low_confidence,
+# nudenet_scan_error, nudenet_no_file_path) — this one specifically marks a
+# MediaSafetyScan row as "a video async-scan task is enqueued and hasn't
+# resolved it yet", which is what apps.media.tasks.scan_video_and_resolve_task
+# checks before doing any work, so a redelivered/duplicate task run can never
+# re-apply a result over one that already resolved (or double-apply the same
+# one twice).
+NUDENET_SCAN_QUEUED_REASON = "nudenet_scan_queued"
+
+
+def content_safety_error_decision(exc: Exception) -> MediaSafetyDecision:
+    """Same fail-closed shape run_nudenet_scan_on_file already uses on any
+    scan exception — factored out so the synchronous image-scan call sites
+    (which call ContentSafetyProvider directly, not through
+    run_nudenet_scan_on_file, since they already have an open file handle
+    in hand) get the identical shape on a service-call failure."""
+    return MediaSafetyDecision(
+        status="pending_review",
+        quarantine=True,
+        provider="nudenet",
+        reason=f"nudenet_scan_error:{type(exc).__name__}",
+        user_message=USER_SAFE_REVIEW_MESSAGE,
+        requires_review=True,
+    )
+
+
+def queued_for_async_scan_decision() -> MediaSafetyDecision:
+    """The placeholder decision every video-scanning call site returns
+    immediately, before the real async scan resolves — same shape
+    (pending_review/quarantine=True/requires_review=True) these call sites
+    already returned before this fix existed (they used to return this
+    permanently; now it's genuinely temporary)."""
+    return MediaSafetyDecision(
+        status="pending_review",
+        quarantine=True,
+        provider="nudenet",
+        reason=NUDENET_SCAN_QUEUED_REASON,
+        user_message=USER_SAFE_REVIEW_MESSAGE,
+        requires_review=True,
+    )
+
 _nudenet_detector = None
 
 
@@ -401,12 +443,25 @@ def run_nudenet_scan_on_file(file_path: str, mime_type: str) -> MediaSafetyDecis
     (extension/size/declared-type) — this is the layer that actually looks at
     pixels.
 
-    Fails CLOSED: any error loading the model or running inference routes to
-    manual review, never to a silent pass — an upload that couldn't be
-    verified is not the same as one confirmed clean.
+    When MEDIA_SAFETY_SERVICE_ENABLED is on, the actual detection runs in the
+    kis-content-safety service instead of in-process — everything below this
+    point (the confidence-threshold decision, status/quarantine/reason
+    mapping) is unchanged either way; only where the raw (label, score) comes
+    from differs. Off by default, so this function's behavior is identical
+    to before that service existed unless explicitly turned on.
+
+    Fails CLOSED: any error loading the model, calling the service, or
+    running inference routes to manual review, never to a silent pass — an
+    upload that couldn't be verified is not the same as one confirmed clean.
     """
     try:
-        if mime_type.startswith("video/"):
+        from .content_safety_provider import ContentSafetyProvider, content_safety_service_enabled
+
+        if content_safety_service_enabled():
+            with open(file_path, "rb") as fh:
+                filename = os.path.basename(file_path)
+                label, score = ContentSafetyProvider().scan(fh, filename=filename, content_type=mime_type)
+        elif mime_type.startswith("video/"):
             label, score = _scan_video_file(file_path)
         else:
             label, score = _scan_image_file(file_path)
@@ -420,6 +475,15 @@ def run_nudenet_scan_on_file(file_path: str, mime_type: str) -> MediaSafetyDecis
             requires_review=True,
         )
 
+    return build_nudenet_decision(label, score)
+
+
+def build_nudenet_decision(label: str | None, score: float) -> MediaSafetyDecision:
+    """The confidence-threshold policy layer, factored out of
+    run_nudenet_scan_on_file so the async video-scan task (apps/media/
+    tasks.py) can apply the exact same threshold/status mapping to a
+    (label, score) it obtained from the content-safety service directly,
+    without duplicating this ladder."""
     if label and score >= NUDENET_AUTO_BLOCK_THRESHOLD:
         return MediaSafetyDecision(
             status="blocked",
@@ -451,6 +515,37 @@ def run_nudenet_scan_on_file(file_path: str, mime_type: str) -> MediaSafetyDecis
         requires_review=False,
         score=score,
     )
+
+
+def scan_saved_upload_for_explicit_content(
+    *, storage_path: str, filename: str, mime_type: str, context: str,
+) -> MediaSafetyDecision:
+    """Single entry point for every call site that has an already-saved
+    (default_storage-relative) file to scan — the shared routing logic
+    behind the fix for the 4 call sites that used to call
+    scan_upload_for_explicit_content(file_path=None) and never got a real
+    verdict. With MEDIA_SAFETY_SERVICE_ENABLED off, behaves exactly like
+    the old call (metadata-only, routes to scan_upload_for_explicit_content
+    with no file_path — unchanged production behavior). With it on:
+    images get a real synchronous scan via the content-safety service;
+    videos get queued_for_async_scan_decision() instead — the caller is
+    responsible for enqueueing apps.media.tasks.scan_video_and_resolve_task
+    once it has a target row id to resolve into (see that task's docstring
+    for the resolution_target/resolution_id contract)."""
+    from .content_safety_provider import ContentSafetyProvider, ContentSafetyProviderError, content_safety_service_enabled
+
+    if not content_safety_service_enabled():
+        return scan_upload_for_explicit_content(filename=filename, mime_type=mime_type, context=context)
+
+    if mime_type.startswith("video/"):
+        return queued_for_async_scan_decision()
+
+    try:
+        with default_storage.open(storage_path, "rb") as fh:
+            label, score = ContentSafetyProvider().scan(fh, filename=filename, content_type=mime_type)
+    except ContentSafetyProviderError as exc:
+        return content_safety_error_decision(exc)
+    return build_nudenet_decision(label, score)
 
 
 def scan_upload_for_explicit_content(
