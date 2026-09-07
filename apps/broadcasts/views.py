@@ -7268,17 +7268,28 @@ def _store_thumbnail_upload(file_obj) -> str:
     return default_storage.save(rel_path, file_obj)
 
 
-def _record_upload_safety(request, file_obj, *, context: str, storage_path: str):
+def _record_upload_safety(request, file_obj, *, context: str, storage_path: str, checksum: str):
     """`storage_path` must already exist in default_storage - callers must
     save the file BEFORE calling this (previously this ran before the
     file was saved anywhere, which is exactly why every caller here never
     got a real NudeNet verdict: scan_upload_for_explicit_content only ever
     runs the real scan when given a file_path, and there was none to give
     it). scan_saved_upload_for_explicit_content is a no-op behavior change
-    when MEDIA_SAFETY_SERVICE_ENABLED is off."""
+    when MEDIA_SAFETY_SERVICE_ENABLED is off.
+
+    `checksum` must be computed by the caller BEFORE storing the file, not
+    here - default_storage.save() (called by _store_upload, which callers
+    run before this) closes the underlying upload stream once consumed
+    (confirmed via a real ValueError: I/O operation on closed file - found
+    in review, not caught by the narrower test_content_safety_integration/
+    test_scan_video_and_resolve_task tests since neither exercises the real
+    save-then-scan sequence, only apps.broadcasts.test_content_safety_wiring
+    does), so calling hash_upload(file_obj) here, after the save, would
+    always raise. hash_upload itself seeks back to the original position
+    when done, so computing it before the save is always safe regardless
+    of caller order."""
     normalized_context = normalize_upload_context(context)
     validate_upload_file_safety(file_obj, context=normalized_context)
-    checksum = hash_upload(file_obj)
     decision = scan_saved_upload_for_explicit_content(
         storage_path=storage_path,
         filename=getattr(file_obj, "name", "") or "upload",
@@ -9178,13 +9189,20 @@ class BroadcastVideoUploadView(APIView):
         serializer = BroadcastVideoUploadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         file_obj = serializer.validated_data["file"]
+        # Checksum BEFORE storing - hash_upload seeks back to the original
+        # position when done, so this is safe regardless of what runs
+        # after it, but _store_upload closes the underlying stream once
+        # consumed, so hash_upload MUST run before it, not after (a real
+        # bug found in review: computing it post-save raised "I/O
+        # operation on closed file").
+        checksum = hash_upload(file_obj)
         # Store BEFORE scanning - a real content-safety scan needs the file
         # to already exist somewhere it can read it back from. Previously
         # scanning ran first with nothing to scan, so this call site never
         # got a real verdict, only a metadata-only stub result.
         relative_path, _ = _store_upload(file_obj, user=request.user)
         safety_decision, safety_scan = _record_upload_safety(
-            request, file_obj, context="broadcast", storage_path=relative_path,
+            request, file_obj, context="broadcast", storage_path=relative_path, checksum=checksum,
         )
         title = serializer.validated_data.get("title") or os.path.splitext(file_obj.name or "")[0] or "Broadcast video"
         description = serializer.validated_data.get("description", "")
@@ -13825,11 +13843,17 @@ def _build_feed_attachment(request, file_obj):
         return None
     media_type = _validate_feed_media_file(file_obj)
     upload_user = request.user if request and getattr(request, "user", None) else None
+    # Checksum BEFORE storing - see _record_upload_safety's docstring: the
+    # storage save closes file_obj's underlying stream once consumed, so
+    # hash_upload must run first, not be left for _record_upload_safety to
+    # compute internally after the save (that was a real bug: "I/O
+    # operation on closed file").
+    checksum = hash_upload(file_obj)
     # Store BEFORE scanning - see _record_upload_safety's docstring for why
     # this ordering is load-bearing, not cosmetic.
     rel_path, bytes_written = _store_upload(file_obj, user=upload_user)
     safety_decision, safety_scan = _record_upload_safety(
-        request, file_obj, context=request.data.get("context") or "broadcast", storage_path=rel_path,
+        request, file_obj, context=request.data.get("context") or "broadcast", storage_path=rel_path, checksum=checksum,
     )
     url = "" if safety_decision.quarantine else (build_media_url(request, rel_path) if request else rel_path)
 
