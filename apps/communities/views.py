@@ -81,7 +81,19 @@ class CommunityViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """
         - Return public communities when ?public=true is passed (for discovery).
-        - Otherwise return communities where the user is the owner or active member.
+        - Otherwise return communities where the user is the owner, an active
+          member, or which are publicly visible (so a genuine first-time
+          user can retrieve/join/request-join a public community they're
+          not a member of yet - get_object() for every detail action,
+          including join/request-join/members/invite-link, goes through
+          this same queryset; without the public OR-clause here, those
+          actions 404'd before ever reaching their own join_policy/
+          permission checks, so a real outsider could never successfully
+          join any community via the standard join route. Caught by the
+          Phase 5 regression tests, not previously covered by anything).
+          PRIVATE/HIDDEN communities remain invisible to non-members here,
+          as intended - they're only reachable via join_by_invite (which
+          looks up by invite_token, not by this queryset).
         - Supports ?search=, ?ordering=-member_count.
         """
         user = self.request.user
@@ -105,7 +117,7 @@ class CommunityViewSet(viewsets.ModelViewSet):
                 qs = qs.annotate(
                     member_count=models.Count(
                         "memberships",
-                        filter=models.Q(memberships__left_at__isnull=True, memberships__is_banned=False),
+                        filter=models.Q(memberships__status=CommunityMembershipStatus.ACTIVE),
                     )
                 ).order_by("-member_count")
             if partner_id:
@@ -132,9 +144,9 @@ class CommunityViewSet(viewsets.ModelViewSet):
             models.Q(owner=user)
             | models.Q(
                 memberships__user=user,
-                memberships__left_at__isnull=True,
-                memberships__is_banned=False,
+                memberships__status=CommunityMembershipStatus.ACTIVE,
             )
+            | models.Q(is_active=True, visibility=CommunityVisibility.PUBLIC)
         )
         if partner_id:
             qs = qs.filter(partner_id=partner_id)

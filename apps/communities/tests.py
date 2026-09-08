@@ -6,11 +6,26 @@ from apps.accounts.models import User
 from apps.chat.models import Conversation, ConversationMember, ConversationType
 from apps.communities.models import (
     Community,
+    CommunityBan,
+    CommunityJoinPolicy,
+    CommunityJoinRequest,
+    CommunityJoinRequestStatus,
     CommunityMembership,
+    CommunityMembershipStatus,
     CommunityPost,
     CommunityRole,
 )
 from apps.communities.serializers import CommunityPostSerializer
+
+
+def _make_user(phone, username):
+    return User.objects.create_user(
+        phone=phone,
+        country="NG",
+        password="pass1234",
+        username=username,
+        email=f"{username}@example.com",
+    )
 
 
 class CommunityPostDiscussionTests(TestCase):
@@ -191,3 +206,321 @@ class ChatCommunityCreationTests(TestCase):
         self.assertTrue(item["is_owner"])
         self.assertTrue(item["is_member"])
         self.assertEqual(item["current_user_role"], CommunityRole.OWNER)
+
+
+class CommunityDefaultCrudPermissionTests(TestCase):
+    """
+    Adversarial/direct-API coverage for the default update/partial_update/
+    destroy actions on both viewsets - these previously had no object-level
+    permission check at all beyond IsAuthenticated (any authenticated user
+    could PATCH/DELETE any community or post). Hits the routes directly,
+    not through any UI helper, and asserts actual DB state, not just the
+    HTTP status code.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = _make_user("+2348120000001", "crud-owner")
+        self.admin = _make_user("+2348120000002", "crud-admin")
+        self.member = _make_user("+2348120000003", "crud-member")
+        self.outsider = _make_user("+2348120000004", "crud-outsider")
+        self.community = Community.objects.create(
+            owner=self.owner, name="CRUD Community", slug="crud-community",
+        )
+        CommunityMembership.objects.create(community=self.community, user=self.owner, role=CommunityRole.OWNER)
+        CommunityMembership.objects.create(community=self.community, user=self.admin, role=CommunityRole.ADMIN)
+        CommunityMembership.objects.create(community=self.community, user=self.member, role=CommunityRole.MEMBER)
+
+    def test_outsider_cannot_patch_community(self):
+        self.client.force_authenticate(self.outsider)
+        res = self.client.patch(
+            f"/api/v1/communities/{self.community.id}/", {"name": "Hijacked"}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN, res.data)
+        self.community.refresh_from_db()
+        self.assertEqual(self.community.name, "CRUD Community")
+
+    def test_plain_member_cannot_patch_community(self):
+        self.client.force_authenticate(self.member)
+        res = self.client.patch(
+            f"/api/v1/communities/{self.community.id}/", {"name": "Hijacked"}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN, res.data)
+        self.community.refresh_from_db()
+        self.assertEqual(self.community.name, "CRUD Community")
+
+    def test_admin_can_patch_community(self):
+        self.client.force_authenticate(self.admin)
+        res = self.client.patch(
+            f"/api/v1/communities/{self.community.id}/", {"avatar_url": "https://example.com/a.jpg"}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.community.refresh_from_db()
+        self.assertEqual(self.community.avatar_url, "https://example.com/a.jpg")
+
+    def test_nobody_can_hard_delete_community_via_default_destroy(self):
+        self.client.force_authenticate(self.owner)
+        res = self.client.delete(f"/api/v1/communities/{self.community.id}/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN, res.data)
+        self.assertTrue(Community.objects.filter(id=self.community.id).exists())
+
+    def test_random_member_cannot_edit_another_users_post(self):
+        post = CommunityPost.objects.create(
+            community=self.community, author=self.owner, text_plain="Original", text_preview="Original",
+        )
+        self.client.force_authenticate(self.member)
+        res = self.client.patch(f"/api/v1/posts/{post.id}/", {"text_plain": "Hijacked"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN, res.data)
+        post.refresh_from_db()
+        self.assertEqual(post.text_plain, "Original")
+
+    def test_author_can_edit_own_post(self):
+        post = CommunityPost.objects.create(
+            community=self.community, author=self.member, text_plain="Original", text_preview="Original",
+        )
+        self.client.force_authenticate(self.member)
+        # text_plain/text_preview are derived, read-only fields - the real
+        # writable input is `text`, a rich-text doc (see
+        # common.rich_text.process_rich_text_document / ALLOWED_NODES).
+        # styled_text is popped by prepare_rich_text_attrs but is never a
+        # declared serializer field, so it's silently dropped by DRF before
+        # validate() ever runs - not a usable input via the real API.
+        edited_doc = {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Edited"}]}]}
+        res = self.client.patch(f"/api/v1/posts/{post.id}/", {"text": edited_doc}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        post.refresh_from_db()
+        self.assertEqual(post.text_plain, "Edited")
+
+    def test_admin_can_edit_someone_elses_post(self):
+        post = CommunityPost.objects.create(
+            community=self.community, author=self.member, text_plain="Original", text_preview="Original",
+        )
+        self.client.force_authenticate(self.admin)
+        moderated_doc = {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Moderated"}]}]}
+        res = self.client.patch(f"/api/v1/posts/{post.id}/", {"text": moderated_doc}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        post.refresh_from_db()
+        self.assertEqual(post.text_plain, "Moderated")
+
+    def test_nobody_can_hard_delete_post_via_default_destroy(self):
+        post = CommunityPost.objects.create(
+            community=self.community, author=self.owner, text_plain="Keep me", text_preview="Keep me",
+        )
+        self.client.force_authenticate(self.owner)
+        res = self.client.delete(f"/api/v1/posts/{post.id}/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN, res.data)
+        self.assertTrue(CommunityPost.objects.filter(id=post.id).exists())
+
+
+class CommunityMembershipLifecycleTests(TestCase):
+    """
+    Full membership state-machine coverage: join/leave/request-join/
+    approve/reject/resubmit/remove/ban/unban, verifying actual
+    CommunityMembership.status transitions in the DB - not just response
+    status codes.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = _make_user("+2348130000001", "lifecycle-owner")
+        self.user = _make_user("+2348130000002", "lifecycle-user")
+        self.community = Community.objects.create(
+            owner=self.owner,
+            name="Lifecycle Community",
+            slug="lifecycle-community",
+            join_policy=CommunityJoinPolicy.OPEN,
+        )
+        CommunityMembership.objects.create(community=self.community, user=self.owner, role=CommunityRole.OWNER)
+
+    def test_join_then_leave_transitions_status(self):
+        self.client.force_authenticate(self.user)
+        join_res = self.client.post(f"/api/v1/communities/{self.community.id}/join/", {}, format="json")
+        self.assertEqual(join_res.status_code, status.HTTP_200_OK, join_res.data)
+        membership = CommunityMembership.objects.get(community=self.community, user=self.user)
+        self.assertEqual(membership.status, CommunityMembershipStatus.ACTIVE)
+
+        leave_res = self.client.post(f"/api/v1/communities/{self.community.id}/leave/", {}, format="json")
+        self.assertEqual(leave_res.status_code, status.HTTP_200_OK, leave_res.data)
+        membership.refresh_from_db()
+        self.assertEqual(membership.status, CommunityMembershipStatus.LEFT)
+        self.assertFalse(
+            CommunityMembership.objects.active().filter(community=self.community, user=self.user).exists()
+        )
+
+    def test_rejected_join_request_can_be_resubmitted(self):
+        self.community.join_policy = CommunityJoinPolicy.REQUEST
+        self.community.save(update_fields=["join_policy"])
+        self.client.force_authenticate(self.user)
+
+        first = self.client.post(f"/api/v1/communities/{self.community.id}/request-join/", {}, format="json")
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        join_req = CommunityJoinRequest.objects.get(community=self.community, user=self.user)
+
+        self.client.force_authenticate(self.owner)
+        reject_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/reject-request/",
+            {"request_id": str(join_req.id)}, format="json",
+        )
+        self.assertEqual(reject_res.status_code, status.HTTP_200_OK, reject_res.data)
+        join_req.refresh_from_db()
+        self.assertEqual(join_req.status, CommunityJoinRequestStatus.REJECTED)
+
+        # Resubmitting must reopen the SAME row (unique_together on
+        # community+user), not error out or silently no-op.
+        self.client.force_authenticate(self.user)
+        second = self.client.post(f"/api/v1/communities/{self.community.id}/request-join/", {}, format="json")
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.assertEqual(
+            CommunityJoinRequest.objects.filter(community=self.community, user=self.user).count(), 1,
+        )
+        join_req.refresh_from_db()
+        self.assertEqual(join_req.status, CommunityJoinRequestStatus.PENDING)
+
+    def test_approve_request_activates_membership(self):
+        self.community.join_policy = CommunityJoinPolicy.REQUEST
+        self.community.save(update_fields=["join_policy"])
+        self.client.force_authenticate(self.user)
+        self.client.post(f"/api/v1/communities/{self.community.id}/request-join/", {}, format="json")
+        join_req = CommunityJoinRequest.objects.get(community=self.community, user=self.user)
+
+        self.client.force_authenticate(self.owner)
+        approve_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/approve-request/",
+            {"request_id": str(join_req.id)}, format="json",
+        )
+        self.assertEqual(approve_res.status_code, status.HTTP_200_OK, approve_res.data)
+        join_req.refresh_from_db()
+        self.assertEqual(join_req.status, CommunityJoinRequestStatus.APPROVED)
+        membership = CommunityMembership.objects.get(community=self.community, user=self.user)
+        self.assertEqual(membership.status, CommunityMembershipStatus.ACTIVE)
+
+    def test_remove_member_is_non_permanent_and_allows_rejoin(self):
+        self.client.force_authenticate(self.user)
+        self.client.post(f"/api/v1/communities/{self.community.id}/join/", {}, format="json")
+
+        self.client.force_authenticate(self.owner)
+        remove_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/remove/",
+            {"user_id": str(self.user.id)}, format="json",
+        )
+        self.assertEqual(remove_res.status_code, status.HTTP_200_OK, remove_res.data)
+        membership = CommunityMembership.objects.get(community=self.community, user=self.user)
+        self.assertEqual(membership.status, CommunityMembershipStatus.REMOVED)
+        self.assertFalse(CommunityBan.objects.filter(community=self.community, user=self.user).exists())
+
+        # A removed (not banned) user can rejoin freely.
+        self.client.force_authenticate(self.user)
+        rejoin_res = self.client.post(f"/api/v1/communities/{self.community.id}/join/", {}, format="json")
+        self.assertEqual(rejoin_res.status_code, status.HTTP_200_OK, rejoin_res.data)
+        membership.refresh_from_db()
+        self.assertEqual(membership.status, CommunityMembershipStatus.ACTIVE)
+
+    def test_ban_blocks_rejoin_until_unbanned(self):
+        self.client.force_authenticate(self.user)
+        self.client.post(f"/api/v1/communities/{self.community.id}/join/", {}, format="json")
+
+        self.client.force_authenticate(self.owner)
+        ban_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/ban/",
+            {"user_id": str(self.user.id)}, format="json",
+        )
+        self.assertEqual(ban_res.status_code, status.HTTP_200_OK, ban_res.data)
+        membership = CommunityMembership.objects.get(community=self.community, user=self.user)
+        self.assertEqual(membership.status, CommunityMembershipStatus.BANNED)
+        self.assertTrue(CommunityBan.objects.filter(community=self.community, user=self.user).exists())
+
+        # Banned user cannot rejoin.
+        self.client.force_authenticate(self.user)
+        blocked_rejoin = self.client.post(f"/api/v1/communities/{self.community.id}/join/", {}, format="json")
+        self.assertEqual(blocked_rejoin.status_code, status.HTTP_403_FORBIDDEN, blocked_rejoin.data)
+        membership.refresh_from_db()
+        self.assertEqual(membership.status, CommunityMembershipStatus.BANNED)
+
+        # Also excluded from the active members list while banned.
+        self.client.force_authenticate(self.owner)
+        members_res = self.client.get(f"/api/v1/communities/{self.community.id}/members/")
+        member_user_ids = {m["user"]["id"] for m in members_res.data}
+        self.assertNotIn(str(self.user.id), member_user_ids)
+
+        # Unban lifts the ban and allows rejoining, but does not silently
+        # restore membership on its own (BANNED -> LEFT, not ACTIVE).
+        unban_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/unban/",
+            {"user_id": str(self.user.id)}, format="json",
+        )
+        self.assertEqual(unban_res.status_code, status.HTTP_200_OK, unban_res.data)
+        self.assertFalse(CommunityBan.objects.filter(community=self.community, user=self.user).exists())
+        membership.refresh_from_db()
+        self.assertEqual(membership.status, CommunityMembershipStatus.LEFT)
+
+        self.client.force_authenticate(self.user)
+        rejoin_res = self.client.post(f"/api/v1/communities/{self.community.id}/join/", {}, format="json")
+        self.assertEqual(rejoin_res.status_code, status.HTTP_200_OK, rejoin_res.data)
+        membership.refresh_from_db()
+        self.assertEqual(membership.status, CommunityMembershipStatus.ACTIVE)
+
+
+class CommunityRoleManagementTests(TestCase):
+    """
+    Covers promote/demote via the canonical members/set-role endpoint
+    (what CommunityInfoPage.tsx now actually calls), including the
+    guardrails around the owner role.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = _make_user("+2348140000001", "role-owner")
+        self.member = _make_user("+2348140000002", "role-member")
+        self.outsider_member = _make_user("+2348140000003", "role-outsider-member")
+        self.community = Community.objects.create(
+            owner=self.owner, name="Role Community", slug="role-community",
+        )
+        CommunityMembership.objects.create(community=self.community, user=self.owner, role=CommunityRole.OWNER)
+        CommunityMembership.objects.create(community=self.community, user=self.member, role=CommunityRole.MEMBER)
+        CommunityMembership.objects.create(
+            community=self.community, user=self.outsider_member, role=CommunityRole.MEMBER,
+        )
+
+    def test_owner_can_promote_and_demote_member(self):
+        self.client.force_authenticate(self.owner)
+        promote_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "admin"}, format="json",
+        )
+        self.assertEqual(promote_res.status_code, status.HTTP_200_OK, promote_res.data)
+        membership = CommunityMembership.objects.get(community=self.community, user=self.member)
+        self.assertEqual(membership.role, CommunityRole.ADMIN)
+
+        demote_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "member"}, format="json",
+        )
+        self.assertEqual(demote_res.status_code, status.HTTP_200_OK, demote_res.data)
+        membership.refresh_from_db()
+        self.assertEqual(membership.role, CommunityRole.MEMBER)
+
+    def test_plain_member_cannot_change_roles(self):
+        self.client.force_authenticate(self.outsider_member)
+        res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "admin"}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN, res.data)
+        membership = CommunityMembership.objects.get(community=self.community, user=self.member)
+        self.assertEqual(membership.role, CommunityRole.MEMBER)
+
+    def test_owner_role_cannot_be_modified_or_assigned(self):
+        self.client.force_authenticate(self.owner)
+        demote_owner_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/set-role/",
+            {"user_id": str(self.owner.id), "role": "member"}, format="json",
+        )
+        self.assertEqual(demote_owner_res.status_code, status.HTTP_400_BAD_REQUEST, demote_owner_res.data)
+
+        assign_owner_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "owner"}, format="json",
+        )
+        self.assertEqual(assign_owner_res.status_code, status.HTTP_400_BAD_REQUEST, assign_owner_res.data)
+        membership = CommunityMembership.objects.get(community=self.community, user=self.member)
+        self.assertEqual(membership.role, CommunityRole.MEMBER)
