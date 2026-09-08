@@ -32,7 +32,10 @@ def notify_nest_of_community_event(*, community_id, event: str, user_ids, data=N
     if not base or not token:
         return
 
-    url = f"{base}/communities/{community_id}/events"
+    # RealtimeInternalController is @Controller('internal') on the Nest
+    # side - missing this prefix 404s (confirmed via a real production
+    # test during this session's closure verification).
+    url = f"{base}/internal/communities/{community_id}/events"
     body = {"event": event, "userIds": clean_user_ids, "data": data or {}}
     try:
         headers = {

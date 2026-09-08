@@ -388,7 +388,10 @@ def _notify_nest_to_quarantine(object_key: str) -> None:
     token = str(getattr(settings, "NEST_INTERNAL_TOKEN", "")).strip()
     if not base or not token:
         return
-    url = f"{base}/attachments/quarantine"
+    # RealtimeInternalController is @Controller('internal') on the Nest
+    # side - missing this prefix 404s (confirmed via a real production
+    # test during this session's closure verification).
+    url = f"{base}/internal/attachments/quarantine"
     body = {"objectKey": object_key}
     try:
         headers = {

@@ -32,7 +32,10 @@ def notify_main_tab_badges_updated(
     if not base or not token or not clean_user_ids:
         return
 
-    url = f"{base}/main-tab-badges/updated"
+    # RealtimeInternalController is @Controller('internal') on the Nest
+    # side - missing this prefix 404s (confirmed via a real production
+    # test during this session's closure verification).
+    url = f"{base}/internal/main-tab-badges/updated"
     payload = {
         "event": MAIN_TAB_BADGES_UPDATED_EVENT,
         "userIds": clean_user_ids,

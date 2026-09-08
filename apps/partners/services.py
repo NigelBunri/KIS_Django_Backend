@@ -1434,7 +1434,10 @@ def notify_nest_of_partner_event(
     if not base or not token:
         return
 
-    url = f"{base}/partners/{partner_id}/events"
+    # RealtimeInternalController is @Controller('internal') on the Nest
+    # side - missing this prefix 404s (confirmed via a real production
+    # test during this session's closure verification).
+    url = f"{base}/internal/partners/{partner_id}/events"
     body = {"event": event, "userIds": clean_user_ids, "data": data or {}}
     try:
         headers = {

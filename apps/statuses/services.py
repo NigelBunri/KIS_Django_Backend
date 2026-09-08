@@ -166,7 +166,11 @@ def deliver_status_reply_message(*, conversation_id: str, sender_id: str, text: 
     if not base or not token:
         raise StatusReplyDeliveryError("Reply delivery is not configured.")
 
-    url = f"{base}/messages/send-as-user"
+    # RealtimeInternalController is @Controller('internal') on the Nest
+    # side - missing this prefix 404s (confirmed via a real production
+    # test during this session's closure verification: B's reply to A's
+    # status returned a 502 from Django wrapping a 404 from Nest).
+    url = f"{base}/internal/messages/send-as-user"
     payload = {
         "conversationId": str(conversation_id),
         "senderId": str(sender_id),

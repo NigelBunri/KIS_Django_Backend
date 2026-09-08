@@ -17,7 +17,15 @@ def _post_to_nest(path: str, payload: dict) -> None:
         logger.warning("[chat.tasks] Missing NEST_INTERNAL_URL or NEST_INTERNAL_TOKEN; skipping notify")
         return
 
-    url = f"{base}/{path.lstrip('/')}"
+    # RealtimeInternalController is mounted at @Controller('internal') on
+    # the Nest side - every route path passed to this helper (conversations/
+    # created, users/:id/purge-messages, conversations/.../moderate-delete)
+    # is relative to that prefix, which must be added here since NEST_INTERNAL_URL
+    # itself is just the bare host:port (see apps/broadcasts/views.py's
+    # notify_kisvideo webhook caller for the one call site that already got
+    # this right - this was the only one that didn't, confirmed via a real
+    # production 404 during Phase 4 status-reply E2E testing).
+    url = f"{base}/internal/{path.lstrip('/')}"
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
