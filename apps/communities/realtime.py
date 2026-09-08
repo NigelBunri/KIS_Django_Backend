@@ -165,6 +165,16 @@ def notify_post_deleted(post) -> None:
     )
 
 
+def notify_settings_changed(community, *, changed_by, changed_fields) -> None:
+    audience = _active_member_ids(community, exclude_user_id=changed_by.id)
+    notify_nest_of_community_event(
+        community_id=community.id,
+        event="community.settings_changed",
+        user_ids=audience,
+        data={"changedFields": sorted(changed_fields)},
+    )
+
+
 def notify_comment_created(comment) -> None:
     post = comment.post
     audience = _active_member_ids(post.community, exclude_user_id=comment.author_id)

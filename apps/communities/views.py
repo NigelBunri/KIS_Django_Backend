@@ -450,12 +450,20 @@ class CommunityViewSet(viewsets.ModelViewSet):
             obj.reviewed_at = None
             obj.save(update_fields=["status", "message", "reviewed_by", "reviewed_at"])
             from apps.communities.realtime import notify_join_request_created
+            from apps.communities.notifications import (
+                notify_join_request_created as notify_join_request_created_persistent,
+            )
 
             notify_join_request_created(community, obj)
+            notify_join_request_created_persistent(community, obj)
         elif created:
             from apps.communities.realtime import notify_join_request_created
+            from apps.communities.notifications import (
+                notify_join_request_created as notify_join_request_created_persistent,
+            )
 
             notify_join_request_created(community, obj)
+            notify_join_request_created_persistent(community, obj)
         serializer = CommunityJoinRequestSerializer(obj)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -491,8 +499,12 @@ class CommunityViewSet(viewsets.ModelViewSet):
         join_req.save(update_fields=["status", "reviewed_by", "reviewed_at"])
 
         from apps.communities.realtime import notify_join_request_decided
+        from apps.communities.notifications import (
+            notify_join_request_decided as notify_join_request_decided_persistent,
+        )
 
         notify_join_request_decided(community, join_req, approved=True)
+        notify_join_request_decided_persistent(community, join_req, approved=True)
         return Response({"detail": "Approved."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="reject-request")
@@ -517,8 +529,12 @@ class CommunityViewSet(viewsets.ModelViewSet):
         join_req.save(update_fields=["status", "reviewed_by", "reviewed_at"])
 
         from apps.communities.realtime import notify_join_request_decided
+        from apps.communities.notifications import (
+            notify_join_request_decided as notify_join_request_decided_persistent,
+        )
 
         notify_join_request_decided(community, join_req, approved=False)
+        notify_join_request_decided_persistent(community, join_req, approved=False)
         return Response({"detail": "Rejected."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="members/set-admin")
@@ -568,8 +584,10 @@ class CommunityViewSet(viewsets.ModelViewSet):
 
         if previous_role != membership.role:
             from apps.communities.realtime import notify_role_changed
+            from apps.communities.notifications import notify_role_changed as notify_role_changed_persistent
 
             notify_role_changed(community, membership, previous_role=previous_role, changed_by=request.user)
+            notify_role_changed_persistent(community, membership, previous_role=previous_role)
 
         serializer = CommunityMembershipSerializer(membership)
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -590,8 +608,10 @@ class CommunityViewSet(viewsets.ModelViewSet):
             community, user_id, reason="Blocked by community admin", banned_by=request.user
         )
         from apps.communities.realtime import notify_member_banned
+        from apps.communities.notifications import notify_member_banned as notify_member_banned_persistent
 
         notify_member_banned(community, user_id, banned_by=request.user)
+        notify_member_banned_persistent(community, user_id)
         return Response(CommunityBanSerializer(ban).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="members/remove")
@@ -624,8 +644,10 @@ class CommunityViewSet(viewsets.ModelViewSet):
         self._remove_conversation_membership(community, user_id)
 
         from apps.communities.realtime import notify_member_left
+        from apps.communities.notifications import notify_member_removed
 
         notify_member_left(community, membership, reason="removed")
+        notify_member_removed(community, user_id)
         return Response({"detail": "Member removed."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["patch"], url_path="settings")
@@ -676,6 +698,12 @@ class CommunityViewSet(viewsets.ModelViewSet):
             for key, value in updates.items():
                 setattr(community, key, value)
             community.save(update_fields=list(updates.keys()))
+
+            from apps.communities.realtime import notify_settings_changed
+            from apps.communities.notifications import notify_settings_changed as notify_settings_changed_persistent
+
+            notify_settings_changed(community, changed_by=request.user, changed_fields=list(updates.keys()))
+            notify_settings_changed_persistent(community, changed_by=request.user, changed_fields=list(updates.keys()))
 
         serializer = CommunityDetailSerializer(community)
         return Response(serializer.data, status=status.HTTP_200_OK)
