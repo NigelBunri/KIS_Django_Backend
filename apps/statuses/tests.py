@@ -302,6 +302,254 @@ class StatusPrivacyContractTests(APITestCase):
         self.assertTrue(scan.quarantine)
 
 
+class StatusReplyTests(StatusPrivacyContractTests):
+    """apps/statuses/views.py::reply() - the known priority bug for Phase 4.
+
+    Reuses StatusPrivacyContractTests' fixtures (author/viewer/excluded/
+    stranger, with author<->viewer and author<->excluded as mutual
+    contacts) since reply() needs the exact same visibility matrix
+    can_view_status() already covers.
+
+    deliver_status_reply_message is patched at the apps.statuses.views
+    import site (not apps.statuses.services, since views.py does
+    `from apps.statuses.services import ... deliver_status_reply_message`
+    inside the method - patching the origin module wouldn't affect the
+    name already bound into views' local scope at call time) - this is a
+    real Django-side unit test, not a live Django<->Nest integration test,
+    so the actual HTTP call to Nest.js is deliberately not exercised here.
+    """
+
+    def _reply_url(self, status_item) -> str:
+        return f"/api/v1/statuses/{status_item.id}/reply/"
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_succeeds_for_visible_status_and_delivers_via_nest(self, mock_deliver):
+        mock_deliver.return_value = {"ok": True, "messageId": "msg-123", "seq": 1}
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "Nice status!"})
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(res.json()["message_id"], "msg-123")
+        self.assertTrue(res.json()["conversation_id"])
+        mock_deliver.assert_called_once()
+        _, kwargs = mock_deliver.call_args
+        self.assertEqual(kwargs["sender_id"], str(self.viewer.id))
+        self.assertEqual(kwargs["text"], "Nice status!")
+        self.assertTrue(
+            AuditLog.objects.filter(action="status.reply", target_id=status_item.id).exists()
+        )
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_404_when_viewer_is_excluded_from_audience(self, mock_deliver):
+        status_item = self._create_status(
+            author=self.author,
+            visibility=StatusVisibility.CONTACTS_EXCEPT,
+            targets=[self.excluded],
+        )
+
+        self.client.force_authenticate(self.excluded)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_404_for_stranger_outside_contacts(self, mock_deliver):
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.stranger)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_404_when_viewer_is_blocked(self, mock_deliver):
+        status_item = self._create_status(author=self.author)
+        UserBlock.objects.create(blocker=self.author, blocked=self.viewer)
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_403_when_author_disabled_replies(self, mock_deliver):
+        status_item = self._create_status(
+            author=self.author, reply_permission=StatusReplyPermission.NOBODY,
+        )
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_rejects_empty_text(self, mock_deliver):
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "   "})
+
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_502_when_nest_delivery_fails(self, mock_deliver):
+        from apps.statuses.services import StatusReplyDeliveryError
+
+        mock_deliver.side_effect = StatusReplyDeliveryError("boom")
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertFalse(
+            AuditLog.objects.filter(action="status.reply", target_id=status_item.id).exists()
+        )
+
+    def test_reply_returns_404_for_missing_status(self):
+        import uuid
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(f"/api/v1/statuses/{uuid.uuid4()}/reply/", {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class StatusDeletionAndMutationTests(StatusPrivacyContractTests):
+    """DELETE (real soft-delete + file cleanup) and PUT/PATCH (should be
+    entirely disabled) on /api/v1/statuses/{id}/ - Phase 4 hardening."""
+
+    def _delete_url(self, status_item) -> str:
+        return f"/api/v1/statuses/{status_item.id}/"
+
+    def test_owner_can_delete_own_status(self):
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.author)
+        res = self.client.delete(self._delete_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+        status_item.refresh_from_db()
+        self.assertTrue(status_item.is_deleted)
+
+    def test_deleted_status_disappears_from_viewer_list(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.author)
+        self.client.delete(self._delete_url(status_item))
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.get(reverse("statuses:status-list"))
+        author_entries = [
+            entry for entry in res.json()["results"] if entry["user"]["id"] == str(self.author.id)
+        ]
+        self.assertEqual(author_entries, [])
+
+    def test_deleting_status_removes_the_underlying_file(self):
+        status_item = self._create_status(author=self.author)
+        status_item.type = StatusType.IMAGE
+        status_item.file.save("test.jpg", SimpleUploadedFile("test.jpg", b"fake-bytes"), save=True)
+        storage = status_item.file.storage
+        stored_name = status_item.file.name
+        self.assertTrue(storage.exists(stored_name))
+
+        self.client.force_authenticate(self.author)
+        res = self.client.delete(self._delete_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(storage.exists(stored_name))
+
+    def test_stranger_cannot_delete_someone_elses_status(self):
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.stranger)
+        res = self.client.delete(self._delete_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        status_item.refresh_from_db()
+        self.assertFalse(status_item.is_deleted)
+
+    def test_put_and_patch_are_disabled(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.author)
+
+        patch_res = self.client.patch(self._delete_url(status_item), {"expires_at": "2099-01-01T00:00:00Z"})
+        put_res = self.client.put(self._delete_url(status_item), {"text": "rewritten"})
+
+        self.assertEqual(patch_res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        self.assertEqual(put_res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        status_item.refresh_from_db()
+        self.assertEqual(status_item.text, "Hello status")
+
+
+class StatusPurgeCommandTests(StatusPrivacyContractTests):
+    """apps.statuses.services.purge_expired_statuses / the
+    purge_expired_statuses management command - Phase 4 hardening for the
+    previously-nonexistent expiry cleanup (expires_at/is_deleted were
+    read-only filters everywhere, nothing ever actually purged a row)."""
+
+    def test_purges_soft_deleted_and_long_expired_statuses(self):
+        from datetime import timedelta
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from apps.statuses.services import purge_expired_statuses
+
+        soft_deleted = self._create_status(author=self.author)
+        soft_deleted.is_deleted = True
+        soft_deleted.save(update_fields=["is_deleted"])
+
+        long_expired = self._create_status(author=self.author)
+        StatusItem.objects.filter(id=long_expired.id).update(
+            expires_at=timezone.now() - timedelta(days=30)
+        )
+
+        recently_expired = self._create_status(author=self.author)
+        StatusItem.objects.filter(id=recently_expired.id).update(
+            expires_at=timezone.now() - timedelta(days=1)
+        )
+
+        still_active = self._create_status(author=self.author)
+
+        result = purge_expired_statuses(grace_days=7)
+
+        self.assertEqual(result["purged_count"], 2)
+        remaining_ids = set(StatusItem.objects.values_list("id", flat=True))
+        self.assertNotIn(soft_deleted.id, remaining_ids)
+        self.assertNotIn(long_expired.id, remaining_ids)
+        self.assertIn(recently_expired.id, remaining_ids)
+        self.assertIn(still_active.id, remaining_ids)
+
+        # The management command is a thin wrapper - confirm it actually
+        # invokes the same function rather than a second implementation.
+        call_command("purge_expired_statuses", "--grace-days", "0")
+        self.assertFalse(StatusItem.objects.filter(id=recently_expired.id).exists())
+        self.assertTrue(StatusItem.objects.filter(id=still_active.id).exists())
+
+    def test_purge_removes_the_underlying_file(self):
+        status_item = self._create_status(author=self.author)
+        status_item.type = StatusType.IMAGE
+        status_item.file.save("test.jpg", SimpleUploadedFile("test.jpg", b"fake-bytes"), save=True)
+        storage = status_item.file.storage
+        stored_name = status_item.file.name
+        status_item.is_deleted = True
+        status_item.save(update_fields=["is_deleted"])
+
+        from apps.statuses.services import purge_expired_statuses
+
+        purge_expired_statuses()
+
+        self.assertFalse(storage.exists(stored_name))
+        self.assertFalse(StatusItem.objects.filter(id=status_item.id).exists())
+
+
 INITIATE_URL = "/api/v1/media/uploads/initiate/"
 
 
@@ -442,3 +690,174 @@ class StatusMediaUploadTests(APITestCase):
         self.client.force_authenticate(self.author)
         res = self.client.get("/api/v1/statuses/00000000-0000-0000-0000-000000000000/media-url/")
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class StatusContentSafetyScanTests(APITestCase):
+    """P0 fix: both status upload paths called scan_upload_for_explicit_
+    content() with no file_path/storage_path at all, which — per that
+    function's own routing (apps/media/safety.py) — can never produce a
+    real detection; with live provider calls enabled it would instead
+    reject every single media status outright. Fixed by moving the scan
+    to after the file exists at a real storage location and routing
+    through scan_saved_upload_for_explicit_content() (the same shared
+    entry point the "4-of-5-sites" pass already uses elsewhere).
+
+    Mocks apps.statuses.status_media.scan_saved_upload_for_explicit_content
+    directly — that's the actual call this fix wires up — rather than the
+    real NudeNet model or content-safety service, since exercising real
+    inference isn't available in this environment (no GPU/model weights)
+    and isn't the point of this test: the point is that a real storage_path
+    is now passed in, and that the resulting decision correctly gates
+    StatusItem creation/visibility."""
+
+    def setUp(self):
+        self.author = User.objects.create_user(
+            phone="+2348000000201", password="password123", country="NG", display_name="Scanned Author",
+        )
+        self.contact = User.objects.create_user(
+            phone="+2348000000202", password="password123", country="NG", display_name="Contact",
+        )
+        UserContact.objects.create(
+            user=self.author, contact_user=self.contact,
+            contact_phone=self.contact.phone, contact_phone_number=self.contact.phone,
+            contact_display_name=self.contact.display_name,
+        )
+        UserContact.objects.create(
+            user=self.contact, contact_user=self.author,
+            contact_phone=self.author.phone, contact_phone_number=self.author.phone,
+            contact_display_name=self.author.display_name,
+        )
+        # APITestCase already provides self.client as a real APIClient —
+        # no need to construct one separately.
+
+    def _post_image(self):
+        upload = SimpleUploadedFile("photo.jpg", b"fake-jpeg-bytes", content_type="image/jpeg")
+        self.client.force_authenticate(self.author)
+        return self.client.post(
+            "/api/v1/statuses/", {"type": "image", "file": upload, "visibility": "contacts"}, format="multipart",
+        )
+
+    def _post_video(self):
+        upload = SimpleUploadedFile("clip.mp4", b"fake-mp4-bytes", content_type="video/mp4")
+        self.client.force_authenticate(self.author)
+        return self.client.post(
+            "/api/v1/statuses/", {"type": "video", "file": upload, "visibility": "contacts"}, format="multipart",
+        )
+
+    def _post_audio(self):
+        upload = SimpleUploadedFile("clip.m4a", b"fake-m4a-bytes", content_type="audio/m4a")
+        self.client.force_authenticate(self.author)
+        return self.client.post(
+            "/api/v1/statuses/", {"type": "audio", "file": upload, "visibility": "contacts"}, format="multipart",
+        )
+
+    def _decision(self, *, status_, quarantine, reason, requires_review=False):
+        from apps.media.safety import MediaSafetyDecision
+
+        return MediaSafetyDecision(
+            status=status_, quarantine=quarantine, provider="nudenet", reason=reason,
+            user_message="test message", requires_review=requires_review,
+        )
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_blocked_image_is_rejected_and_never_created(self, mock_scan):
+        mock_scan.return_value = self._decision(status_="blocked", quarantine=True, reason="nudenet_explicit:TEST")
+        response = self._post_image()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(StatusItem.objects.count(), 0)
+        # The scan really was called with a real, on-storage path — not
+        # skipped, not called with file_path=None like the pre-fix code.
+        self.assertTrue(mock_scan.called)
+        self.assertTrue(mock_scan.call_args.kwargs.get("storage_path"))
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_passed_image_is_created_and_visible(self, mock_scan):
+        mock_scan.return_value = self._decision(status_="passed", quarantine=False, reason="nudenet_clean")
+        response = self._post_image()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        item = StatusItem.objects.get(id=response.data["id"])
+        self.assertEqual(item.moderation_status, "passed")
+
+        self.client.force_authenticate(self.contact)
+        listing = self.client.get("/api/v1/statuses/")
+        author_entry = next((e for e in listing.data["results"] if e["user"]["id"] == str(self.author.id)), None)
+        self.assertIsNotNone(author_entry, "passed status should be visible to a contact")
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_queued_video_is_pending_and_hidden_from_others_but_visible_to_author(self, mock_scan):
+        from apps.statuses.status_media import NUDENET_SCAN_QUEUED_REASON
+
+        mock_scan.return_value = self._decision(
+            status_="pending_review", quarantine=True, reason=NUDENET_SCAN_QUEUED_REASON, requires_review=True,
+        )
+        with patch("apps.media.tasks.scan_video_and_resolve_task.delay") as mock_delay:
+            response = self._post_video()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        item = StatusItem.objects.get(id=response.data["id"])
+        self.assertEqual(item.moderation_status, "pending_review")
+        # The real point of this fix: quarantined/pending content must not
+        # silently become publicly visible — a genuinely async decision
+        # enqueues the same resolver task the other 3 video call sites use.
+        mock_delay.assert_called_once()
+        scan = MediaSafetyScan.objects.filter(result__resolution_id=str(item.id)).first()
+        self.assertIsNotNone(scan)
+        self.assertEqual(scan.result.get("resolution_target"), "status_item")
+
+        self.client.force_authenticate(self.contact)
+        listing = self.client.get("/api/v1/statuses/")
+        author_entry = next((e for e in listing.data["results"] if e["user"]["id"] == str(self.author.id)), None)
+        self.assertIsNone(author_entry, "pending_review video must not be visible to a contact yet")
+
+        self.client.force_authenticate(self.author)
+        own_listing = self.client.get("/api/v1/statuses/")
+        own_entry = next(e for e in own_listing.data["results"] if e["user"]["id"] == str(self.author.id))
+        self.assertEqual(len(own_entry["items"]), 1, "author must still see their own pending status")
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_async_resolution_flips_pending_video_to_passed_and_visible(self, mock_scan):
+        from apps.statuses.status_media import NUDENET_SCAN_QUEUED_REASON
+
+        mock_scan.return_value = self._decision(
+            status_="pending_review", quarantine=True, reason=NUDENET_SCAN_QUEUED_REASON, requires_review=True,
+        )
+        with patch("apps.media.tasks.scan_video_and_resolve_task.delay"):
+            response = self._post_video()
+        item_id = response.data["id"]
+        scan = MediaSafetyScan.objects.get(result__resolution_id=item_id)
+
+        # ContentSafetyProvider is imported locally inside
+        # scan_video_and_resolve_task (not at apps.media.tasks module
+        # level), so it must be patched at its defining module instead —
+        # the function-local `from .content_safety_provider import
+        # ContentSafetyProvider` still resolves to this patched object
+        # since the patch is active before the task runs.
+        with patch("apps.media.content_safety_provider.ContentSafetyProvider") as mock_provider_cls:
+            mock_provider_cls.return_value.scan.return_value = (None, 0.0)  # clean
+            from apps.media.tasks import scan_video_and_resolve_task
+
+            scan_video_and_resolve_task.run(scan_id=str(scan.id))
+
+        item = StatusItem.objects.get(id=item_id)
+        self.assertEqual(item.moderation_status, "passed")
+
+        self.client.force_authenticate(self.contact)
+        listing = self.client.get("/api/v1/statuses/")
+        author_entry = next((e for e in listing.data["results"] if e["user"]["id"] == str(self.author.id)), None)
+        self.assertIsNotNone(author_entry, "resolved-clean video should now be visible to a contact")
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_audio_status_never_invokes_visual_scan(self, mock_scan):
+        response = self._post_audio()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        item = StatusItem.objects.get(id=response.data["id"])
+        self.assertEqual(item.moderation_status, "passed")
+        mock_scan.assert_not_called()
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_text_status_never_invokes_visual_scan(self, mock_scan):
+        self.client.force_authenticate(self.author)
+        response = self.client.post(
+            "/api/v1/statuses/", {"type": "text", "text": "hello world", "visibility": "contacts"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        mock_scan.assert_not_called()

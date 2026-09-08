@@ -3,19 +3,21 @@ import json
 from rest_framework import serializers
 
 from apps.accounts.models import UserContact
-from apps.media.models import MediaSafetyScan
-from apps.media.safety import (
-    USER_SAFE_REVIEW_MESSAGE,
-    hash_upload,
-    scan_upload_for_explicit_content,
-    validate_upload_file_safety,
-)
+from apps.media.safety import validate_upload_file_safety
 from apps.statuses.models import (
     StatusAudienceTarget,
     StatusItem,
+    StatusModerationStatus,
     StatusReplyPermission,
     StatusType,
     StatusVisibility,
+)
+from apps.statuses.status_media import (
+    NUDENET_SCAN_QUEUED_REASON,
+    SCANNABLE_STATUS_TYPES,
+    resolve_confirmed_status_media,
+    run_status_content_safety_scan,
+    status_scan_result_message,
 )
 
 
@@ -26,6 +28,7 @@ class StatusItemSerializer(serializers.ModelSerializer):
     audience_user_ids = serializers.SerializerMethodField()
     view_count = serializers.SerializerMethodField()
     viewed_by_preview = serializers.SerializerMethodField()
+    moderation_status = serializers.SerializerMethodField()
 
     class Meta:
         model = StatusItem
@@ -45,7 +48,19 @@ class StatusItemSerializer(serializers.ModelSerializer):
             "expires_at",
             "viewed",
             "reply_allowed",
+            "moderation_status",
         ]
+
+    def get_moderation_status(self, obj: StatusItem) -> str | None:
+        # Owner-only: a non-owner viewer can never actually receive a
+        # non-PASSED row in the first place (can_view_status excludes
+        # pending_review/blocked for everyone but the author), so this is
+        # purely "let the author see their own status is still processing
+        # / was flagged" rather than a privacy control by itself.
+        request = self.context.get("request")
+        if not request or not getattr(request, "user", None) or obj.user_id != request.user.id:
+            return None
+        return obj.moderation_status
 
     def get_file_url(self, obj: StatusItem) -> str | None:
         if not obj.file:
@@ -205,41 +220,18 @@ class StatusCreateSerializer(serializers.ModelSerializer):
         if status_type != StatusType.TEXT and not file and not media_id:
             raise serializers.ValidationError({"file": "Media status requires a file or mediaId."})
         if file:
-            request = self.context.get("request")
-            user = getattr(request, "user", None)
+            # Cheap, metadata-only checks only (extension/size/declared-type)
+            # - the actual explicit-content scan can't run yet because
+            # nothing has been written to storage yet at this point in the
+            # request (validate() runs before create()). Moved to create(),
+            # after FieldFile.save(..., save=False) gives the scanner a real
+            # storage_path to inspect — see that method and
+            # apps/statuses/status_media.py::run_status_content_safety_scan.
             validate_upload_file_safety(file, context="status")
-            checksum = hash_upload(file)
-            decision = scan_upload_for_explicit_content(
-                filename=getattr(file, "name", "status-upload"),
-                mime_type=getattr(file, "content_type", "") or "",
-                context="status",
-            )
-            MediaSafetyScan.objects.create(
-                owner=user if user and user.is_authenticated else None,
-                context="status",
-                original_name=getattr(file, "name", "") or "",
-                mime_type=getattr(file, "content_type", "") or "",
-                bytes=getattr(file, "size", 0) or 0,
-                checksum=checksum,
-                provider=decision.provider,
-                status=decision.status,
-                quarantine=decision.quarantine,
-                requires_review=decision.requires_review,
-                policy_version=decision.policy_version,
-                reason=decision.reason,
-                result={
-                    **decision.as_metadata(),
-                    "surface": "messaging_status",
-                },
-            )
-            if decision.quarantine or decision.requires_review or decision.status in {"blocked", "failed", "pending_review"}:
-                raise serializers.ValidationError({"file": decision.user_message or USER_SAFE_REVIEW_MESSAGE})
         elif media_id:
-            from apps.statuses.status_media import resolve_and_validate_status_media
-
             request = self.context.get("request")
             user = getattr(request, "user", None)
-            self._resolved_media_intent = resolve_and_validate_status_media(
+            self._resolved_media_intent = resolve_confirmed_status_media(
                 user=user, media_id=media_id, status_type=status_type,
             )
         if visibility in (StatusVisibility.CONTACTS_EXCEPT, StatusVisibility.ONLY_SHARE_WITH) and not target_user_ids:
@@ -276,8 +268,80 @@ class StatusCreateSerializer(serializers.ModelSerializer):
         validated_data.pop("allowed_user_ids", None)
         validated_data.pop("excluded_user_ids", None)
         validated_data.pop("media_id", None)
-        item = super().create(validated_data)
+        upload_file = validated_data.pop("file", None)
+        status_type = validated_data.get("type")
+        scannable = status_type in SCANNABLE_STATUS_TYPES
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
         intent = getattr(self, "_resolved_media_intent", None)
+
+        # Not yet saved to the DB - constructing in memory first (rather
+        # than super().create(), a single objects.create() call) is what
+        # lets a synchronously-scanned-and-blocked image/audio never become
+        # a real row at all, matching the pre-fix behavior of raising
+        # before any row existed - only now the scan actually has bytes to
+        # look at instead of running with no file_path and being unable to
+        # produce a real verdict.
+        item = StatusItem(**validated_data)
+        scan = None
+
+        if upload_file is not None:
+            # Write the bytes to storage now, WITHOUT saving the model row
+            # (save=False) - this is what gives the scanner below a real,
+            # on-disk/S3 storage_path to inspect. Previously the scan ran
+            # in validate(), before any bytes existed anywhere, which is
+            # exactly why it could never produce a real detection.
+            item.file.save(upload_file.name, upload_file, save=False)
+            if scannable:
+                decision, scan = run_status_content_safety_scan(
+                    storage_path=item.file.name,
+                    filename=upload_file.name,
+                    mime_type=getattr(upload_file, "content_type", "") or "",
+                    status_type=status_type,
+                    owner=user,
+                    size_bytes=getattr(upload_file, "size", 0) or 0,
+                )
+                if decision.reason == NUDENET_SCAN_QUEUED_REASON:
+                    item.moderation_status = StatusModerationStatus.PENDING_REVIEW
+                elif decision.quarantine or decision.status == "blocked":
+                    # Never becomes a real row - delete the bytes just
+                    # written and reject, same user-facing outcome as
+                    # before (a rejection with nothing created), just
+                    # backed by a real scan now instead of an automatic
+                    # metadata-only pending_review every time.
+                    item.file.delete(save=False)
+                    raise serializers.ValidationError({"file": status_scan_result_message(decision)})
+                else:
+                    item.moderation_status = StatusModerationStatus.PASSED
+            # Audio: no visual content to scan - moderation_status stays
+            # at the model default (PASSED).
+        elif intent is not None:
+            item.file.name = intent.object_key
+            if scannable:
+                decision, scan = run_status_content_safety_scan(
+                    storage_path=intent.object_key,
+                    filename=intent.original_filename or "status-upload",
+                    mime_type=intent.content_type or "",
+                    status_type=status_type,
+                    owner=user,
+                    upload_id=str(intent.id),
+                    size_bytes=intent.size_bytes or 0,
+                )
+                if decision.reason == NUDENET_SCAN_QUEUED_REASON:
+                    item.moderation_status = StatusModerationStatus.PENDING_REVIEW
+                elif decision.quarantine or decision.status == "blocked":
+                    # Leave the S3 object alone - mark_attached()/
+                    # sync_attachment() below never runs since we raise
+                    # first, so the existing unattached-upload expiry sweep
+                    # (expire_unattached_confirmed_intents) reclaims it the
+                    # same way it would any other never-consumed intent.
+                    raise serializers.ValidationError({"file": status_scan_result_message(decision)})
+                else:
+                    item.moderation_status = StatusModerationStatus.PASSED
+
+        item.save()
+
         if intent is not None:
             # Bind the already-uploaded S3 object without re-reading/
             # re-uploading the bytes (same pattern as
@@ -285,15 +349,27 @@ class StatusCreateSerializer(serializers.ModelSerializer):
             # the upload consumed only now that the StatusItem row is real —
             # a failure earlier in this method never reaches here, so an
             # upload is never silently consumed without a status to show for it.
-            item.file.name = intent.object_key
-            item.save(update_fields=["file"])
             # Phase 2: keeps MediaAsset.attached_at/target_type/target_id in
-            # sync with this (Phase 1B) attach-at-create-time behavior —
-            # mark_attached() alone (the old call here) left the canonical
-            # asset's own attached_at/target fields unset.
+            # sync with this attach-at-create-time behavior.
             from apps.media.services import lifecycle
 
             lifecycle.sync_attachment(intent=intent, target_type="statuses.StatusItem", target_id=str(item.id))
+
+        if scan is not None and item.moderation_status == StatusModerationStatus.PENDING_REVIEW:
+            # Video: the scan above only enqueued the real check - point it
+            # at the row it should resolve into now that the row exists,
+            # then hand off to the same async task/resolver architecture
+            # the other 3 video-scanning call sites use (apps/media/tasks.py).
+            from apps.media.tasks import ContentSafetyResolutionTarget, scan_video_and_resolve_task
+
+            scan.result = {
+                **scan.result,
+                "resolution_target": ContentSafetyResolutionTarget.STATUS_ITEM.value,
+                "resolution_id": str(item.id),
+            }
+            scan.save(update_fields=["result"])
+            scan_video_and_resolve_task.delay(scan_id=str(scan.id))
+
         if target_user_ids:
             StatusAudienceTarget.objects.bulk_create(
                 [

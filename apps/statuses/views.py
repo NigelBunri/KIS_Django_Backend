@@ -31,11 +31,58 @@ class StatusViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     pagination_class = None
+    # PUT/PATCH were reachable but unintended: ModelViewSet wires them to
+    # UpdateModelMixin by default, which used StatusItemSerializer (the
+    # *read* serializer - the only one with no read_only_fields at all)
+    # for the write. That let an owner silently rewrite expires_at/
+    # created_at/type/text/style/visibility on an already-posted status
+    # with zero re-validation (no content-safety re-scan, no text-required
+    # check, no audience-target sync for a visibility change) - a real
+    # authorization/data-integrity gap Phase 4's security audit caught,
+    # not a hypothetical. WhatsApp itself has no "edit a posted status"
+    # feature either - the correct product behavior is delete-and-repost,
+    # which destroy() below already supports. No frontend route ever
+    # called PATCH/PUT here (confirmed: no update route exists in
+    # ROUTES.statuses), so this closes a real gap, not a used feature.
+    http_method_names = ["get", "post", "delete", "head", "options"]
 
     def get_serializer_class(self):
         if self.action == "create":
             return StatusCreateSerializer
         return StatusItemSerializer
+
+    def destroy(self, request, *args, **kwargs):
+        """Soft-deletes (is_deleted=True, matching the is_deleted filter
+        every read path in this file already applies) AND actually removes
+        the underlying media file from storage now, rather than leaving it
+        orphaned forever - the previous default ModelViewSet.destroy()
+        hard-deleted the row (cascading away StatusItemView/
+        StatusAudienceTarget with it) but never touched status_item.file
+        at all, since Django's Model.delete() never deletes FieldFile
+        content by default. A hard-deleted row also meant is_deleted, a
+        field every single read-path query filters on, was dead - written
+        nowhere in the codebase.
+        """
+        status_item = self.get_object()
+        if status_item.file:
+            try:
+                status_item.file.delete(save=False)
+            except Exception:
+                # Best-effort - a storage-backend hiccup must not block the
+                # user from deleting their own status; the row still flips
+                # to is_deleted=True below, which is what every read path
+                # actually enforces.
+                pass
+        status_item.is_deleted = True
+        status_item.save(update_fields=["is_deleted"])
+        AuditLog.objects.create(
+            actor_id=request.user.id,
+            action="status.delete",
+            target_type="STATUS",
+            target_id=status_item.id,
+            metadata={},
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def _parse_user_ids(self) -> set[str] | None:
         request = self.request
@@ -523,6 +570,28 @@ class StatusViewSet(viewsets.ModelViewSet):
         except StatusItem.DoesNotExist:
             return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Was previously missing entirely - this endpoint only checked
+        # reply_permission, never whether the caller can actually see the
+        # status at all. That meant a user excluded from a status's
+        # audience (or blocked, or looking at a still-pending-review item)
+        # could still successfully reply to it, as long as the author
+        # hadn't set reply_permission=nobody - a real authorization bypass,
+        # not just a missing frontend affordance (get_reply_allowed() on
+        # the serializer already computed the correct answer for the UI,
+        # but the backend action itself never enforced it). 404, not 403 -
+        # matches this codebase's existing hide-not-reveal convention for
+        # content a caller has no business knowing exists.
+        blocked_user_ids = self._get_blocked_user_ids()
+        _, _, mutual_contact_ids = self._get_status_contacts()
+        if not self._can_view_status(
+            status_item,
+            viewer_id=str(request.user.id),
+            blocked_user_ids=blocked_user_ids,
+            author_contact_ids=self._get_author_contact_ids({str(status_item.user_id)}),
+            mutual_contact_ids=mutual_contact_ids,
+        ):
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
         if status_item.reply_permission == "nobody":
             return Response({"detail": "Replies disabled for this status."}, status=status.HTTP_403_FORBIDDEN)
 
@@ -530,32 +599,52 @@ class StatusViewSet(viewsets.ModelViewSet):
         if not text:
             return Response({"detail": "Reply text is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        from apps.chat.models import Conversation, ConversationMember, Message
         from apps.chat.services import get_or_create_direct_conversation
+        from apps.statuses.services import StatusReplyDeliveryError, deliver_status_reply_message
 
+        # A second, independent bug hiding behind the ImportError above:
+        # this call previously passed user_a=/user_b_id= keyword args, but
+        # the real signature is positional (user_a, user_b) and takes User
+        # instances, not a bare id - and it returns a (Conversation, bool)
+        # tuple, not a single Conversation. That mismatch would have raised
+        # TypeError every time too, just never reached by real traffic
+        # since the Message import above always failed first.
         try:
-            conversation = get_or_create_direct_conversation(
-                user_a=request.user,
-                user_b_id=status_item.user_id,
-            )
+            conversation, _created = get_or_create_direct_conversation(request.user, status_item.user)
         except Exception:
             return Response({"detail": "Could not open conversation."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        msg = Message.objects.create(
-            conversation=conversation,
-            sender_id=request.user.id,
-            kind="text",
-            text=text,
-            metadata={"status_reply_id": str(status_item.id)},
-        )
+        # The real message content lives entirely in Nest.js/MongoDB, not
+        # in a Django-ORM model (there is no Message model in apps.chat -
+        # the previous `from apps.chat.models import ... Message` import
+        # here was unconditionally raising ImportError on every single
+        # call, so this endpoint has never actually worked). This delivers
+        # the reply through the same real send pipeline a live chat send
+        # uses (seq allocation + message persistence + realtime emit to
+        # the conversation room), via a dedicated internal endpoint - see
+        # deliver_status_reply_message's docstring for exactly what it
+        # does and does not do.
+        try:
+            result = deliver_status_reply_message(
+                conversation_id=str(conversation.id),
+                sender_id=str(request.user.id),
+                text=text,
+            )
+        except StatusReplyDeliveryError:
+            return Response(
+                {"detail": "Could not deliver your reply right now. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        message_id = str(result.get("messageId") or "")
         AuditLog.objects.create(
             actor_id=request.user.id,
             action="status.reply",
             target_type="STATUS",
             target_id=status_item.id,
-            metadata={"message_id": str(msg.id), "text_len": len(text)},
+            metadata={"message_id": message_id, "text_len": len(text)},
         )
         return Response(
-            {"replied": True, "message_id": str(msg.id), "conversation_id": str(conversation.id)},
+            {"replied": True, "message_id": message_id, "conversation_id": str(conversation.id)},
             status=status.HTTP_201_CREATED,
         )

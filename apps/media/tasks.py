@@ -169,6 +169,7 @@ class ContentSafetyResolutionTarget(str, enum.Enum):
     BROADCAST_VIDEO = "broadcast_video"
     MEDIA_ASSET = "media_asset"
     EDUCATION_MATERIAL = "education_material"
+    STATUS_ITEM = "status_item"
 
 
 def _resolve_broadcast_video(target_id: str, decision, storage_path: str) -> None:
@@ -239,10 +240,37 @@ def _resolve_education_material(target_id: str, decision, storage_path: str) -> 
     material.save(update_fields=update_fields)
 
 
+def _resolve_status_item(target_id: str, decision, storage_path: str) -> None:
+    from apps.statuses.models import StatusItem, StatusModerationStatus
+
+    try:
+        item = StatusItem.objects.get(id=target_id)
+    except StatusItem.DoesNotExist:
+        logger.warning("content_safety.resolve.missing_target", extra={"target": "status_item", "target_id": target_id})
+        return
+    item.moderation_status = (
+        StatusModerationStatus.BLOCKED
+        if decision.status == "blocked"
+        else StatusModerationStatus.PENDING_REVIEW
+        if decision.quarantine or decision.requires_review
+        else StatusModerationStatus.PASSED
+    )
+    item.save(update_fields=["moderation_status"])
+    # No visibility side-effect beyond the field itself - can_view_status()
+    # (apps/statuses/services.py) reads moderation_status directly on every
+    # read path, so flipping it here is the entire "make visible" /
+    # "keep hidden" decision. Unlike MediaAsset/BroadcastVideo there's no
+    # separate canonical_url/video_url to populate - StatusItem.file was
+    # already pointed at the real object at create() time (see
+    # StatusCreateSerializer.create), it was only ever the *visibility*
+    # that was withheld pending this resolution, not the file reference.
+
+
 _RESOLVERS = {
     ContentSafetyResolutionTarget.BROADCAST_VIDEO: _resolve_broadcast_video,
     ContentSafetyResolutionTarget.MEDIA_ASSET: _resolve_media_asset,
     ContentSafetyResolutionTarget.EDUCATION_MATERIAL: _resolve_education_material,
+    ContentSafetyResolutionTarget.STATUS_ITEM: _resolve_status_item,
 }
 
 

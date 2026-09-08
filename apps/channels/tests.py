@@ -3,7 +3,7 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
-from apps.channels.models import Channel
+from apps.channels.models import Channel, Subchannel
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
 from apps.partners.models import (
     Partner,
@@ -380,3 +380,266 @@ class VoiceChannelTierGateApiTests(TestCase):
         body["channel_type"] = Channel.ChannelType.TEXT
         response = self.client.post("/api/v1/partner-channels/channels/", body, format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+
+class _PersonalChannelTestBase(TestCase):
+    """Fixtures for a personal (non-partner) Channel — the case
+    ChannelServerOrganizationApiTests above doesn't cover, since every
+    channel there belongs to self.partner. Subchannel authorization and
+    private-channel access are both personal-channel-shaped bugs, so
+    tested against a personal channel specifically, not a partner one
+    (which already had its own, separate, correctly-working permission
+    system before this pass — see apps/partners/services.py)."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = self._create_user("owner", "+237672000001")
+        self.stranger = self._create_user("stranger", "+237672000002")
+        self.member = self._create_user("member", "+237672000003")
+
+    def _create_user(self, username: str, phone: str) -> User:
+        suffix = phone[-4:]
+        return User.objects.create_user(
+            phone=phone,
+            country="CM",
+            password="pass1234",
+            email=f"{username}-{suffix}@example.com",
+            username=f"{username}-{suffix}",
+            display_name=username.title(),
+            phone_country_code="+237",
+            phone_number=phone[-9:],
+        )
+
+    def _create_personal_channel(self, *, owner: User, name: str, slug: str, channel_type: str = Channel.ChannelType.ANNOUNCEMENT) -> Channel:
+        conversation = Conversation.objects.create(
+            type=ConversationType.CHANNEL, title=name, created_by=owner,
+        )
+        ConversationMember.objects.create(
+            conversation=conversation, user=owner, base_role=BaseConversationRole.OWNER,
+        )
+        return Channel.objects.create(
+            partner=None, community=None, category=None,
+            owner=owner, conversation=conversation, name=name, slug=slug, channel_type=channel_type,
+        )
+
+
+class SubchannelAuthorizationTests(_PersonalChannelTestBase):
+    """P0 fix: SubchannelViewSet previously had no ownership/permission
+    check at all on create/update/destroy beyond IsAuthenticated — any
+    authenticated user could create, rename, or delete a subchannel of ANY
+    channel. Tests the exact matrix the task asked for: owner can manage,
+    an unrelated authenticated user cannot, and a direct API request
+    (not routed through any frontend) cannot bypass the restriction."""
+
+    def setUp(self):
+        super().setUp()
+        self.channel = self._create_personal_channel(owner=self.owner, name="Owner Channel", slug="owner-channel")
+        ConversationMember.objects.create(
+            conversation=self.channel.conversation, user=self.member, base_role=BaseConversationRole.MEMBER,
+        )
+
+    def test_owner_can_create_subchannel(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            "/api/v1/subchannels/", {"channel": str(self.channel.id), "name": "General"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_unrelated_authenticated_user_cannot_create_subchannel(self):
+        """The exact gap: previously succeeded (201) for anyone."""
+        self.client.force_authenticate(self.stranger)
+        response = self.client.post(
+            "/api/v1/subchannels/", {"channel": str(self.channel.id), "name": "General"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_plain_member_cannot_create_subchannel(self):
+        """Membership alone isn't management — only owner/admin can."""
+        self.client.force_authenticate(self.member)
+        response = self.client.post(
+            "/api/v1/subchannels/", {"channel": str(self.channel.id), "name": "General"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_owner_can_update_and_delete_subchannel(self):
+        self.client.force_authenticate(self.owner)
+        sub = Subchannel.objects.create(channel=self.channel, name="General", created_by=self.owner)
+        update = self.client.patch(f"/api/v1/subchannels/{sub.id}/", {"name": "Renamed"}, format="json")
+        self.assertEqual(update.status_code, status.HTTP_200_OK, update.data)
+        delete = self.client.delete(f"/api/v1/subchannels/{sub.id}/")
+        self.assertEqual(delete.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_unrelated_authenticated_user_cannot_update_subchannel(self):
+        sub = Subchannel.objects.create(channel=self.channel, name="General", created_by=self.owner)
+        self.client.force_authenticate(self.stranger)
+        response = self.client.patch(f"/api/v1/subchannels/{sub.id}/", {"name": "Hijacked"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        sub.refresh_from_db()
+        self.assertEqual(sub.name, "General")
+
+    def test_unrelated_authenticated_user_cannot_delete_subchannel(self):
+        """The exact gap, direct-API-request form: DELETE by id, no
+        ownership check previously existed at all."""
+        sub = Subchannel.objects.create(channel=self.channel, name="General", created_by=self.owner)
+        self.client.force_authenticate(self.stranger)
+        response = self.client.delete(f"/api/v1/subchannels/{sub.id}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Subchannel.objects.filter(id=sub.id).exists())
+
+    def test_plain_member_cannot_delete_subchannel(self):
+        sub = Subchannel.objects.create(channel=self.channel, name="General", created_by=self.owner)
+        self.client.force_authenticate(self.member)
+        response = self.client.delete(f"/api/v1/subchannels/{sub.id}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Subchannel.objects.filter(id=sub.id).exists())
+
+
+class PersonalPrivateChannelAccessTests(_PersonalChannelTestBase):
+    """P0 fix: channel_type=PRIVATE was a label with zero backend
+    enforcement for personal (non-partner) channels — discoverable,
+    directly retrievable, and self-subscribable by anyone. Tests the
+    access model this pass actually implements: hidden from discovery/
+    search/direct-retrieve/self-subscribe for non-members, with the
+    owner/admin able to grant access via the new members-add action."""
+
+    def setUp(self):
+        super().setUp()
+        self.private_channel = self._create_personal_channel(
+            owner=self.owner, name="Private Club", slug="private-club", channel_type=Channel.ChannelType.PRIVATE,
+        )
+        self.public_channel = self._create_personal_channel(
+            owner=self.owner, name="Public Square", slug="public-square", channel_type=Channel.ChannelType.ANNOUNCEMENT,
+        )
+
+    def test_private_channel_excluded_from_stranger_discovery_list(self):
+        self.client.force_authenticate(self.stranger)
+        response = self.client.get("/api/v1/partner-channels/channels/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = {row["id"] for row in response.data["results"]}
+        self.assertNotIn(str(self.private_channel.id), ids)
+        self.assertIn(str(self.public_channel.id), ids)
+
+    def test_private_channel_excluded_from_stranger_search(self):
+        self.client.force_authenticate(self.stranger)
+        response = self.client.get("/api/v1/partner-channels/channels/?q=Private")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = {row["id"] for row in response.data["results"]}
+        self.assertNotIn(str(self.private_channel.id), ids)
+
+    def test_private_channel_visible_to_owner_in_discovery(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.get("/api/v1/partner-channels/channels/")
+        ids = {row["id"] for row in response.data["results"]}
+        self.assertIn(str(self.private_channel.id), ids)
+
+    def test_private_channel_direct_retrieve_404_for_stranger(self):
+        """Not 403 — a private channel a non-member has no business
+        knowing exists shouldn't confirm its existence via a
+        distinguishable error code."""
+        self.client.force_authenticate(self.stranger)
+        response = self.client.get(f"/api/v1/partner-channels/channels/{self.private_channel.id}/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_private_channel_direct_retrieve_ok_for_owner(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.get(f"/api/v1/partner-channels/channels/{self.private_channel.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_private_channel_self_subscribe_rejected_for_stranger(self):
+        """The exact gap: previously succeeded (201, granted membership)
+        for literally anyone, regardless of channel_type."""
+        self.client.force_authenticate(self.stranger)
+        response = self.client.post(f"/api/v1/partner-channels/channels/{self.private_channel.id}/subscribe/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(
+            ConversationMember.objects.filter(
+                conversation=self.private_channel.conversation, user=self.stranger, left_at__isnull=True,
+            ).exists()
+        )
+
+    def test_public_channel_self_subscribe_still_works_for_stranger(self):
+        """Confirms the fix is scoped to PRIVATE only — a normal personal
+        channel's existing open-subscribe behavior is unchanged."""
+        self.client.force_authenticate(self.stranger)
+        response = self.client.post(f"/api/v1/partner-channels/channels/{self.public_channel.id}/subscribe/")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_owner_can_invite_stranger_via_add_member(self):
+        """The real 'invite-only' mechanism: owner explicitly grants
+        access. After being added, the invited user can see and retrieve
+        the channel like any other member."""
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f"/api/v1/partner-channels/channels/{self.private_channel.id}/members/",
+            {"user_id": str(self.stranger.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        self.client.force_authenticate(self.stranger)
+        retrieve = self.client.get(f"/api/v1/partner-channels/channels/{self.private_channel.id}/")
+        self.assertEqual(retrieve.status_code, status.HTTP_200_OK)
+        discovery = self.client.get("/api/v1/partner-channels/channels/")
+        ids = {row["id"] for row in discovery.data["results"]}
+        self.assertIn(str(self.private_channel.id), ids)
+
+    def test_stranger_cannot_add_themselves_as_member(self):
+        """Only channel-manage permission can add members — a non-owner
+        can't grant themselves (or anyone else) access this way either.
+
+        Uses the PUBLIC channel specifically: on the private one, get_object()
+        itself already 404s a non-member before this action's own manage-
+        permission check is ever reached (see
+        test_private_channel_direct_retrieve_404_for_stranger) — this test
+        isolates the manage-permission gate itself, which is what actually
+        stops a stranger who *can* see a channel from adding members to it."""
+        self.client.force_authenticate(self.stranger)
+        response = self.client.post(
+            f"/api/v1/partner-channels/channels/{self.public_channel.id}/members/",
+            {"user_id": str(self.stranger.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_stranger_add_member_on_private_channel_is_hidden_as_404(self):
+        """Companion to the above: for a channel the stranger can't even
+        see, the response is 404 (existence hidden), not 403 — consistent
+        with retrieve/subscribe's own behavior for the same case."""
+        self.client.force_authenticate(self.stranger)
+        response = self.client.post(
+            f"/api/v1/partner-channels/channels/{self.private_channel.id}/members/",
+            {"user_id": str(self.stranger.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_member_list_not_visible_to_non_member_even_for_public_channel(self):
+        """Privacy-by-default on the roster itself, not just channel
+        content — get_object() alone doesn't gate this for a public
+        channel, so the members() action's own explicit check is the real
+        enforcement point here."""
+        self.client.force_authenticate(self.stranger)
+        response = self.client.get(f"/api/v1/partner-channels/channels/{self.public_channel.id}/members/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class ChannelDiscoveryOrderingTests(_PersonalChannelTestBase):
+    """P0 fix: order_by('?') re-randomizes on every query, which breaks
+    pagination (duplicate/skipped rows across pages since page 2's query
+    re-randomizes independently of page 1's). Tests the property that
+    actually matters for pagination correctness: repeated, unmodified
+    queries return channels in the same order."""
+
+    def setUp(self):
+        super().setUp()
+        for i in range(5):
+            self._create_personal_channel(owner=self.owner, name=f"Channel {i}", slug=f"channel-{i}")
+
+    def test_repeated_discovery_queries_return_stable_order(self):
+        self.client.force_authenticate(self.owner)
+        first = self.client.get("/api/v1/partner-channels/channels/")
+        second = self.client.get("/api/v1/partner-channels/channels/")
+        first_ids = [row["id"] for row in first.data["results"]]
+        second_ids = [row["id"] for row in second.data["results"]]
+        self.assertEqual(first_ids, second_ids)
+        self.assertGreaterEqual(len(first_ids), 5)
