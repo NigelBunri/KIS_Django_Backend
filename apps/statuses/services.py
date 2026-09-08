@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from apps.accounts.models import UserContact
 
-from .models import StatusItem, StatusVisibility
+from .models import StatusItem, StatusModerationStatus, StatusVisibility
 
 
 def can_view_status(
@@ -30,6 +30,20 @@ def can_view_status(
     author_id = str(status_item.user_id)
     if author_id == viewer_id:
         return True
+    # Content-safety gate, centralized here so every read path that calls
+    # this function (list, search, mark_view, media_url) gets it
+    # automatically: a status still awaiting an async scan (video) or one
+    # a scan actually flagged must never be visible to anyone but its own
+    # author, who already returned True above. This is what makes
+    # "quarantined content cannot silently become publicly visible" true
+    # for the async (video) path — a synchronously-scanned image/audio/
+    # text status never reaches this point in a non-PASSED state at all
+    # (StatusCreateSerializer rejects it before the row is even created).
+    if status_item.moderation_status in (
+        StatusModerationStatus.PENDING_REVIEW,
+        StatusModerationStatus.BLOCKED,
+    ):
+        return False
     if author_id in blocked_user_ids or viewer_id in blocked_user_ids:
         return False
 

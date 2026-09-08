@@ -20,6 +20,23 @@ class StatusVisibility(models.TextChoices):
     ONLY_SHARE_WITH = "only_share_with", "Only share with"
 
 
+class StatusModerationStatus(models.TextChoices):
+    """Gates visibility to viewers other than the author — see
+    apps/statuses/services.py::can_view_status. Distinct from is_deleted
+    (author-initiated removal) and expires_at (time-based); this is
+    content-safety-initiated. PASSED is the default for every status that
+    either didn't need a visual scan (text/audio) or was scanned
+    synchronously and cleared (image, or video once its async scan
+    resolves clean) - real production behavior is unchanged for anyone
+    until MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED/MEDIA_SAFETY_SERVICE_
+    ENABLED are turned on, since scan_saved_upload_for_explicit_content
+    routes to the same always-passing stub path until then."""
+
+    PASSED = "passed", "Passed"
+    PENDING_REVIEW = "pending_review", "Pending review"
+    BLOCKED = "blocked", "Blocked"
+
+
 class StatusReplyPermission(models.TextChoices):
     CONTACTS = "contacts", "Contacts"
     NOBODY = "nobody", "Nobody"
@@ -52,6 +69,13 @@ class StatusItem(models.Model):
         max_length=16,
         choices=StatusReplyPermission.choices,
         default=StatusReplyPermission.CONTACTS,
+    )
+    moderation_status = models.CharField(
+        max_length=16,
+        choices=StatusModerationStatus.choices,
+        default=StatusModerationStatus.PASSED,
+        db_index=True,
+        help_text="Content-safety gate — see StatusModerationStatus and can_view_status().",
     )
     expires_at = models.DateTimeField(db_index=True)
     is_deleted = models.BooleanField(default=False)

@@ -442,3 +442,174 @@ class StatusMediaUploadTests(APITestCase):
         self.client.force_authenticate(self.author)
         res = self.client.get("/api/v1/statuses/00000000-0000-0000-0000-000000000000/media-url/")
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class StatusContentSafetyScanTests(APITestCase):
+    """P0 fix: both status upload paths called scan_upload_for_explicit_
+    content() with no file_path/storage_path at all, which — per that
+    function's own routing (apps/media/safety.py) — can never produce a
+    real detection; with live provider calls enabled it would instead
+    reject every single media status outright. Fixed by moving the scan
+    to after the file exists at a real storage location and routing
+    through scan_saved_upload_for_explicit_content() (the same shared
+    entry point the "4-of-5-sites" pass already uses elsewhere).
+
+    Mocks apps.statuses.status_media.scan_saved_upload_for_explicit_content
+    directly — that's the actual call this fix wires up — rather than the
+    real NudeNet model or content-safety service, since exercising real
+    inference isn't available in this environment (no GPU/model weights)
+    and isn't the point of this test: the point is that a real storage_path
+    is now passed in, and that the resulting decision correctly gates
+    StatusItem creation/visibility."""
+
+    def setUp(self):
+        self.author = User.objects.create_user(
+            phone="+2348000000201", password="password123", country="NG", display_name="Scanned Author",
+        )
+        self.contact = User.objects.create_user(
+            phone="+2348000000202", password="password123", country="NG", display_name="Contact",
+        )
+        UserContact.objects.create(
+            user=self.author, contact_user=self.contact,
+            contact_phone=self.contact.phone, contact_phone_number=self.contact.phone,
+            contact_display_name=self.contact.display_name,
+        )
+        UserContact.objects.create(
+            user=self.contact, contact_user=self.author,
+            contact_phone=self.author.phone, contact_phone_number=self.author.phone,
+            contact_display_name=self.author.display_name,
+        )
+        # APITestCase already provides self.client as a real APIClient —
+        # no need to construct one separately.
+
+    def _post_image(self):
+        upload = SimpleUploadedFile("photo.jpg", b"fake-jpeg-bytes", content_type="image/jpeg")
+        self.client.force_authenticate(self.author)
+        return self.client.post(
+            "/api/v1/statuses/", {"type": "image", "file": upload, "visibility": "contacts"}, format="multipart",
+        )
+
+    def _post_video(self):
+        upload = SimpleUploadedFile("clip.mp4", b"fake-mp4-bytes", content_type="video/mp4")
+        self.client.force_authenticate(self.author)
+        return self.client.post(
+            "/api/v1/statuses/", {"type": "video", "file": upload, "visibility": "contacts"}, format="multipart",
+        )
+
+    def _post_audio(self):
+        upload = SimpleUploadedFile("clip.m4a", b"fake-m4a-bytes", content_type="audio/m4a")
+        self.client.force_authenticate(self.author)
+        return self.client.post(
+            "/api/v1/statuses/", {"type": "audio", "file": upload, "visibility": "contacts"}, format="multipart",
+        )
+
+    def _decision(self, *, status_, quarantine, reason, requires_review=False):
+        from apps.media.safety import MediaSafetyDecision
+
+        return MediaSafetyDecision(
+            status=status_, quarantine=quarantine, provider="nudenet", reason=reason,
+            user_message="test message", requires_review=requires_review,
+        )
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_blocked_image_is_rejected_and_never_created(self, mock_scan):
+        mock_scan.return_value = self._decision(status_="blocked", quarantine=True, reason="nudenet_explicit:TEST")
+        response = self._post_image()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(StatusItem.objects.count(), 0)
+        # The scan really was called with a real, on-storage path — not
+        # skipped, not called with file_path=None like the pre-fix code.
+        self.assertTrue(mock_scan.called)
+        self.assertTrue(mock_scan.call_args.kwargs.get("storage_path"))
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_passed_image_is_created_and_visible(self, mock_scan):
+        mock_scan.return_value = self._decision(status_="passed", quarantine=False, reason="nudenet_clean")
+        response = self._post_image()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        item = StatusItem.objects.get(id=response.data["id"])
+        self.assertEqual(item.moderation_status, "passed")
+
+        self.client.force_authenticate(self.contact)
+        listing = self.client.get("/api/v1/statuses/")
+        author_entry = next((e for e in listing.data["results"] if e["user"]["id"] == str(self.author.id)), None)
+        self.assertIsNotNone(author_entry, "passed status should be visible to a contact")
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_queued_video_is_pending_and_hidden_from_others_but_visible_to_author(self, mock_scan):
+        from apps.statuses.status_media import NUDENET_SCAN_QUEUED_REASON
+
+        mock_scan.return_value = self._decision(
+            status_="pending_review", quarantine=True, reason=NUDENET_SCAN_QUEUED_REASON, requires_review=True,
+        )
+        with patch("apps.media.tasks.scan_video_and_resolve_task.delay") as mock_delay:
+            response = self._post_video()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        item = StatusItem.objects.get(id=response.data["id"])
+        self.assertEqual(item.moderation_status, "pending_review")
+        # The real point of this fix: quarantined/pending content must not
+        # silently become publicly visible — a genuinely async decision
+        # enqueues the same resolver task the other 3 video call sites use.
+        mock_delay.assert_called_once()
+        scan = MediaSafetyScan.objects.filter(result__resolution_id=str(item.id)).first()
+        self.assertIsNotNone(scan)
+        self.assertEqual(scan.result.get("resolution_target"), "status_item")
+
+        self.client.force_authenticate(self.contact)
+        listing = self.client.get("/api/v1/statuses/")
+        author_entry = next((e for e in listing.data["results"] if e["user"]["id"] == str(self.author.id)), None)
+        self.assertIsNone(author_entry, "pending_review video must not be visible to a contact yet")
+
+        self.client.force_authenticate(self.author)
+        own_listing = self.client.get("/api/v1/statuses/")
+        own_entry = next(e for e in own_listing.data["results"] if e["user"]["id"] == str(self.author.id))
+        self.assertEqual(len(own_entry["items"]), 1, "author must still see their own pending status")
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_async_resolution_flips_pending_video_to_passed_and_visible(self, mock_scan):
+        from apps.statuses.status_media import NUDENET_SCAN_QUEUED_REASON
+
+        mock_scan.return_value = self._decision(
+            status_="pending_review", quarantine=True, reason=NUDENET_SCAN_QUEUED_REASON, requires_review=True,
+        )
+        with patch("apps.media.tasks.scan_video_and_resolve_task.delay"):
+            response = self._post_video()
+        item_id = response.data["id"]
+        scan = MediaSafetyScan.objects.get(result__resolution_id=item_id)
+
+        # ContentSafetyProvider is imported locally inside
+        # scan_video_and_resolve_task (not at apps.media.tasks module
+        # level), so it must be patched at its defining module instead —
+        # the function-local `from .content_safety_provider import
+        # ContentSafetyProvider` still resolves to this patched object
+        # since the patch is active before the task runs.
+        with patch("apps.media.content_safety_provider.ContentSafetyProvider") as mock_provider_cls:
+            mock_provider_cls.return_value.scan.return_value = (None, 0.0)  # clean
+            from apps.media.tasks import scan_video_and_resolve_task
+
+            scan_video_and_resolve_task.run(scan_id=str(scan.id))
+
+        item = StatusItem.objects.get(id=item_id)
+        self.assertEqual(item.moderation_status, "passed")
+
+        self.client.force_authenticate(self.contact)
+        listing = self.client.get("/api/v1/statuses/")
+        author_entry = next((e for e in listing.data["results"] if e["user"]["id"] == str(self.author.id)), None)
+        self.assertIsNotNone(author_entry, "resolved-clean video should now be visible to a contact")
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_audio_status_never_invokes_visual_scan(self, mock_scan):
+        response = self._post_audio()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        item = StatusItem.objects.get(id=response.data["id"])
+        self.assertEqual(item.moderation_status, "passed")
+        mock_scan.assert_not_called()
+
+    @patch("apps.statuses.status_media.scan_saved_upload_for_explicit_content")
+    def test_text_status_never_invokes_visual_scan(self, mock_scan):
+        self.client.force_authenticate(self.author)
+        response = self.client.post(
+            "/api/v1/statuses/", {"type": "text", "text": "hello world", "visibility": "contacts"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        mock_scan.assert_not_called()

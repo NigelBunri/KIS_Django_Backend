@@ -1,5 +1,6 @@
 # apps/channels/views.py
 from django.db import models
+from django.db.models import Count, Q
 from rest_framework import viewsets, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -27,6 +28,29 @@ from apps.partners.services import (
     user_has_partner_permission,
 )
 from apps.partners.tiers import require_partner_feature
+
+
+def _is_member(channel: Channel, user) -> bool:
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    return ConversationMember.objects.filter(
+        conversation=channel.conversation, user=user, left_at__isnull=True,
+    ).exists()
+
+
+def _personal_channel_hidden_from(channel: Channel, user) -> bool:
+    """True if this is a personal (non-partner) PRIVATE channel and the
+    given user is neither its owner nor an existing member — i.e. it
+    should behave as if it doesn't exist for them: absent from discovery/
+    search, 404 on direct retrieve, rejected on self-subscribe. Partner
+    channels are untouched here — see channel_access_model_note()."""
+    if channel.partner_id:
+        return False
+    if channel.channel_type != Channel.ChannelType.PRIVATE:
+        return False
+    if user and getattr(user, "is_authenticated", False) and channel.owner_id == getattr(user, "id", None):
+        return False
+    return not _is_member(channel, user)
 
 
 class ChannelViewSet(viewsets.ModelViewSet):
@@ -57,11 +81,26 @@ class ChannelViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """
-        Public list:
-        - Return all non-archived channels.
-        - Allow optional search by ?q=
-        - Randomize order to avoid ranking bias.
+        Public (non-partner-scoped) list/search:
+        - Return all non-archived, non-hidden channels.
+        - Allow optional search by ?q= (real backend search — the same
+          queryset/filter/order the plain list uses, not a separate path).
+        - Deterministic order: subscriber count (a real, queryable signal —
+          not a fake/ML recommendation) then recency, both stable across
+          pages. Previously order_by("?") re-randomized on every request,
+          which breaks pagination outright (duplicate/skipped rows across
+          pages) — replaced, not just re-tuned.
+        - PRIVATE personal (non-partner) channels are excluded here for
+          anyone who isn't the owner or an existing member — see
+          _personal_channel_hidden_from()'s docstring for the full access
+          model. This is real ORM-level filtering (a correlated EXISTS
+          subquery), not a Python post-filter, so it doesn't break
+          pagination or force materializing the whole catalog into memory
+          the way the existing partner-branch visibility filter below
+          does (that one is unchanged in this pass — a separate, smaller-
+          scale case: one partner's channel list, not the whole platform).
         """
+        user = self.request.user
         qs = Channel.objects.select_related(
             "conversation",
             "owner",
@@ -90,7 +129,19 @@ class ChannelViewSet(viewsets.ModelViewSet):
             visible_ids = [channel.id for channel in filter_partner_channels_for_user(ordered_channels, self.request.user)]
             return qs.filter(id__in=visible_ids).order_by("category__order", "category__name", "order", "name")
 
-        return qs.order_by("?")
+        viewer_membership = ConversationMember.objects.filter(
+            conversation_id=models.OuterRef("conversation_id"), user=user, left_at__isnull=True,
+        )
+        qs = qs.annotate(_viewer_is_member=models.Exists(viewer_membership))
+        qs = qs.exclude(
+            models.Q(partner__isnull=True)
+            & models.Q(channel_type=Channel.ChannelType.PRIVATE)
+            & ~models.Q(owner_id=getattr(user, "id", None))
+            & models.Q(_viewer_is_member=False)
+        )
+
+        qs = qs.annotate(subscriber_count=Count("conversation__memberships", filter=Q(conversation__memberships__left_at__isnull=True), distinct=True))
+        return qs.order_by("-subscriber_count", "-created_at", "id")
 
     def get_object(self):
         channel = super().get_object()
@@ -100,6 +151,13 @@ class ChannelViewSet(viewsets.ModelViewSet):
             return channel
         if channel.partner_id and not partner_user_can_view_channel(channel, self.request.user):
             raise PermissionDenied("Not allowed to view this channel.")
+        if _personal_channel_hidden_from(channel, self.request.user):
+            # 404, not 403 - a private channel a non-member has no
+            # business knowing exists at all shouldn't even confirm its
+            # existence via a distinguishable error code.
+            from django.http import Http404
+
+            raise Http404("No Channel matches the given query.")
         return channel
 
     def _user_can_manage_channel(self, channel: Channel, user) -> bool:
@@ -207,6 +265,102 @@ class ChannelViewSet(viewsets.ModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=["post"], url_path="unsubscribe")
+    def unsubscribe(self, request, pk=None):
+        """
+        Leave this channel. Idempotent — calling it twice, or calling it
+        having never subscribed, both return 200 with subscribed=False
+        rather than a 404/409, since "not a member" is the end state
+        either way and a client retrying a dropped response shouldn't see
+        an error for a leave that already succeeded.
+
+        Soft-leaves (sets left_at) rather than deleting the
+        ConversationMember row, matching how every other conversation type
+        in this codebase already tracks membership history (chat groups,
+        communities) — re-subscribing later reuses/reactivates the same
+        row rather than risking a duplicate.
+        """
+        channel = self.get_object()
+        member = ConversationMember.objects.filter(
+            conversation=channel.conversation, user=request.user, left_at__isnull=True,
+        ).first()
+        if not member:
+            return Response({"subscribed": False}, status=status.HTTP_200_OK)
+        if member.base_role == BaseConversationRole.OWNER:
+            raise ValidationError({"detail": "The owner cannot unsubscribe — archive or transfer ownership instead."})
+        from django.utils import timezone
+
+        member.left_at = timezone.now()
+        member.save(update_fields=["left_at"])
+        return Response({"subscribed": False}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="members")
+    def members(self, request, pk=None):
+        """
+        GET  /channels/{id}/members/  — list current members. Requires
+             existing membership (or manage permission) — a private
+             channel's member list must not be enumerable by an outsider
+             even indirectly, matching get_object()'s own retrieve-time gate.
+        POST /channels/{id}/members/  — add a specific user as a member.
+             Requires channel-manage permission (owner, or admin/manager
+             via the partner permission system for partner channels). This
+             is the actual "invite" mechanism for PRIVATE personal
+             channels, since those reject self-service subscribe() —
+             see _personal_channel_hidden_from()'s docstring. Matches the
+             frontend's already-defined addMembersToChannel/
+             getChannelMembers routes, which previously pointed at a URL
+             with no backend handler at all for POST.
+        """
+        channel = self.get_object()
+        if request.method == "GET":
+            if not (_is_member(channel, request.user) or self._user_can_manage_channel(channel, request.user)):
+                raise PermissionDenied("Not allowed to view this channel's members.")
+            rows = ConversationMember.objects.filter(
+                conversation=channel.conversation, left_at__isnull=True,
+            ).select_related("user")
+            data = [
+                {
+                    "user_id": str(m.user_id),
+                    "display_name": getattr(m.user, "display_name", "") or getattr(m.user, "username", ""),
+                    "role": m.base_role,
+                }
+                for m in rows
+            ]
+            return Response({"results": data, "count": len(data)})
+
+        if not self._user_can_manage_channel(channel, request.user):
+            raise PermissionDenied("Not allowed to manage this channel's members.")
+        target_user_id = str(request.data.get("user_id") or "").strip()
+        if not target_user_id:
+            raise ValidationError({"user_id": "This field is required."})
+        requested_role = str(request.data.get("role") or BaseConversationRole.MEMBER).strip().lower()
+        if requested_role not in (BaseConversationRole.MEMBER, BaseConversationRole.ADMIN, BaseConversationRole.READONLY):
+            raise ValidationError({"role": "Must be member, admin, or readonly."})
+
+        from apps.accounts.models import User
+
+        try:
+            target_user = User.objects.get(id=target_user_id)
+        except User.DoesNotExist:
+            raise ValidationError({"user_id": "User not found."})
+
+        member, created = ConversationMember.objects.get_or_create(
+            conversation=channel.conversation,
+            user=target_user,
+            defaults={"base_role": requested_role},
+        )
+        if not created and member.left_at is not None:
+            # Re-adding someone who previously left — reactivate rather
+            # than error, same idempotent-membership convention as
+            # unsubscribe()'s own soft-leave.
+            member.left_at = None
+            member.base_role = requested_role
+            member.save(update_fields=["left_at", "base_role"])
+        return Response(
+            {"user_id": str(target_user.id), "role": member.base_role, "added": True},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
     @action(detail=True, methods=["get", "post"], url_path="overwrites")
     def overwrites(self, request, pk=None):
         channel = self.get_object()
@@ -276,6 +430,16 @@ class SubchannelViewSet(viewsets.ModelViewSet):
     - update:   PATCH  /api/v1/subchannels/{id}/
     - delete:   DELETE /api/v1/subchannels/{id}/
     - members:  GET    /api/v1/subchannels/{id}/members/
+
+    SECURITY: create/update/destroy/members all require channel-MANAGE
+    permission on the parent Channel — reuses partner_user_can_manage_
+    channel(), the exact same function ChannelViewSet.get_object() already
+    gates its own update/destroy/archive/overwrites actions with, rather
+    than a second, separately-maintained rule. Previously this ViewSet had
+    no ownership check at all beyond IsAuthenticated: any authenticated
+    user (not just the channel's owner/admins) could create, rename, or
+    delete a subchannel of ANY channel on the platform via a direct API
+    request — confirmed a real gap, not a theoretical one, fixed here.
     """
     permission_classes = [IsAuthenticated]
     serializer_class = SubchannelSerializer
@@ -287,6 +451,18 @@ class SubchannelViewSet(viewsets.ModelViewSet):
             qs = qs.filter(channel_id=channel_id)
         return qs
 
+    def get_object(self):
+        subchannel = super().get_object()
+        if self.action in {"update", "partial_update", "destroy"}:
+            if not partner_user_can_manage_channel(subchannel.channel, self.request.user):
+                raise PermissionDenied("Not allowed to manage this channel's subchannels.")
+        elif self.action == "members":
+            if not partner_user_can_view_channel(subchannel.channel, self.request.user):
+                raise PermissionDenied("Not allowed to view this channel.")
+        elif subchannel.channel.partner_id and not partner_user_can_view_channel(subchannel.channel, self.request.user):
+            raise PermissionDenied("Not allowed to view this channel.")
+        return subchannel
+
     def perform_create(self, serializer):
         channel_id = self.request.data.get("channel")
         if not channel_id:
@@ -295,6 +471,8 @@ class SubchannelViewSet(viewsets.ModelViewSet):
             channel = Channel.objects.get(pk=channel_id)
         except Channel.DoesNotExist:
             raise ValidationError({"channel": "Channel not found."})
+        if not partner_user_can_manage_channel(channel, self.request.user):
+            raise PermissionDenied("Not allowed to manage this channel's subchannels.")
         serializer.save(channel=channel, created_by=self.request.user)
 
     @action(detail=True, methods=["get"], url_path="members")
