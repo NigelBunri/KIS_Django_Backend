@@ -101,6 +101,11 @@ class ChannelDetailSerializer(ChannelImageUrlSerializerMixin, serializers.ModelS
     can_post = serializers.SerializerMethodField()
     category_id = serializers.UUIDField(source="category.id", read_only=True)
     category_name = serializers.CharField(source="category.name", read_only=True)
+    # Detail-view-only engagement/ownership context (not on ChannelListSerializer
+    # — a per-row COUNT would make the paginated discovery list N+1; the detail
+    # view is a single-object fetch, so the extra query here is negligible).
+    subscriber_count = serializers.SerializerMethodField()
+    owner_display_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Channel
@@ -119,10 +124,12 @@ class ChannelDetailSerializer(ChannelImageUrlSerializerMixin, serializers.ModelS
             "category_id",
             "category_name",
             "owner",
+            "owner_display_name",
             "is_archived",
             "is_subscribed",
             "member_role",
             "can_post",
+            "subscriber_count",
             "conversation_id",
             "created_at",
             "updated_at",
@@ -145,6 +152,24 @@ class ChannelDetailSerializer(ChannelImageUrlSerializerMixin, serializers.ModelS
     def get_can_post(self, obj):
         member = _member_for(obj, self.context["request"].user)
         return _can_send(obj, member, self.context["request"].user)
+
+    def get_subscriber_count(self, obj):
+        # get_queryset() already annotates this for the normal (non-partner-
+        # filtered) retrieve path — reuse it instead of a second query when
+        # present; fall back to a direct count for the partner-filtered
+        # branch (or any other path that reaches this serializer unannotated).
+        annotated = getattr(obj, "subscriber_count", None)
+        if annotated is not None:
+            return annotated
+        return ConversationMember.objects.filter(
+            conversation=obj.conversation, left_at__isnull=True,
+        ).count()
+
+    def get_owner_display_name(self, obj):
+        owner = obj.owner
+        if not owner:
+            return ""
+        return getattr(owner, "display_name", "") or getattr(owner, "username", "") or ""
 
 
 class ChannelCreateSerializer(ChannelImageUrlSerializerMixin, serializers.ModelSerializer):
