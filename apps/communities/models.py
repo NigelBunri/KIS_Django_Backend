@@ -137,6 +137,40 @@ class Community(models.Model):
         super().save(*args, **kwargs)
 
 
+class CommunityMembershipStatus(models.TextChoices):
+    """
+    The single source of truth for whether a membership row currently
+    grants access. Every membership check in this app must filter on this
+    field — not on left_at/is_banned directly — see
+    CommunityMembershipQuerySet.active() below.
+
+    ACTIVE  — full participant, currently in the community.
+    LEFT    — the user left voluntarily. May rejoin depending on the
+              community's join_policy (same rules as a first-time joiner).
+    REMOVED — an admin/mod removed them. Not permanently banned — future
+              rejoining follows the same join_policy as anyone else,
+              exactly like LEFT, but recorded distinctly for audit/UX
+              ("you were removed by an admin" vs "you left").
+    BANNED  — explicitly prohibited from joining or participating in any
+              way until an admin unbans them. Overrides join_policy
+              entirely: no join, no invite link, no join request, no
+              re-approval can lift this — only an explicit unban.
+    """
+
+    ACTIVE = "active", "Active"
+    LEFT = "left", "Left"
+    REMOVED = "removed", "Removed"
+    BANNED = "banned", "Banned"
+
+
+class CommunityMembershipQuerySet(models.QuerySet):
+    def active(self):
+        return self.filter(status=CommunityMembershipStatus.ACTIVE)
+
+    def banned(self):
+        return self.filter(status=CommunityMembershipStatus.BANNED)
+
+
 class CommunityMembership(models.Model):
     id = models.BigAutoField(primary_key=True)
     community = models.ForeignKey(
@@ -154,6 +188,13 @@ class CommunityMembership(models.Model):
         choices=CommunityRole.choices,
         default=CommunityRole.MEMBER,
     )
+    status = models.CharField(
+        max_length=16,
+        choices=CommunityMembershipStatus.choices,
+        default=CommunityMembershipStatus.ACTIVE,
+        db_index=True,
+        help_text="Single source of truth for membership state - see CommunityMembershipStatus.",
+    )
     can_access_all_groups = models.BooleanField(
         default=False,
         help_text="If true, member can access all groups in the community.",
@@ -161,11 +202,18 @@ class CommunityMembership(models.Model):
     joined_at = models.DateTimeField(default=timezone.now)
     left_at = models.DateTimeField(null=True, blank=True)
     is_muted = models.BooleanField(default=False)
+    # is_banned is kept as a derived, write-through mirror of
+    # status == BANNED for any external/legacy code (admin filters,
+    # reports, other apps) that still queries it directly - status is the
+    # only field new code should branch on. Always kept in sync by the
+    # mark_*()/reactivate() methods below; never set directly elsewhere.
     is_banned = models.BooleanField(default=False)
     lesson_access_only = models.BooleanField(
         default=False,
         help_text="Only enrolled for lesson-focused access.",
     )
+
+    objects = CommunityMembershipQuerySet.as_manager()
 
     class Meta:
         db_table = "community_membership"
@@ -173,11 +221,38 @@ class CommunityMembership(models.Model):
         indexes = [
             models.Index(fields=["community", "user"]),
             models.Index(fields=["user", "joined_at"]),
+            models.Index(fields=["community", "status"]),
         ]
 
     @property
     def is_active(self) -> bool:
-        return self.left_at is None and not self.is_banned
+        return self.status == CommunityMembershipStatus.ACTIVE
+
+    def reactivate(self, *, role: str | None = None) -> None:
+        """Transition to ACTIVE from any prior state (join/rejoin/approve/unban)."""
+        self.status = CommunityMembershipStatus.ACTIVE
+        self.left_at = None
+        self.is_banned = False
+        if role is not None:
+            self.role = role
+        self.joined_at = timezone.now()
+        self.save(update_fields=["status", "left_at", "is_banned", "role", "joined_at"])
+
+    def mark_left(self) -> None:
+        self.status = CommunityMembershipStatus.LEFT
+        self.left_at = timezone.now()
+        self.save(update_fields=["status", "left_at"])
+
+    def mark_removed(self) -> None:
+        self.status = CommunityMembershipStatus.REMOVED
+        self.left_at = timezone.now()
+        self.save(update_fields=["status", "left_at"])
+
+    def mark_banned(self) -> None:
+        self.status = CommunityMembershipStatus.BANNED
+        self.left_at = timezone.now()
+        self.is_banned = True
+        self.save(update_fields=["status", "left_at", "is_banned"])
 
 
 class CommunityJoinRequestStatus(models.TextChoices):
