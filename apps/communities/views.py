@@ -764,8 +764,10 @@ class CommunityViewSet(viewsets.ModelViewSet):
             expires_at=request.data.get("expires_at"),
         )
         from apps.communities.realtime import notify_member_banned
+        from apps.communities.notifications import notify_member_banned as notify_member_banned_persistent
 
         notify_member_banned(community, user_id, banned_by=request.user)
+        notify_member_banned_persistent(community, user_id)
         return Response(CommunityBanSerializer(ban).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="unban")

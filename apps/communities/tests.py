@@ -16,6 +16,7 @@ from apps.communities.models import (
     CommunityRole,
 )
 from apps.communities.serializers import CommunityPostSerializer
+from apps.notifications.models import Notification
 
 
 def _make_user(phone, username):
@@ -524,3 +525,125 @@ class CommunityRoleManagementTests(TestCase):
         self.assertEqual(assign_owner_res.status_code, status.HTTP_400_BAD_REQUEST, assign_owner_res.data)
         membership = CommunityMembership.objects.get(community=self.community, user=self.member)
         self.assertEqual(membership.role, CommunityRole.MEMBER)
+
+
+class CommunityNotificationTriggerTests(TestCase):
+    """
+    Asserts an actual Notification row is created for each Community
+    lifecycle trigger, not merely that the triggering action returned
+    success - a gap in the original Phase 5 pass that let a real bug
+    through: the `ban` action was missing its persistent-notification
+    call entirely (only `block_member` had it), found via live
+    verification and fixed alongside these tests.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = _make_user("+2348150000001", "notif-owner")
+        self.member = _make_user("+2348150000002", "notif-member")
+        self.requester = _make_user("+2348150000003", "notif-requester")
+        self.community = Community.objects.create(
+            owner=self.owner,
+            name="Notification Community",
+            slug="notification-community",
+            join_policy=CommunityJoinPolicy.REQUEST,
+        )
+        CommunityMembership.objects.create(community=self.community, user=self.owner, role=CommunityRole.OWNER)
+        CommunityMembership.objects.create(community=self.community, user=self.member, role=CommunityRole.MEMBER)
+
+    def test_join_request_created_notifies_admins_only(self):
+        self.client.force_authenticate(self.requester)
+        res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/request-join/", {}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        self.assertTrue(
+            Notification.objects.filter(
+                user_id=self.owner.id, type="community.join_request.created",
+            ).exists()
+        )
+        # Plain (non-admin) member must NOT be notified of join requests.
+        self.assertFalse(
+            Notification.objects.filter(
+                user_id=self.member.id, type="community.join_request.created",
+            ).exists()
+        )
+
+    def test_join_request_decided_notifies_requester(self):
+        self.client.force_authenticate(self.requester)
+        self.client.post(f"/api/v1/communities/{self.community.id}/request-join/", {}, format="json")
+        join_req = CommunityJoinRequest.objects.get(community=self.community, user=self.requester)
+
+        self.client.force_authenticate(self.owner)
+        res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/approve-request/",
+            {"request_id": str(join_req.id)}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        notif = Notification.objects.filter(
+            user_id=self.requester.id, type="community.join_request.decided",
+        ).first()
+        self.assertIsNotNone(notif)
+
+    def test_role_change_notifies_affected_member(self):
+        self.client.force_authenticate(self.owner)
+        res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "admin"}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        self.assertTrue(
+            Notification.objects.filter(
+                user_id=self.member.id, type="community.role_changed",
+            ).exists()
+        )
+
+    def test_removal_notifies_affected_member(self):
+        self.client.force_authenticate(self.owner)
+        res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/remove/",
+            {"user_id": str(self.member.id)}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        self.assertTrue(
+            Notification.objects.filter(
+                user_id=self.member.id, type="community.member_removed",
+            ).exists()
+        )
+
+    def test_ban_notifies_affected_member(self):
+        self.client.force_authenticate(self.owner)
+        res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/ban/",
+            {"user_id": str(self.member.id)}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        notif = Notification.objects.filter(
+            user_id=self.member.id, type="community.member_banned",
+        ).first()
+        self.assertIsNotNone(notif)
+        # No moderation detail (reason, banned_by) leaked into the
+        # notification body shown to the banned user.
+        self.assertNotIn("reason", notif.body.lower())
+
+    def test_block_member_also_notifies_affected_member(self):
+        # members/block is the second ban entrypoint (_ban_user's other
+        # caller) - must independently trigger the same notification,
+        # not just the /ban/ action.
+        self.client.force_authenticate(self.owner)
+        res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/block/",
+            {"user_id": str(self.member.id)}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        self.assertTrue(
+            Notification.objects.filter(
+                user_id=self.member.id, type="community.member_banned",
+            ).exists()
+        )
