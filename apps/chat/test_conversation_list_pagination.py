@@ -170,3 +170,39 @@ class ConversationListPaginationTests(TestCase):
         self.assertEqual(res.status_code, 200)
         ids = {row["id"] for row in res.json()["results"]}
         self.assertTrue({str(c.id) for c in convos}.issubset(ids))
+
+    def test_group_conversation_with_mixed_member_pin_states_is_not_duplicated(self):
+        # Regression guard for a real landmine in the ordering fix: ordering
+        # by `-memberships__is_pinned` on a queryset already filtered through
+        # the same `memberships` relation, combined with `.distinct()`, could
+        # in principle fan a single group conversation out into multiple rows
+        # if Postgres's DISTINCT (which must include ORDER BY columns in its
+        # SELECT list) saw more than one is_pinned value per conversation.
+        # That can only happen if the ORDER BY's join to `memberships` isn't
+        # scoped to the requesting user's own membership row. Verified via
+        # `.query` SQL inspection that Django reuses a single JOIN already
+        # constrained by the filter's `user_id` equality, but a group with
+        # actual mixed pin states across members is the real, direct test.
+        group = Conversation.objects.create(type=ConversationType.GROUP, created_by=self.user)
+        ConversationMember.objects.create(
+            conversation=group, user=self.user, base_role=BaseConversationRole.OWNER,
+            is_pinned=True,
+        )
+        other_members = []
+        for i in range(5):
+            peer = User.objects.create_user(phone=f"+234821{i:06d}", password="pw123456", country="NG")
+            ConversationMember.objects.create(
+                conversation=group, user=peer, base_role=BaseConversationRole.MEMBER,
+                is_pinned=False,  # deliberately opposite of self.user's own pin state
+            )
+            other_members.append(peer)
+
+        res = self.client.get("/api/v1/conversations/", {"page": 1, "page_size": 100})
+        self.assertEqual(res.status_code, 200)
+        ids = [row["id"] for row in res.json()["results"]]
+
+        self.assertEqual(
+            ids.count(str(group.id)), 1,
+            "group conversation was duplicated - ordering join is not scoped to the requesting user's own membership",
+        )
+        self.assertEqual(res.json()["meta"]["count"], 1)
