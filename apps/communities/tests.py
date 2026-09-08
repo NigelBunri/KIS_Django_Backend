@@ -666,3 +666,50 @@ class CommunityNotificationTriggerTests(TestCase):
                 user_id=self.member.id, type="community.member_banned",
             ).exists()
         )
+
+    def test_settings_changed_notifies_active_members_only_for_visibility_and_join_policy(self):
+        # A second active member so there's a real audience distinct from
+        # the owner making the change.
+        other_member = _make_user("+2348150000004", "notif-settings-member")
+        CommunityMembership.objects.create(
+            community=self.community, user=other_member, role=CommunityRole.MEMBER,
+        )
+        self.client.force_authenticate(self.owner)
+        res = self.client.patch(
+            f"/api/v1/communities/{self.community.id}/settings/",
+            {"visibility": "private", "join_policy": "invite_only"}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        self.assertTrue(
+            Notification.objects.filter(
+                user_id=other_member.id, type="community.settings_changed",
+            ).exists()
+        )
+        self.assertTrue(
+            Notification.objects.filter(
+                user_id=self.member.id, type="community.settings_changed",
+            ).exists()
+        )
+        # The owner who made the change is not notified of their own action.
+        self.assertFalse(
+            Notification.objects.filter(
+                user_id=self.owner.id, type="community.settings_changed",
+            ).exists()
+        )
+
+    def test_settings_changed_does_not_notify_for_minor_capability_toggles(self):
+        # allow_polls isn't in NOTIFIABLE_SETTINGS_FIELDS - toggling it
+        # shouldn't interrupt every member with a notification.
+        self.client.force_authenticate(self.owner)
+        res = self.client.patch(
+            f"/api/v1/communities/{self.community.id}/settings/",
+            {"allow_polls": False}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        self.assertFalse(
+            Notification.objects.filter(
+                user_id=self.member.id, type="community.settings_changed",
+            ).exists()
+        )
