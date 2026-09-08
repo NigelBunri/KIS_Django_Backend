@@ -206,3 +206,69 @@ class ConversationListPaginationTests(TestCase):
             "group conversation was duplicated - ordering join is not scoped to the requesting user's own membership",
         )
         self.assertEqual(res.json()["meta"]["count"], 1)
+
+
+class ConversationListMidPaginationConcurrencyTests(TestCase):
+    """
+    Phase 10.1 controlled concurrency check: what happens to REST page-number
+    pagination (offset-based) when a conversation's sort key changes between
+    fetching page 1 and page 2 - the exact race a live app can hit if a
+    message arrives mid-walk. This is a known, structural limitation of
+    OFFSET pagination over a live-changing ORDER BY key, not unique to this
+    fix. Documents the actual behavior with real evidence rather than
+    asserting it can't happen.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(phone="+2348100000201", password="pw123456", country="NG")
+        self.client.force_authenticate(self.user)
+
+    def test_conversation_crossing_the_page_boundary_between_fetches(self):
+        base_time = timezone.now()
+        conversations = []
+        for i in range(30):
+            peer = User.objects.create_user(phone=f"+234822{i:06d}", password="pw123456", country="NG")
+            convo = Conversation.objects.create(
+                type=ConversationType.DIRECT,
+                created_by=self.user,
+                last_message_at=base_time - datetime.timedelta(seconds=i),
+            )
+            ConversationMember.objects.create(conversation=convo, user=self.user, base_role=BaseConversationRole.OWNER)
+            ConversationMember.objects.create(conversation=convo, user=peer, base_role=BaseConversationRole.MEMBER)
+            conversations.append(convo)
+        # page_size=25 (default): page 1 = conversations[0..24], page 2 = conversations[25..29].
+
+        page1 = self.client.get("/api/v1/conversations/", {"page": 1}).json()
+        page1_ids = [row["id"] for row in page1["results"]]
+        self.assertEqual(len(page1_ids), 25)
+
+        # Simulate a message arriving, mid-walk, for the conversation that
+        # was about to be the FIRST item of page 2 - the worst case, since it
+        # jumps furthest (to position 0, ahead of everything already served
+        # on page 1).
+        boundary_convo = conversations[25]
+        Conversation.objects.filter(id=boundary_convo.id).update(last_message_at=timezone.now() + datetime.timedelta(hours=1))
+
+        page2 = self.client.get("/api/v1/conversations/", {"page": 2}).json()
+        page2_ids = [row["id"] for row in page2["results"]]
+
+        combined = page1_ids + page2_ids
+        boundary_id = str(boundary_convo.id)
+
+        # Real, observed, honestly-reported behavior (not "cannot happen"):
+        occurrences = combined.count(boundary_id)
+        if occurrences == 0:
+            outcome = "OMITTED - conversation is missing from both page fetches for this refresh cycle"
+        elif occurrences == 2:
+            outcome = "DUPLICATED - conversation appears on both page fetches for this refresh cycle"
+        else:
+            outcome = "present exactly once (lucky ordering for this data shape)"
+        print(f"\n[Phase 10.1 concurrency check] mid-pagination boundary-crossing outcome: {outcome}")
+
+        # This test intentionally does not assert occurrences == 1: the
+        # point is to observe and document REST pagination's real behavior
+        # under this race, not to claim the race is impossible. See the
+        # Phase 10.1 report for what actually happens and why the socket
+        # layer (untouched by this diff) is the real mitigation.
+        self.assertIn(occurrences, (0, 1, 2), "sanity check - id should appear 0, 1, or 2 times, never more")
