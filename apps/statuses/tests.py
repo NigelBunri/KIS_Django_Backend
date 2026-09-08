@@ -302,6 +302,254 @@ class StatusPrivacyContractTests(APITestCase):
         self.assertTrue(scan.quarantine)
 
 
+class StatusReplyTests(StatusPrivacyContractTests):
+    """apps/statuses/views.py::reply() - the known priority bug for Phase 4.
+
+    Reuses StatusPrivacyContractTests' fixtures (author/viewer/excluded/
+    stranger, with author<->viewer and author<->excluded as mutual
+    contacts) since reply() needs the exact same visibility matrix
+    can_view_status() already covers.
+
+    deliver_status_reply_message is patched at the apps.statuses.views
+    import site (not apps.statuses.services, since views.py does
+    `from apps.statuses.services import ... deliver_status_reply_message`
+    inside the method - patching the origin module wouldn't affect the
+    name already bound into views' local scope at call time) - this is a
+    real Django-side unit test, not a live Django<->Nest integration test,
+    so the actual HTTP call to Nest.js is deliberately not exercised here.
+    """
+
+    def _reply_url(self, status_item) -> str:
+        return f"/api/v1/statuses/{status_item.id}/reply/"
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_succeeds_for_visible_status_and_delivers_via_nest(self, mock_deliver):
+        mock_deliver.return_value = {"ok": True, "messageId": "msg-123", "seq": 1}
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "Nice status!"})
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(res.json()["message_id"], "msg-123")
+        self.assertTrue(res.json()["conversation_id"])
+        mock_deliver.assert_called_once()
+        _, kwargs = mock_deliver.call_args
+        self.assertEqual(kwargs["sender_id"], str(self.viewer.id))
+        self.assertEqual(kwargs["text"], "Nice status!")
+        self.assertTrue(
+            AuditLog.objects.filter(action="status.reply", target_id=status_item.id).exists()
+        )
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_404_when_viewer_is_excluded_from_audience(self, mock_deliver):
+        status_item = self._create_status(
+            author=self.author,
+            visibility=StatusVisibility.CONTACTS_EXCEPT,
+            targets=[self.excluded],
+        )
+
+        self.client.force_authenticate(self.excluded)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_404_for_stranger_outside_contacts(self, mock_deliver):
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.stranger)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_404_when_viewer_is_blocked(self, mock_deliver):
+        status_item = self._create_status(author=self.author)
+        UserBlock.objects.create(blocker=self.author, blocked=self.viewer)
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_403_when_author_disabled_replies(self, mock_deliver):
+        status_item = self._create_status(
+            author=self.author, reply_permission=StatusReplyPermission.NOBODY,
+        )
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_rejects_empty_text(self, mock_deliver):
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "   "})
+
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_deliver.assert_not_called()
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_reply_returns_502_when_nest_delivery_fails(self, mock_deliver):
+        from apps.statuses.services import StatusReplyDeliveryError
+
+        mock_deliver.side_effect = StatusReplyDeliveryError("boom")
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertFalse(
+            AuditLog.objects.filter(action="status.reply", target_id=status_item.id).exists()
+        )
+
+    def test_reply_returns_404_for_missing_status(self):
+        import uuid
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(f"/api/v1/statuses/{uuid.uuid4()}/reply/", {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class StatusDeletionAndMutationTests(StatusPrivacyContractTests):
+    """DELETE (real soft-delete + file cleanup) and PUT/PATCH (should be
+    entirely disabled) on /api/v1/statuses/{id}/ - Phase 4 hardening."""
+
+    def _delete_url(self, status_item) -> str:
+        return f"/api/v1/statuses/{status_item.id}/"
+
+    def test_owner_can_delete_own_status(self):
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.author)
+        res = self.client.delete(self._delete_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+        status_item.refresh_from_db()
+        self.assertTrue(status_item.is_deleted)
+
+    def test_deleted_status_disappears_from_viewer_list(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.author)
+        self.client.delete(self._delete_url(status_item))
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.get(reverse("statuses:status-list"))
+        author_entries = [
+            entry for entry in res.json()["results"] if entry["user"]["id"] == str(self.author.id)
+        ]
+        self.assertEqual(author_entries, [])
+
+    def test_deleting_status_removes_the_underlying_file(self):
+        status_item = self._create_status(author=self.author)
+        status_item.type = StatusType.IMAGE
+        status_item.file.save("test.jpg", SimpleUploadedFile("test.jpg", b"fake-bytes"), save=True)
+        storage = status_item.file.storage
+        stored_name = status_item.file.name
+        self.assertTrue(storage.exists(stored_name))
+
+        self.client.force_authenticate(self.author)
+        res = self.client.delete(self._delete_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(storage.exists(stored_name))
+
+    def test_stranger_cannot_delete_someone_elses_status(self):
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.stranger)
+        res = self.client.delete(self._delete_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        status_item.refresh_from_db()
+        self.assertFalse(status_item.is_deleted)
+
+    def test_put_and_patch_are_disabled(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.author)
+
+        patch_res = self.client.patch(self._delete_url(status_item), {"expires_at": "2099-01-01T00:00:00Z"})
+        put_res = self.client.put(self._delete_url(status_item), {"text": "rewritten"})
+
+        self.assertEqual(patch_res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        self.assertEqual(put_res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        status_item.refresh_from_db()
+        self.assertEqual(status_item.text, "Hello status")
+
+
+class StatusPurgeCommandTests(StatusPrivacyContractTests):
+    """apps.statuses.services.purge_expired_statuses / the
+    purge_expired_statuses management command - Phase 4 hardening for the
+    previously-nonexistent expiry cleanup (expires_at/is_deleted were
+    read-only filters everywhere, nothing ever actually purged a row)."""
+
+    def test_purges_soft_deleted_and_long_expired_statuses(self):
+        from datetime import timedelta
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from apps.statuses.services import purge_expired_statuses
+
+        soft_deleted = self._create_status(author=self.author)
+        soft_deleted.is_deleted = True
+        soft_deleted.save(update_fields=["is_deleted"])
+
+        long_expired = self._create_status(author=self.author)
+        StatusItem.objects.filter(id=long_expired.id).update(
+            expires_at=timezone.now() - timedelta(days=30)
+        )
+
+        recently_expired = self._create_status(author=self.author)
+        StatusItem.objects.filter(id=recently_expired.id).update(
+            expires_at=timezone.now() - timedelta(days=1)
+        )
+
+        still_active = self._create_status(author=self.author)
+
+        result = purge_expired_statuses(grace_days=7)
+
+        self.assertEqual(result["purged_count"], 2)
+        remaining_ids = set(StatusItem.objects.values_list("id", flat=True))
+        self.assertNotIn(soft_deleted.id, remaining_ids)
+        self.assertNotIn(long_expired.id, remaining_ids)
+        self.assertIn(recently_expired.id, remaining_ids)
+        self.assertIn(still_active.id, remaining_ids)
+
+        # The management command is a thin wrapper - confirm it actually
+        # invokes the same function rather than a second implementation.
+        call_command("purge_expired_statuses", "--grace-days", "0")
+        self.assertFalse(StatusItem.objects.filter(id=recently_expired.id).exists())
+        self.assertTrue(StatusItem.objects.filter(id=still_active.id).exists())
+
+    def test_purge_removes_the_underlying_file(self):
+        status_item = self._create_status(author=self.author)
+        status_item.type = StatusType.IMAGE
+        status_item.file.save("test.jpg", SimpleUploadedFile("test.jpg", b"fake-bytes"), save=True)
+        storage = status_item.file.storage
+        stored_name = status_item.file.name
+        status_item.is_deleted = True
+        status_item.save(update_fields=["is_deleted"])
+
+        from apps.statuses.services import purge_expired_statuses
+
+        purge_expired_statuses()
+
+        self.assertFalse(storage.exists(stored_name))
+        self.assertFalse(StatusItem.objects.filter(id=status_item.id).exists())
+
+
 INITIATE_URL = "/api/v1/media/uploads/initiate/"
 
 
