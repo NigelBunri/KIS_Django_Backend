@@ -1430,7 +1430,10 @@ def notify_nest_of_partner_event(
         return
 
     base = str(getattr(settings, "NEST_INTERNAL_URL", "")).strip().rstrip("/")
-    token = str(getattr(settings, "NEST_INTERNAL_TOKEN", "")).strip()
+    # Nest's InternalAuthGuard checks against its own DJANGO_INTERNAL_TOKEN
+    # env var, not NEST_INTERNAL_TOKEN (which Nest never reads) - see
+    # apps/chat/tasks.py's _post_to_nest for the full explanation.
+    token = str(getattr(settings, "DJANGO_INTERNAL_TOKEN", "")).strip()
     if not base or not token:
         return
 

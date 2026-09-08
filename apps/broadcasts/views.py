@@ -453,7 +453,10 @@ def _fetch_channel_messages(
     conversation_id: str | None = None,
 ) -> list[dict]:
     base = getattr(settings, "NEST_INTERNAL_URL", "").rstrip("/")
-    token = getattr(settings, "NEST_INTERNAL_TOKEN", "")
+    # Nest's InternalAuthGuard checks against its own DJANGO_INTERNAL_TOKEN
+    # env var, not NEST_INTERNAL_TOKEN (which Nest never reads) - see
+    # apps/chat/tasks.py's _post_to_nest for the full explanation.
+    token = getattr(settings, "DJANGO_INTERNAL_TOKEN", "")
     if not base or not token or not conversation_ids:
         return []
 
@@ -8802,7 +8805,7 @@ class BroadcastChannelMessageView(APIView):
         channel = Channel.objects.filter(conversation=conversation).first()
 
         valid_message_ids = [str(mid) for mid in message_ids if mid]
-        if getattr(settings, "NEST_INTERNAL_URL", "") and getattr(settings, "NEST_INTERNAL_TOKEN", ""):
+        if getattr(settings, "NEST_INTERNAL_URL", "") and getattr(settings, "DJANGO_INTERNAL_TOKEN", ""):
             fetched = _fetch_channel_messages(
                 [str(conversation_id)],
                 timezone.now() - timedelta(days=30),

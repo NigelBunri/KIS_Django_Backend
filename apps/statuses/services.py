@@ -162,7 +162,12 @@ def deliver_status_reply_message(*, conversation_id: str, sender_id: str, text: 
     from apps.chat.internal_signing import sign_internal_request
 
     base = str(getattr(settings, "NEST_INTERNAL_URL", "")).strip().rstrip("/")
-    token = str(getattr(settings, "NEST_INTERNAL_TOKEN", "")).strip()
+    # Nest's InternalAuthGuard checks against its own DJANGO_INTERNAL_TOKEN
+    # env var, not NEST_INTERNAL_TOKEN (which Nest never reads) - see
+    # apps/chat/tasks.py's _post_to_nest for the full explanation. Using
+    # the wrong secret here always failed with 401 invalid_token (confirmed
+    # via a real production test during this session's closure verification).
+    token = str(getattr(settings, "DJANGO_INTERNAL_TOKEN", "")).strip()
     if not base or not token:
         raise StatusReplyDeliveryError("Reply delivery is not configured.")
 

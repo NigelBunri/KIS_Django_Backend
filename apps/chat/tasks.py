@@ -12,9 +12,16 @@ logger = logging.getLogger(__name__)
 
 def _post_to_nest(path: str, payload: dict) -> None:
     base = getattr(settings, "NEST_INTERNAL_URL", "").rstrip("/")
-    token = getattr(settings, "NEST_INTERNAL_TOKEN", "")
+    # Nest's InternalAuthGuard checks incoming X-Internal-Auth against its
+    # own DJANGO_INTERNAL_TOKEN env var - the same shared secret already
+    # used symmetrically for the Nest->Django direction (see
+    # apps/chat/internal_auth.py). NEST_INTERNAL_TOKEN is a separate,
+    # unrelated setting that Nest's codebase never reads at all - using it
+    # here always failed with 401 invalid_token (confirmed via a real
+    # production test during this session's closure verification).
+    token = getattr(settings, "DJANGO_INTERNAL_TOKEN", "")
     if not base or not token:
-        logger.warning("[chat.tasks] Missing NEST_INTERNAL_URL or NEST_INTERNAL_TOKEN; skipping notify")
+        logger.warning("[chat.tasks] Missing NEST_INTERNAL_URL or DJANGO_INTERNAL_TOKEN; skipping notify")
         return
 
     # RealtimeInternalController is mounted at @Controller('internal') on

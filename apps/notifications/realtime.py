@@ -27,7 +27,10 @@ def notify_main_tab_badges_updated(
     must still succeed and clients will refresh on focus/fallback events.
     """
     base = getattr(settings, "NEST_INTERNAL_URL", "").rstrip("/")
-    token = getattr(settings, "NEST_INTERNAL_TOKEN", "")
+    # Nest's InternalAuthGuard checks against its own DJANGO_INTERNAL_TOKEN
+    # env var, not NEST_INTERNAL_TOKEN (which Nest never reads) - see
+    # apps/chat/tasks.py's _post_to_nest for the full explanation.
+    token = getattr(settings, "DJANGO_INTERNAL_TOKEN", "")
     clean_user_ids = sorted({str(user_id) for user_id in user_ids if user_id})
     if not base or not token or not clean_user_ids:
         return
