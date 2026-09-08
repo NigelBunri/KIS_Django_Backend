@@ -892,14 +892,18 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
         return response
 
     def partial_update(self, request, *args, **kwargs):
+        # No notify_post_updated call here: DRF's UpdateModelMixin.partial_update
+        # is implemented as `return self.update(request, *args, **kwargs)` -
+        # since self.update resolves to THIS class's own override above (not
+        # DRF's base), super().partial_update() below already runs that
+        # override in full, including its own notify_post_updated call. A
+        # second call here fired the live "post updated" event twice for
+        # every single PATCH - confirmed via live verification (two
+        # community.post_updated socket deliveries for one edit request).
         post = self.get_object()
         if not self._can_edit_post(post, request.user):
             raise PermissionDenied("You don't have permission to edit this post.")
-        response = super().partial_update(request, *args, **kwargs)
-        from apps.communities.realtime import notify_post_updated
-
-        notify_post_updated(post)
-        return response
+        return super().partial_update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
         # Real deletion is intentionally routed through the delete_post

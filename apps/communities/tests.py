@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.test import TestCase
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -291,6 +293,23 @@ class CommunityDefaultCrudPermissionTests(TestCase):
         self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
         post.refresh_from_db()
         self.assertEqual(post.text_plain, "Edited")
+
+    def test_patch_fires_post_updated_realtime_event_exactly_once(self):
+        # DRF's UpdateModelMixin.partial_update calls self.update(...)
+        # internally, which resolves to CommunityPostViewSet's own update()
+        # override - a naive notify call in both update() and
+        # partial_update() double-fires on every single PATCH. Found via
+        # live verification (two community.post_updated socket deliveries
+        # for one edit request).
+        post = CommunityPost.objects.create(
+            community=self.community, author=self.member, text_plain="Original", text_preview="Original",
+        )
+        self.client.force_authenticate(self.member)
+        edited_doc = {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Edited"}]}]}
+        with patch("apps.communities.realtime.notify_post_updated") as mock_notify:
+            res = self.client.patch(f"/api/v1/posts/{post.id}/", {"text": edited_doc}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(mock_notify.call_count, 1)
 
     def test_admin_can_edit_someone_elses_post(self):
         post = CommunityPost.objects.create(
