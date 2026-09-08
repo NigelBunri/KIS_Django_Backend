@@ -23,6 +23,7 @@ from apps.communities.serializers import (
 )
 from apps.communities.models import (
     CommunityMembership,
+    CommunityMembershipStatus,
     CommunityJoinRequest,
     CommunityJoinRequestStatus,
     CommunityRole,
@@ -80,7 +81,19 @@ class CommunityViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """
         - Return public communities when ?public=true is passed (for discovery).
-        - Otherwise return communities where the user is the owner or active member.
+        - Otherwise return communities where the user is the owner, an active
+          member, or which are publicly visible (so a genuine first-time
+          user can retrieve/join/request-join a public community they're
+          not a member of yet - get_object() for every detail action,
+          including join/request-join/members/invite-link, goes through
+          this same queryset; without the public OR-clause here, those
+          actions 404'd before ever reaching their own join_policy/
+          permission checks, so a real outsider could never successfully
+          join any community via the standard join route. Caught by the
+          Phase 5 regression tests, not previously covered by anything).
+          PRIVATE/HIDDEN communities remain invisible to non-members here,
+          as intended - they're only reachable via join_by_invite (which
+          looks up by invite_token, not by this queryset).
         - Supports ?search=, ?ordering=-member_count.
         """
         user = self.request.user
@@ -104,7 +117,7 @@ class CommunityViewSet(viewsets.ModelViewSet):
                 qs = qs.annotate(
                     member_count=models.Count(
                         "memberships",
-                        filter=models.Q(memberships__left_at__isnull=True, memberships__is_banned=False),
+                        filter=models.Q(memberships__status=CommunityMembershipStatus.ACTIVE),
                     )
                 ).order_by("-member_count")
             if partner_id:
@@ -131,9 +144,9 @@ class CommunityViewSet(viewsets.ModelViewSet):
             models.Q(owner=user)
             | models.Q(
                 memberships__user=user,
-                memberships__left_at__isnull=True,
-                memberships__is_banned=False,
+                memberships__status=CommunityMembershipStatus.ACTIVE,
             )
+            | models.Q(is_active=True, visibility=CommunityVisibility.PUBLIC)
         )
         if partner_id:
             qs = qs.filter(partner_id=partner_id)
@@ -158,11 +171,39 @@ class CommunityViewSet(viewsets.ModelViewSet):
             _log.error("community.create failed exc=%r validated=%r", exc, getattr(serializer, '_validated_data', None))
             raise
 
+    def update(self, request, *args, **kwargs):
+        # The default PUT/PATCH path had no permission check at all (only
+        # IsAuthenticated at the class level) - any authenticated user
+        # could rewrite any community's name/description/visibility/
+        # join_policy/is_active/etc via this route regardless of role,
+        # completely bypassing the correctly-checked update_settings
+        # action. avatar_url updates (CommunityInfoPage.tsx) are the one
+        # confirmed legitimate caller of this endpoint - gating it to
+        # owner/admin here is what makes that call safe.
+        community = self.get_object()
+        if not self._has_owner_privileges(community, request.user):
+            raise PermissionDenied("Only community owners/admins can update this community.")
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        community = self.get_object()
+        if not self._has_owner_privileges(community, request.user):
+            raise PermissionDenied("Only community owners/admins can update this community.")
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        # No frontend caller uses DELETE /communities/{id}/ - the intended
+        # path is the deactivate action (soft-delete, owner-only, already
+        # correctly checked). The default hard-delete route had zero
+        # permission check; block it outright rather than reviewing and
+        # exposing a second, more destructive deletion mechanism no one
+        # actually needs.
+        raise PermissionDenied("Communities cannot be deleted directly. Use the deactivate action.")
+
     def _get_membership(self, community: Community, user):
-        return CommunityMembership.objects.filter(
+        return CommunityMembership.objects.active().filter(
             community=community,
             user=user,
-            left_at__isnull=True,
         ).first()
 
     def _has_owner_privileges(self, community: Community, user):
@@ -201,23 +242,93 @@ class CommunityViewSet(viewsets.ModelViewSet):
     def _ensure_conversation_membership(self, community: Community, user):
         from apps.chat.models import ConversationMember, BaseConversationRole
 
-        if community.main_conversation_id:
-            ConversationMember.objects.get_or_create(
-                conversation=community.main_conversation,
+        for conversation in (community.main_conversation, community.posts_conversation):
+            if not conversation:
+                continue
+            member, created = ConversationMember.objects.get_or_create(
+                conversation=conversation,
                 user=user,
                 defaults={"base_role": BaseConversationRole.MEMBER},
             )
-        if community.posts_conversation_id:
-            ConversationMember.objects.get_or_create(
-                conversation=community.posts_conversation,
-                user=user,
-                defaults={"base_role": BaseConversationRole.MEMBER},
-            )
+            # get_or_create alone would leave a previously-removed
+            # ConversationMember row stale (left_at still set) when a user
+            # rejoins - they'd have a CommunityMembership but no working
+            # chat access, since nothing re-activates the conversation
+            # side. Symmetric to _remove_conversation_membership below.
+            if not created and member.left_at is not None:
+                member.left_at = None
+                member.save(update_fields=["left_at"])
+
+    def _remove_conversation_membership(self, community: Community, user_id):
+        from apps.chat.models import ConversationMember
+
+        conversation_ids = [
+            cid for cid in (community.main_conversation_id, community.posts_conversation_id) if cid
+        ]
+        if conversation_ids:
+            ConversationMember.objects.filter(
+                conversation_id__in=conversation_ids,
+                user_id=user_id,
+                left_at__isnull=True,
+            ).update(left_at=timezone.now())
 
     def _update_membership_role(self, membership: CommunityMembership, role: str):
         membership.role = role
         membership.save(update_fields=["role"])
         return membership
+
+    def _check_not_banned(self, community: Community, user):
+        if CommunityBan.objects.filter(community=community, user=user).exists():
+            raise PermissionDenied("You are banned from this community.")
+        membership = CommunityMembership.objects.filter(community=community, user=user).first()
+        if membership and membership.status == CommunityMembershipStatus.BANNED:
+            raise PermissionDenied("You are banned from this community.")
+
+    @transaction.atomic
+    def _activate_membership(self, community: Community, user, *, role=CommunityRole.MEMBER):
+        """
+        Single entry point for every way a user becomes an active member:
+        direct join, invite-link join, admin add-members, and approved
+        join requests all go through this. A ban check here is the ONE
+        place that decision is made, so every path enforces it identically
+        instead of each one re-implementing (and inevitably diverging on,
+        as join()/approve_request() previously did) the same rule -
+        join_by_invite() was the only path that got it right before this.
+        """
+        self._check_not_banned(community, user)
+        membership = CommunityMembership.objects.filter(community=community, user=user).first()
+        if membership is None:
+            membership = CommunityMembership.objects.create(
+                community=community,
+                user=user,
+                role=role,
+                status=CommunityMembershipStatus.ACTIVE,
+            )
+        elif membership.status != CommunityMembershipStatus.ACTIVE:
+            membership.reactivate(role=role)
+        self._ensure_conversation_membership(community, user)
+        return membership
+
+    @transaction.atomic
+    def _ban_user(self, community: Community, user_id, *, reason="", banned_by=None, expires_at=None):
+        """
+        Single canonical ban path. `ban` and `members/block` (below) both
+        call this now - previously they were two independent
+        implementations with different side effects (only one of them set
+        left_at), which is exactly why a ban()-banned user's membership
+        row could still look "active" everywhere that checked left_at
+        instead of status.
+        """
+        ban, _ = CommunityBan.objects.update_or_create(
+            community=community,
+            user_id=user_id,
+            defaults={"reason": reason, "banned_by": banned_by, "expires_at": expires_at},
+        )
+        membership = CommunityMembership.objects.filter(community=community, user_id=user_id).first()
+        if membership:
+            membership.mark_banned()
+        self._remove_conversation_membership(community, user_id)
+        return ban
 
     @action(detail=True, methods=["post"], url_path="deactivate")
     def deactivate(self, request, pk=None):
@@ -243,7 +354,7 @@ class CommunityViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="members")
     def members(self, request, pk=None):
         community = self.get_object()
-        qs = CommunityMembership.objects.filter(community=community, left_at__isnull=True)
+        qs = CommunityMembership.objects.active().filter(community=community)
         serializer = CommunityMembershipSerializer(qs, many=True)
         return Response(serializer.data)
 
@@ -258,18 +369,13 @@ class CommunityViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        membership, _ = CommunityMembership.objects.get_or_create(
-            community=community,
-            user=user,
-            defaults={"role": CommunityRole.MEMBER},
-        )
-        if membership.left_at is not None:
-            membership.left_at = None
-            membership.is_banned = False
-            membership.save(update_fields=["left_at", "is_banned"])
+        # _activate_membership raises PermissionDenied (-> 403) if the user
+        # is banned - join() no longer has its own copy of that check to
+        # forget.
+        membership = self._activate_membership(community, user, role=CommunityRole.MEMBER)
+        from apps.communities.realtime import notify_member_joined
 
-        self._ensure_conversation_membership(community, user)
-
+        notify_member_joined(community, membership)
         return Response(CommunityMembershipSerializer(membership).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="add-members")
@@ -295,24 +401,21 @@ class CommunityViewSet(viewsets.ModelViewSet):
 
         users = User.objects.filter(id__in=user_ids, is_active=True)
         added: list[str] = []
+        skipped_banned: list[str] = []
 
         for target in users:
             if target.id == request.user.id:
                 continue
-            m, created = CommunityMembership.objects.get_or_create(
-                community=community,
-                user=target,
-                defaults={"role": CommunityRole.MEMBER},
-            )
-            if m.left_at is not None or m.is_banned:
-                m.left_at = None
-                m.is_banned = False
-                m.save(update_fields=["left_at", "is_banned"])
-            self._ensure_conversation_membership(community, target)
-            if created:
+            try:
+                self._activate_membership(community, target, role=CommunityRole.MEMBER)
                 added.append(str(target.id))
+            except PermissionDenied:
+                skipped_banned.append(str(target.id))
 
-        return Response({"added": added, "count": len(added)}, status=status.HTTP_200_OK)
+        return Response(
+            {"added": added, "count": len(added), "skipped_banned": skipped_banned},
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["post", "delete"], url_path="leave")
     def leave(self, request, pk=None):
@@ -320,8 +423,10 @@ class CommunityViewSet(viewsets.ModelViewSet):
         membership = self._get_membership(community, request.user)
         if not membership:
             return Response({"detail": "Not a member."}, status=status.HTTP_400_BAD_REQUEST)
-        membership.left_at = timezone.now()
-        membership.save(update_fields=["left_at"])
+        membership.mark_left()
+        from apps.communities.realtime import notify_member_left
+
+        notify_member_left(community, membership, reason="left")
         return Response({"detail": "Left community."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="request-join")
@@ -333,15 +438,49 @@ class CommunityViewSet(viewsets.ModelViewSet):
                 {"detail": "Community does not use join requests."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        obj, _ = CommunityJoinRequest.objects.get_or_create(
+        self._check_not_banned(community, user)
+        existing_membership = self._get_membership(community, user)
+        if existing_membership:
+            return Response({"detail": "You are already a member."}, status=status.HTTP_400_BAD_REQUEST)
+
+        obj, created = CommunityJoinRequest.objects.get_or_create(
             community=community,
             user=user,
             defaults={"message": request.data.get("message", "")},
         )
+        if not created and obj.status != CommunityJoinRequestStatus.PENDING:
+            # Re-requesting after a rejection (or any other terminal state)
+            # must actually become a new pending request - get_or_create
+            # alone just returns the same, permanently-REJECTED row, which
+            # silently no-ops every future attempt and never becomes
+            # visible to admins again. Reopen the same row (still one row
+            # per community+user, per the unique_together constraint)
+            # rather than leaving it stuck.
+            obj.status = CommunityJoinRequestStatus.PENDING
+            obj.message = request.data.get("message", obj.message)
+            obj.reviewed_by = None
+            obj.reviewed_at = None
+            obj.save(update_fields=["status", "message", "reviewed_by", "reviewed_at"])
+            from apps.communities.realtime import notify_join_request_created
+            from apps.communities.notifications import (
+                notify_join_request_created as notify_join_request_created_persistent,
+            )
+
+            notify_join_request_created(community, obj)
+            notify_join_request_created_persistent(community, obj)
+        elif created:
+            from apps.communities.realtime import notify_join_request_created
+            from apps.communities.notifications import (
+                notify_join_request_created as notify_join_request_created_persistent,
+            )
+
+            notify_join_request_created(community, obj)
+            notify_join_request_created_persistent(community, obj)
         serializer = CommunityJoinRequestSerializer(obj)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="approve-request")
+    @transaction.atomic
     def approve_request(self, request, pk=None):
         community = self.get_object()
         if not self._has_owner_privileges(community, request.user):
@@ -351,20 +490,33 @@ class CommunityViewSet(viewsets.ModelViewSet):
         join_req = CommunityJoinRequest.objects.filter(id=request_id, community=community).first()
         if not join_req:
             return Response({"detail": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
+        if join_req.status != CommunityJoinRequestStatus.PENDING:
+            return Response(
+                {"detail": f"Request is already {join_req.status}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            self._activate_membership(community, join_req.user, role=CommunityRole.MEMBER)
+        except PermissionDenied as exc:
+            # The user was banned after requesting (or is banned under a
+            # different flow entirely) - leave the request PENDING rather
+            # than silently marking it approved with no real membership
+            # behind it. An admin can unban first, then approve.
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
 
         join_req.status = CommunityJoinRequestStatus.APPROVED
         join_req.reviewed_by = request.user
         join_req.reviewed_at = timezone.now()
         join_req.save(update_fields=["status", "reviewed_by", "reviewed_at"])
 
-        CommunityMembership.objects.update_or_create(
-            community=community,
-            user=join_req.user,
-            defaults={"role": CommunityRole.MEMBER, "left_at": None, "is_banned": False},
+        from apps.communities.realtime import notify_join_request_decided
+        from apps.communities.notifications import (
+            notify_join_request_decided as notify_join_request_decided_persistent,
         )
 
-        self._ensure_conversation_membership(community, join_req.user)
-
+        notify_join_request_decided(community, join_req, approved=True)
+        notify_join_request_decided_persistent(community, join_req, approved=True)
         return Response({"detail": "Approved."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="reject-request")
@@ -377,116 +529,137 @@ class CommunityViewSet(viewsets.ModelViewSet):
         join_req = CommunityJoinRequest.objects.filter(id=request_id, community=community).first()
         if not join_req:
             return Response({"detail": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
+        if join_req.status != CommunityJoinRequestStatus.PENDING:
+            return Response(
+                {"detail": f"Request is already {join_req.status}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         join_req.status = CommunityJoinRequestStatus.REJECTED
         join_req.reviewed_by = request.user
         join_req.reviewed_at = timezone.now()
         join_req.save(update_fields=["status", "reviewed_by", "reviewed_at"])
 
+        from apps.communities.realtime import notify_join_request_decided
+        from apps.communities.notifications import (
+            notify_join_request_decided as notify_join_request_decided_persistent,
+        )
+
+        notify_join_request_decided(community, join_req, approved=False)
+        notify_join_request_decided_persistent(community, join_req, approved=False)
         return Response({"detail": "Rejected."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="members/set-admin")
     def set_admin(self, request, pk=None):
+        # Kept for backward compatibility with any existing caller, but
+        # set_member_role below is the canonical, more general endpoint -
+        # this now just delegates to it instead of duplicating the same
+        # role-change logic a second time.
         community = self.get_object()
-        if not self._has_owner_privileges(community, request.user):
-            raise PermissionDenied("Only owners can change admin roles.")
-
-        user_id = request.data.get("user_id")
-        if not user_id:
-            return Response({"detail": "user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-        membership = CommunityMembership.objects.filter(
-            community=community,
-            user_id=user_id,
-            left_at__isnull=True,
-        ).first()
-        if not membership:
-            return Response({"detail": "Member not found."}, status=status.HTTP_404_NOT_FOUND)
-        if membership.role == CommunityRole.OWNER:
-            return Response({"detail": "Owner role cannot be modified."}, status=status.HTTP_400_BAD_REQUEST)
-
         make_admin = bool(request.data.get("make_admin", True))
-        target_role = CommunityRole.ADMIN if make_admin else CommunityRole.MEMBER
-        membership = self._update_membership_role(membership, target_role)
-        return Response(
-            {"user_id": str(user_id), "role": membership.role},
-            status=status.HTTP_200_OK,
-        )
+        role_value = CommunityRole.ADMIN if make_admin else CommunityRole.MEMBER
+        return self._set_member_role_response(community, request, role_value)
 
     @action(detail=True, methods=["post"], url_path="members/set-role")
     def set_member_role(self, request, pk=None):
         community = self.get_object()
+        role_value = request.data.get("role")
+        if not role_value:
+            return Response({"detail": "role is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            target_role = CommunityRole(role_value)
+        except ValueError:
+            return Response({"detail": "Invalid role value."}, status=status.HTTP_400_BAD_REQUEST)
+        return self._set_member_role_response(community, request, target_role)
+
+    def _set_member_role_response(self, community: Community, request, target_role: str):
         if not self._has_owner_privileges(community, request.user):
-            raise PermissionDenied("Only owners can change member roles.")
+            raise PermissionDenied("Only owners/admins can change member roles.")
 
         user_id = request.data.get("user_id")
-        role_value = request.data.get("role")
-        if not user_id or not role_value:
-            return Response({"detail": "user_id and role are required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not user_id:
+            return Response({"detail": "user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        membership = CommunityMembership.objects.filter(
+        membership = CommunityMembership.objects.active().filter(
             community=community,
             user_id=user_id,
-            left_at__isnull=True,
         ).first()
         if not membership:
             return Response({"detail": "Member not found."}, status=status.HTTP_404_NOT_FOUND)
         if membership.role == CommunityRole.OWNER:
             return Response({"detail": "Owner role cannot be modified."}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            target_role = CommunityRole(role_value)
-        except ValueError:
-            return Response({"detail": "Invalid role value."}, status=status.HTTP_400_BAD_REQUEST)
-
         if target_role == CommunityRole.OWNER:
             return Response({"detail": "Cannot assign owner role."}, status=status.HTTP_400_BAD_REQUEST)
 
+        previous_role = membership.role
         membership = self._update_membership_role(membership, target_role)
+
+        if previous_role != membership.role:
+            from apps.communities.realtime import notify_role_changed
+            from apps.communities.notifications import notify_role_changed as notify_role_changed_persistent
+
+            notify_role_changed(community, membership, previous_role=previous_role, changed_by=request.user)
+            notify_role_changed_persistent(community, membership, previous_role=previous_role)
+
         serializer = CommunityMembershipSerializer(membership)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="members/block")
     def block_member(self, request, pk=None):
+        # Historically a second, divergent ban implementation (it set
+        # left_at on the membership, the /ban/ action below didn't) - both
+        # routes now delegate to the one real ban path so they always
+        # produce identical, correct state.
         community = self.get_object()
         if not self._has_owner_privileges(community, request.user):
             raise PermissionDenied("Only admins can block members.")
         user_id = request.data.get("user_id")
         if not user_id:
             return Response({"detail": "user_id required."}, status=status.HTTP_400_BAD_REQUEST)
-        membership = CommunityMembership.objects.filter(
-            community=community,
-            user_id=user_id,
-            left_at__isnull=True,
-        ).first()
-        if membership:
-            membership.is_banned = True
-            membership.left_at = timezone.now()
-            membership.save(update_fields=["is_banned", "left_at"])
-
-        ban, _ = CommunityBan.objects.update_or_create(
-            community=community,
-            user_id=user_id,
-            defaults={"reason": "Blocked by community admin", "banned_by": request.user},
+        ban = self._ban_user(
+            community, user_id, reason="Blocked by community admin", banned_by=request.user
         )
+        from apps.communities.realtime import notify_member_banned
+        from apps.communities.notifications import notify_member_banned as notify_member_banned_persistent
+
+        notify_member_banned(community, user_id, banned_by=request.user)
+        notify_member_banned_persistent(community, user_id)
         return Response(CommunityBanSerializer(ban).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="members/remove")
+    @transaction.atomic
     def remove_member(self, request, pk=None):
+        """
+        Non-permanent removal - the member loses access immediately, but
+        is NOT banned: they can rejoin later through the community's
+        normal join_policy, exactly like anyone who left voluntarily.
+        Distinct from ban() below, which is permanent until explicitly
+        unbanned. This is what the frontend's "Remove from community"
+        action now actually calls (see CommunityInfoPage.tsx) - it
+        previously called ban() by mistake.
+        """
         community = self.get_object()
         if not self._has_owner_privileges(community, request.user):
             raise PermissionDenied("Only admins can remove members.")
         user_id = request.data.get("user_id")
         if not user_id:
             return Response({"detail": "user_id required."}, status=status.HTTP_400_BAD_REQUEST)
-        membership = CommunityMembership.objects.filter(
+        membership = CommunityMembership.objects.active().filter(
             community=community,
             user_id=user_id,
-            left_at__isnull=True,
         ).first()
         if not membership:
             return Response({"detail": "Member not found."}, status=status.HTTP_404_NOT_FOUND)
-        membership.left_at = timezone.now()
-        membership.save(update_fields=["left_at"])
+        if membership.role == CommunityRole.OWNER:
+            return Response({"detail": "The owner cannot be removed."}, status=status.HTTP_400_BAD_REQUEST)
+        membership.mark_removed()
+        self._remove_conversation_membership(community, user_id)
+
+        from apps.communities.realtime import notify_member_left
+        from apps.communities.notifications import notify_member_removed
+
+        notify_member_left(community, membership, reason="removed")
+        notify_member_removed(community, user_id)
         return Response({"detail": "Member removed."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["patch"], url_path="settings")
@@ -538,6 +711,12 @@ class CommunityViewSet(viewsets.ModelViewSet):
                 setattr(community, key, value)
             community.save(update_fields=list(updates.keys()))
 
+            from apps.communities.realtime import notify_settings_changed
+            from apps.communities.notifications import notify_settings_changed as notify_settings_changed_persistent
+
+            notify_settings_changed(community, changed_by=request.user, changed_fields=list(updates.keys()))
+            notify_settings_changed_persistent(community, changed_by=request.user, changed_fields=list(updates.keys()))
+
         serializer = CommunityDetailSerializer(community)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -574,36 +753,54 @@ class CommunityViewSet(viewsets.ModelViewSet):
         user_id = request.data.get("user_id")
         if not user_id:
             return Response({"detail": "user_id required."}, status=status.HTTP_400_BAD_REQUEST)
-        ban, _ = CommunityBan.objects.update_or_create(
-            community=community,
-            user_id=user_id,
-            defaults={
-                "reason": request.data.get("reason", ""),
-                "banned_by": request.user,
-                "expires_at": request.data.get("expires_at"),
-            },
+        target_membership = CommunityMembership.objects.filter(community=community, user_id=user_id).first()
+        if target_membership and target_membership.role == CommunityRole.OWNER:
+            return Response({"detail": "The owner cannot be banned."}, status=status.HTTP_400_BAD_REQUEST)
+        ban = self._ban_user(
+            community,
+            user_id,
+            reason=request.data.get("reason", ""),
+            banned_by=request.user,
+            expires_at=request.data.get("expires_at"),
         )
-        CommunityMembership.objects.filter(community=community, user_id=user_id).update(is_banned=True)
+        from apps.communities.realtime import notify_member_banned
+        from apps.communities.notifications import notify_member_banned as notify_member_banned_persistent
+
+        notify_member_banned(community, user_id, banned_by=request.user)
+        notify_member_banned_persistent(community, user_id)
         return Response(CommunityBanSerializer(ban).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="unban")
+    @transaction.atomic
     def unban(self, request, pk=None):
         community = self.get_object()
         if not self._has_owner_privileges(community, request.user):
             raise PermissionDenied("Only admins can unban.")
 
         user_id = request.data.get("user_id")
+        if not user_id:
+            return Response({"detail": "user_id required."}, status=status.HTTP_400_BAD_REQUEST)
         CommunityBan.objects.filter(community=community, user_id=user_id).delete()
-        CommunityMembership.objects.filter(community=community, user_id=user_id).update(is_banned=False)
+        membership = CommunityMembership.objects.filter(
+            community=community, user_id=user_id, status=CommunityMembershipStatus.BANNED
+        ).first()
+        if membership:
+            # Unbanning lifts the prohibition; it does not silently restore
+            # membership. The user still needs to (re)join through the
+            # community's normal join_policy, same as anyone else who
+            # isn't currently a member - a REQUEST or INVITE_ONLY community
+            # shouldn't readmit someone with no review just because they
+            # were once unbanned.
+            membership.status = CommunityMembershipStatus.LEFT
+            membership.is_banned = False
+            membership.save(update_fields=["status", "is_banned"])
         return Response({"detail": "Unbanned."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get", "post"], url_path="invite-link")
     def invite_link(self, request, pk=None):
         """GET returns current link; POST regenerates it. Admins only."""
         community = self.get_object()
-        membership = CommunityMembership.objects.filter(
-            community=community, user=request.user, left_at__isnull=True, is_banned=False
-        ).first()
+        membership = self._get_membership(community, request.user)
         role = membership.role if membership else None
         if role not in ("owner", "admin", "mod"):
             raise PermissionDenied("Only admins can manage the invite link.")
@@ -627,16 +824,17 @@ class CommunityViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Invalid or expired invite link."}, status=404)
         if not community.allow_join_link:
             return Response({"detail": "Invite links are disabled for this community."}, status=403)
-        existing = CommunityMembership.objects.filter(community=community, user=request.user).first()
-        if existing and existing.left_at is None and not existing.is_banned:
+        existing = self._get_membership(community, request.user)
+        if existing:
             return Response({"detail": "Already a member."})
-        if existing and existing.is_banned:
-            return Response({"detail": "You are banned from this community."}, status=403)
-        CommunityMembership.objects.update_or_create(
-            community=community,
-            user=request.user,
-            defaults={"role": CommunityRole.MEMBER, "left_at": None, "is_banned": False},
-        )
+        # _activate_membership raises PermissionDenied (-> 403) for a
+        # banned user - same single ban check every other join path now
+        # uses, instead of this route's own (previously correct, but now
+        # redundant) inline version of the same check.
+        membership = self._activate_membership(community, request.user, role=CommunityRole.MEMBER)
+        from apps.communities.realtime import notify_member_joined
+
+        notify_member_joined(community, membership)
         return Response({"detail": "Joined successfully.", "community_id": str(community.id)})
 
 
@@ -654,12 +852,66 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
         user = self.request.user
         community_id = self.request.query_params.get("community")
         blocked_ids = UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
-        qs = CommunityPost.objects.select_related("community", "author")
+        # Previously this only filtered by community_id when the caller
+        # happened to pass one - GET /posts/ with no query param (or a
+        # retrieve/update/destroy on any post id) returned/operated on
+        # posts from EVERY community, including PRIVATE and HIDDEN ones
+        # the requesting user isn't a member of. Mirrors the same
+        # public-or-member visibility rule CommunityViewSet.get_queryset()
+        # already applies to listing communities themselves.
+        visible_communities = Community.objects.filter(
+            models.Q(visibility=CommunityVisibility.PUBLIC)
+            | models.Q(owner=user)
+            | models.Q(memberships__user=user, memberships__status=CommunityMembershipStatus.ACTIVE)
+        ).distinct()
+        qs = CommunityPost.objects.select_related("community", "author").filter(
+            community__in=visible_communities
+        )
         if community_id:
             qs = qs.filter(community_id=community_id)
         if blocked_ids:
             qs = qs.exclude(author_id__in=blocked_ids)
         return qs.filter(is_deleted=False).order_by("-created_at")
+
+    def _can_edit_post(self, post: CommunityPost, user) -> bool:
+        return post.author_id == user.id or self._is_owner_or_admin(post.community, user)
+
+    def update(self, request, *args, **kwargs):
+        # PATCH /posts/{id}/ had no permission check at all beyond
+        # IsAuthenticated - any authenticated user could edit any post in
+        # any community. This is now the one canonical, secured edit path
+        # (the frontend previously called a nonexistent .../edit/ route -
+        # see CommunityFeedScreen.tsx's editEndpoint, now pointed here).
+        post = self.get_object()
+        if not self._can_edit_post(post, request.user):
+            raise PermissionDenied("You don't have permission to edit this post.")
+        response = super().update(request, *args, **kwargs)
+        from apps.communities.realtime import notify_post_updated
+
+        notify_post_updated(post)
+        return response
+
+    def partial_update(self, request, *args, **kwargs):
+        # No notify_post_updated call here: DRF's UpdateModelMixin.partial_update
+        # is implemented as `return self.update(request, *args, **kwargs)` -
+        # since self.update resolves to THIS class's own override above (not
+        # DRF's base), super().partial_update() below already runs that
+        # override in full, including its own notify_post_updated call. A
+        # second call here fired the live "post updated" event twice for
+        # every single PATCH - confirmed via live verification (two
+        # community.post_updated socket deliveries for one edit request).
+        post = self.get_object()
+        if not self._can_edit_post(post, request.user):
+            raise PermissionDenied("You don't have permission to edit this post.")
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        # Real deletion is intentionally routed through the delete_post
+        # action below (soft delete + permission check + real-time event).
+        # The default DELETE verb had zero permission check and would hard-
+        # delete via the ORM - block it outright rather than maintaining a
+        # second, divergent deletion mechanism.
+        raise PermissionDenied("Use the delete action to remove a post.")
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
@@ -685,11 +937,9 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
         if not posts:
             return {}
         community_ids = {post.community_id for post in posts if post.community_id}
-        memberships = CommunityMembership.objects.filter(
+        memberships = CommunityMembership.objects.active().filter(
             community_id__in=community_ids,
             user=user,
-            left_at__isnull=True,
-            is_banned=False,
         ).values_list("community_id", flat=True)
         member_ids = {str(cid) for cid in memberships}
         metadata = {}
@@ -706,11 +956,9 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
         return metadata
 
     def _get_membership(self, community: Community, user):
-        return CommunityMembership.objects.filter(
+        return CommunityMembership.objects.active().filter(
             community=community,
             user=user,
-            left_at__isnull=True,
-            is_banned=False,
         ).first()
 
     def _is_owner_or_admin(self, community: Community, user):
@@ -745,7 +993,11 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
         if community.require_post_approval:
             status_val = CommunityPostStatus.PENDING
 
-        serializer.save(author=self.request.user, status=status_val)
+        post = serializer.save(author=self.request.user, status=status_val)
+        if status_val == CommunityPostStatus.PUBLISHED:
+            from apps.communities.realtime import notify_post_created
+
+            notify_post_created(post)
 
     @action(detail=True, methods=["post"], url_path="comment")
     def comment(self, request, pk=None):
@@ -760,6 +1012,9 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
             author=request.user,
             text=request.data.get("text", ""),
         )
+        from apps.communities.realtime import notify_comment_created
+
+        notify_comment_created(comment)
         return Response(CommunityPostCommentSerializer(comment).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"], url_path="comment-room")
@@ -844,12 +1099,14 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="delete")
     def delete_post(self, request, pk=None):
         post = self.get_object()
-        membership = self._get_membership(post.community, request.user)
         is_owner = post.author_id == request.user.id
         if not (is_owner or self._is_owner_or_admin(post.community, request.user)):
             raise PermissionDenied("Not allowed to delete this post.")
         post.is_deleted = True
         post.save(update_fields=["is_deleted"])
+        from apps.communities.realtime import notify_post_deleted
+
+        notify_post_deleted(post)
         return Response({"detail": "Post deleted."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="broadcast")

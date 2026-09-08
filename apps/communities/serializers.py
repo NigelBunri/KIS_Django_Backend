@@ -13,6 +13,7 @@ from apps.communities.models import (
     CommunityPostReaction,
     CommunityCommentReaction,
     CommunityRole,
+    CommunityMembershipStatus,
 )
 from apps.chat.models import ConversationType  # must include POST
 from apps.accounts.models import User
@@ -46,11 +47,9 @@ class CommunityMembershipStateSerializerMixin:
             setattr(
                 obj,
                 cache_name,
-                CommunityMembership.objects.filter(
+                CommunityMembership.objects.active().filter(
                     community=obj,
                     user=user,
-                    left_at__isnull=True,
-                    is_banned=False,
                 ).first(),
             )
         return getattr(obj, cache_name)
@@ -229,6 +228,9 @@ class CommunityCreateSerializer(CommunityImageUrlSerializerMixin, serializers.Mo
             "slug",
             "description",
             "avatar_url",
+            "visibility",
+            "join_policy",
+            "post_policy",
             "create_main_conversation",
             "create_posts_conversation",
             "main_conversation_id",
@@ -236,6 +238,9 @@ class CommunityCreateSerializer(CommunityImageUrlSerializerMixin, serializers.Mo
         ]
         extra_kwargs = {
             "slug": {"required": False, "allow_blank": True},
+            "visibility": {"required": False},
+            "join_policy": {"required": False},
+            "post_policy": {"required": False},
         }
 
     def validate(self, attrs):
@@ -337,13 +342,14 @@ class CommunityMembershipSerializer(serializers.ModelSerializer):
             "community",
             "user",
             "role",
+            "status",
             "joined_at",
             "left_at",
             "is_muted",
             "is_banned",
             "can_access_all_groups",
         ]
-        read_only_fields = ["joined_at", "left_at", "is_banned"]
+        read_only_fields = ["status", "joined_at", "left_at", "is_banned"]
 
 
 def prepare_rich_text_attrs(attrs):
