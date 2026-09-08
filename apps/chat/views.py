@@ -9,6 +9,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Q
+from django.db.models.functions import Coalesce
 
 from .internal_auth import require_internal_auth
 from rest_framework import viewsets, mixins, status
@@ -281,6 +282,23 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 | Q(memberships__user__phone__icontains=q)
                 | Q(memberships__user__username__icontains=q)
             ).distinct()
+        # Deterministic ordering, required for stable page-number pagination:
+        # without an explicit ORDER BY, Postgres may return rows in a
+        # different order across two LIMIT/OFFSET calls against the same
+        # unordered query (esp. once autovacuum/concurrent writes touch the
+        # table), silently dropping or duplicating conversations across
+        # pages. Pinned-first, then most-recently-active (falling back to
+        # creation time for a conversation with no messages yet, so it
+        # doesn't jump to the top ahead of genuinely active conversations
+        # purely because NULL sorts first under a naive DESC ordering), then
+        # id as a final tiebreak for exact-timestamp ties.
+        qs = qs.annotate(
+            _list_sort_activity=Coalesce('last_message_at', 'created_at'),
+        ).order_by(
+            '-memberships__is_pinned',
+            '-_list_sort_activity',
+            '-id',
+        )
         return qs
 
     def get_serializer_class(self):
@@ -320,7 +338,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 | Q(memberships__user__phone__icontains=query)
                 | Q(memberships__user__username__icontains=query)
             ).distinct()
-        qs = qs.order_by("-last_message_at", "-updated_at")[:50]
+        # get_queryset() already applies the pinned/activity/id ordering
+        # above; re-slicing here just caps the search result count.
+        qs = qs[:50]
         data = ConversationListSerializer(qs, many=True, context={"request": request}).data
         return Response({"results": data, "count": len(data)}, status=status.HTTP_200_OK)
 
