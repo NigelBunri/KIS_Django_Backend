@@ -710,7 +710,23 @@ def confirm_upload_intent(*, user, upload_id) -> dict:
                             {"detail": "This upload context has no attachment handler configured."}
                         )
                     else:
-                        result = handler(intent, already_confirmed=False)
+                        try:
+                            result = handler(intent, already_confirmed=False)
+                        except ValidationError as exc:
+                            # A handler can reject the attach itself (e.g. an
+                            # explicit-content scan blocked it) — mirrors the
+                            # object_missing/size_mismatch/content_type_mismatch
+                            # branches above: mark_failed() writes commit as
+                            # part of this same transaction (which DOES
+                            # commit — only the raise is deferred), so any
+                            # audit rows the handler already wrote (a
+                            # MediaSafetyScan, a moderation alert) survive
+                            # instead of rolling back with an in-block raise.
+                            intent.mark_failed(
+                                "attach_rejected",
+                                str(getattr(exc, "detail", "") or "Attach rejected."),
+                            )
+                            error = exc
 
     if error is not None:
         raise error
@@ -725,6 +741,99 @@ def confirm_upload_intent(*, user, upload_id) -> dict:
 # serialized shape the surface's existing API already returns.
 # --------------------------------------------------------------------------
 
+def run_and_record_explicit_content_scan(intent: MediaUploadIntent, *, upload_context: str):
+    """Phase 2 wiring referenced in MediaModerationState's own docstring:
+    runs the same synchronous scan apps.media.views.UploadFileView uses for
+    the generic upload path, against the already-confirmed S3 object this
+    intent points at, then records the verdict onto both the append-only
+    MediaSafetyScan audit trail and the canonical asset's projected
+    moderation_state. Returns the MediaSafetyDecision so the caller can
+    decide whether to proceed with attaching.
+
+    Images only (synchronous scan cost is fine at this size); a video
+    context reaching here would need the same async-queue treatment
+    apps.statuses/apps.broadcasts already use, not implemented here."""
+    from .models import MediaSafetyScan
+    from .safety import NUDENET_SCAN_QUEUED_REASON, MediaSafetyDecision, scan_saved_upload_for_explicit_content
+
+    asset = intent.canonical_asset
+    mime_type = intent.content_type or ""
+    if mime_type.startswith("image/") or mime_type.startswith("video/"):
+        decision = scan_saved_upload_for_explicit_content(
+            storage_path=intent.object_key,
+            filename=intent.original_filename or "upload",
+            mime_type=mime_type,
+            context=upload_context,
+        )
+    else:
+        # NudeNet is a vision model — a non-image/video upload (e.g. a PDF
+        # complaint attachment) has nothing for it to scan. Recorded as
+        # "passed" rather than silently skipped, so the audit trail still
+        # shows every attach went through this checkpoint.
+        decision = MediaSafetyDecision(
+            status="passed", quarantine=False, provider="not_applicable",
+            reason="non_visual_mime_type", user_message="Upload accepted.", requires_review=False,
+        )
+
+    if asset is not None:
+        state_by_status = {
+            "passed": MediaModerationState.PASSED,
+            "pending_review": MediaModerationState.PENDING_REVIEW,
+            "blocked": MediaModerationState.QUARANTINED,
+        }
+        asset.moderation_state = state_by_status.get(decision.status, MediaModerationState.PENDING_REVIEW)
+        asset.save(update_fields=["moderation_state", "updated_at"])
+
+    scan = MediaSafetyScan.objects.create(
+        asset=asset,
+        owner=intent.owner,
+        upload_id=str(intent.id),
+        context=upload_context,
+        original_name=intent.original_filename or "upload",
+        mime_type=intent.content_type or "",
+        bytes=intent.size_bytes or 0,
+        checksum="",
+        provider=decision.provider,
+        status=decision.status,
+        quarantine=decision.quarantine,
+        requires_review=decision.requires_review,
+        policy_version=decision.policy_version,
+        reason=decision.reason,
+        result={**decision.as_metadata(), "surface": "upload_intent_attach", "upload_context": upload_context},
+    )
+    try:
+        from apps.moderation.services import create_media_safety_alert_for_scan
+
+        create_media_safety_alert_for_scan(scan, actor=intent.owner)
+    except Exception:
+        logger.warning(
+            "media_upload_intent.moderation_alert_failed",
+            extra={"upload_id": str(intent.id), "context": upload_context},
+        )
+
+    if decision.reason == NUDENET_SCAN_QUEUED_REASON and asset is not None:
+        # A video landed here: scan_saved_upload_for_explicit_content
+        # returned only a placeholder "pending" verdict, same as every
+        # other video call site (apps.statuses/apps.broadcasts) - this
+        # queues the real async resolution rather than leaving the scan
+        # (and the caller's attach decision) permanently stuck on the
+        # placeholder. Mirrors apps.media.views.UploadFileView's identical
+        # enqueue exactly, reusing the same generic MEDIA_ASSET resolver.
+        from .tasks import ContentSafetyResolutionTarget, scan_video_and_resolve_task
+
+        scan.result = {
+            **scan.result,
+            "resolution_target": ContentSafetyResolutionTarget.MEDIA_ASSET.value,
+            "resolution_id": str(asset.id),
+            "storage_path": intent.object_key,
+            "mime_type": intent.content_type or "",
+        }
+        scan.save(update_fields=["result"])
+        scan_video_and_resolve_task.delay(scan_id=str(scan.id))
+
+    return decision
+
+
 def _attach_profile_image(intent: MediaUploadIntent, field_name: str, *, already_confirmed: bool) -> dict:
     from apps.accounts.models import Profile
     from apps.accounts.serializers import ProfileSerializer
@@ -734,8 +843,18 @@ def _attach_profile_image(intent: MediaUploadIntent, field_name: str, *, already
     profile, _ = Profile.objects.select_for_update().get_or_create(user=intent.owner)
     field = getattr(profile, field_name)
     previous_name = field.name if field else None
+    is_new_upload = not already_confirmed or previous_name != intent.object_key
 
-    if not already_confirmed or previous_name != intent.object_key:
+    if is_new_upload:
+        decision = run_and_record_explicit_content_scan(intent, upload_context="profile")
+        if decision.status == "blocked":
+            logger.warning(
+                "media_upload_intent.profile_image_blocked",
+                extra={"upload_id": str(intent.id), "user_id": str(intent.owner_id), "field": field_name},
+            )
+            raise ValidationError({"detail": decision.user_message})
+
+    if is_new_upload:
         # Assigning .name directly (not .save(name, content)) binds the
         # already-uploaded S3 object without Django re-reading/re-uploading
         # the bytes — S3MediaStorage._object_key() is a pass-through, so

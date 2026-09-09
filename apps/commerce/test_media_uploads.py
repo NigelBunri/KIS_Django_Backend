@@ -243,6 +243,53 @@ class CommerceAttachTests(CommerceMediaUploadTestBase):
         product.refresh_from_db()
         self.assertTrue(product.main_image.name)
 
+    def test_clearly_prohibited_shop_image_is_rejected_not_attached(self, mock_client):
+        # Closes a real gap found while auditing AI-moderation coverage:
+        # resolve_confirmed_media() (the one choke point every commerce
+        # attach_*() function calls) previously never scanned anything at
+        # all. Mocks the scan boundary with a canned verdict - no real or
+        # simulated explicit content is used.
+        media_id = self._initiate_and_confirm(self.owner, mock_client)
+        self.client.force_authenticate(self.owner)
+        with patch("apps.media.safety.scan_saved_upload_for_explicit_content") as mock_scan:
+            from apps.media.safety import MediaSafetyDecision
+
+            mock_scan.return_value = MediaSafetyDecision(
+                status="blocked", quarantine=True, provider="nudenet",
+                reason="nudenet_explicit:TEST_LABEL", user_message="This upload was not accepted.",
+                requires_review=False, score=0.95,
+            )
+            response = self.client.post(
+                f"/api/v1/commerce/shops/{self.shop.id}/image/attach/", {"mediaId": media_id}, format="json",
+            )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.shop.refresh_from_db()
+        self.assertFalse(self.shop.image_file.name)
+
+    def test_ambiguous_product_image_still_attaches_and_is_flagged(self, mock_client):
+        product = Product.objects.create(shop=self.shop, sku="SKU-ATTACH-SAFETY", name="P-safety", price=Decimal("10.00"))
+        media_id = self._initiate_and_confirm(
+            self.owner, mock_client, purpose="product_main_image", productId=str(product.id),
+        )
+        self.client.force_authenticate(self.owner)
+        with patch("apps.media.safety.scan_saved_upload_for_explicit_content") as mock_scan:
+            from apps.media.safety import MediaSafetyDecision
+            from apps.media.models import MediaAsset, MediaModerationState
+
+            mock_scan.return_value = MediaSafetyDecision(
+                status="pending_review", quarantine=True, provider="nudenet",
+                reason="nudenet_low_confidence:TEST_LABEL", user_message="Your upload is under review.",
+                requires_review=True, score=0.4,
+            )
+            response = self.client.post(
+                f"/api/v1/commerce/products/{product.id}/main-image/attach/", {"mediaId": media_id}, format="json",
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        product.refresh_from_db()
+        self.assertTrue(product.main_image.name)
+        intent = MediaUploadIntent.objects.get(id=media_id)
+        self.assertEqual(intent.canonical_asset.moderation_state, MediaModerationState.PENDING_REVIEW)
+
     def test_replacing_shop_image_updates_db_before_deleting_old_object(self, mock_client):
         # Explicitly reuse ONE mock client across both round trips so the
         # delete_object assertion below inspects the client that's actually

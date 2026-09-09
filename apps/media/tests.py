@@ -206,7 +206,22 @@ class MediaSafetyUploadTests(APITestCase):
         self.assertNotIn("bucket_key", scan.result)
         self.assertNotIn("path", scan.result)
 
-    @override_settings(MEDIA_EXPLICIT_SCAN_REQUIRED=False, MEDIA_SAFETY_ENABLED=True)
+    @override_settings(
+        MEDIA_EXPLICIT_SCAN_REQUIRED=False,
+        MEDIA_SAFETY_ENABLED=True,
+        # Explicit rather than relying on these defaulting to off - this
+        # test's own point is "local-style configuration" (no live
+        # scanning infra at all), which must not silently depend on
+        # whatever values a given environment's MEDIA_SAFETY_LIVE_PROVIDER_
+        # CALLS_ENABLED / MEDIA_SAFETY_SERVICE_ENABLED happen to carry (e.g.
+        # production, where both are genuinely on). Without the service
+        # flag pinned off here too, scan_saved_upload_for_explicit_content
+        # calls the real content-safety service directly with this test's
+        # non-image byte fixture, which fails closed to pending_review
+        # instead of exercising the stub path this test is actually about.
+        MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED=False,
+        MEDIA_SAFETY_SERVICE_ENABLED=False,
+    )
     def test_upload_remains_usable_in_local_style_configuration(self):
         upload = SimpleUploadedFile("family-photo.jpg", b"safe image bytes", content_type="image/jpeg")
 
@@ -311,16 +326,39 @@ class MediaSafetyUploadTests(APITestCase):
         self.assertEqual(len(rows), 1)
 
 
+def _synthetic_test_jpeg_bytes() -> bytes:
+    """A tiny, genuinely valid, solid-color JPEG - not a real photo of
+    anyone or anything - so any code path that actually opens/decodes the
+    "uploaded" object (e.g. the explicit-content scan reading the object
+    body via default_storage.open()) gets real, decodable bytes instead of
+    crashing on a MagicMock. Safe/synthetic per this project's fixture
+    rules; regenerated lazily so importing this module never requires
+    Pillow unless a test actually calls _mock_s3_client()."""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), color=(120, 140, 160)).save(buf, format="JPEG")
+    return buf.getvalue()
+
+
 def _mock_s3_client(**overrides):
     """A MagicMock standing in for S3MediaStorage._client()'s boto3 client.
     All tests in MediaUploadIntentTests patch S3MediaStorage._client with
     this — no test in this class ever talks to real AWS."""
+    import io
+
     client = MagicMock()
     client.generate_presigned_url.return_value = "https://mock-bucket.s3.mock-region.amazonaws.com/mock-signed?X-Amz-Signature=redacted"
     # Matches _initiate()'s default size_bytes=1_000_000 so tests that don't
     # care about size stay within the confirm flow's declared/actual size
     # tolerance instead of accidentally tripping size_mismatch.
     client.head_object.return_value = {"ContentLength": 1_000_000, "ContentType": "image/jpeg"}
+    # A fresh BytesIO per call (side_effect, not return_value) - .read()
+    # consumes the stream, and confirm/attach flows that scan can call
+    # get_object more than once across a test.
+    client.get_object.side_effect = lambda **kwargs: {"Body": io.BytesIO(_synthetic_test_jpeg_bytes())}
     for key, value in overrides.items():
         setattr(client, key, value)
     return client
@@ -624,7 +662,11 @@ class CanonicalMediaAssetTests(APITestCase):
         self.assertEqual(asset.bytes, 1_000_000)
         self.assertEqual(asset.size, 1_000_000)  # alias property
         self.assertEqual(asset.status, "ready")
-        self.assertEqual(asset.moderation_state, MediaModerationState.NOT_SCANNED)
+        # Was NOT_SCANNED prior to the explicit-content-scan wiring fix in
+        # apps.media.upload_intent (profile_avatar auto-attach now actually
+        # scans, same as every other attach path) - PASSED here reflects
+        # the mocked S3 object (a clean synthetic JPEG) genuinely passing.
+        self.assertEqual(asset.moderation_state, MediaModerationState.PASSED)
         self.assertEqual(asset.visibility, MediaVisibility.PRIVATE)
         self.assertIsNotNone(asset.confirmed_at)
         # Phase 2: profile auto-attach now syncs the canonical asset too

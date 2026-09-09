@@ -215,6 +215,12 @@ def resolve_confirmed_media(*, user, media_id, expected_context: str) -> MediaUp
         raise ValidationError({"mediaId": f"This media is not confirmed (status={intent.status})."})
     if intent.attached_at is not None:
         raise ValidationError({"mediaId": "This media has already been attached and cannot be reused."})
+
+    decision = upload_intent.run_and_record_explicit_content_scan(intent, upload_context="commerce")
+    if decision.status == "blocked":
+        intent.mark_failed("explicit_content_blocked", decision.user_message)
+        raise ValidationError({"mediaId": decision.user_message})
+
     return intent
 
 
