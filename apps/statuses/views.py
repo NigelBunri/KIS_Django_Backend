@@ -598,6 +598,15 @@ class StatusViewSet(viewsets.ModelViewSet):
         text = (request.data.get("text") or "").strip()
         if not text:
             return Response({"detail": "Reply text is required."}, status=status.HTTP_400_BAD_REQUEST)
+        # Optional, client-generated idempotency key (same convention as a
+        # normal chat send's clientId - see chatTypes.ts on the RN side).
+        # A double-tap before the UI disables the send button re-uses the
+        # same key, so Nest's createIdempotent (keyed on conversationId +
+        # clientId) returns the existing message instead of creating a
+        # second one. Older app versions that don't send this yet get no
+        # regression - Nest already falls back to a random clientId of its
+        # own when none is forwarded, exactly like before this field existed.
+        client_id = (request.data.get("client_id") or "").strip() or None
 
         from apps.chat.services import get_or_create_direct_conversation
         from apps.statuses.services import StatusReplyDeliveryError, deliver_status_reply_message
@@ -629,6 +638,7 @@ class StatusViewSet(viewsets.ModelViewSet):
                 conversation_id=str(conversation.id),
                 sender_id=str(request.user.id),
                 text=text,
+                client_id=client_id,
             )
         except StatusReplyDeliveryError:
             return Response(

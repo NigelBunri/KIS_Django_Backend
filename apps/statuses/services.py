@@ -138,7 +138,7 @@ class StatusReplyDeliveryError(Exception):
     (caller's fault)."""
 
 
-def deliver_status_reply_message(*, conversation_id: str, sender_id: str, text: str) -> dict:
+def deliver_status_reply_message(*, conversation_id: str, sender_id: str, text: str, client_id: str | None = None) -> dict:
     """Creates the actual reply message via Nest.js/MongoDB — the only place
     real chat content lives (Django has no Message model at all; see
     RealtimeInternalController.sendMessageAsUser on the Nest side). This is
@@ -181,6 +181,14 @@ def deliver_status_reply_message(*, conversation_id: str, sender_id: str, text: 
         "senderId": str(sender_id),
         "text": text,
     }
+    # If the caller (a client-generated idempotency key from the reply
+    # compose UI - see apps/statuses/views.py's reply() action) forwards
+    # one, Nest's createIdempotent dedupes a retried/double-tapped reply
+    # into the existing message instead of creating a second one. When
+    # absent, Nest generates its own random clientId (its pre-existing
+    # behavior) - no regression for older app versions.
+    if client_id:
+        payload["clientId"] = client_id
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
