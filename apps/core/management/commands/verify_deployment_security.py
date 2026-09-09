@@ -99,7 +99,13 @@ class Command(BaseCommand):
                 not _is_weak_secret(getattr(settings, key, "")),
                 "present and strong enough by local policy",
             )
-        for key in ("JWT_SECRET", "DJANGO_INTERNAL_TOKEN", "NEST_INTERNAL_TOKEN"):
+        # NEST_INTERNAL_TOKEN intentionally excluded - it's never read by any
+        # code path. Every Django->Nest internal call signs with
+        # DJANGO_INTERNAL_TOKEN (the same secret already checked above),
+        # since that's the only one Nest's InternalAuthGuard verifies
+        # against. See apps/chat/tasks.py's _post_to_nest for the full
+        # explanation of why this used to be the wrong secret.
+        for key in ("JWT_SECRET", "DJANGO_INTERNAL_TOKEN"):
             value = os.environ.get(key, "")
             check(
                 f"{key} configured",
