@@ -33,6 +33,7 @@ class ReferralHistoryEntrySerializer(serializers.Serializer):
 
 class ReferralSummarySerializer(serializers.Serializer):
     code = serializers.CharField()
+    referral_link = serializers.CharField()
     current_referral_rate_percent = serializers.DecimalField(max_digits=5, decimal_places=2, allow_null=True)
     current_referral_rate_tier = serializers.CharField(allow_null=True)
     total_referred = serializers.IntegerField()

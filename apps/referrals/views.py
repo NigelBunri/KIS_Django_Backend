@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from django.conf import settings
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -46,8 +47,16 @@ class MyReferralsView(APIView):
         current_tier = get_current_tier(request.user)
         current_rate = get_referral_rate_percent(current_tier) if current_tier else None
 
+        # Same canonical-domain source as apps.groups/communities/partners'
+        # own invite_link actions (KIS_WEBSITE_PUBLIC_BASE_URL, resolved by
+        # apps.core.link_resolver.PublicLinkResolveView) - never the API
+        # host, which has no matching web route.
+        base = getattr(settings, "KIS_WEBSITE_PUBLIC_BASE_URL", "").rstrip("/")
+        referral_link = f"{base}/join/referral/{code_record.code}"
+
         payload = {
             "code": code_record.code,
+            "referral_link": referral_link,
             "current_referral_rate_percent": current_rate,
             "current_referral_rate_tier": current_tier.name if current_tier else None,
             "total_referred": referrals.count(),

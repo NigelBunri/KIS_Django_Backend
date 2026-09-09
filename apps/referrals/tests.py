@@ -449,6 +449,12 @@ class MyReferralsViewTests(TestCase):
         res = anon.get("/api/v1/referrals/me/")
         self.assertEqual(res.status_code, 401)
 
+    def test_response_includes_a_shareable_referral_link(self):
+        res = self.client.get("/api/v1/referrals/me/")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(f"/join/referral/{self.code.code}", res.data["referral_link"])
+        self.assertTrue(res.data["referral_link"].startswith("http"))
+
 
 # ---------------------------------------------------------------------
 # Phase 3: qualification-based referral engine

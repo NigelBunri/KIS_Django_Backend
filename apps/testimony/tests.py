@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import override_settings
@@ -9,7 +10,8 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
-from apps.media.models import MediaUploadIntent
+from apps.media.models import MediaSafetyScan, MediaUploadIntent
+from apps.media.safety import MediaSafetyDecision
 from .models import UserTestimony
 
 
@@ -137,3 +139,63 @@ class TestimonyMediaAttachmentTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+
+    # Testimony media is publicly viewable with no auth gate
+    # (can_view_testimony_media) and was found completely unscanned during
+    # an AI-moderation coverage audit - the worst combination in that
+    # audit. These mock the scan boundary with canned verdicts; no real or
+    # simulated explicit content is used anywhere here.
+
+    def test_clearly_prohibited_image_attachment_is_rejected_not_saved(self):
+        intent = _confirmed_intent(self.user, content_type="image/jpeg")
+        with patch("apps.media.safety.scan_saved_upload_for_explicit_content") as mock_scan:
+            mock_scan.return_value = MediaSafetyDecision(
+                status="blocked", quarantine=True, provider="nudenet",
+                reason="nudenet_explicit:TEST_LABEL", user_message="This upload was not accepted.",
+                requires_review=False, score=0.95,
+            )
+            response = self.client.post(
+                self._list_create_url(),
+                {"category": "faith", "title": "Prohibited image", "resource_attachment": {"media_id": str(intent.id)}},
+                format="json",
+            )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertFalse(UserTestimony.objects.filter(title="Prohibited image").exists())
+        intent.refresh_from_db()
+        self.assertIsNone(intent.attached_at)
+        scan = MediaSafetyScan.objects.get(upload_id=str(intent.id))
+        self.assertEqual(scan.status, "blocked")
+
+    def test_ambiguous_image_attachment_still_attaches_and_is_flagged(self):
+        intent = _confirmed_intent(self.user, content_type="image/jpeg")
+        with patch("apps.media.safety.scan_saved_upload_for_explicit_content") as mock_scan:
+            mock_scan.return_value = MediaSafetyDecision(
+                status="pending_review", quarantine=True, provider="nudenet",
+                reason="nudenet_low_confidence:TEST_LABEL", user_message="Your upload is under review.",
+                requires_review=True, score=0.4,
+            )
+            response = self.client.post(
+                self._list_create_url(),
+                {"category": "faith", "title": "Ambiguous image", "resource_attachment": {"media_id": str(intent.id)}},
+                format="json",
+            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        intent.refresh_from_db()
+        self.assertIsNotNone(intent.attached_at)
+        scan = MediaSafetyScan.objects.get(upload_id=str(intent.id))
+        self.assertTrue(scan.requires_review)
+
+    def test_video_attachment_queues_async_scan_instead_of_reading_synchronously(self):
+        # Video mustn't try to synchronously open the (real, unmocked) S3
+        # object this fixture never actually uploaded - it must route
+        # through the same placeholder-then-async-resolve path every other
+        # video call site uses.
+        intent = _confirmed_intent(self.user, content_type="video/mp4")
+        response = self.client.post(
+            self._list_create_url(),
+            {"category": "faith", "title": "Video queues safely", "resource_attachment": {"media_id": str(intent.id)}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        scan = MediaSafetyScan.objects.get(upload_id=str(intent.id))
+        self.assertEqual(scan.reason, "nudenet_scan_queued")

@@ -80,12 +80,25 @@ class UserTestimonySerializer(serializers.ModelSerializer):
     def get_safe_resource_url(self, obj):
         return _resolve_testimony_media_url(obj.resource_url, self.context.get("request"))
 
-    def _apply_attachment(self, instance, attachment):
+    def _resolve_attachment_intent(self, attachment):
+        # Deliberately called BEFORE create()/update() open their own
+        # transaction.atomic() block below - resolve_testimony_media() may
+        # run a real explicit-content scan and write a MediaSafetyScan
+        # audit row + mark_failed() on a rejection. Calling it from inside
+        # that later atomic block would roll those writes back the instant
+        # it raises (rejecting a blocked attachment), silently destroying
+        # the only audit trail of what got blocked and why - exactly the
+        # hazard apps.media.upload_intent.confirm_upload_intent's own
+        # handler-call site already guards against for the same reason.
         if not attachment:
-            return
+            return None
         media_id = attachment.get("media_id") or attachment.get("mediaId")
         request = self.context.get("request")
-        intent = resolve_testimony_media(user=request.user, media_id=media_id)
+        return resolve_testimony_media(user=request.user, media_id=media_id)
+
+    def _bind_attachment(self, instance, intent, attachment):
+        if intent is None:
+            return
         instance.resource_url = intent.object_key
         instance.resource_name = str(attachment.get("name") or intent.original_filename or "")[:255]
         instance.resource_mime_type = intent.content_type or ""
@@ -95,22 +108,26 @@ class UserTestimonySerializer(serializers.ModelSerializer):
 
         lifecycle.sync_attachment(intent=intent, target_type="testimony.UserTestimony", target_id=str(instance.id))
 
-    @transaction.atomic
     def create(self, validated_data):
-        # Atomic: _apply_attachment can raise (bad/foreign/reused media_id)
-        # after the row above is already inserted — without this, a
-        # rejected attachment left an orphaned text-only testimony behind
-        # instead of failing the request cleanly.
         attachment = validated_data.pop("resource_attachment", None)
-        instance = super().create(validated_data)
-        self._apply_attachment(instance, attachment)
+        intent = self._resolve_attachment_intent(attachment)
+        # Atomic from here down only: binding a resolved-valid intent can
+        # still fail for unrelated DB reasons after the row is inserted,
+        # and a rejected attachment must not leave an orphaned text-only
+        # testimony behind - but by this point the attachment has already
+        # passed (or been rejected with its audit trail intact by) content
+        # safety, outside this transaction.
+        with transaction.atomic():
+            instance = super().create(validated_data)
+            self._bind_attachment(instance, intent, attachment)
         return instance
 
-    @transaction.atomic
     def update(self, instance, validated_data):
         attachment = validated_data.pop("resource_attachment", None)
-        instance = super().update(instance, validated_data)
-        self._apply_attachment(instance, attachment)
+        intent = self._resolve_attachment_intent(attachment)
+        with transaction.atomic():
+            instance = super().update(instance, validated_data)
+            self._bind_attachment(instance, intent, attachment)
         return instance
 
 

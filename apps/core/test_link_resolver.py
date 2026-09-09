@@ -7,11 +7,13 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
+from apps.accounts.models import AuditLog
 from apps.chat.models import Conversation, ConversationType
 from apps.chat.models import ContactShareLink
 from apps.communities.models import Community
 from apps.groups.models import Group
 from apps.partners.models import Partner, PartnerInvite
+from apps.referrals.models import ReferralCode
 
 User = get_user_model()
 
@@ -174,6 +176,52 @@ class PublicLinkResolveViewTests(TestCase):
         resp = self.client.get(self._url("contact", "resolvertoken3"))
         self.assertEqual(resp.status_code, 410)
         self.assertEqual(resp.data["status"], "expired")
+
+    # --- referral ----------------------------------------------------------
+
+    def test_valid_referral_code_resolves(self):
+        code_record = ReferralCode.get_or_create_for_user(self.owner)
+        resp = self.client.get(self._url("referral", code_record.code))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["type"], "referral")
+        self.assertEqual(resp.data["referral_code"], code_record.code)
+
+    def test_referral_code_is_case_insensitive(self):
+        code_record = ReferralCode.get_or_create_for_user(self.owner)
+        resp = self.client.get(self._url("referral", code_record.code.lower()))
+        self.assertEqual(resp.status_code, 200)
+
+    def test_nonexistent_referral_code_is_404_not_500(self):
+        resp = self.client.get(self._url("referral", "NOTAREALCODE"))
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.data["status"], "invalid")
+
+    def test_referral_response_never_includes_owner_contact_info(self):
+        code_record = ReferralCode.get_or_create_for_user(self.owner)
+        resp = self.client.get(self._url("referral", code_record.code))
+        body_text = str(resp.data)
+        self.assertNotIn("+15550000101", body_text)
+        self.assertNotIn("resolver_owner@example.com", body_text)
+
+    def test_resolving_a_referral_link_logs_a_click_but_never_creates_a_referral(self):
+        # Clicking must never itself grant or imply a reward - only real
+        # registration (apps.referrals.services.register_referral) does.
+        from apps.referrals.models import Referral
+
+        code_record = ReferralCode.get_or_create_for_user(self.owner)
+        self.client.get(self._url("referral", code_record.code))
+        self.assertFalse(Referral.objects.filter(referrer=self.owner).exists())
+        self.assertTrue(
+            AuditLog.objects.filter(actor_id=self.owner.id, action="referral.link_clicked").exists()
+        )
+
+    def test_resolving_same_referral_link_twice_logs_two_separate_clicks(self):
+        code_record = ReferralCode.get_or_create_for_user(self.owner)
+        self.client.get(self._url("referral", code_record.code))
+        self.client.get(self._url("referral", code_record.code))
+        self.assertEqual(
+            AuditLog.objects.filter(actor_id=self.owner.id, action="referral.link_clicked").count(), 2,
+        )
 
     # --- no PII leakage --------------------------------------------------
 

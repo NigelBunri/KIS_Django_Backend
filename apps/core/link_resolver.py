@@ -27,7 +27,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-SUPPORTED_TYPES = {"call", "broadcast-call", "group", "community", "partner", "contact"}
+SUPPORTED_TYPES = {"call", "broadcast-call", "group", "community", "partner", "contact", "referral"}
 
 
 def _not_found():
@@ -119,6 +119,40 @@ def _resolve_contact(token: str):
     })
 
 
+def _resolve_referral(token: str):
+    """A ReferralCode is permanent and never revoked/expired (one per user,
+    created lazily, unique(). "This link is invalid" is the only failure
+    mode here — never expired/revoked, unlike the other resolvers.
+
+    Logs a real, minimal "link clicked" AuditLog event against the
+    referrer (reusing the existing audit mechanism rather than inventing a
+    new attribution-events model) — this is Part 8's "link clicked" state.
+    Deliberately does NOT create or touch any Referral row: clicking a
+    link is not attribution, and must never itself grant or imply a
+    reward. Attribution only happens for real at registration
+    (apps.referrals.services.register_referral, called with the referrer's
+    own code, independent of whether this endpoint was ever hit)."""
+    from apps.accounts.models import AuditLog
+    from apps.referrals.models import ReferralCode
+
+    code = (token or "").strip().upper()
+    code_record = ReferralCode.objects.select_related("user").filter(code=code).first()
+    if not code_record:
+        return _not_found()
+
+    referrer = code_record.user
+    AuditLog.log(referrer, "referral.link_clicked", {"referral_code": code})
+
+    display_name = getattr(referrer, "display_name", None) or getattr(referrer, "username", None) or "A KIS member"
+    return Response({
+        "status": "ok",
+        "type": "referral",
+        "name": display_name,
+        "avatar_url": getattr(getattr(referrer, "profile", None), "avatar_url", None) or None,
+        "referral_code": code,
+    })
+
+
 def _resolve_call(token: str, link_type: str):
     # No server-side validity check here on purpose (see module docstring)
     # - Django doesn't own call data and Nest's own join-by-token endpoint
@@ -139,6 +173,7 @@ _RESOLVERS = {
     "community": _resolve_community,
     "partner": _resolve_partner,
     "contact": _resolve_contact,
+    "referral": _resolve_referral,
 }
 
 
