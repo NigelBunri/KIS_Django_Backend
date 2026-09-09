@@ -600,3 +600,52 @@ class PrincipalRole(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user_id} -> {self.role_id} @ {self.scope_type}:{self.scope_id}"
+
+
+class ContactShareLink(models.Model):
+    """
+    A private, shareable link that lets someone start a direct-message
+    request with `owner` WITHOUT ever seeing `owner`'s phone number or any
+    other private identifier - the whole point of this model (see PART 7
+    of the deep-links spec: "no phone-number exposure... recipient must
+    not automatically gain access to private profile information").
+
+    Deliberately does NOT create or touch any Conversation itself - see
+    apps.chat.contact_links.redeem_contact_link(), which is the only
+    thing that ever calls get_or_create_direct_conversation(...,
+    use_request_flow=True) on a resolved link. That's the SAME pending-DM-
+    request path (and the same UserBlock check) every other "message this
+    person" entry point in this app already goes through - a contact link
+    is just a second way to arrive at that one real mechanism, not a new
+    messaging system.
+
+    One standing, reusable link per owner (mirrors Group/Community's own
+    invite_token - no per-use expiry by default), get-or-create + a real
+    regenerate-to-revoke path (a fresh token immediately invalidates
+    whoever still has the old link, matching the group/community
+    invite-link action's own semantics), plus an explicit is_active
+    kill-switch and optional expires_at for an owner who wants a
+    single-purpose link rather than a standing one.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name="contact_share_link",
+    )
+    token = models.CharField(max_length=64, unique=True, db_index=True)
+    is_active = models.BooleanField(default=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    use_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "chat_contact_share_link"
+
+    def is_expired(self) -> bool:
+        return bool(self.expires_at and self.expires_at <= timezone.now())
+
+    def is_redeemable(self) -> bool:
+        return self.is_active and not self.is_expired()

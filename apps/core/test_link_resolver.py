@@ -8,6 +8,7 @@ from django.urls import reverse
 from rest_framework.test import APIClient
 
 from apps.chat.models import Conversation, ConversationType
+from apps.chat.models import ContactShareLink
 from apps.communities.models import Community
 from apps.groups.models import Group
 from apps.partners.models import Partner, PartnerInvite
@@ -143,6 +144,36 @@ class PublicLinkResolveViewTests(TestCase):
         resp = self.client.get(self._url("broadcast-call", "any-token-at-all"))
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data["type"], "broadcast-call")
+
+    # --- contact -----------------------------------------------------
+
+    def test_valid_contact_link_resolves_without_exposing_owner_id_or_phone(self):
+        link = ContactShareLink.objects.create(owner=self.owner, token="resolvertoken1")
+        resp = self.client.get(self._url("contact", "resolvertoken1"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["type"], "contact")
+        body_text = str(resp.data)
+        self.assertNotIn(str(self.owner.id), body_text)
+        self.assertNotIn("+15550000101", body_text)
+
+    def test_inactive_contact_link_is_revoked(self):
+        ContactShareLink.objects.create(owner=self.owner, token="resolvertoken2", is_active=False)
+        resp = self.client.get(self._url("contact", "resolvertoken2"))
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.data["status"], "revoked")
+
+    def test_expired_contact_link_is_expired_status(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        ContactShareLink.objects.create(
+            owner=self.owner, token="resolvertoken3",
+            expires_at=timezone.now() - timedelta(hours=1),
+        )
+        resp = self.client.get(self._url("contact", "resolvertoken3"))
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.data["status"], "expired")
 
     # --- no PII leakage --------------------------------------------------
 

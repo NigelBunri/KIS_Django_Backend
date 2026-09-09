@@ -27,7 +27,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-SUPPORTED_TYPES = {"call", "broadcast-call", "group", "community", "partner"}
+SUPPORTED_TYPES = {"call", "broadcast-call", "group", "community", "partner", "contact"}
 
 
 def _not_found():
@@ -92,6 +92,33 @@ def _resolve_partner(token: str):
     })
 
 
+def _resolve_contact(token: str):
+    from apps.chat.models import ContactShareLink
+
+    link = ContactShareLink.objects.select_related("owner").filter(token=token).first()
+    if not link:
+        return _not_found()
+    if not link.is_active:
+        return Response({"status": "revoked", "detail": "This link is no longer active."}, status=410)
+    if link.is_expired():
+        return Response({"status": "expired", "detail": "This link has expired."}, status=410)
+    owner = link.owner
+    # Deliberately excludes owner.id (and obviously phone/email) - an
+    # unauthenticated caller gets only what's needed to decide whether to
+    # tap "Message", never a usable identifier. See
+    # apps.chat.contact_links.RedeemContactLinkView, the only place this
+    # token is ever resolved into a real action, which re-looks-up the
+    # owner from the token itself once the caller is authenticated -
+    # nothing here needs to round-trip an id through the client.
+    display_name = getattr(owner, "display_name", None) or getattr(owner, "username", None) or "This person"
+    return Response({
+        "status": "ok",
+        "type": "contact",
+        "name": display_name,
+        "avatar_url": getattr(getattr(owner, "profile", None), "avatar_url", None) or None,
+    })
+
+
 def _resolve_call(token: str, link_type: str):
     # No server-side validity check here on purpose (see module docstring)
     # - Django doesn't own call data and Nest's own join-by-token endpoint
@@ -111,6 +138,7 @@ _RESOLVERS = {
     "group": _resolve_group,
     "community": _resolve_community,
     "partner": _resolve_partner,
+    "contact": _resolve_contact,
 }
 
 
