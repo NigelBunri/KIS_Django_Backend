@@ -255,7 +255,12 @@ KIS_AI_FINANCIAL_ADVICE_ENABLED = _env_bool("KIS_AI_FINANCIAL_ADVICE_ENABLED", F
 # Public web / growth safety. Public pages expose only published public content
 # and redacted metadata; embeds still obey their stricter embed flags/policies.
 KIS_PUBLIC_WEB_ENABLED = _env_bool("KIS_PUBLIC_WEB_ENABLED", True)
-KIS_PUBLIC_WEB_BASE_URL = os.environ.get("KIS_PUBLIC_WEB_BASE_URL", "https://kis.app").strip().rstrip("/")
+# kis.app is registered (real DNS) but has no live web server behind it as
+# of 2026-09-09 (a direct HTTPS probe times out with no response) -
+# provisioning that is out of scope for a link-generation fix, so this
+# defaults to the one domain that's actually live and deployed today.
+# Override via env if/when kis.app is genuinely stood up.
+KIS_PUBLIC_WEB_BASE_URL = os.environ.get("KIS_PUBLIC_WEB_BASE_URL", "https://kingdomimpactventures.org").strip().rstrip("/")
 KIS_PUBLIC_WEB_INDEXING_ENABLED = _env_bool("KIS_PUBLIC_WEB_INDEXING_ENABLED", False)
 KIS_PUBLIC_REFERRALS_ENABLED = _env_bool("KIS_PUBLIC_REFERRALS_ENABLED", False)
 
@@ -616,6 +621,13 @@ REST_FRAMEWORK = {
         # brute-forcing them. Reusing password_reset's rate for recovery
         # (same risk class: a guessable token there is account takeover).
         "device_link": _env_throttle_rate("THROTTLE_DEVICE_LINK", dev_default="6000/min", prod_default="20/min"),
+        # Public deep-link resolver (group/community/partner/contact invite
+        # tokens) - AllowAny by design (the web landing page must show a
+        # preview before the visitor has logged in), same enumeration risk
+        # class as device_link/password_reset: a guessable token here
+        # reveals whether it's valid and, for contact links, a real user's
+        # name/photo.
+        "link_resolve": _env_throttle_rate("THROTTLE_LINK_RESOLVE", dev_default="6000/min", prod_default="30/min"),
         "upload": _env_throttle_rate("THROTTLE_UPLOAD", dev_default="6000/min", prod_default="300/min"),
         "search": _env_throttle_rate("THROTTLE_SEARCH", dev_default="6000/min", prod_default="600/min"),
         # ChannelContentViewEventView is AllowAny (anonymous viewers must be

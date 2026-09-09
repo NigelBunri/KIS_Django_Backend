@@ -512,7 +512,11 @@ class GroupViewSet(viewsets.ModelViewSet):
             group.invite_token = secrets.token_urlsafe(24)
             group.save(update_fields=["invite_token"])
 
-        base = getattr(settings, "SITE_URL", "").rstrip("/")
+        # SITE_URL is the Django API host itself (api.kingdomimpactventures.org)
+        # - a link built from it points at a domain with no matching web
+        # route at all. KIS_WEBSITE_PUBLIC_BASE_URL is the real, deployed
+        # website that actually serves /join/... (see PublicLinkResolveView).
+        base = getattr(settings, "KIS_WEBSITE_PUBLIC_BASE_URL", "").rstrip("/")
         invite_link = f"{base}/join/group/{group.invite_token}"
         return Response({"invite_link": invite_link, "invite_token": group.invite_token})
 

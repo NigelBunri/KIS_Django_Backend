@@ -720,6 +720,12 @@ class PartnerInviteSerializer(serializers.ModelSerializer):
     is_expired = serializers.BooleanField(read_only=True)
     has_uses_remaining = serializers.BooleanField(read_only=True)
     is_redeemable = serializers.SerializerMethodField()
+    # Partner invites previously had no shareable URL at all - only a raw
+    # code, meant to be typed into the app's own "redeem invite" field
+    # manually. This computes the same {base}/join/<type>/<token> shape
+    # every other invite type (group/community) already uses, so a partner
+    # invite can be shared as a real clickable link too.
+    invite_link = serializers.SerializerMethodField()
 
     class Meta:
         model = PartnerInvite
@@ -740,6 +746,7 @@ class PartnerInviteSerializer(serializers.ModelSerializer):
             "is_expired",
             "has_uses_remaining",
             "is_redeemable",
+            "invite_link",
             "created_at",
             "updated_at",
         ]
@@ -753,6 +760,7 @@ class PartnerInviteSerializer(serializers.ModelSerializer):
             "is_expired",
             "has_uses_remaining",
             "is_redeemable",
+            "invite_link",
             "created_at",
             "updated_at",
         ]
@@ -765,6 +773,14 @@ class PartnerInviteSerializer(serializers.ModelSerializer):
 
     def get_is_redeemable(self, obj):
         return obj.is_redeemable()
+
+    def get_invite_link(self, obj):
+        from django.conf import settings
+
+        base = str(getattr(settings, "KIS_WEBSITE_PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+        if not base:
+            return None
+        return f"{base}/join/partner/{obj.code}"
 
 
 class PartnerOnboardingProgressSerializer(serializers.ModelSerializer):

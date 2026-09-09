@@ -809,7 +809,11 @@ class CommunityViewSet(viewsets.ModelViewSet):
         if request.method == "POST" or not community.invite_token:
             community.invite_token = secrets.token_urlsafe(24)
             community.save(update_fields=["invite_token"])
-        base = getattr(settings, "SITE_URL", "").rstrip("/")
+        # SITE_URL is the Django API host itself (api.kingdomimpactventures.org)
+        # - a link built from it points at a domain with no matching web
+        # route at all. KIS_WEBSITE_PUBLIC_BASE_URL is the real, deployed
+        # website that actually serves /join/... (see PublicLinkResolveView).
+        base = getattr(settings, "KIS_WEBSITE_PUBLIC_BASE_URL", "").rstrip("/")
         link = f"{base}/join/community/{community.invite_token}"
         return Response({"invite_link": link, "invite_token": community.invite_token})
 

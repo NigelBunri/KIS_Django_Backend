@@ -62,6 +62,7 @@ from .views import (
     LinkPreviewView,
     TranslateView,
 )
+from .link_resolver import PublicLinkResolveView
 
 app_name = "core"
 
@@ -147,6 +148,7 @@ urlpatterns = [
     path("core/monetization/safety-summary/", MonetizationSafetySummaryView.as_view(), name="core-monetization-safety-summary"),
     path("core/ai/safety-policy/", AIAssistanceSafetyPolicyView.as_view(), name="core-ai-safety-policy"),
     path("link-preview/", LinkPreviewView.as_view(), name="link-preview"),
+    path("links/resolve/<str:link_type>/<str:token>/", PublicLinkResolveView.as_view(), name="public-link-resolve"),
     path("translate/", TranslateView.as_view(), name="translate"),
 ]
 
