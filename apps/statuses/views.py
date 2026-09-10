@@ -317,14 +317,19 @@ class StatusViewSet(viewsets.ModelViewSet):
             incoming_bytes = file_obj.size if file_obj else (resolved_intent.size_bytes if resolved_intent else None)
             if incoming_bytes is not None and incoming_bytes > limit_bytes:
                 raise ValidationError({"detail": "Status file exceeds your storage limit."})
+        # Hard product cap: a status lives for at most 2 days no matter what
+        # a tier's status_retention_days preset says (some tiers configure
+        # up to 14) - StatusItem.save()'s own fallback already defaults to
+        # 2 days when expires_at is omitted, so clamping here just makes
+        # every tier actually honor that ceiling instead of only the ones
+        # with no explicit retention preset.
         retention_days = features.get("status_retention_days")
-        expires_at = None
         if isinstance(retention_days, int) and retention_days > 0:
-            expires_at = timezone.now() + timedelta(days=retention_days)
-        if expires_at:
-            serializer.save(user=user, expires_at=expires_at)
+            retention_days = min(retention_days, 2)
         else:
-            serializer.save(user=user)
+            retention_days = 2
+        expires_at = timezone.now() + timedelta(days=retention_days)
+        serializer.save(user=user, expires_at=expires_at)
 
     @action(detail=False, methods=["get"], url_path="mine")
     def mine(self, request):

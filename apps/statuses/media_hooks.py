@@ -53,5 +53,5 @@ def can_view_status_media(user, asset) -> AccessDecision:
 def register() -> None:
     from apps.media import purposes
 
-    for name in ("status_image", "status_video", "status_audio"):
+    for name in ("status_image", "status_video", "status_audio", "status_document"):
         purposes.register_access_authorizer(name, can_view_status_media)

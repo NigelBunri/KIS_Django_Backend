@@ -12,6 +12,7 @@ class StatusType(models.TextChoices):
     VIDEO = "video", "Video"
     AUDIO = "audio", "Audio"
     TEXT = "text", "Text"
+    DOCUMENT = "document", "Document"
 
 
 class StatusVisibility(models.TextChoices):
@@ -57,6 +58,13 @@ class StatusItem(models.Model):
     type = models.CharField(max_length=16, choices=StatusType.choices)
     text = models.TextField(blank=True)
     file = models.FileField(upload_to=status_upload_path, null=True, blank=True)
+    # Only meaningfully used by type=document today - a PDF/Word attachment
+    # needs its real filename shown to viewers (there's no visual preview
+    # to identify it by, unlike image/video). The direct-to-S3 path stores
+    # the file under a random object key (see key_prefix in
+    # apps/media/upload_intent.py), so the name has to be captured
+    # separately at create time rather than derived from the storage path.
+    original_filename = models.CharField(max_length=255, blank=True)
     duration_ms = models.PositiveIntegerField(null=True, blank=True)
     style = models.JSONField(default=dict, blank=True)
     visibility = models.CharField(

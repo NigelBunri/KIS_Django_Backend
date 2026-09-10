@@ -38,6 +38,7 @@ class StatusItemSerializer(serializers.ModelSerializer):
             "text",
             "style",
             "file_url",
+            "original_filename",
             "duration_ms",
             "visibility",
             "reply_permission",
@@ -293,6 +294,7 @@ class StatusCreateSerializer(serializers.ModelSerializer):
             # in validate(), before any bytes existed anywhere, which is
             # exactly why it could never produce a real detection.
             item.file.save(upload_file.name, upload_file, save=False)
+            item.original_filename = upload_file.name
             if scannable:
                 decision, scan = run_status_content_safety_scan(
                     storage_path=item.file.name,
@@ -318,6 +320,7 @@ class StatusCreateSerializer(serializers.ModelSerializer):
             # at the model default (PASSED).
         elif intent is not None:
             item.file.name = intent.object_key
+            item.original_filename = intent.original_filename or ""
             if scannable:
                 decision, scan = run_status_content_safety_scan(
                     storage_path=intent.object_key,

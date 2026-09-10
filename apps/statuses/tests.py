@@ -14,6 +14,7 @@ from apps.statuses.models import (
     StatusAudienceTarget,
     StatusItem,
     StatusItemView,
+    StatusModerationStatus,
     StatusMute,
     StatusReplyPermission,
     StatusType,
@@ -620,6 +621,35 @@ class StatusMediaUploadTests(APITestCase):
         intent = MediaUploadIntent.objects.get(id=media_id)
         self.assertEqual(created.file.name, intent.object_key)
         self.assertIsNotNone(intent.attached_at)
+
+    def test_document_status_binds_object_key_and_preserves_original_filename(self, mock_client):
+        media_id = self._initiate_and_confirm(
+            mock_client,
+            context="status_document",
+            content_type="application/pdf",
+            filename="Sermon Notes.pdf",
+        )
+
+        res = self.client.post(
+            "/api/v1/statuses/",
+            {"type": StatusType.DOCUMENT, "media_id": media_id, "visibility": StatusVisibility.CONTACTS},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        created = StatusItem.objects.get(id=res.data["id"])
+        intent = MediaUploadIntent.objects.get(id=media_id)
+        self.assertEqual(created.file.name, intent.object_key)
+        self.assertEqual(created.original_filename, "Sermon Notes.pdf")
+        # Not visually scannable (see SCANNABLE_STATUS_TYPES) - passes
+        # immediately like audio/text, never queued for review.
+        self.assertEqual(created.moderation_status, StatusModerationStatus.PASSED)
+        # original_filename round-trips through the read serializer (list/
+        # search), not the create response - StatusCreateSerializer only
+        # returns write-relevant fields.
+        list_res = self.client.get("/api/v1/statuses/")
+        mine = next(entry for entry in list_res.data["results"] if entry["user"]["id"] == str(self.author.id))
+        self.assertEqual(mine["items"][0]["original_filename"], "Sermon Notes.pdf")
 
     def test_status_media_context_must_match_declared_type(self, mock_client):
         media_id = self._initiate_and_confirm(

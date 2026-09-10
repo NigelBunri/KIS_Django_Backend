@@ -307,6 +307,10 @@ register_purpose("status_audio", _PurposeSpec(
     context="status", moderation_context="status", retention_days=None,
     target_types=("statuses.StatusItem",), allow_attach=False, visibility_class="restricted",
 ))
+register_purpose("status_document", _PurposeSpec(
+    context="status", moderation_context="status", retention_days=None,
+    target_types=("statuses.StatusItem",), allow_attach=False, visibility_class="restricted",
+))
 
 # Channel/broadcast content video (creator studio upload). Like status_*
 # above, attachment happens at CREATE time on the owning record - but via

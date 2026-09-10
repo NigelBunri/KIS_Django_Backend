@@ -153,6 +153,20 @@ def _status_audio_max_bytes() -> int:
     return int(getattr(settings, "STATUS_AUDIO_MAX_UPLOAD_BYTES", 15 * 1024 * 1024))
 
 
+def _status_document_allowed_content_types() -> set[str]:
+    configured = getattr(settings, "STATUS_DOCUMENT_ALLOWED_CONTENT_TYPES", "")
+    values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
+    return values or {
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+
+
+def _status_document_max_bytes() -> int:
+    return int(getattr(settings, "STATUS_DOCUMENT_MAX_UPLOAD_BYTES", 20 * 1024 * 1024))
+
+
 def _education_image_allowed_content_types() -> set[str]:
     configured = getattr(settings, "EDUCATION_IMAGE_ALLOWED_CONTENT_TYPES", "")
     values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
@@ -332,6 +346,14 @@ UPLOAD_CONTEXTS: dict[str, UploadContextConfig] = {
         allowed_content_types=_status_audio_allowed_content_types,
         max_bytes=_status_audio_max_bytes,
         key_prefix="status/aud",
+    ),
+    # PDF/Word status attachments - not visually scannable (see
+    # SCANNABLE_STATUS_TYPES in apps/statuses/status_media.py), so like
+    # status_audio these go straight to moderation_status=PASSED.
+    "status_document": UploadContextConfig(
+        allowed_content_types=_status_document_allowed_content_types,
+        max_bytes=_status_document_max_bytes,
+        key_prefix="status/doc",
     ),
     # Education contexts. Like commerce, these are confirm-only (see
     # _confirm_only_media_descriptor) with a separate, per-institution-
@@ -943,6 +965,7 @@ ATTACH_HANDLERS: dict[str, Callable[[MediaUploadIntent], dict]] = {
     "status_video": _confirm_only_media_descriptor,
     "channel_content_video": _confirm_only_media_descriptor,
     "status_audio": _confirm_only_media_descriptor,
+    "status_document": _confirm_only_media_descriptor,
     "education_institution_logo": _confirm_only_media_descriptor,
     "education_module_cover_image": _confirm_only_media_descriptor,
     "education_material": _confirm_only_media_descriptor,

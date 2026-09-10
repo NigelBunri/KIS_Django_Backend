@@ -898,6 +898,19 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.broadcasts.tasks.purge_expired_broadcasts_task",
         "schedule": 24 * 60 * 60,
     },
+    # purge_expired_statuses existed as a real, working function and
+    # management command (apps/statuses/management/commands/
+    # purge_expired_statuses.py) but was never actually scheduled - a
+    # status's expires_at (2 days, hard-capped regardless of tier - see
+    # StatusViewSet.perform_create) already hid it from every read path,
+    # but the row and its media file sat in storage indefinitely unless
+    # someone ran the command by hand. Hourly, not daily: a poster
+    # deleting/reposting expects "gone" to mean gone reasonably soon, not
+    # up to a day later.
+    "purge-expired-statuses": {
+        "task": "apps.statuses.tasks.purge_expired_statuses_task",
+        "schedule": 60 * 60,
+    },
     # PhoneOTP rows (phone number + attempt count, tied to a hashed but
     # still purpose-identifying OTP code) had no cleanup of any kind -
     # every registration/login/reset/email-verify code ever issued stayed

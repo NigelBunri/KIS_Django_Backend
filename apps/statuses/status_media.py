@@ -40,6 +40,7 @@ STATUS_TYPE_TO_CONTEXT = {
     "image": "status_image",
     "video": "status_video",
     "audio": "status_audio",
+    "document": "status_document",
 }
 
 # Only image/video actually have visual content for NudeNet to inspect —

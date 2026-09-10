@@ -79,11 +79,11 @@ def can_view_status(
 
 
 def purge_expired_statuses(*, limit: int = 500, grace_days: int = 7) -> dict:
-    """Manual/cron fallback for hard-deleting old StatusItem rows and their
-    media - mirrors apps/media/management/commands/expire_media_uploads.py's
-    documented purpose: this exists for deployments that don't run Celery
-    Beat (this repo has no confirmed-running Beat schedule at all - see the
-    Phase 4 report), not as a second cleanup mechanism competing with one.
+    """Hard-deletes old StatusItem rows and their media. Scheduled hourly
+    via apps.statuses.tasks.purge_expired_statuses_task (see
+    CELERY_BEAT_SCHEDULE); also callable by hand via the
+    purge_expired_statuses management command for a deployment where Celery
+    Beat isn't running.
 
     Before this, expires_at and is_deleted were read-only filters used by
     every query in this app but nothing ever actually removed a row or its
