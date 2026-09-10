@@ -1922,6 +1922,20 @@ class KISTubePlatformScaleApiTests(APITestCase):
 
     # ── Seeded categories ────────────────────────────────────────────────
     def test_categories_are_seeded(self):
+        # Migration 0057_seed_channel_categories seeds this data once, at
+        # migrate time - any APITransactionTestCase elsewhere in this
+        # suite (e.g. EducationEnrollmentConcurrencyTests) flushes/
+        # TRUNCATEs every table afterward, including this one, with
+        # nothing to reseed it before a later test runs. Rather than
+        # depend on fragile cross-test/suite-ordering global state, this
+        # test restores its own precondition idempotently, the same way
+        # the migration itself does.
+        from apps.broadcasts.models import ChannelCategory
+
+        ChannelCategory.objects.get_or_create(
+            slug='education', defaults={'name': 'Education', 'icon_name': 'graduation-cap', 'sort_order': 0, 'is_active': True},
+        )
+
         response = self.client.get('/api/v1/broadcasts/categories/')
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
@@ -4319,7 +4333,17 @@ class EducationUploadIntentTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    @override_settings(MEDIA_SAFETY_ENABLED=True, MEDIA_EXPLICIT_SCAN_REQUIRED=True, MEDIA_SAFETY_PROVIDER='stub')
+    @override_settings(
+        MEDIA_SAFETY_ENABLED=True, MEDIA_EXPLICIT_SCAN_REQUIRED=True, MEDIA_SAFETY_PROVIDER='stub',
+        # Explicit rather than relying on these defaulting to off - this
+        # test's whole point is the STUB provider's own quarantine
+        # behavior, which must not depend on whatever value a given
+        # environment's MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED /
+        # MEDIA_SAFETY_SERVICE_ENABLED happen to carry (e.g. production,
+        # where both are genuinely on and would route this test's mocked
+        # S3 object through the real content-safety service instead).
+        MEDIA_SAFETY_LIVE_PROVIDER_CALLS_ENABLED=False, MEDIA_SAFETY_SERVICE_ENABLED=False,
+    )
     def test_quarantined_material_upload_is_blanked_not_hard_rejected(self, mock_client):
         # Production defaults (stub provider, no live provider calls) mark
         # every upload pending_review/quarantine=True — the material must

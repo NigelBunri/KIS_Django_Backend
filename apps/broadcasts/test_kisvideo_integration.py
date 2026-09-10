@@ -225,10 +225,26 @@ class _ChannelContentTestBase(APITestCase):
 
 
 class ChannelContentAssetUploadFlagGatingTests(_ChannelContentTestBase):
+    # Every test here posts a video with a made-up storage_path
+    # ("videos/x.mp4") that was never actually uploaded - that's fine for
+    # what this class tests (kisvideo job-queueing gated by
+    # KIS_VIDEO_SERVICE_ENABLED), but the real explicit-content scan
+    # (apps.broadcasts.media_pipeline.scan_channel_asset_payload_for_
+    # explicit_content) correctly fails closed against a storage path that
+    # doesn't resolve to a real object. Neutralized here (pass-through, no
+    # mutation) so these tests stay about what they're actually testing;
+    # apps.broadcasts.test_channel_asset_explicit_content_scan covers the
+    # scan itself directly.
+    def _patch_scan_passthrough(self):
+        return patch(
+            "apps.broadcasts.views.scan_channel_asset_payload_for_explicit_content",
+            side_effect=lambda payload: payload,
+        )
+
     @override_settings(KIS_VIDEO_SERVICE_ENABLED=False)
     def test_flag_off_does_not_queue_kisvideo_job(self):
         self.client.force_authenticate(user=self.owner)
-        with patch("apps.broadcasts.tasks.push_asset_to_kisvideo.delay") as mock_delay:
+        with patch("apps.broadcasts.tasks.push_asset_to_kisvideo.delay") as mock_delay, self._patch_scan_passthrough():
             response = self.client.post(
                 f"/api/v1/broadcasts/channel-contents/{self.content.id}/assets/",
                 {"asset_type": "video", "storage_path": "videos/x.mp4", "mime_type": "video/mp4"},
@@ -244,7 +260,7 @@ class ChannelContentAssetUploadFlagGatingTests(_ChannelContentTestBase):
     @override_settings(KIS_VIDEO_SERVICE_ENABLED=True)
     def test_flag_on_queues_kisvideo_job_for_video_asset(self):
         self.client.force_authenticate(user=self.owner)
-        with patch("apps.broadcasts.tasks.push_asset_to_kisvideo.delay") as mock_delay:
+        with patch("apps.broadcasts.tasks.push_asset_to_kisvideo.delay") as mock_delay, self._patch_scan_passthrough():
             response = self.client.post(
                 f"/api/v1/broadcasts/channel-contents/{self.content.id}/assets/",
                 {"asset_type": "video", "storage_path": "videos/x.mp4", "mime_type": "video/mp4"},

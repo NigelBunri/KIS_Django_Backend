@@ -1,4 +1,8 @@
+import datetime
+from unittest.mock import patch
+
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -6,7 +10,8 @@ from apps.accounts.models import AccountTier, Subscription, User
 from apps.accounts.tiers import ensure_default_account_tiers
 from apps.channels.models import Channel
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
-from apps.media.models import MediaAsset
+from apps.media.models import MediaAsset, MediaSafetyScan, MediaUploadIntent
+from apps.media.safety import MediaSafetyDecision
 from apps.partners.models import (
     Partner,
     PartnerMembership,
@@ -64,6 +69,25 @@ class TasksTestBase(TestCase):
 
     def _task_url(self, task, suffix=""):
         return f"/api/v1/tasks/{task.id}/{suffix}"
+
+    def _confirmed_image_asset(self, owner):
+        # Unlike test_submit_with_report_attachment's plain MediaAsset.
+        # objects.create(), this asset has a real backing MediaUploadIntent
+        # (canonical_asset) - the reverse `source_intent` link the
+        # explicit-content scan wiring needs to find something to scan.
+        asset = MediaAsset.objects.create(
+            owner=owner, type="image", bucket_key=f"private/tasks/report/{owner.id}/photo.jpg",
+            mime_type="image/jpeg", bytes=1024, original_filename="photo.jpg", status="ready",
+        )
+        intent = MediaUploadIntent.objects.create(
+            owner=owner, context="task_report", original_filename="photo.jpg",
+            object_key=asset.bucket_key, content_type="image/jpeg", size_bytes=1024,
+            status=MediaUploadIntent.STATUS_CONFIRMED,
+            expires_at=timezone.now() + datetime.timedelta(hours=1), confirmed_at=timezone.now(),
+        )
+        intent.canonical_asset = asset
+        intent.save(update_fields=["canonical_asset"])
+        return asset
 
 
 class TaskTierGateApiTests(TasksTestBase):
@@ -214,6 +238,77 @@ class TaskMemberWorkflowApiTests(TasksTestBase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # Closes a real gap found while auditing AI-moderation coverage: task
+    # report/reference attachments went through the same generic
+    # presigned-upload confirm flow as profile/commerce/testimony, but
+    # nothing ever called the explicit-content scanner for them. These
+    # mock the scan boundary with canned verdicts - no real or simulated
+    # explicit content is used anywhere here.
+
+    def test_clearly_prohibited_report_image_is_rejected_not_attached(self):
+        task = self._create_task(assigned_to=self.member, status=TaskStatus.IN_PROGRESS)
+        asset = self._confirmed_image_asset(self.member)
+        self.client.force_authenticate(self.member)
+
+        with patch("apps.media.safety.scan_saved_upload_for_explicit_content") as mock_scan:
+            mock_scan.return_value = MediaSafetyDecision(
+                status="blocked", quarantine=True, provider="nudenet",
+                reason="nudenet_explicit:TEST_LABEL", user_message="This upload was not accepted.",
+                requires_review=False, score=0.95,
+            )
+            response = self.client.post(
+                self._task_url(task, "submit/"), {"asset_ids": [str(asset.id)]}, format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        task.refresh_from_db()
+        self.assertEqual(task.status, TaskStatus.IN_PROGRESS)
+        self.assertEqual(task.attachments.count(), 0)
+        scan = MediaSafetyScan.objects.get(upload_id=str(asset.source_intent.id))
+        self.assertEqual(scan.status, "blocked")
+
+    def test_ambiguous_report_image_still_attaches_and_is_flagged(self):
+        task = self._create_task(assigned_to=self.member, status=TaskStatus.IN_PROGRESS)
+        asset = self._confirmed_image_asset(self.member)
+        self.client.force_authenticate(self.member)
+
+        with patch("apps.media.safety.scan_saved_upload_for_explicit_content") as mock_scan:
+            mock_scan.return_value = MediaSafetyDecision(
+                status="pending_review", quarantine=True, provider="nudenet",
+                reason="nudenet_low_confidence:TEST_LABEL", user_message="Your upload is under review.",
+                requires_review=True, score=0.4,
+            )
+            response = self.client.post(
+                self._task_url(task, "submit/"), {"asset_ids": [str(asset.id)]}, format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(len(response.data["attachments"]), 1)
+        scan = MediaSafetyScan.objects.get(upload_id=str(asset.source_intent.id))
+        self.assertTrue(scan.requires_review)
+
+    def test_reference_attachment_at_task_creation_is_also_scanned(self):
+        asset = self._confirmed_image_asset(self.owner)
+        self.client.force_authenticate(self.owner)
+
+        with patch("apps.media.safety.scan_saved_upload_for_explicit_content") as mock_scan:
+            mock_scan.return_value = MediaSafetyDecision(
+                status="blocked", quarantine=True, provider="nudenet",
+                reason="nudenet_explicit:TEST_LABEL", user_message="This upload was not accepted.",
+                requires_review=False, score=0.95,
+            )
+            response = self.client.post(
+                self._list_create_url(),
+                {
+                    "title": "Task with bad reference",
+                    "assigned_to_id": str(self.member.id), "reference_asset_ids": [str(asset.id)],
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertFalse(Task.objects.filter(title="Task with bad reference").exists())
 
 
 class TaskReviewWorkflowApiTests(TasksTestBase):

@@ -149,6 +149,76 @@ def prepare_channel_asset_payload(payload: dict[str, Any], *, content_type: str 
     return next_payload
 
 
+# Channel content assets (KISTube-style video/image posts) have no
+# MediaUploadIntent/MediaAsset behind them - storage_path/url are taken
+# straight from whatever the client posts (see _asset_payload_from_attachment
+# in feed_entry_store.py). attachment_requires_safety_review/
+# validate_asset_ready_for_publish already gate on processing_status, but
+# until this function existed nothing ever set that status from a REAL
+# scan - an honest client's own self-reported status was the only thing
+# ever checked, which a client that simply omits the field bypasses
+# entirely. Found during an AI-moderation coverage audit.
+_SCANNABLE_ASSET_TYPES = {"image"} | VIDEO_ASSET_TYPES
+
+
+def scan_channel_asset_payload_for_explicit_content(payload: dict[str, Any]) -> dict[str, Any]:
+    """Runs a real explicit-content scan against payload["storage_path"]
+    before the caller ever persists a ChannelContentAsset row. Mutates and
+    returns `payload` with processing_status/metadata reflecting the real
+    verdict; raises ValidationError (nothing persisted) on a hard block.
+
+    Synchronous for both images AND video - the same "runs inline, adds
+    real latency, but is the only way this scan actually runs today"
+    convention this exact view already uses one call site over for its
+    Content ID/copyright scan (apps.broadcasts.views.
+    ChannelContentAssetUploadView.post), rather than building a second,
+    parallel async-resolution pipeline for a model this platform's
+    existing MediaAsset-keyed async resolver (apps.media.tasks) doesn't
+    know how to update."""
+    asset_type = str(payload.get("asset_type") or "").strip().lower()
+    storage_path = str(payload.get("storage_path") or "").strip()
+    if asset_type not in _SCANNABLE_ASSET_TYPES or not storage_path:
+        return payload
+
+    from django.core.files.storage import default_storage
+
+    from apps.media.content_safety_provider import ContentSafetyProvider, content_safety_service_enabled
+    from apps.media.safety import (
+        build_nudenet_decision, content_safety_error_decision, scan_upload_for_explicit_content,
+    )
+
+    mime_type = str(payload.get("mime_type") or "").strip()
+    filename = storage_path.rsplit("/", 1)[-1] or "upload"
+
+    if content_safety_service_enabled():
+        try:
+            with default_storage.open(storage_path, "rb") as fh:
+                label, score = ContentSafetyProvider().scan(fh, filename=filename, content_type=mime_type)
+            decision = build_nudenet_decision(label, score)
+        except Exception as exc:
+            # Broad on purpose, matching apps.media.safety.
+            # run_nudenet_scan_on_file's own fail-closed catch-all: a
+            # ContentSafetyProviderError (network/service failure), a
+            # FileNotFoundError (storage_path doesn't resolve to a real,
+            # already-uploaded object - never trust a client-supplied path
+            # merely because it looks well-formed), or any other
+            # unexpected failure must all route to manual review, never a
+            # silent pass just because the failure mode wasn't anticipated.
+            decision = content_safety_error_decision(exc)
+    else:
+        decision = scan_upload_for_explicit_content(filename=filename, mime_type=mime_type, context="channel")
+
+    if decision.status == "blocked":
+        raise ValidationError({"attachment": decision.user_message})
+
+    status_by_decision = {"passed": "ready", "not_configured": "ready", "pending_review": "pending_review"}
+    payload["processing_status"] = status_by_decision.get(decision.status, "pending_review")
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    metadata["explicit_content_scan"] = decision.as_metadata()
+    payload["metadata"] = metadata
+    return payload
+
+
 def validate_asset_ready_for_publish(asset_or_payload: Any) -> None:
     payload = _safe_asset_dict(asset_or_payload)
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}

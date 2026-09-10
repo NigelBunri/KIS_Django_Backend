@@ -10,6 +10,7 @@ from rest_framework.views import APIView
 
 from apps.accounts.models import User
 from apps.channels.models import Channel
+from apps.media import upload_intent
 from apps.media.models import MediaAsset
 from apps.partners.models import Partner
 from apps.partners.services import (
@@ -136,6 +137,16 @@ class TaskChannelListCreateView(APIView):
             if not assignee:
                 raise ValidationError({"assigned_to_id": "User not found."})
 
+        reference_ids = data.get("reference_asset_ids") or []
+        owned_reference_assets = list(MediaAsset.objects.filter(id__in=reference_ids, owner=request.user))
+        for asset in owned_reference_assets:
+            intent = getattr(asset, "source_intent", None)
+            if intent is None:
+                continue
+            decision = upload_intent.run_and_record_explicit_content_scan(intent, upload_context="general")
+            if decision.status == "blocked":
+                raise ValidationError({"detail": decision.user_message})
+
         with transaction.atomic():
             task = Task.objects.create(
                 partner=partner,
@@ -154,13 +165,10 @@ class TaskChannelListCreateView(APIView):
                     to_assignee=assignee,
                 )
 
-            reference_ids = data.get("reference_asset_ids") or []
-            if reference_ids:
-                owned_assets = MediaAsset.objects.filter(id__in=reference_ids, owner=request.user)
-                for asset in owned_assets:
-                    TaskAttachment.objects.create(
-                        task=task, asset=asset, kind=TaskAttachment.Kind.REFERENCE, uploaded_by=request.user,
-                    )
+            for asset in owned_reference_assets:
+                TaskAttachment.objects.create(
+                    task=task, asset=asset, kind=TaskAttachment.Kind.REFERENCE, uploaded_by=request.user,
+                )
 
         if assignee:
             _notify_task_event(
@@ -257,20 +265,35 @@ class TaskSubmitView(APIView):
         asset_ids = serializer.validated_data.get("asset_ids") or []
         note = serializer.validated_data.get("note", "")
 
+        # Explicit-content scan, resolved BEFORE the atomic block below -
+        # found unscanned during an AI-moderation coverage audit (task
+        # reports go through the same generic presigned-upload confirm
+        # flow as profile/commerce/testimony, which never called the
+        # scanner). Scanning here, outside any transaction, mirrors
+        # apps.testimony.serializers' fix for the same rollback hazard:
+        # a MediaSafetyScan audit row from a rejected asset must survive
+        # even though the task submission itself is rejected.
+        owned_assets_for_scan = list(MediaAsset.objects.filter(id__in=asset_ids, owner=request.user))
+        for asset in owned_assets_for_scan:
+            intent = getattr(asset, "source_intent", None)
+            if intent is None:
+                continue
+            decision = upload_intent.run_and_record_explicit_content_scan(intent, upload_context="general")
+            if decision.status == "blocked":
+                raise ValidationError({"detail": decision.user_message})
+
         with transaction.atomic():
             previous_status = task.status
             task.status = TaskStatus.SUBMITTED
             task.submitted_at = timezone.now()
             task.save(update_fields=["status", "submitted_at", "updated_at"])
 
-            if asset_ids:
-                owned_assets = MediaAsset.objects.filter(id__in=asset_ids, owner=request.user)
-                for asset in owned_assets:
-                    TaskAttachment.objects.create(
-                        task=task, asset=asset, kind=TaskAttachment.Kind.REPORT, uploaded_by=request.user,
-                    )
-                for _ in owned_assets:
-                    _log_activity(task, request.user, TaskActivityLog.EventType.ATTACHMENT_ADDED)
+            for asset in owned_assets_for_scan:
+                TaskAttachment.objects.create(
+                    task=task, asset=asset, kind=TaskAttachment.Kind.REPORT, uploaded_by=request.user,
+                )
+            for _ in owned_assets_for_scan:
+                _log_activity(task, request.user, TaskActivityLog.EventType.ATTACHMENT_ADDED)
 
             _log_activity(
                 task, request.user, TaskActivityLog.EventType.STATUS_CHANGED,

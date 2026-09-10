@@ -19,6 +19,7 @@ from apps.chat.models import ConversationType  # must include POST
 from apps.accounts.models import User
 from common.rich_text import build_plain_text_document, process_rich_text_document
 from common.media_urls import absolutize_backend_media, normalize_image_payload
+from apps.media.safety import reject_external_image_url_if_unsafe
 from django.utils.text import slugify
 
 
@@ -33,7 +34,15 @@ class CommunityImageUrlSerializerMixin:
         return payload
 
     def validate_avatar_url(self, value):
-        return normalize_image_payload(value)
+        # normalize_image_payload reduces an already-KIS-hosted URL down
+        # to a relative path first, so a real community avatar never
+        # round-trips through the external fetch-and-scan below - only a
+        # genuinely external (or raw, unproxied storage) URL does. See
+        # apps.media.safety.reject_external_image_url_if_unsafe's own
+        # docstring for why this closes a real, structural moderation
+        # bypass (a plain client-writable URL field with no owned file to
+        # have ever forgotten to scan).
+        return reject_external_image_url_if_unsafe(normalize_image_payload(value))
 
 
 class CommunityMembershipStateSerializerMixin:

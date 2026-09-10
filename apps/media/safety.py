@@ -607,3 +607,121 @@ def validate_attachment_metadata_for_safe_messaging(attachments: Any) -> None:
     for attachment in attachments:
         if attachment_requires_safety_review(attachment):
             raise ValidationError({"attachments": USER_SAFE_REVIEW_MESSAGE})
+
+
+# Community.avatar_url / Partner.avatar_url / Partner.logo_url are plain
+# client-writable URLField's with no backing MediaUploadIntent/MediaAsset
+# at all - found during an AI-moderation coverage audit as a structural
+# bypass distinct from every other gap that audit closed: there is no
+# owned file for the platform to have forgotten to scan, only a client-
+# supplied string. Fetching an arbitrary client-supplied URL server-side
+# is an SSRF surface, so this enforces real guards (https only, DNS-
+# resolved IP must not be private/loopback/link-local/reserved, capped
+# response size, capped timeout, image content-types only) before ever
+# handing the bytes to the scanner - never trust a URL merely because it
+# looks well-formed.
+_EXTERNAL_IMAGE_FETCH_TIMEOUT_SECONDS = 10
+_EXTERNAL_IMAGE_FETCH_MAX_BYTES = 15 * 1024 * 1024
+
+
+def _hostname_resolves_only_to_public_addresses(hostname: str) -> bool:
+    import ipaddress
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        raw_ip = info[4][0]
+        try:
+            ip = ipaddress.ip_address(raw_ip.split("%")[0])
+        except ValueError:
+            return False
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+        ):
+            return False
+    return bool(infos)
+
+
+def fetch_and_scan_external_image_url(url: str) -> "MediaSafetyDecision":
+    """Real network fetch + explicit-content scan of a client-supplied
+    image URL, with SSRF guards. Returns a fail-closed MediaSafetyDecision
+    (pending_review) for anything that can't be safely fetched/verified -
+    a URL server owners must reject on principle (private IP, wrong
+    scheme, oversized, wrong content-type, fetch failure) is exactly as
+    unverifiable as a real content-safety-provider outage, and gets the
+    same treatment."""
+    import requests as _requests
+    from urllib.parse import urlparse
+
+    from .content_safety_provider import content_safety_service_enabled
+
+    def _closed(reason: str) -> "MediaSafetyDecision":
+        return MediaSafetyDecision(
+            status="pending_review", quarantine=True, provider="url_fetch",
+            reason=reason, user_message=USER_SAFE_REVIEW_MESSAGE, requires_review=True,
+        )
+
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme != "https" or not parsed.hostname:
+        return _closed("external_url_scheme_rejected")
+    if not _hostname_resolves_only_to_public_addresses(parsed.hostname):
+        return _closed("external_url_private_address_rejected")
+
+    try:
+        resp = _requests.get(
+            url, timeout=_EXTERNAL_IMAGE_FETCH_TIMEOUT_SECONDS, stream=True,
+            headers={"User-Agent": "KIS-ContentSafety/1.0"},
+        )
+    except Exception:
+        return _closed("external_url_fetch_failed")
+
+    try:
+        if not resp.ok:
+            return _closed("external_url_fetch_failed")
+        content_type = str(resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not content_type.startswith("image/"):
+            return _closed("external_url_not_an_image")
+
+        body = bytearray()
+        for chunk in resp.iter_content(chunk_size=65536):
+            body.extend(chunk)
+            if len(body) > _EXTERNAL_IMAGE_FETCH_MAX_BYTES:
+                return _closed("external_url_too_large")
+    finally:
+        resp.close()
+
+    filename = (parsed.path.rsplit("/", 1)[-1] or "image")[:255]
+    if not content_safety_service_enabled():
+        return scan_upload_for_explicit_content(filename=filename, mime_type=content_type, context="general")
+
+    from .content_safety_provider import ContentSafetyProvider, ContentSafetyProviderError
+    import io
+
+    try:
+        label, score = ContentSafetyProvider().scan(io.BytesIO(bytes(body)), filename=filename, content_type=content_type)
+    except ContentSafetyProviderError as exc:
+        return content_safety_error_decision(exc)
+    except Exception as exc:
+        return content_safety_error_decision(exc)
+    return build_nudenet_decision(label, score)
+
+
+def reject_external_image_url_if_unsafe(url: str) -> str:
+    """Validator entry point for Community/Partner avatar_url/logo_url -
+    unlike an upload with a quarantine slot to hold ambiguous content in,
+    these fields have no separate "pending" storage and are default
+    publicly visible, so anything short of a clean pass is rejected
+    outright (stricter than the upload-quarantine flows elsewhere) rather
+    than saved in an unreviewed state."""
+    text = str(url or "").strip()
+    if not text or not text.startswith("http"):
+        return url
+
+    decision = fetch_and_scan_external_image_url(text)
+    if decision.status not in ("passed", "not_configured"):
+        raise ValidationError({"detail": decision.user_message})
+    return url

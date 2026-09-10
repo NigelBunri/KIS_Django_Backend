@@ -90,6 +90,7 @@ from apps.broadcasts.feed_entry_store import (
 )
 from apps.broadcasts.media_pipeline import (
     prepare_channel_asset_payload,
+    scan_channel_asset_payload_for_explicit_content,
     validate_channel_content_ready_for_publish,
     validate_feed_entry_ready_for_broadcast,
 )
@@ -15779,6 +15780,7 @@ class ChannelContentAssetUploadView(APIView):
         else:
             validate_attachment_metadata_for_safe_messaging([payload])
             payload = prepare_channel_asset_payload(payload, content_type=content.content_type)
+        payload = scan_channel_asset_payload_for_explicit_content(payload)
         asset = ChannelContentAsset.objects.create(content=content, **payload)
         if asset.asset_type in ("video", "short_video") and asset.storage_path:
             # Best-effort Content ID scan right on upload, not just when a

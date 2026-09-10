@@ -254,9 +254,14 @@ class CommunityDefaultCrudPermissionTests(TestCase):
 
     def test_admin_can_patch_community(self):
         self.client.force_authenticate(self.admin)
-        res = self.client.patch(
-            f"/api/v1/communities/{self.community.id}/", {"avatar_url": "https://example.com/a.jpg"}, format="json",
-        )
+        # avatar_url is scanned for explicit content on write (see
+        # apps.media.safety.reject_external_image_url_if_unsafe) - a real
+        # unmocked network fetch of example.com isn't what this test is
+        # about, so it's neutralized here to a clean pass.
+        with patch("apps.communities.serializers.reject_external_image_url_if_unsafe", side_effect=lambda v: v):
+            res = self.client.patch(
+                f"/api/v1/communities/{self.community.id}/", {"avatar_url": "https://example.com/a.jpg"}, format="json",
+            )
         self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
         self.community.refresh_from_db()
         self.assertEqual(self.community.avatar_url, "https://example.com/a.jpg")

@@ -3,7 +3,7 @@ from django.db import models
 from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import serializers
-from apps.media.safety import validate_attachment_metadata_for_safe_messaging
+from apps.media.safety import reject_external_image_url_if_unsafe, validate_attachment_metadata_for_safe_messaging
 
 from apps.partners.models import (
     Partner,
@@ -112,10 +112,13 @@ class PartnerImageUrlSerializerMixin:
         return payload
 
     def validate_avatar_url(self, value):
-        return normalize_image_payload(value)
+        # See apps.communities.serializers.CommunityImageUrlSerializerMixin
+        # .validate_avatar_url for why this order (normalize first, then
+        # scan only what's left over as genuinely external) is correct.
+        return reject_external_image_url_if_unsafe(normalize_image_payload(value))
 
     def validate_logo_url(self, value):
-        return normalize_image_payload(value)
+        return reject_external_image_url_if_unsafe(normalize_image_payload(value))
 
 
 class PartnerListSerializer(PartnerImageUrlSerializerMixin, serializers.ModelSerializer):
