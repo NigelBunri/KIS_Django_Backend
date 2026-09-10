@@ -16,6 +16,7 @@ from apps.statuses.models import (
     StatusItemView,
     StatusModerationStatus,
     StatusMute,
+    StatusReaction,
     StatusReplyPermission,
     StatusType,
     StatusVisibility,
@@ -421,6 +422,74 @@ class StatusReplyTests(StatusPrivacyContractTests):
         res = self.client.post(f"/api/v1/statuses/{uuid.uuid4()}/reply/", {"text": "Hi"})
 
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class StatusReactionTests(StatusPrivacyContractTests):
+    """apps/statuses/views.py::react()/reactions() - heart/emoji quick-
+    reactions. Same visibility/permission gating as reply() (reuses the
+    same fixtures), plus the owner-only aggregate view react() writes a
+    StatusReaction row for."""
+
+    def _react_url(self, status_item) -> str:
+        return f"/api/v1/statuses/{status_item.id}/react/"
+
+    def _reactions_url(self, status_item) -> str:
+        return f"/api/v1/statuses/{status_item.id}/reactions/"
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_react_delivers_via_nest_and_records_reaction(self, mock_deliver):
+        mock_deliver.return_value = {"ok": True, "messageId": "msg-456", "seq": 1}
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.viewer)
+        res = self.client.post(self._react_url(status_item), {"emoji": "❤️"})
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(res.json()["message_id"], "msg-456")
+        mock_deliver.assert_called_once()
+        _, kwargs = mock_deliver.call_args
+        self.assertEqual(kwargs["text"], "❤️")
+        self.assertTrue(
+            StatusReaction.objects.filter(status=status_item, user=self.viewer, emoji="❤️").exists()
+        )
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_second_reaction_from_same_user_replaces_the_first(self, mock_deliver):
+        mock_deliver.return_value = {"ok": True, "messageId": "msg-1", "seq": 1}
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+
+        self.client.post(self._react_url(status_item), {"emoji": "❤️"})
+        self.client.post(self._react_url(status_item), {"emoji": "😂"})
+
+        self.assertEqual(StatusReaction.objects.filter(status=status_item, user=self.viewer).count(), 1)
+        self.assertEqual(
+            StatusReaction.objects.get(status=status_item, user=self.viewer).emoji, "😂",
+        )
+
+    @patch("apps.statuses.services.deliver_status_reply_message")
+    def test_react_returns_404_for_stranger_outside_contacts(self, mock_deliver):
+        status_item = self._create_status(author=self.author)
+
+        self.client.force_authenticate(self.stranger)
+        res = self.client.post(self._react_url(status_item), {"emoji": "❤️"})
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        mock_deliver.assert_not_called()
+
+    def test_reactions_endpoint_is_owner_only(self):
+        status_item = self._create_status(author=self.author)
+        StatusReaction.objects.create(status=status_item, user=self.viewer, emoji="❤️")
+
+        self.client.force_authenticate(self.author)
+        owner_res = self.client.get(self._reactions_url(status_item))
+        self.assertEqual(owner_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(owner_res.json()["reaction_count"], 1)
+        self.assertEqual(owner_res.json()["results"][0]["emoji"], "❤️")
+
+        self.client.force_authenticate(self.viewer)
+        non_owner_res = self.client.get(self._reactions_url(status_item))
+        self.assertEqual(non_owner_res.status_code, status.HTTP_404_NOT_FOUND)
 
 
 class StatusDeletionAndMutationTests(StatusPrivacyContractTests):

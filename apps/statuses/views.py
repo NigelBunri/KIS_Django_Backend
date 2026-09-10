@@ -19,6 +19,7 @@ from apps.statuses.models import (
     StatusItem,
     StatusItemView,
     StatusMute,
+    StatusReaction,
     StatusVisibility,
 )
 from apps.statuses.serializers import StatusItemSerializer, StatusCreateSerializer
@@ -662,4 +663,107 @@ class StatusViewSet(viewsets.ModelViewSet):
         return Response(
             {"replied": True, "message_id": message_id, "conversation_id": str(conversation.id)},
             status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="react")
+    def react(self, request, pk=None):
+        """Heart/emoji quick-reaction. Same authorization, chat-delivery,
+        and idempotency handling as reply() above (a reaction IS a reply
+        as far as the recipient's chat room is concerned) - the only
+        addition is upserting a StatusReaction row so the status owner can
+        see an aggregate "who reacted, with what" via the reactions
+        action below, without it living only as a message buried in their
+        conversation list."""
+        try:
+            status_item = self._base_status_queryset().get(id=pk)
+        except StatusItem.DoesNotExist:
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        blocked_user_ids = self._get_blocked_user_ids()
+        _, _, mutual_contact_ids = self._get_status_contacts()
+        if not self._can_view_status(
+            status_item,
+            viewer_id=str(request.user.id),
+            blocked_user_ids=blocked_user_ids,
+            author_contact_ids=self._get_author_contact_ids({str(status_item.user_id)}),
+            mutual_contact_ids=mutual_contact_ids,
+        ):
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if status_item.reply_permission == "nobody":
+            return Response({"detail": "Reactions disabled for this status."}, status=status.HTTP_403_FORBIDDEN)
+
+        emoji = (request.data.get("emoji") or "").strip()
+        if not emoji:
+            return Response({"detail": "An emoji is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(emoji) > 16:
+            return Response({"detail": "Invalid emoji."}, status=status.HTTP_400_BAD_REQUEST)
+        client_id = (request.data.get("client_id") or "").strip() or None
+
+        from apps.chat.services import get_or_create_direct_conversation
+        from apps.statuses.services import StatusReplyDeliveryError, deliver_status_reply_message
+
+        try:
+            conversation, _created = get_or_create_direct_conversation(request.user, status_item.user)
+        except Exception:
+            return Response({"detail": "Could not open conversation."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        try:
+            result = deliver_status_reply_message(
+                conversation_id=str(conversation.id),
+                sender_id=str(request.user.id),
+                text=emoji,
+                client_id=client_id,
+            )
+        except StatusReplyDeliveryError:
+            return Response(
+                {"detail": "Could not deliver your reaction right now. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        StatusReaction.objects.update_or_create(
+            status=status_item, user=request.user, defaults={"emoji": emoji, "created_at": timezone.now()},
+        )
+
+        message_id = str(result.get("messageId") or "")
+        AuditLog.objects.create(
+            actor_id=request.user.id,
+            action="status.react",
+            target_type="STATUS",
+            target_id=status_item.id,
+            metadata={"message_id": message_id, "emoji": emoji},
+        )
+        return Response(
+            {"reacted": True, "message_id": message_id, "conversation_id": str(conversation.id)},
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["get"], url_path="reactions")
+    def reactions(self, request, pk=None):
+        try:
+            status_item = self.get_queryset().get(id=pk, user=request.user)
+        except StatusItem.DoesNotExist:
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        rows = (
+            StatusReaction.objects.filter(status=status_item)
+            .select_related("user")
+            .order_by("-created_at")
+        )
+        results = [
+            {
+                "id": str(row.user_id),
+                "display_name": row.user.display_name or row.user.phone or f"User {row.user_id}",
+                "emoji": row.emoji,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+        return Response(
+            {
+                "status_id": str(status_item.id),
+                "reaction_count": len(results),
+                "results": results,
+            },
+            status=status.HTTP_200_OK,
         )

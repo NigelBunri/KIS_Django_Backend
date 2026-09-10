@@ -160,6 +160,35 @@ class StatusItemView(models.Model):
         return f"StatusView {self.status_id} by {self.user_id}"
 
 
+class StatusReaction(models.Model):
+    """One heart/emoji reaction per (status, user) - a second tap by the
+    same viewer replaces their previous emoji rather than stacking a
+    second row, matching the "double-tap to heart, tap again to change
+    it" convention this is modeled on. Deliberately separate from a chat
+    message: the reaction is ALSO delivered into the chat room as a real
+    message (see deliver_status_reply_message, called from the same
+    `react` action that writes this row), but that message lives entirely
+    in Nest.js/MongoDB like every other reply - this row exists purely so
+    the status owner can see an aggregate "who reacted, with what" without
+    having to dig through their conversations."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    status = models.ForeignKey(StatusItem, on_delete=models.CASCADE, related_name="reactions")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="status_reactions")
+    emoji = models.CharField(max_length=16)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["status", "user"], name="status_item_unique_reaction"),
+        ]
+        indexes = [
+            models.Index(fields=["status", "user"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"StatusReaction {self.status_id} by {self.user_id} ({self.emoji})"
+
+
 class StatusMute(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
