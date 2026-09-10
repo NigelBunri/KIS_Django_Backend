@@ -3422,7 +3422,11 @@ class BroadcastVideoContractTests(APITestCase):
             self.assertEqual(range_response.status_code, status.HTTP_206_PARTIAL_CONTENT)
             self.assertEqual(range_response['Accept-Ranges'], 'bytes')
             self.assertEqual(range_response['Content-Range'], 'bytes 0-3/16')
-            self.assertEqual(range_response.content, b'0123')
+            # Range responses now stream (StreamingHttpResponse) rather than
+            # buffering the whole requested range into memory first - see
+            # BroadcastVideoStreamView._serve_video's comment. .content only
+            # exists on a non-streaming HttpResponse.
+            self.assertEqual(b''.join(range_response.streaming_content), b'0123')
 
     def test_video_stream_endpoint_redirects_to_remote_storage_url(self):
         # When default_storage is a remote backend (S3/Supabase), the stream

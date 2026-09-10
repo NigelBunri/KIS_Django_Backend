@@ -21,7 +21,7 @@ from django.core.cache import cache
 from django.core.files.storage import FileSystemStorage, default_storage
 from django.db import IntegrityError, models, transaction
 from django.db.models import Q
-from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect
+from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
@@ -9277,6 +9277,25 @@ class BroadcastVideoUploadView(APIView):
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
+# 256KB - large enough to be an efficient number of read()/yield cycles for
+# a big video, small enough that the first chunk (and therefore the HTTP
+# response's first bytes) goes out almost immediately rather than after
+# buffering something sizeable.
+_VIDEO_STREAM_CHUNK_SIZE = 256 * 1024
+
+
+def _iter_file_range(file_path: str, start: int, length: int, chunk_size: int = _VIDEO_STREAM_CHUNK_SIZE):
+    with open(file_path, "rb") as fh:
+        fh.seek(start)
+        remaining = length
+        while remaining > 0:
+            data = fh.read(min(chunk_size, remaining))
+            if not data:
+                break
+            remaining -= len(data)
+            yield data
+
+
 class BroadcastVideoStreamView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
@@ -9327,12 +9346,20 @@ class BroadcastVideoStreamView(APIView):
             end = file_size - 1
         length = end - start + 1
 
-        with open(file_path, "rb") as fh:
-            fh.seek(start)
-            chunk = fh.read(length)
-
-        resp = HttpResponse(
-            chunk,
+        # Was `fh.read(length)` — for an open-ended request (`Range: bytes=0-`,
+        # what a player commonly sends on its very first request, before it
+        # knows the file size) that reads the ENTIRE file into memory before
+        # this view returns anything, then hands it to HttpResponse as one
+        # non-streaming blob. For a long video that's slow to start (nothing
+        # is sent until the full read completes) and risks the response
+        # getting cut off mid-transfer by a proxy/worker read timeout while
+        # still buffering - which the player then reads as "the video ended
+        # early" rather than a network error, exactly matching a long video
+        # appearing to stop after a minute or so. Streaming fixed-size chunks
+        # instead starts sending bytes almost immediately and keeps memory
+        # use bounded regardless of file size.
+        resp = StreamingHttpResponse(
+            _iter_file_range(file_path, start, length),
             status=206,
             content_type=mime_type,
         )
