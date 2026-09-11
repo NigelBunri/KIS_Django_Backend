@@ -24,6 +24,8 @@ from admin_control.views import (
     AdminUserBanView,
     AdminUserUnbanView,
     AdminUserTierChangeView,
+    AdminUserDeviceWipeView,
+    AdminDeviceWipeAllView,
     AdminPlatformStatsView,
     # Content moderation
     AdminContentQueueView,
@@ -75,6 +77,8 @@ urlpatterns = [
     path("users/<str:user_id>/ban/", AdminUserBanView.as_view(), name="admin-user-ban"),
     path("users/<str:user_id>/unban/", AdminUserUnbanView.as_view(), name="admin-user-unban"),
     path("users/<str:user_id>/set-tier/", AdminUserTierChangeView.as_view(), name="admin-user-set-tier"),
+    path("users/<str:user_id>/wipe-devices/", AdminUserDeviceWipeView.as_view(), name="admin-user-wipe-devices"),
+    path("devices/wipe-all/", AdminDeviceWipeAllView.as_view(), name="admin-devices-wipe-all"),
 
     # ── Content moderation ────────────────────────────────────────────────
     path("content/queue/", AdminContentQueueView.as_view(), name="admin-content-queue"),

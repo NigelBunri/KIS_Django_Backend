@@ -156,6 +156,55 @@ class AdminUserManagementTests(TestCase):
         self.assertIn("target@test.com", emails)
 
 
+# ─── Device wipe (per-user + platform-wide) ──────────────────────────────────
+
+class AdminDeviceWipeTests(TestCase):
+    def setUp(self):
+        from apps.accounts.models import Device
+
+        self.Device = Device
+        self.client = APIClient()
+        self.admin = _make_user("admin@test.com", is_superuser=True, is_staff=True, tier="Partner Pro")
+        _make_admin_role(self.admin)
+        self.target = _make_user("target@test.com", tier="Free")
+        self.other = _make_user("other@test.com", tier="Free")
+        Device.objects.create(user=self.target, device_id="parent-1", platform="android", is_parent=True)
+        Device.objects.create(user=self.target, device_id="secondary-1", platform="ios", is_parent=False)
+        Device.objects.create(user=self.other, device_id="parent-2", platform="web", is_parent=True)
+        self.client.force_authenticate(user=self.admin)
+
+    def test_wipe_devices_for_one_user_leaves_other_users_untouched(self):
+        resp = self.client.post(f"/control/admin/users/{self.target.id}/wipe-devices/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["deleted_count"], 2)
+        self.assertFalse(self.Device.objects.filter(user=self.target).exists())
+        self.assertTrue(self.Device.objects.filter(user=self.other).exists())
+        self.target.refresh_from_db()
+        self.assertEqual(self.target.status, "active")
+
+    def test_wipe_all_devices_requires_confirm_phrase(self):
+        resp = self.client.post("/control/admin/devices/wipe-all/")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(self.Device.objects.filter(user=self.target).exists())
+
+    def test_wipe_all_devices_deletes_every_account_devices(self):
+        resp = self.client.post("/control/admin/devices/wipe-all/", {"confirm": "WIPE ALL DEVICES"})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["users_affected"], 2)
+        self.assertEqual(resp.data["devices_deleted"], 3)
+        self.assertFalse(self.Device.objects.exists())
+        self.assertTrue(User.objects.filter(id=self.target.id).exists())
+        self.assertTrue(User.objects.filter(id=self.other.id).exists())
+
+    def test_wipe_all_devices_denied_for_non_super_admin(self):
+        staffer = _make_user("staffer@test.com", is_staff=True, tier="Free")
+        role_client = APIClient()
+        role_client.force_authenticate(user=staffer)
+        resp = role_client.post("/control/admin/devices/wipe-all/", {"confirm": "WIPE ALL DEVICES"})
+        self.assertIn(resp.status_code, (status.HTTP_403_FORBIDDEN,))
+        self.assertTrue(self.Device.objects.filter(user=self.target).exists())
+
+
 # ─── Content moderation ───────────────────────────────────────────────────────
 
 class AdminContentModerationTests(TestCase):

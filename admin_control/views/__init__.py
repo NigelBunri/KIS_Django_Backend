@@ -21,6 +21,8 @@ from .user_management import (
     AdminUserBanView,
     AdminUserUnbanView,
     AdminUserTierChangeView,
+    AdminUserDeviceWipeView,
+    AdminDeviceWipeAllView,
     AdminPlatformStatsView,
 )
 from .content_moderation import (
@@ -67,6 +69,8 @@ __all__ = [
     "AdminUserBanView",
     "AdminUserUnbanView",
     "AdminUserTierChangeView",
+    "AdminUserDeviceWipeView",
+    "AdminDeviceWipeAllView",
     "AdminPlatformStatsView",
     # Content moderation
     "AdminContentQueueView",

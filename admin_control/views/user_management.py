@@ -10,6 +10,7 @@ from rest_framework.permissions import IsAuthenticated
 
 from admin_control.audit.logging import AuditLogger
 from admin_control.permissions import IsAdminControlUser
+from admin_control.roles import AdminAccessService
 
 
 def _safe_int(val, default, lo=1, hi=250):
@@ -207,6 +208,82 @@ class AdminUserTierChangeView(APIView):
             metadata={"from": old_tier, "to": resolved},
         )
         return Response({"user": _serialize_user(user), "action": "tier_changed", "old_tier": old_tier, "new_tier": resolved})
+
+
+class AdminUserDeviceWipeView(APIView):
+    """
+    POST /control/admin/users/<user_id>/wipe-devices/
+    Deletes every Device row (parent + secondary) for one account, so its
+    next login registers a fresh parent device with no pairing/secondary-
+    code prompt. The account itself is untouched.
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "users.moderate"
+
+    def post(self, request, user_id):
+        from apps.accounts.device_admin import wipe_devices_for_user
+
+        user = _get_user_or_404(user_id)
+        if isinstance(user, Response):
+            return user
+
+        reason = str(request.data.get("reason", "")).strip() or "admin_reset"
+        result = wipe_devices_for_user(user, actor=request.user, reason=reason)
+
+        AuditLogger.log(
+            actor=request.user,
+            action_type="user.devices_wiped",
+            target_app="accounts",
+            target_model="User",
+            target_pk=str(user.id),
+            severity="warning",
+            metadata=result,
+        )
+        return Response({"user": _serialize_user(user), "action": "devices_wiped", **result})
+
+
+class AdminDeviceWipeAllView(APIView):
+    """
+    POST /control/admin/devices/wipe-all/
+    Body: {confirm: "WIPE ALL DEVICES", reason?: str}
+
+    Platform-wide: deletes every Device row for every account so every user's
+    next login registers a fresh parent device with no secondary/pairing-code
+    prompt. Accounts are kept — only device history is removed. Restricted to
+    super-admin (GO) role regardless of the caller's granular permission
+    grants, and requires an exact confirmation phrase since this is
+    irreversible and affects the entire user base in one call.
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "platform.dangerous_ops"
+
+    CONFIRM_PHRASE = "WIPE ALL DEVICES"
+
+    def post(self, request):
+        if not AdminAccessService.is_super_admin(request.user):
+            return Response(
+                {"detail": "Only a super-admin (GO) may run a platform-wide device wipe."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if str(request.data.get("confirm", "")).strip() != self.CONFIRM_PHRASE:
+            return Response(
+                {"detail": f'Send {{"confirm": "{self.CONFIRM_PHRASE}"}} to proceed.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from apps.accounts.device_admin import wipe_all_devices
+
+        reason = str(request.data.get("reason", "")).strip() or "admin_console_platform_wide_wipe"
+        result = wipe_all_devices(actor=request.user, reason=reason)
+
+        AuditLogger.log(
+            actor=request.user,
+            action_type="platform.devices_wiped_all",
+            severity="critical",
+            metadata=result,
+        )
+        return Response({"action": "devices_wiped_all", **result})
 
 
 class AdminPlatformStatsView(APIView):
