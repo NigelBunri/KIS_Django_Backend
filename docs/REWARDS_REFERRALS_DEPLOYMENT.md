@@ -48,29 +48,25 @@ expected.
 
 ### 1.3 The Celery worker/beat/redis production services — STILL PENDING
 
-**This is the single most important item in this checklist.** `render.yaml`
-at the repo root fully defines three additional services — `kis-celery-worker`,
-`kis-celery-beat`, and a managed `kis-redis` instance — as a complete,
-correct Render Blueprint. The file has carried this note since Phase 10:
-
-> "applying it (via `render blueprint launch` or connecting this repo as a
-> Blueprint in the Render dashboard) is what actually provisions and starts
-> billing for these services, and that step is intentionally left for a
-> human to trigger explicitly."
+**This is the single most important item in this checklist.** Production
+runs on AWS Lightsail via Docker (see the ops runbook) — `docker-compose.yml`
+defines `worker` and `beat` services alongside `web`, `db`, and `redis`, but
+defining a service in the compose file doesn't guarantee it's actually
+running on the box.
 
 **As of the end of Phase 13, this has never been confirmed done.** Every
 local check of `verify_celery_launch` throughout Phases 10–13 has reported
 `worker_ping: no worker responded — is one running?`, which only proves no
 worker is reachable from the local dev machine — it says nothing about
-production. **Before or immediately after this deploy, confirm directly in
-the Render dashboard whether `kis-celery-worker` and `kis-celery-beat` are
-provisioned and running.** If they are not, every scheduled job described in
-this document (reward expiration, referral settlement, reconciliation, and
-the three pre-existing jobs) will be correctly configured but will never
-actually execute in production — `calculate_redemption`/`apply_rewards`/
-manual redemption flows are unaffected (they're request-time, not
-scheduled), but nothing will expire coins, settle referrals, or reconcile
-without a live worker + beat process.
+production. **Before or immediately after this deploy, SSH into the
+Lightsail box and confirm directly (`docker compose ps`) whether the
+`worker` and `beat` containers are up.** If they are not, every scheduled
+job described in this document (reward expiration, referral settlement,
+reconciliation, and the three pre-existing jobs) will be correctly
+configured but will never actually execute in production —
+`calculate_redemption`/`apply_rewards`/manual redemption flows are
+unaffected (they're request-time, not scheduled), but nothing will expire
+coins, settle referrals, or reconcile without a live worker + beat process.
 
 ---
 
@@ -101,8 +97,8 @@ Expect `"ready": true` and all of the following checks to show `"pass"`:
   throughout this project. This is the actual proof a live worker process
   exists in production, not just that it's configured to exist.
 
-If `worker_ping` still warns after deploy, that confirms the Render
-Blueprint services from §1.3 have not been launched — stop and resolve that
+If `worker_ping` still warns after deploy, that confirms the `worker`/`beat`
+containers from §1.3 are not actually running — stop and resolve that
 before considering this feature live, since no scheduled job will run
 otherwise.
 
@@ -165,7 +161,7 @@ operational item outstanding:
   records (`RewardLedgerEntry`, `Referral`).
 
 **What actually blocks real-world effect, not code readiness**: §1.3 above
-— confirm the Render Blueprint's worker/beat/redis services are actually
+— confirm the Lightsail box's worker/beat containers are actually
 running in production. Everything this project built that depends on a
 scheduled job (reward expiration, referral settlement, reconciliation) is
 inert without it. This is a five-minute operational check/action, not

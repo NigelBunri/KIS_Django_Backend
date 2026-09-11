@@ -10,7 +10,7 @@ Phase 9: observability improvements.
     booleans (presence-only, never a live probe, never part of the ok/503
     gate).
   - config.settings.production's Sentry init() now sets release from
-    RENDER_GIT_COMMIT (a real, Render-provided env var) so an error can be
+    SENTRY_RELEASE (set by the deploy process itself) so an error can be
     tied to the deploy that shipped it.
 
 Run:
@@ -120,7 +120,7 @@ def _run_production_import(overrides: dict[str, str]) -> subprocess.CompletedPro
         "INTERNAL_SIGNATURE_REQUIRED": "",
         "NEST_INTERNAL_TOKEN": "",
         "SENTRY_DSN": "",
-        "RENDER_GIT_COMMIT": "",
+        "SENTRY_RELEASE": "",
     }
     base_env.update(overrides)
     script = (
@@ -142,34 +142,34 @@ def _run_production_import(overrides: dict[str, str]) -> subprocess.CompletedPro
 
 
 class SentryReleaseTrackingTests(unittest.TestCase):
-    def test_release_is_set_from_render_git_commit_when_sentry_configured(self):
+    def test_release_is_set_from_sentry_release_env_when_sentry_configured(self):
         result = _run_production_import({
             "SENTRY_DSN": "https://abc123@o12345.ingest.sentry.io/6789",
-            "RENDER_GIT_COMMIT": "deadbeef1234",
+            "SENTRY_RELEASE": "deadbeef1234",
         })
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("IMPORT_OK", result.stdout)
         self.assertIn("RELEASE=deadbeef1234", result.stdout)
         self.assertIn("ENVIRONMENT=production", result.stdout)
 
-    def test_render_git_commit_takes_priority_over_sentrys_own_git_autodetection(self):
-        # When RENDER_GIT_COMMIT is unset, sentry_sdk falls back to
+    def test_sentry_release_env_takes_priority_over_sentrys_own_git_autodetection(self):
+        # When SENTRY_RELEASE is unset, sentry_sdk falls back to
         # auto-detecting the release from the local .git HEAD itself
         # (confirmed empirically — this is documented sentry_sdk behavior,
         # not something this code implements) — so an explicit
-        # RENDER_GIT_COMMIT must win over that auto-detection, not just
+        # SENTRY_RELEASE must win over that auto-detection, not just
         # over an empty string.
         result = _run_production_import({
             "SENTRY_DSN": "https://abc123@o12345.ingest.sentry.io/6789",
-            "RENDER_GIT_COMMIT": "deadbeef1234",
+            "SENTRY_RELEASE": "deadbeef1234",
         })
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RELEASE=deadbeef1234", result.stdout)
 
-    def test_release_falls_back_to_sentrys_git_autodetection_when_render_git_commit_is_not_set(self):
+    def test_release_falls_back_to_sentrys_git_autodetection_when_sentry_release_is_not_set(self):
         result = _run_production_import({
             "SENTRY_DSN": "https://abc123@o12345.ingest.sentry.io/6789",
-            "RENDER_GIT_COMMIT": "",
+            "SENTRY_RELEASE": "",
         })
         self.assertEqual(result.returncode, 0, result.stderr)
         release_line = next(line for line in result.stdout.splitlines() if line.startswith("RELEASE="))

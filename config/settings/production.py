@@ -123,11 +123,13 @@ if _sentry_dsn:
         traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
         send_default_pii=False,
         environment="production",
-        # RENDER_GIT_COMMIT is auto-injected by Render at build and runtime
-        # (not something we set) — ties an error report to the exact commit
-        # that shipped it, instead of every deploy showing up as the same
-        # undifferentiated "production" bucket in Sentry.
-        release=os.environ.get("RENDER_GIT_COMMIT", "").strip() or None,
+        # SENTRY_RELEASE is set by the deploy process itself (e.g. to the
+        # git commit/rollback tag being deployed - see the Lightsail deploy
+        # runbook) — ties an error report to the exact build that shipped
+        # it, instead of every deploy showing up as the same
+        # undifferentiated "production" bucket in Sentry. Falls back to
+        # sentry_sdk's own git-autodetection when unset.
+        release=os.environ.get("SENTRY_RELEASE", "").strip() or None,
     )
 
 # Object storage — require an explicit remote provider in production to prevent
