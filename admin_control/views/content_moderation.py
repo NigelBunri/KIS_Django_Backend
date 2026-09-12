@@ -205,6 +205,17 @@ class AdminContentTrendView(APIView):
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _serialize_flag(flag):
+    tags = getattr(flag, "tags", None) or {}
+    scan_id = tags.get("media_safety_scan_id") if isinstance(tags, dict) else None
+    media_safety_scan = None
+    if scan_id:
+        from apps.media.models import MediaSafetyScan
+        from .media_safety import _serialize_scan
+        try:
+            media_safety_scan = _serialize_scan(MediaSafetyScan.objects.get(id=scan_id))
+        except MediaSafetyScan.DoesNotExist:
+            media_safety_scan = None
+
     return {
         "id": str(flag.id),
         "target_type": flag.target_type,
@@ -219,6 +230,7 @@ def _serialize_flag(flag):
         "reporter_email": None,
         "reviewed_at": flag.reviewed_at.isoformat() if getattr(flag, "reviewed_at", None) else None,
         "created_at": flag.created_at.isoformat() if flag.created_at else None,
+        "media_safety_scan": media_safety_scan,
     }
 
 

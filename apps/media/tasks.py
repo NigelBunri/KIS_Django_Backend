@@ -298,6 +298,8 @@ def scan_video_and_resolve_task(self, *, scan_id: str):
     "still queued", so a stuck item is findable rather than silently stuck
     forever with no signal.
     """
+    from apps.moderation.services import create_media_safety_alert_for_scan
+
     from .content_safety_provider import ContentSafetyProvider, ContentSafetyProviderError
     from .models import MediaSafetyScan
     from .safety import NUDENET_SCAN_QUEUED_REASON, build_nudenet_decision
@@ -365,6 +367,16 @@ def scan_video_and_resolve_task(self, *, scan_id: str):
 
     resolver = _RESOLVERS[target_type]
     resolver(target_id, decision, storage_path)
+
+    if decision.quarantine:
+        # This was the actual gap: every OTHER content-safety path (the
+        # synchronous image path in scan_uploaded_object_task above) already
+        # raises a moderation Flag on quarantine, but this async video-
+        # resolve path never did - a blocked/pending_review video verdict
+        # updated MediaSafetyScan and the resolver target, then went
+        # nowhere near GO's moderation queue. Confirmed empirically: zero
+        # Flag rows existed for any video scan before this fix.
+        create_media_safety_alert_for_scan(scan)
 
     return {"status": "resolved", "decision_status": decision.status}
 

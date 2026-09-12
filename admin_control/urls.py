@@ -38,6 +38,9 @@ from admin_control.views import (
     AdminIncidentSummaryView,
     # Child safety
     AdminUnsupervisedMinorsListView,
+    AdminMediaSafetyScanListView,
+    AdminMediaSafetyScanSummaryView,
+    AdminMediaSafetyScanMediaUrlView,
     # Partner oversight
     AdminPartnerListView,
     AdminPartnerDetailView,
@@ -79,6 +82,15 @@ urlpatterns = [
     path("users/<str:user_id>/set-tier/", AdminUserTierChangeView.as_view(), name="admin-user-set-tier"),
     path("users/<str:user_id>/wipe-devices/", AdminUserDeviceWipeView.as_view(), name="admin-user-wipe-devices"),
     path("devices/wipe-all/", AdminDeviceWipeAllView.as_view(), name="admin-devices-wipe-all"),
+
+    # ── Media safety (content-safety scan ground truth) ──────────────────
+    path("media-safety/scans/", AdminMediaSafetyScanListView.as_view(), name="admin-media-safety-scans"),
+    path("media-safety/summary/", AdminMediaSafetyScanSummaryView.as_view(), name="admin-media-safety-summary"),
+    path(
+        "media-safety/scans/<str:scan_id>/media-url/",
+        AdminMediaSafetyScanMediaUrlView.as_view(),
+        name="admin-media-safety-scan-media-url",
+    ),
 
     # ── Content moderation ────────────────────────────────────────────────
     path("content/queue/", AdminContentQueueView.as_view(), name="admin-content-queue"),

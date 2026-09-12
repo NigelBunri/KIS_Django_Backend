@@ -7316,6 +7316,13 @@ def _record_upload_safety(request, file_obj, *, context: str, storage_path: str,
         reason=decision.reason,
         result=decision.as_metadata(),
     )
+    if decision.quarantine:
+        # Matches the async video-resolve path's fix (apps/media/tasks.py's
+        # scan_video_and_resolve_task) - without this, a synchronously-
+        # scanned quarantine/block verdict updated MediaSafetyScan but never
+        # reached GO's moderation queue at all.
+        from apps.moderation.services import create_media_safety_alert_for_scan
+        create_media_safety_alert_for_scan(scan)
     return decision, scan
 
 

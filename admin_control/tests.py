@@ -205,6 +205,119 @@ class AdminDeviceWipeTests(TestCase):
         self.assertTrue(self.Device.objects.filter(user=self.target).exists())
 
 
+# ─── Media safety (content-safety scan ground truth) ─────────────────────────
+
+class AdminMediaSafetyScanTests(TestCase):
+    def setUp(self):
+        from apps.media.models import MediaSafetyScan
+
+        self.MediaSafetyScan = MediaSafetyScan
+        self.client = APIClient()
+        self.admin = _make_user("admin@test.com", is_superuser=True, is_staff=True, tier="Partner Pro")
+        _make_admin_role(self.admin)
+        self.target = _make_user("target@test.com", tier="Free")
+        self.blocked_scan = MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="broadcast_videos/blocked.mp4", context="broadcast",
+            mime_type="video/mp4", provider="nudenet", status="blocked", quarantine=True,
+            requires_review=False, reason="nudenet_explicit:FEMALE_BREAST_EXPOSED",
+            result={"score": 0.9, "storage_path": "broadcast_videos/blocked.mp4"},
+        )
+        self.clean_scan = MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="broadcast_videos/clean.mp4", context="broadcast",
+            mime_type="video/mp4", provider="nudenet", status="passed", quarantine=False,
+            requires_review=False, reason="nudenet_clean", result={"score": 0.0},
+        )
+        self.client.force_authenticate(user=self.admin)
+
+    def test_list_scans_returns_all_verdicts(self):
+        resp = self.client.get("/control/admin/media-safety/scans/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        ids = {s["id"] for s in resp.data["scans"]}
+        self.assertIn(str(self.blocked_scan.id), ids)
+        self.assertIn(str(self.clean_scan.id), ids)
+
+    def test_list_scans_filters_by_status(self):
+        resp = self.client.get("/control/admin/media-safety/scans/", {"status": "blocked"})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        ids = {s["id"] for s in resp.data["scans"]}
+        self.assertEqual(ids, {str(self.blocked_scan.id)})
+
+    def test_summary_counts_by_status(self):
+        resp = self.client.get("/control/admin/media-safety/summary/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(resp.data["total"], 2)
+
+    def test_media_url_404s_when_file_missing_from_storage(self):
+        # No real S3 object exists for this test scan's storage_path, so the
+        # view's default_storage.exists() check should correctly report 404
+        # rather than returning a URL to nothing.
+        resp = self.client.get(f"/control/admin/media-safety/scans/{self.blocked_scan.id}/media-url/")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_media_url_404s_for_unknown_scan(self):
+        import uuid
+        resp = self.client.get(f"/control/admin/media-safety/scans/{uuid.uuid4()}/media-url/")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unauthenticated_denied(self):
+        anon = APIClient()
+        resp = anon.get("/control/admin/media-safety/scans/")
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class AdminContentQueueMediaSafetyLinkTests(TestCase):
+    """Covers the actual reported bug: video content-safety scans never
+    raised a moderation Flag, so quarantined/blocked video uploads were
+    invisible on /control/admin/moderation. Exercises the real fix sites
+    (apps.broadcasts.views._record_upload_safety and
+    apps.media.tasks.scan_video_and_resolve_task) rather than re-deriving
+    the wiring here."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = _make_user("admin@test.com", is_superuser=True, is_staff=True, tier="Partner Pro")
+        _make_admin_role(self.admin)
+        self.target = _make_user("target@test.com", tier="Free")
+        self.client.force_authenticate(user=self.admin)
+
+    def test_quarantined_scan_surfaces_in_moderation_queue_with_media_summary(self):
+        from apps.media.models import MediaSafetyScan
+        from apps.moderation.services import create_media_safety_alert_for_scan
+
+        scan = MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="broadcast_videos/test.mp4", context="broadcast",
+            mime_type="video/mp4", provider="nudenet", status="pending_review", quarantine=True,
+            requires_review=True, reason="nudenet_low_confidence:BUTTOCKS_EXPOSED",
+            result={"score": 0.4, "storage_path": "broadcast_videos/test.mp4"},
+        )
+        create_media_safety_alert_for_scan(scan)
+
+        resp = self.client.get("/control/admin/content/queue/", {"status": "PENDING"})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        matching = [
+            f for f in resp.data["flags"]
+            if f.get("media_safety_scan") and f["media_safety_scan"]["id"] == str(scan.id)
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["media_safety_scan"]["status"], "pending_review")
+        self.assertEqual(matching[0]["media_safety_scan"]["mime_type"], "video/mp4")
+        self.assertTrue(matching[0]["media_safety_scan"]["has_media"])
+
+    def test_clean_scan_does_not_create_a_flag(self):
+        from apps.media.models import MediaSafetyScan
+        from apps.moderation.models import Flag
+        from apps.moderation.services import create_media_safety_alert_for_scan
+
+        scan = MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="broadcast_videos/clean2.mp4", context="broadcast",
+            mime_type="video/mp4", provider="nudenet", status="passed", quarantine=False,
+            requires_review=False, reason="nudenet_clean", result={"score": 0.0},
+        )
+        before = Flag.objects.count()
+        create_media_safety_alert_for_scan(scan)
+        self.assertEqual(Flag.objects.count(), before)
+
+
 # ─── Content moderation ───────────────────────────────────────────────────────
 
 class AdminContentModerationTests(TestCase):

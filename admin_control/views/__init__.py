@@ -37,6 +37,11 @@ from .incidents import (
     AdminIncidentSummaryView,
 )
 from .child_safety import AdminUnsupervisedMinorsListView
+from .media_safety import (
+    AdminMediaSafetyScanListView,
+    AdminMediaSafetyScanSummaryView,
+    AdminMediaSafetyScanMediaUrlView,
+)
 from .partner_oversight import (
     AdminPartnerListView,
     AdminPartnerDetailView,
@@ -83,6 +88,10 @@ __all__ = [
     "AdminIncidentSummaryView",
     # Child safety
     "AdminUnsupervisedMinorsListView",
+    # Media safety (content-safety scan ground truth)
+    "AdminMediaSafetyScanListView",
+    "AdminMediaSafetyScanSummaryView",
+    "AdminMediaSafetyScanMediaUrlView",
     # Partner oversight
     "AdminPartnerListView",
     "AdminPartnerDetailView",
