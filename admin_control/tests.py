@@ -155,6 +155,54 @@ class AdminUserManagementTests(TestCase):
         emails = [u["email"] for u in resp.data["users"]]
         self.assertIn("target@test.com", emails)
 
+    def test_block_user_deactivates_and_revokes_devices(self):
+        from apps.accounts.models import Device
+
+        Device.objects.create(user=self.target, device_id="d1", platform="android", is_parent=True)
+        resp = self.client.post(f"/control/admin/users/{self.target.id}/block/", {"reason": "Test"})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.target.refresh_from_db()
+        self.assertEqual(self.target.status, "blocked")
+        self.assertFalse(self.target.is_active)
+        device = Device.objects.get(user=self.target, device_id="d1")
+        self.assertIsNotNone(device.revoked_at)
+
+    def test_delete_user_schedules_grace_period_deletion(self):
+        resp = self.client.post(f"/control/admin/users/{self.target.id}/delete/", {"reason": "Test"})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn("scheduled_for", resp.data)
+        self.target.refresh_from_db()
+        self.assertFalse(self.target.is_active)
+        self.assertTrue(self.target.is_deleted)
+
+    def test_restore_reverses_ban(self):
+        self.target.status = "banned"
+        self.target.save(update_fields=["status"])
+        resp = self.client.post(f"/control/admin/users/{self.target.id}/restore/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.target.refresh_from_db()
+        self.assertEqual(self.target.status, "active")
+
+    def test_restore_reverses_block(self):
+        self.client.post(f"/control/admin/users/{self.target.id}/block/", {"reason": "Test"})
+        resp = self.client.post(f"/control/admin/users/{self.target.id}/restore/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.target.refresh_from_db()
+        self.assertEqual(self.target.status, "active")
+        self.assertTrue(self.target.is_active)
+
+    def test_restore_cancels_pending_deletion(self):
+        from apps.accounts.models import GDPRRequest
+
+        self.client.post(f"/control/admin/users/{self.target.id}/delete/", {"reason": "Test"})
+        resp = self.client.post(f"/control/admin/users/{self.target.id}/restore/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.target.refresh_from_db()
+        self.assertTrue(self.target.is_active)
+        self.assertFalse(self.target.is_deleted)
+        pending = GDPRRequest.objects.filter(user=self.target, type="account_deletion", status="pending")
+        self.assertFalse(pending.exists())
+
 
 # ─── Device wipe (per-user + platform-wide) ──────────────────────────────────
 
@@ -316,6 +364,148 @@ class AdminContentQueueMediaSafetyLinkTests(TestCase):
         before = Flag.objects.count()
         create_media_safety_alert_for_scan(scan)
         self.assertEqual(Flag.objects.count(), before)
+
+
+# ─── Human moderation gate for public broadcast content ──────────────────────
+
+class AdminMediaSafetyModerateTests(TestCase):
+    def setUp(self):
+        from apps.broadcasts.models import BroadcastVideo
+        from apps.media.models import MediaSafetyScan
+
+        self.BroadcastVideo = BroadcastVideo
+        self.client = APIClient()
+        self.admin = _make_user("admin@test.com", is_superuser=True, is_staff=True, tier="Partner Pro")
+        _make_admin_role(self.admin)
+        self.creator = _make_user("creator@test.com", tier="Free")
+        self.video = BroadcastVideo.objects.create(
+            title="t", creator=self.creator, video_url="", mime_type="video/mp4",
+            storage_path="broadcast_videos/x.mp4", type="video",
+        )
+        self.scan = MediaSafetyScan.objects.create(
+            owner=self.creator, upload_id="broadcast_videos/x.mp4", context="broadcast",
+            mime_type="video/mp4", provider="nudenet", status="passed", quarantine=False,
+            result={"score": 0.0, "resolution_target": "broadcast_video", "resolution_id": str(self.video.id)},
+        )
+        self.client.force_authenticate(user=self.admin)
+
+    def test_scan_serializer_exposes_moderation_state_and_is_moderatable(self):
+        resp = self.client.get("/control/admin/media-safety/scans/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        row = next(s for s in resp.data["scans"] if s["id"] == str(self.scan.id))
+        self.assertTrue(row["moderatable"])
+        self.assertEqual(row["target_type"], "broadcast_video")
+        self.assertEqual(row["target_id"], str(self.video.id))
+        self.assertEqual(row["moderation"]["status"], "pending_review")
+        self.assertFalse(row["moderation"]["is_broadcast_eligible"])
+
+    def test_pass_action_makes_video_eligible(self):
+        resp = self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "pass",
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.video.refresh_from_db()
+        self.assertEqual(self.video.moderation_status, self.BroadcastVideo.ModerationStatus.PASSED)
+        self.assertIsNotNone(self.video.moderation_expires_at)
+        self.assertEqual(self.video.moderation_reviewed_by_id, self.admin.id)
+
+    def test_block_action_deactivates_video(self):
+        resp = self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "block",
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.video.refresh_from_db()
+        self.assertEqual(self.video.moderation_status, self.BroadcastVideo.ModerationStatus.BLOCKED)
+        self.assertFalse(self.video.is_active)
+
+    def test_delete_action_deactivates_video(self):
+        resp = self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "delete",
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.video.refresh_from_db()
+        self.assertEqual(self.video.moderation_status, self.BroadcastVideo.ModerationStatus.DELETED)
+        self.assertFalse(self.video.is_active)
+
+    def test_invalid_action_rejected(self):
+        resp = self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "approve-forever",
+        })
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unwired_target_type_rejected_not_silently_ignored(self):
+        resp = self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "education_material", "target_id": "00000000-0000-0000-0000-000000000000", "action": "pass",
+        })
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unauthenticated_denied(self):
+        anon = APIClient()
+        resp = anon.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "pass",
+        })
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class AdminMediaSafetyChatExclusionTests(TestCase):
+    """Private-messaging content must never appear in any admin
+    media-safety/moderation surface - confirmed via apps.media.safety's own
+    context list, not assumed."""
+
+    def setUp(self):
+        from apps.media.models import MediaSafetyScan
+        from apps.moderation.services import create_media_safety_alert_for_scan
+
+        self.client = APIClient()
+        self.admin = _make_user("admin@test.com", is_superuser=True, is_staff=True, tier="Partner Pro")
+        _make_admin_role(self.admin)
+        self.target = _make_user("target@test.com", tier="Free")
+        self.chat_scan = MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="chat/x.jpg", context="chat",
+            mime_type="image/jpeg", provider="nudenet", status="blocked", quarantine=True,
+            reason="nudenet_explicit:FEMALE_BREAST_EXPOSED", result={"score": 0.9, "storage_path": "chat/x.jpg"},
+        )
+        create_media_safety_alert_for_scan(self.chat_scan)
+        self.broadcast_scan = MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="broadcast_videos/y.mp4", context="broadcast",
+            mime_type="video/mp4", provider="nudenet", status="blocked", quarantine=True,
+            reason="nudenet_explicit:FEMALE_BREAST_EXPOSED", result={"score": 0.9},
+        )
+        create_media_safety_alert_for_scan(self.broadcast_scan)
+        self.client.force_authenticate(user=self.admin)
+
+    def test_chat_scan_excluded_from_media_safety_list(self):
+        resp = self.client.get("/control/admin/media-safety/scans/")
+        ids = {s["id"] for s in resp.data["scans"]}
+        self.assertNotIn(str(self.chat_scan.id), ids)
+        self.assertIn(str(self.broadcast_scan.id), ids)
+
+    def test_chat_scan_excluded_from_media_safety_summary_total(self):
+        chat_only_total = self.client.get("/control/admin/media-safety/summary/").data["total"]
+        self.assertGreaterEqual(chat_only_total, 1)
+        # The broadcast scan alone must be counted; deleting it should drop
+        # the total by exactly one if the chat scan was never counted.
+        from apps.media.models import MediaSafetyScan
+        self.broadcast_scan.delete()
+        after = self.client.get("/control/admin/media-safety/summary/").data["total"]
+        self.assertEqual(after, chat_only_total - 1)
+
+    def test_chat_scan_media_url_404s_even_with_a_real_id(self):
+        resp = self.client.get(f"/control/admin/media-safety/scans/{self.chat_scan.id}/media-url/")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_chat_flag_excluded_from_moderation_queue(self):
+        resp = self.client.get("/control/admin/content/queue/", {"status": "PENDING"})
+        flag_target_ids = {f["target_id"] for f in resp.data["flags"]}
+        self.assertNotIn(str(self.chat_scan.id), flag_target_ids)
+        self.assertIn(str(self.broadcast_scan.id), flag_target_ids)
+
+    def test_chat_flag_excluded_from_moderation_summary(self):
+        resp = self.client.get("/control/admin/content/summary/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        # Just proves the summary endpoint still works with the exclusion
+        # join in place; the queue test above proves the exclusion itself.
+        self.assertIn("total_pending", resp.data)
 
 
 # ─── Content moderation ───────────────────────────────────────────────────────

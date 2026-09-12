@@ -20,6 +20,9 @@ from .user_management import (
     AdminUserDetailView,
     AdminUserBanView,
     AdminUserUnbanView,
+    AdminUserBlockView,
+    AdminUserDeleteView,
+    AdminUserRestoreView,
     AdminUserTierChangeView,
     AdminUserDeviceWipeView,
     AdminDeviceWipeAllView,
@@ -41,6 +44,7 @@ from .media_safety import (
     AdminMediaSafetyScanListView,
     AdminMediaSafetyScanSummaryView,
     AdminMediaSafetyScanMediaUrlView,
+    AdminMediaSafetyModerateView,
 )
 from .partner_oversight import (
     AdminPartnerListView,
@@ -73,6 +77,9 @@ __all__ = [
     "AdminUserDetailView",
     "AdminUserBanView",
     "AdminUserUnbanView",
+    "AdminUserBlockView",
+    "AdminUserDeleteView",
+    "AdminUserRestoreView",
     "AdminUserTierChangeView",
     "AdminUserDeviceWipeView",
     "AdminDeviceWipeAllView",
@@ -92,6 +99,7 @@ __all__ = [
     "AdminMediaSafetyScanListView",
     "AdminMediaSafetyScanSummaryView",
     "AdminMediaSafetyScanMediaUrlView",
+    "AdminMediaSafetyModerateView",
     # Partner oversight
     "AdminPartnerListView",
     "AdminPartnerDetailView",

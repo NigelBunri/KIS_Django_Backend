@@ -9183,8 +9183,13 @@ class BroadcastVideoListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        from .moderation_gate import filter_broadcast_eligible
+
         video_type = (request.query_params.get("type") or "").lower()
-        qs = BroadcastVideo.objects.filter(is_active=True)
+        # filter_broadcast_eligible is the single authoritative "may this be
+        # public" rule (apps.broadcasts.moderation_gate) — an AI-clean scan
+        # alone is never enough; only an unexpired human PASS is.
+        qs = filter_broadcast_eligible(BroadcastVideo.objects.filter(is_active=True))
         if video_type in ("short", "video"):
             qs = qs.filter(type=video_type)
         videos = qs.order_by("-created_at")[:40]
@@ -9241,7 +9246,10 @@ class BroadcastVideoUploadView(APIView):
             duration_seconds=int(round(duration)),
             transcript_segments=transcript_segments,
         )
-        video.video_url = "" if safety_decision.quarantine else build_media_url(request, relative_path)
+        # video_url stays "" regardless of the AI verdict — see
+        # apps.broadcasts.moderation_gate: only an explicit, unexpired human
+        # PASS makes a video public, never an AI scan alone. Set by
+        # apply_moderation_decision() when a moderator passes it.
         ensure_local_thumbnail(video)
         if safety_decision.reason == NUDENET_SCAN_QUEUED_REASON:
             from apps.media.tasks import ContentSafetyResolutionTarget, scan_video_and_resolve_task
@@ -9255,7 +9263,6 @@ class BroadcastVideoUploadView(APIView):
             }
             safety_scan.save(update_fields=["result"])
             scan_video_and_resolve_task.delay(scan_id=str(safety_scan.id))
-        video.save(update_fields=["video_url"])
         payload = BroadcastVideoSerializer(video, context={"request": request}).data
         payload["scan_status"] = safety_decision.status
         payload["quarantined"] = safety_decision.quarantine
@@ -9308,7 +9315,17 @@ class BroadcastVideoStreamView(APIView):
     authentication_classes = []
 
     def get(self, request, video_id):
+        from .moderation_gate import is_broadcast_eligible
+
         video = get_object_or_404(BroadcastVideo, id=video_id, is_active=True)
+        # Live re-check, not just the list endpoint's queryset filter - closes
+        # the gap where a human PASS expires (or is reversed) between when a
+        # feed was rendered and when this URL is actually requested. The
+        # creator previewing their own still-pending upload is the one
+        # deliberate exception: that's not "public" distribution.
+        is_owner = bool(getattr(request.user, "is_authenticated", False)) and video.creator_id == getattr(request.user, "id", None)
+        if not is_owner and not is_broadcast_eligible(video):
+            raise Http404("Video not found.")
 
         # Remote backends (S3/Supabase) have no local filesystem path — hand
         # the client a direct (signed, if private) URL instead of proxying
@@ -13921,7 +13938,13 @@ def _build_feed_attachment(request, file_obj):
             description='',
             channel=None,
             creator=request.user if request.user.is_authenticated else None,
-            video_url=url,
+            # Deliberately blank regardless of the AI verdict (`url` above)
+            # — see apps.broadcasts.moderation_gate: only an explicit human
+            # PASS makes a video public, never an AI scan alone. Public
+            # playback (BroadcastVideoStreamView) is gated independently of
+            # this field anyway, but leaving it blank until passed is a
+            # second, defense-in-depth reason nothing can play it early.
+            video_url='',
             thumbnail_url='',
             mime_type=file_obj.content_type or '',
             storage_path=rel_path,

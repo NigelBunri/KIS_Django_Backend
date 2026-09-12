@@ -173,18 +173,20 @@ class ContentSafetyResolutionTarget(str, enum.Enum):
 
 
 def _resolve_broadcast_video(target_id: str, decision, storage_path: str) -> None:
-    from apps.broadcasts.media_utils import build_media_url
+    """Deliberately does NOT touch video_url or moderation_status. An AI
+    verdict, clean or not, only ever feeds the moderation queue (via the
+    quarantine->Flag alert above in the caller) — it is never sufficient on
+    its own to make a video public. See apps.broadcasts.moderation_gate:
+    only an explicit, unexpired human PASS does that. This function exists
+    (rather than being removed) so the resolver-dispatch table's shape
+    stays uniform across target types, and as the anchor point for any
+    future purely-informational side effect that should still run when a
+    video's AI scan resolves (e.g. updating a "why is this still pending"
+    admin hint) without ever re-introducing an AI-driven visibility path."""
     from apps.broadcasts.models import BroadcastVideo
 
-    try:
-        video = BroadcastVideo.objects.get(id=target_id)
-    except BroadcastVideo.DoesNotExist:
+    if not BroadcastVideo.objects.filter(id=target_id).exists():
         logger.warning("content_safety.resolve.missing_target", extra={"target": "broadcast_video", "target_id": target_id})
-        return
-    if not decision.quarantine and video.storage_path:
-        video.video_url = build_media_url(None, video.storage_path)
-        video.save(update_fields=["video_url"])
-    # Quarantined: video_url is already "" from creation time — nothing to do.
 
 
 def _resolve_media_asset(target_id: str, decision, storage_path: str) -> None:

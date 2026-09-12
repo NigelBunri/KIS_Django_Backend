@@ -29,9 +29,19 @@ class AdminContentQueueView(APIView):
     required_permission = "content.moderate"
 
     def get(self, request):
+        from apps.media.models import MediaSafetyScan
         from apps.moderation.models import Flag
 
-        qs = Flag.objects.all().order_by("-created_at")
+        from .media_safety import CHAT_EXCLUDED_CONTEXTS
+
+        # Private-messaging content never appears in this public-content
+        # moderation queue — confirmed via apps.media.safety's own context
+        # list, not assumed. Flags raised from a media-safety scan carry
+        # target_id=<scan.id> (see apps.moderation.services.
+        # create_media_safety_alert_for_scan), so this excludes any flag
+        # whose linked scan is a chat/dm/group upload.
+        chat_scan_ids = MediaSafetyScan.objects.filter(context__in=CHAT_EXCLUDED_CONTEXTS).values("id")
+        qs = Flag.objects.exclude(target_id__in=chat_scan_ids).order_by("-created_at")
 
         flag_status = request.query_params.get("status", "PENDING")
         if flag_status:
@@ -70,13 +80,19 @@ class AdminContentQueueSummaryView(APIView):
 
     def get(self, request):
         from django.db.models import Count
+        from apps.media.models import MediaSafetyScan
         from apps.moderation.models import Flag
 
-        by_severity = list(Flag.objects.filter(status="PENDING").values("severity").annotate(count=Count("id")))
-        by_type = list(Flag.objects.filter(status="PENDING").values("target_type").annotate(count=Count("id")))
-        total_pending = Flag.objects.filter(status="PENDING").count()
-        total_critical = Flag.objects.filter(status="PENDING", severity="critical").count()
-        actioned_today = Flag.objects.filter(
+        from .media_safety import CHAT_EXCLUDED_CONTEXTS
+
+        chat_scan_ids = MediaSafetyScan.objects.filter(context__in=CHAT_EXCLUDED_CONTEXTS).values("id")
+        base = Flag.objects.exclude(target_id__in=chat_scan_ids)
+
+        by_severity = list(base.filter(status="PENDING").values("severity").annotate(count=Count("id")))
+        by_type = list(base.filter(status="PENDING").values("target_type").annotate(count=Count("id")))
+        total_pending = base.filter(status="PENDING").count()
+        total_critical = base.filter(status="PENDING", severity="critical").count()
+        actioned_today = base.filter(
             status__in=["ACTIONED", "DISMISSED"],
             updated_at__date=timezone.now().date(),
         ).count()

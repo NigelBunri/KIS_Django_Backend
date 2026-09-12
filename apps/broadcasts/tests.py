@@ -3372,7 +3372,12 @@ class BroadcastVideoContractTests(APITestCase):
             attachment.get('stream_url', '').startswith('http://192.168.110.62:8000/api/v1/broadcasts/videos/')
         )
         video = BroadcastVideo.objects.get(id=attachment.get('video_id'))
-        self.assertTrue(video.video_url.startswith('http://192.168.110.62:8000/media/'))
+        # video_url is deliberately blank regardless of the AI verdict now
+        # (apps.broadcasts.moderation_gate) - only an explicit, unexpired
+        # human PASS populates it. The attachment's own 'url' field above
+        # (still AI-gated only) is unaffected by this change.
+        self.assertEqual(video.video_url, '')
+        self.assertEqual(video.moderation_status, BroadcastVideo.ModerationStatus.PENDING_REVIEW)
 
     @override_settings(MEDIA_ROOT=None)
     def test_video_stream_endpoint_supports_inline_and_range_requests(self):

@@ -948,6 +948,14 @@ MEDIA_SAFETY_ALLOWED_MIME_PREFIXES = os.environ.get("MEDIA_SAFETY_ALLOWED_MIME_P
 MEDIA_SAFETY_ALLOWED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_ALLOWED_EXTENSIONS", "")
 MEDIA_SAFETY_BLOCKED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_BLOCKED_EXTENSIONS", "")
 
+# Human moderation authority for public broadcast content (see
+# apps.broadcasts.moderation_gate). An AI scan verdict alone never makes
+# content public - a human PASS does, and it isn't permanent: it expires
+# after this many days and the content becomes ineligible again until
+# re-passed. Deliberately independent of MEDIA_SAFETY_* above, which govern
+# the AI scan itself, not the human approval layer built on top of it.
+BROADCAST_MODERATION_REVALIDATION_DAYS = int(os.environ.get("BROADCAST_MODERATION_REVALIDATION_DAYS", "90"))
+
 # Self-hosted NudeNet detection, extracted out of this process into its own
 # service (kis-content-safety). Off by default — with the flag off, the 5
 # call sites that scan uploads behave exactly as they did before this

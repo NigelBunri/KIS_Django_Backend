@@ -1,9 +1,11 @@
 import os
 import tempfile
 import uuid
+from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
+from django.utils import timezone
 
 from apps.broadcasts import views as broadcasts_views
 from apps.broadcasts.models import BroadcastVideo
@@ -60,6 +62,13 @@ class BroadcastVideoStreamRangeTests(TestCase):
             mime_type="video/mp4",
             storage_path=self.storage_path,
             duration_seconds=3600,
+            # Range-request streaming is what this suite covers, not the
+            # moderation gate (apps.broadcasts.moderation_gate) - pre-passed
+            # so BroadcastVideoStreamView's eligibility check doesn't 404
+            # every request here before the code under test ever runs.
+            moderation_status=BroadcastVideo.ModerationStatus.PASSED,
+            moderation_passed_at=timezone.now(),
+            moderation_expires_at=timezone.now() + timedelta(days=90),
         )
         self.url = f"/api/v1/broadcasts/videos/{self.video.id}/stream/"
 

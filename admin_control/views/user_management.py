@@ -172,6 +172,137 @@ class AdminUserUnbanView(APIView):
         return Response({"user": _serialize_user(user), "action": "unbanned"})
 
 
+class AdminUserBlockView(APIView):
+    """
+    POST /control/admin/users/<user_id>/block/
+    Body: {reason}
+    Distinct from ban/suspend: also revokes every active device session
+    immediately (ban/suspend historically didn't - block is the "kick them
+    out right now" action) and sets is_active=False, which is what
+    LoginSerializer's password-login path actually checks (the status
+    string alone only blocks apps.otp's OTP-login path).
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "users.moderate"
+
+    def post(self, request, user_id):
+        from apps.accounts.models import Device
+        from apps.accounts.views import revoke_device_session
+
+        user = _get_user_or_404(user_id)
+        if isinstance(user, Response):
+            return user
+
+        reason = str(request.data.get("reason", "")).strip() or "Blocked by admin"
+        user.status = "blocked"
+        user.is_active = False
+        user.save(update_fields=["status", "is_active"])
+        for device in Device.objects.filter(user=user, revoked_at__isnull=True):
+            revoke_device_session(user, device, reason="account_blocked_by_admin", request=request)
+
+        AuditLogger.log(
+            actor=request.user,
+            action_type="user.blocked",
+            target_app="accounts",
+            target_model="User",
+            target_pk=str(user.id),
+            severity="warning",
+            metadata={"reason": reason},
+        )
+        return Response({"user": _serialize_user(user), "action": "blocked"})
+
+
+class AdminUserDeleteView(APIView):
+    """
+    POST /control/admin/users/<user_id>/delete/
+    Body: {reason}
+    Reuses the exact same grace-period deletion machinery as the user's
+    own self-service account deletion (apps.accounts.views.
+    schedule_account_deletion) rather than a second, admin-only deletion
+    path - deactivates, soft-deletes, revokes every device session, and
+    files the GDPRRequest the daily purge sweep hard-deletes after
+    settings.ACCOUNT_DELETION_GRACE_DAYS. Reversible via restore/ until
+    then, exactly like the self-service flow's own reactivation window.
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "users.moderate"
+
+    def post(self, request, user_id):
+        from apps.accounts.views import schedule_account_deletion
+
+        user = _get_user_or_404(user_id)
+        if isinstance(user, Response):
+            return user
+
+        reason = str(request.data.get("reason", "")).strip() or "Deleted by admin"
+        gdpr_request = schedule_account_deletion(user, request=request, actor=request.user, source="admin_console")
+
+        AuditLogger.log(
+            actor=request.user,
+            action_type="user.deleted",
+            target_app="accounts",
+            target_model="User",
+            target_pk=str(user.id),
+            severity="critical",
+            metadata={"reason": reason, "scheduled_for": gdpr_request.scheduled_for.isoformat()},
+        )
+        return Response({
+            "user": _serialize_user(user),
+            "action": "deleted",
+            "scheduled_for": gdpr_request.scheduled_for.isoformat(),
+        })
+
+
+class AdminUserRestoreView(APIView):
+    """
+    POST /control/admin/users/<user_id>/restore/
+    Reverses ban, suspend, block, OR a pending scheduled deletion - one
+    button for "undo whatever moderation state this account is in",
+    covering the case AdminUserUnbanView alone doesn't (it only clears the
+    status string, not is_active/is_deleted/a pending GDPRRequest). Only
+    cancels a deletion still inside its grace period, matching
+    AccountReactivationView's own window.
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "users.moderate"
+
+    def post(self, request, user_id):
+        from django.db import transaction
+        from django.utils import timezone
+
+        from apps.accounts.models import GDPRRequest
+
+        user = _get_user_or_404(user_id)
+        if isinstance(user, Response):
+            return user
+
+        with transaction.atomic():
+            pending = (
+                GDPRRequest.objects.select_for_update()
+                .filter(user=user, type="account_deletion", status="pending", scheduled_for__gt=timezone.now())
+                .order_by("-created_at")
+                .first()
+            )
+            if pending:
+                pending.status = "cancelled"
+                pending.completed_at = timezone.now()
+                pending.save(update_fields=["status", "completed_at", "updated_at"])
+            user.status = "active"
+            user.is_active = True
+            user.is_deleted = False
+            user.save(update_fields=["status", "is_active", "is_deleted"])
+
+        AuditLogger.log(
+            actor=request.user,
+            action_type="user.restored",
+            target_app="accounts",
+            target_model="User",
+            target_pk=str(user.id),
+            metadata={"had_pending_deletion": bool(pending)},
+        )
+        return Response({"user": _serialize_user(user), "action": "restored"})
+
+
 class AdminUserTierChangeView(APIView):
     """
     POST /control/admin/users/<user_id>/set-tier/
@@ -351,6 +482,8 @@ def _serialize_user(user, full: bool = False):
         "phone": user.phone,
         "tier": user.tier,
         "status": getattr(user, "status", "active"),
+        "is_active": user.is_active,
+        "is_deleted": getattr(user, "is_deleted", False),
         "country": getattr(user, "country", ""),
         "is_staff": user.is_staff,
         "is_superuser": user.is_superuser,

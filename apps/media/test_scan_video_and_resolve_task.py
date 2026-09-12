@@ -67,7 +67,12 @@ class ScanVideoAndResolveTaskTests(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.status, "passed")
         video.refresh_from_db()
-        self.assertTrue(video.video_url)
+        # An AI-clean scan must NEVER be sufficient to make a video public
+        # on its own (apps.broadcasts.moderation_gate) - only an explicit,
+        # unexpired human PASS does. video_url/moderation_status are
+        # untouched by the AI resolution regardless of its verdict.
+        self.assertEqual(video.video_url, "")
+        self.assertEqual(video.moderation_status, BroadcastVideo.ModerationStatus.PENDING_REVIEW)
 
     @patch("apps.media.tasks.default_storage")
     @patch("apps.media.content_safety_provider._requests")

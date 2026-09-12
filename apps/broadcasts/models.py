@@ -3106,6 +3106,18 @@ class BroadcastVideo(models.Model):
         ("video", "Video"),
     ]
 
+    class ModerationStatus(models.TextChoices):
+        """The single authoritative gate for public visibility - see
+        apps.broadcasts.moderation_gate.is_broadcast_eligible(). PENDING_REVIEW
+        is the default for every new upload: an AI-clean scan alone is
+        NEVER sufficient to make a video public, only an explicit human
+        PASS (apps.moderation admin action) is. PASSED itself is not
+        permanent - see moderation_expires_at."""
+        PENDING_REVIEW = "pending_review", "Pending review"
+        PASSED = "passed", "Passed"
+        BLOCKED = "blocked", "Blocked"
+        DELETED = "deleted", "Deleted"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
@@ -3124,6 +3136,18 @@ class BroadcastVideo(models.Model):
     duration_seconds = models.PositiveIntegerField(default=0)
     transcript_segments = models.JSONField(default=list, blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
+    moderation_status = models.CharField(
+        max_length=16, choices=ModerationStatus.choices, default=ModerationStatus.PENDING_REVIEW, db_index=True,
+    )
+    moderation_passed_at = models.DateTimeField(null=True, blank=True)
+    # Stored directly (not recomputed from moderation_passed_at + a settings
+    # window on every read) so the public-listing/playback queries below can
+    # filter on it with a plain indexed comparison rather than a Python-side
+    # per-row recompute.
+    moderation_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    moderation_reviewed_by = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL, related_name="moderated_broadcast_videos",
+    )
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 

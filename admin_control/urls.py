@@ -23,6 +23,9 @@ from admin_control.views import (
     AdminUserDetailView,
     AdminUserBanView,
     AdminUserUnbanView,
+    AdminUserBlockView,
+    AdminUserDeleteView,
+    AdminUserRestoreView,
     AdminUserTierChangeView,
     AdminUserDeviceWipeView,
     AdminDeviceWipeAllView,
@@ -41,6 +44,7 @@ from admin_control.views import (
     AdminMediaSafetyScanListView,
     AdminMediaSafetyScanSummaryView,
     AdminMediaSafetyScanMediaUrlView,
+    AdminMediaSafetyModerateView,
     # Partner oversight
     AdminPartnerListView,
     AdminPartnerDetailView,
@@ -79,6 +83,9 @@ urlpatterns = [
     path("users/<str:user_id>/", AdminUserDetailView.as_view(), name="admin-user-detail"),
     path("users/<str:user_id>/ban/", AdminUserBanView.as_view(), name="admin-user-ban"),
     path("users/<str:user_id>/unban/", AdminUserUnbanView.as_view(), name="admin-user-unban"),
+    path("users/<str:user_id>/block/", AdminUserBlockView.as_view(), name="admin-user-block"),
+    path("users/<str:user_id>/delete/", AdminUserDeleteView.as_view(), name="admin-user-delete"),
+    path("users/<str:user_id>/restore/", AdminUserRestoreView.as_view(), name="admin-user-restore"),
     path("users/<str:user_id>/set-tier/", AdminUserTierChangeView.as_view(), name="admin-user-set-tier"),
     path("users/<str:user_id>/wipe-devices/", AdminUserDeviceWipeView.as_view(), name="admin-user-wipe-devices"),
     path("devices/wipe-all/", AdminDeviceWipeAllView.as_view(), name="admin-devices-wipe-all"),
@@ -91,6 +98,7 @@ urlpatterns = [
         AdminMediaSafetyScanMediaUrlView.as_view(),
         name="admin-media-safety-scan-media-url",
     ),
+    path("media-safety/moderate/", AdminMediaSafetyModerateView.as_view(), name="admin-media-safety-moderate"),
 
     # ── Content moderation ────────────────────────────────────────────────
     path("content/queue/", AdminContentQueueView.as_view(), name="admin-content-queue"),
