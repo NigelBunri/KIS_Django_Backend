@@ -427,13 +427,15 @@ def _notify_nest_to_quarantine(object_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocked-content permanent deletion — a definitive AI (or staff-confirmed)
-# block starts a MEDIA_BLOCKED_CONTENT_DELETION_HOURS countdown (default 24h,
-# see apps.moderation.services._takedown_and_schedule_deletion) to
-# permanently delete the underlying file and its public content record.
-# Human approval was never required to take the content offline (that
-# already happened immediately via apps.broadcasts.moderation_gate.
-# apply_ai_block_takedown) - this is only the delayed, final purge.
+# Blocked-content permanent deletion — an AI (or staff) block takes content
+# offline immediately on its own (apps.broadcasts.moderation_gate.
+# apply_ai_block_takedown / apps.moderation.services._takedown_blocked_content),
+# but per explicit product policy AI never schedules or performs the actual
+# file/record deletion. Only a human admin's explicit "Delete" action
+# (admin_control.views.media_safety.AdminMediaSafetyModerateView) sets
+# MediaSafetyScan.scheduled_deletion_at; this sweep just processes whatever
+# a human has actually scheduled, promptly (every 15 min), so illicit
+# material a human confirmed for deletion doesn't linger in storage.
 # ---------------------------------------------------------------------------
 
 from django.utils import timezone
@@ -494,3 +496,92 @@ def delete_blocked_media() -> dict:
 @shared_task
 def delete_blocked_media_task():
     return delete_blocked_media()
+
+
+# ---------------------------------------------------------------------------
+# Orphaned-record housekeeping - distinct from delete_blocked_media above,
+# which performs a HUMAN's explicit delete decision. This function makes no
+# moderation judgment of its own: it only ever reacts to storage state that
+# is already true (the underlying S3 object is gone, for whatever reason -
+# a prior partial failure, a manual/manual-console intervention, a legacy
+# path that predates this system), so the database never keeps a dangling
+# reference to a file that no longer exists. It never removes a file that
+# is still actually stored.
+#
+# Scoped to every non-deleted MediaSafetyScan, not just "blocked" ones -
+# any scan whose file is gone is stale data regardless of its moderation
+# status. At current volume (low hundreds of rows) one existence check per
+# row per run is cheap; this does not batch S3 HEAD calls and would need
+# revisiting (e.g. S3 inventory/event-driven sync instead of polling) if
+# this table grows into the tens of thousands.
+# ---------------------------------------------------------------------------
+
+def sync_orphaned_media_records() -> dict:
+    from .models import MediaSafetyScan
+
+    now = timezone.now()
+    candidates = MediaSafetyScan.objects.filter(deleted_at__isnull=True).exclude(upload_id="")
+
+    synced = 0
+    errors = 0
+    for scan in candidates.iterator():
+        try:
+            result = scan.result if isinstance(scan.result, dict) else {}
+            storage_path = str(result.get("storage_path") or scan.upload_id or "").strip()
+            if not storage_path or default_storage.exists(storage_path):
+                continue  # no path to check, or the file is still genuinely there
+
+            scan.deleted_at = now
+            scan.save(update_fields=["deleted_at", "updated_at"])
+
+            target_type = str(result.get("resolution_target") or "")
+            target_id = str(result.get("resolution_id") or "")
+            resolver = _DELETE_TARGET_RESOLVERS.get(target_type)
+            if resolver and target_id:
+                resolver(target_id)
+
+            synced += 1
+        except Exception:
+            errors += 1
+            logger.exception("Failed to sync orphaned media record (scan_id=%s)", scan.id)
+
+    return {"synced": synced, "errors": errors}
+
+
+@shared_task
+def sync_orphaned_media_records_task():
+    return sync_orphaned_media_records()
+
+
+# ---------------------------------------------------------------------------
+# Stuck-scan safety net - a video content-safety scan is queued for async
+# resolution (safety.NUDENET_SCAN_QUEUED_REASON) at upload time, then
+# resolved by scan_video_and_resolve_task. If that .delay() call silently
+# failed, or a worker crashed before ever picking the task up, the scan
+# would sit "pending"/incomplete forever with nothing to notice or retry
+# it. This sweep re-enqueues any scan still carrying the queued marker
+# after stale_after_minutes. Safe to re-run/duplicate: scan_video_and_
+# resolve_task only ever proceeds if the scan's reason is STILL the queued
+# marker (see its own docstring), so re-enqueuing an already-resolving or
+# already-resolved scan is always a no-op, never a double-apply.
+# ---------------------------------------------------------------------------
+
+def resolve_stuck_video_scans(*, stale_after_minutes: int = 60) -> dict:
+    from datetime import timedelta
+
+    from .models import MediaSafetyScan
+    from .safety import NUDENET_SCAN_QUEUED_REASON
+
+    cutoff = timezone.now() - timedelta(minutes=stale_after_minutes)
+    stuck = MediaSafetyScan.objects.filter(reason=NUDENET_SCAN_QUEUED_REASON, created_at__lt=cutoff)
+
+    requeued = 0
+    for scan in stuck.iterator():
+        scan_video_and_resolve_task.delay(scan_id=str(scan.id))
+        requeued += 1
+    return {"requeued": requeued}
+
+
+@shared_task
+def resolve_stuck_video_scans_task():
+    return resolve_stuck_video_scans()

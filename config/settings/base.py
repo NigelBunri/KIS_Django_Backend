@@ -894,15 +894,38 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.accounts.tasks.purge_accounts_past_grace_period_task",
         "schedule": 15 * 60,
     },
-    # Permanently deletes the file + public content record for anything an
-    # AI (or staff-confirmed) block scheduled for deletion
-    # MEDIA_BLOCKED_CONTENT_DELETION_HOURS ago (apps/media/tasks.py,
-    # apps/moderation/services.py's _takedown_and_schedule_deletion). The
-    # content is already taken offline immediately on block - this sweep is
-    # only the delayed, final purge.
+    # Permanently deletes the file + public content record for anything a
+    # HUMAN admin has explicitly scheduled for deletion (admin_control's
+    # AdminMediaSafetyModerateView "delete" action sets
+    # MediaSafetyScan.scheduled_deletion_at itself; apps/media/tasks.py's
+    # delete_blocked_media just processes whatever is due). AI can take
+    # content offline (block) on its own, but per explicit product policy
+    # AI never schedules or performs the actual deletion - only a human
+    # reviewing the moderation queue can. This sweep runs every 15 minutes
+    # purely so a human's "Delete" click is acted on promptly, not to
+    # enforce any timer of its own.
     "delete-blocked-media": {
         "task": "apps.media.tasks.delete_blocked_media_task",
         "schedule": 15 * 60,
+    },
+    # Pure housekeeping, not a moderation decision: cleans up any
+    # MediaSafetyScan (and its linked content row) whose underlying storage
+    # object is already gone for any reason, so the database never keeps a
+    # dangling reference to a file that no longer exists. Hourly - this is
+    # hygiene, not enforcement, so it doesn't need the 15-minute cadence
+    # above.
+    "sync-orphaned-media-records": {
+        "task": "apps.media.tasks.sync_orphaned_media_records_task",
+        "schedule": 60 * 60,
+    },
+    # Safety net so a video content-safety scan can never sit "pending"/
+    # incomplete indefinitely if its original scan_video_and_resolve_task
+    # enqueue silently failed or a worker crashed before picking it up -
+    # re-enqueues anything still queued-for-scan after an hour. Idempotent:
+    # see resolve_stuck_video_scans's own docstring.
+    "resolve-stuck-video-scans": {
+        "task": "apps.media.tasks.resolve_stuck_video_scans_task",
+        "schedule": 30 * 60,
     },
     # cleanup_expired_broadcast_items existed as a real, working function
     # and management command (apps/broadcasts/management/commands/
@@ -971,10 +994,12 @@ MEDIA_SAFETY_BLOCKED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_BLOCKED_EXTENSION
 # the AI scan itself, not the human approval layer built on top of it.
 BROADCAST_MODERATION_REVALIDATION_DAYS = int(os.environ.get("BROADCAST_MODERATION_REVALIDATION_DAYS", "90"))
 
-# A definitive AI block starts this countdown to permanent deletion of the
-# underlying file + its public content record (apps.moderation.services.
-# create_media_safety_alert_for_scan, apps.media.tasks.delete_blocked_media_task).
-MEDIA_BLOCKED_CONTENT_DELETION_HOURS = int(os.environ.get("MEDIA_BLOCKED_CONTENT_DELETION_HOURS", "24"))
+# NOTE: there is deliberately no "hours until auto-delete" setting here. AI
+# may take blocked content offline immediately (see apply_ai_block_takedown)
+# but per explicit product policy never schedules or performs the actual
+# deletion - only a human admin's explicit "Delete" action in the moderation
+# dashboard does (admin_control.views.media_safety.AdminMediaSafetyModerateView),
+# which apps.media.tasks.delete_blocked_media then acts on promptly.
 
 # Admin-initiated account deletion following a violation review (distinct
 # from the self-service ACCOUNT_DELETION_GRACE_DAYS window above, which is

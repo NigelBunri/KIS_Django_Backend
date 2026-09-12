@@ -1,8 +1,11 @@
 """
-The 24h (MEDIA_BLOCKED_CONTENT_DELETION_HOURS) permanent-deletion sweep -
-apps.media.tasks.delete_blocked_media(). Covers idempotency/retry-safety,
-the actual file + public-content-record deletion, and that a not-yet-due
-or already-deleted scan is correctly left alone.
+The permanent-deletion sweep - apps.media.tasks.delete_blocked_media().
+Covers idempotency/retry-safety, the actual file + public-content-record
+deletion, and that a not-yet-due or already-deleted scan is correctly left
+alone. This sweep only ever acts on a scan whose scheduled_deletion_at a
+HUMAN admin explicitly set (see AdminMediaSafetyModerateView's "delete"
+action) - AI never sets it, so these tests set it directly rather than
+going through the AI-block path.
 """
 from __future__ import annotations
 

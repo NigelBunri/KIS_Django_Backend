@@ -319,8 +319,10 @@ class BulkViolationTests(APITestCase):
 
 class AiBlockTakedownTests(APITestCase):
     """A definitive AI BLOCKED verdict must immediately take the linked
-    public content offline and start the deletion countdown - no human
-    approval required for this specific transition."""
+    public content offline - no human approval required for that. But per
+    explicit product policy, AI must NEVER schedule or perform the actual
+    file/record deletion on its own - only a human admin's explicit
+    "Delete" action does that (see AdminMediaSafetyModerateActionTests)."""
 
     def setUp(self):
         User = get_user_model()
@@ -349,32 +351,27 @@ class AiBlockTakedownTests(APITestCase):
         self.assertEqual(self.video.moderation_status, BroadcastVideo.ModerationStatus.BLOCKED)
         self.assertFalse(self.video.is_active)
 
-    def test_ai_block_schedules_deletion(self):
-        from datetime import timedelta
-
-        from django.utils import timezone
-
+    def test_ai_block_never_schedules_deletion_on_its_own(self):
+        """The core policy this test class exists to prove: AI may take
+        content offline, but must never start a deletion countdown by
+        itself. Only a human's explicit "Delete" action may set
+        scheduled_deletion_at (see admin_control's AdminMediaSafetyModerateView)."""
         from apps.moderation.services import create_media_safety_alert_for_scan
 
-        before = timezone.now()
         create_media_safety_alert_for_scan(self.scan)
 
         self.scan.refresh_from_db()
-        self.assertIsNotNone(self.scan.scheduled_deletion_at)
-        self.assertGreater(self.scan.scheduled_deletion_at, before + timedelta(hours=23))
-        self.assertLess(self.scan.scheduled_deletion_at, before + timedelta(hours=25))
+        self.assertIsNone(self.scan.scheduled_deletion_at)
         self.assertIsNone(self.scan.deleted_at)
 
-    def test_duplicate_call_does_not_push_the_deletion_countdown_out(self):
+    def test_duplicate_ai_block_calls_never_schedule_deletion_either(self):
         from apps.moderation.services import create_media_safety_alert_for_scan
 
         create_media_safety_alert_for_scan(self.scan)
-        self.scan.refresh_from_db()
-        first_deadline = self.scan.scheduled_deletion_at
-
         create_media_safety_alert_for_scan(self.scan)
+
         self.scan.refresh_from_db()
-        self.assertEqual(self.scan.scheduled_deletion_at, first_deadline)
+        self.assertIsNone(self.scan.scheduled_deletion_at)
 
 
 class AppealRestoresBroadcastEligibilityTests(APITestCase):
@@ -406,10 +403,21 @@ class AppealRestoresBroadcastEligibilityTests(APITestCase):
         self.video.refresh_from_db()
         self.assertFalse(self.video.is_active)  # sanity: takedown actually happened
 
-    def test_overturning_the_block_restores_broadcast_eligibility_and_cancels_deletion(self):
+    def test_overturning_the_block_restores_broadcast_eligibility_and_cancels_a_pending_human_deletion(self):
+        """A human had already scheduled this content for deletion (e.g.
+        clicked "Delete" in the moderation dashboard) before new evidence
+        led to the block being overturned via appeal/approve - the approve
+        path must cancel that pending deletion, not merely leave
+        scheduled_deletion_at at None because AI never set it in the first
+        place (see AiBlockTakedownTests for that separate guarantee)."""
         from apps.broadcasts.models import BroadcastVideo
         from apps.broadcasts.moderation_gate import is_broadcast_eligible
         from apps.moderation.services import apply_media_safety_action
+
+        from django.utils import timezone
+
+        self.scan.scheduled_deletion_at = timezone.now()
+        self.scan.save(update_fields=["scheduled_deletion_at"])
 
         apply_media_safety_action(self.scan, action="approve", actor=self.admin, notes="False positive.")
 

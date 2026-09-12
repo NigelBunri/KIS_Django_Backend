@@ -324,23 +324,24 @@ def create_media_safety_alert_for_scan(scan: MediaSafetyScan, *, actor=None, req
     # with high confidence. Low-confidence pending_review scans do NOT reach
     # here — those wait for apply_media_safety_action's manual "block".
     if scan.status == "blocked":
-        _takedown_and_schedule_deletion(scan)
+        _takedown_blocked_content(scan)
         apply_ai_flag_consequence(scan, flag)
 
 
-def _takedown_and_schedule_deletion(scan: MediaSafetyScan) -> None:
+def _takedown_blocked_content(scan: MediaSafetyScan) -> None:
     """A definitive AI block is immediately sufficient to take content
-    offline on its own - no human approval required (see
-    apps.broadcasts.moderation_gate.apply_ai_block_takedown). Also starts
-    the MEDIA_BLOCKED_CONTENT_DELETION_HOURS countdown that apps.media.
-    tasks.delete_blocked_media_task permanently deletes the file and its
-    public content record on. Guarded against a redelivered/duplicate call
-    for the same scan already having scheduled a deletion - real idempotency
-    here, not just "runs the takedown again harmlessly", since resetting the
-    countdown on every duplicate call would mean a sufficiently frequent
-    retry could postpone deletion indefinitely."""
-    from datetime import timedelta
+    OFFLINE on its own - no human approval required (see
+    apps.broadcasts.moderation_gate.apply_ai_block_takedown).
 
+    Deliberately does NOT schedule permanent deletion. Per explicit product
+    decision, AI may never autonomously destroy a file/record - deletion
+    only ever happens when a human admin explicitly clicks "Delete" in the
+    moderation dashboard (admin_control's AdminMediaSafetyModerateView sets
+    scan.scheduled_deletion_at itself when that action is chosen; see also
+    apps.media.tasks.delete_blocked_media_task, which processes only
+    whatever a human has actually scheduled - it applies no timer of its
+    own). This function's job ends at takedown; the content then sits
+    quarantined (off, not public) indefinitely until a human reviews it."""
     result = scan.result if isinstance(scan.result, dict) else {}
     target_type = str(result.get("resolution_target") or "")
     target_id = str(result.get("resolution_id") or "")
@@ -348,11 +349,6 @@ def _takedown_and_schedule_deletion(scan: MediaSafetyScan) -> None:
         from apps.broadcasts.moderation_gate import apply_ai_block_takedown
 
         apply_ai_block_takedown(target_type, target_id)
-
-    if scan.scheduled_deletion_at is None:
-        hours = int(getattr(settings, "MEDIA_BLOCKED_CONTENT_DELETION_HOURS", 24))
-        scan.scheduled_deletion_at = timezone.now() + timedelta(hours=hours)
-        scan.save(update_fields=["scheduled_deletion_at", "updated_at"])
 
 
 def apply_media_safety_action(scan: MediaSafetyScan, *, action: str, actor, notes: str = "", request=None) -> MediaSafetyScan:
@@ -390,9 +386,9 @@ def apply_media_safety_action(scan: MediaSafetyScan, *, action: str, actor, note
         update_fields.extend(["status", "quarantine", "requires_review", "reason"])
         if scan.asset_id:
             MediaAsset.objects.filter(id=scan.asset_id).update(status="ready", updated_at=timezone.now())
-        # Cancels the 24h deletion countdown if it hasn't run yet, and
-        # restores the underlying content's broadcast eligibility - the
-        # human-moderation-gate counterpart to the AI takedown this same
+        # Cancels a human-scheduled deletion if one was set and hasn't run
+        # yet, and restores the underlying content's broadcast eligibility -
+        # the human-moderation-gate counterpart to the AI takedown this same
         # scan may have triggered.
         scan.scheduled_deletion_at = None
         update_fields.append("scheduled_deletion_at")
@@ -431,10 +427,10 @@ def apply_media_safety_action(scan: MediaSafetyScan, *, action: str, actor, note
     scan.save(update_fields=sorted(set(update_fields)))
 
     # A manual staff "block" is a CONFIRMED violation exactly like a
-    # high-confidence AI auto-block - applies the same strike + 24h
-    # deletion countdown (create_media_safety_alert_for_scan's automatic
-    # path never touches this scan since it's a manual decision, not the
-    # queued-for-review flow that function watches).
+    # high-confidence AI auto-block - applies the same strike (takedown
+    # only, no deletion scheduling - see _takedown_blocked_content; a human
+    # still has to explicitly choose "Delete" separately to actually
+    # destroy anything).
     if normalized == "block":
         # get_or_create, not a bare filter - this scan may never have gone
         # through create_media_safety_alert_for_scan at all (e.g. a staff
@@ -443,7 +439,7 @@ def apply_media_safety_action(scan: MediaSafetyScan, *, action: str, actor, note
         # which apply_ai_flag_consequence can't attach a required-FK
         # ModerationAction row to.
         flag = _get_or_create_media_safety_flag(scan, actor=actor, request=request)
-        _takedown_and_schedule_deletion(scan)
+        _takedown_blocked_content(scan)
         apply_ai_flag_consequence(scan, flag)
     record_moderation_audit(
         actor=actor,

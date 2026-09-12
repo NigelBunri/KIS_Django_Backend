@@ -549,7 +549,11 @@ class AdminMediaSafetyModerateTests(TestCase):
 
         self.scan.refresh_from_db()
         self.assertEqual(self.scan.status, "blocked")
-        self.assertIsNotNone(self.scan.scheduled_deletion_at)
+        # Block takes the content down and strikes the account, but per
+        # explicit product policy never schedules deletion on its own -
+        # only the separate, explicit "delete" action does that (see
+        # test_delete_action_forces_immediate_deletion_sweep_eligibility).
+        self.assertIsNone(self.scan.scheduled_deletion_at)
 
     def test_delete_action_deactivates_video(self):
         resp = self.client.post("/control/admin/media-safety/moderate/", {
