@@ -1,6 +1,7 @@
 """Tests for KCAN admin control: superadmin setup, access control, user management, content moderation."""
 from __future__ import annotations
 
+import datetime
 from io import StringIO
 
 from django.core.management import call_command
@@ -202,6 +203,115 @@ class AdminUserManagementTests(TestCase):
         self.assertFalse(self.target.is_deleted)
         pending = GDPRRequest.objects.filter(user=self.target, type="account_deletion", status="pending")
         self.assertFalse(pending.exists())
+
+
+# ─── Violation review + admin-initiated violation deletion ───────────────────
+
+class AdminUserViolationsAndScheduleDeletionTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = _make_user("admin@test.com", is_superuser=True, is_staff=True, tier="Partner Pro")
+        _make_admin_role(self.admin)
+        self.target = _make_user("target@test.com", tier="Free")
+        self.client.force_authenticate(user=self.admin)
+
+    def test_violations_view_reports_strike_count_and_blocked_incidents(self):
+        from apps.media.models import MediaSafetyScan
+        from apps.moderation.services import create_media_safety_alert_for_scan
+
+        for i in range(3):
+            scan = MediaSafetyScan.objects.create(
+                owner=self.target, upload_id=f"x{i}.jpg", context="broadcast", mime_type="image/jpeg",
+                provider="nudenet", status="blocked", quarantine=True, requires_review=False,
+                reason="nudenet_explicit:FEMALE_BREAST_EXPOSED",
+            )
+            create_media_safety_alert_for_scan(scan)
+
+        resp = self.client.get(f"/control/admin/users/{self.target.id}/violations/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["violation_count"], 3)
+        self.assertEqual(len(resp.data["blocked_incidents"]), 3)
+        self.assertEqual(len(resp.data["warning_history"]), 3)
+        self.assertIsNone(resp.data["pending_deletion"])
+
+    def test_violations_view_reports_pending_deletion(self):
+        from apps.accounts.views import schedule_account_deletion
+
+        schedule_account_deletion(
+            self.target, actor=self.admin, source="admin_violation_review",
+            grace_period=datetime.timedelta(hours=3),
+        )
+        resp = self.client.get(f"/control/admin/users/{self.target.id}/violations/")
+        self.assertIsNotNone(resp.data["pending_deletion"])
+
+    def test_schedule_violation_deletion_uses_the_short_grace_window(self):
+        from apps.accounts.models import GDPRRequest
+        from django.utils import timezone
+
+        with self.settings(ACCOUNT_VIOLATION_DELETION_WARNING_HOURS=3):
+            resp = self.client.post(
+                f"/control/admin/users/{self.target.id}/schedule-violation-deletion/",
+                {"reason": "Repeated violations"},
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        gdpr_request = GDPRRequest.objects.get(user=self.target, type="account_deletion", status="pending")
+        delta = gdpr_request.scheduled_for - timezone.now()
+        self.assertTrue(datetime.timedelta(hours=2, minutes=55) < delta < datetime.timedelta(hours=3, minutes=5))
+
+        self.target.refresh_from_db()
+        self.assertFalse(self.target.is_active)
+        self.assertTrue(self.target.is_deleted)
+
+    def test_restore_after_violation_deletion_sends_a_notification(self):
+        from apps.notifications.models import Notification
+
+        self.client.post(
+            f"/control/admin/users/{self.target.id}/schedule-violation-deletion/",
+            {"reason": "Repeated violations"},
+        )
+        before = Notification.objects.filter(user_id=self.target.id, type="account.deletion_cancelled").count()
+
+        resp = self.client.post(f"/control/admin/users/{self.target.id}/restore/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        after = Notification.objects.filter(user_id=self.target.id, type="account.deletion_cancelled").count()
+        self.assertEqual(after, before + 1)
+
+    def test_unauthenticated_denied(self):
+        anon = APIClient()
+        resp = anon.post(f"/control/admin/users/{self.target.id}/schedule-violation-deletion/", {"reason": "x"})
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ─── Suspicious activity: warning notifications surfaced with recipient ──────
+
+class SuspiciousActivityWarningNotificationsTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = _make_user("admin@test.com", is_superuser=True, is_staff=True, tier="Partner Pro")
+        _make_admin_role(self.admin)
+        self.target = _make_user("target@test.com", tier="Free")
+        self.client.force_authenticate(user=self.admin)
+
+    def test_suspicious_activity_includes_warning_notifications_with_recipient(self):
+        from apps.media.models import MediaSafetyScan
+        from apps.moderation.services import create_media_safety_alert_for_scan
+
+        scan = MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="x.jpg", context="broadcast", mime_type="image/jpeg",
+            provider="nudenet", status="blocked", quarantine=True, requires_review=False,
+            reason="nudenet_explicit:FEMALE_BREAST_EXPOSED",
+        )
+        create_media_safety_alert_for_scan(scan)
+
+        resp = self.client.get("/control/admin/activity/flags/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn("flags", resp.data)
+        notifications = resp.data["warning_notifications"]
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(notifications[0]["user_id"], str(self.target.id))
+        self.assertIn("warning", notifications[0]["title"].lower())
 
 
 # ─── Device wipe (per-user + platform-wide) ──────────────────────────────────
@@ -418,6 +528,29 @@ class AdminMediaSafetyModerateTests(TestCase):
         self.assertEqual(self.video.moderation_status, self.BroadcastVideo.ModerationStatus.BLOCKED)
         self.assertFalse(self.video.is_active)
 
+    def test_block_action_applies_a_real_strike_and_notification(self):
+        """The actual reconciliation this endpoint exists for: a Block here
+        must drive the SAME real apps.moderation consequences (strike,
+        warning notification) as the pre-existing staff moderation queue -
+        not a second, disconnected BroadcastVideo-only field write."""
+        from apps.moderation.models import UserReputation
+        from apps.notifications.models import Notification
+
+        resp = self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "block",
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        reputation = UserReputation.objects.get(user_id=self.creator.id)
+        self.assertEqual(reputation.flags_received, 1)
+        self.assertTrue(
+            Notification.objects.filter(user_id=self.creator.id, type="MODERATION_WARNING").exists()
+        )
+
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, "blocked")
+        self.assertIsNotNone(self.scan.scheduled_deletion_at)
+
     def test_delete_action_deactivates_video(self):
         resp = self.client.post("/control/admin/media-safety/moderate/", {
             "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "delete",
@@ -426,6 +559,34 @@ class AdminMediaSafetyModerateTests(TestCase):
         self.video.refresh_from_db()
         self.assertEqual(self.video.moderation_status, self.BroadcastVideo.ModerationStatus.DELETED)
         self.assertFalse(self.video.is_active)
+
+    def test_delete_action_forces_immediate_deletion_sweep_eligibility(self):
+        from django.utils import timezone
+
+        resp = self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "delete",
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.scan.refresh_from_db()
+        self.assertIsNotNone(self.scan.scheduled_deletion_at)
+        self.assertLessEqual(self.scan.scheduled_deletion_at, timezone.now())
+
+    def test_pass_action_applies_through_the_real_approve_path(self):
+        """Confirms "pass" here is not a disconnected write either - it
+        goes through apply_media_safety_action's "approve" branch, which
+        also clears the scan's own quarantine/status fields, not just the
+        BroadcastVideo-side moderation_status."""
+        # First block it (as an admin correcting an earlier decision would).
+        self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "block",
+        })
+        self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": str(self.video.id), "action": "pass",
+        })
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, "passed")
+        self.assertFalse(self.scan.quarantine)
+        self.assertIsNone(self.scan.scheduled_deletion_at)
 
     def test_invalid_action_rejected(self):
         resp = self.client.post("/control/admin/media-safety/moderate/", {

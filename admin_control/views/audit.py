@@ -15,6 +15,40 @@ from admin_control.serializers import (
 )
 
 
+def _recent_warning_notifications(limit: int = 100) -> list[dict]:
+    """The actual moderation warning/suspension notifications sent to
+    users (apps.moderation.services.apply_ai_flag_consequence), with who
+    received each one - an admin reviewing suspicious activity should see
+    what was actually communicated, not just that "a warning was issued"
+    in an audit log line. Reuses apps.notifications' real Notification
+    rows rather than a second, parallel record of what was sent."""
+    from apps.accounts.models import User
+    from apps.notifications.models import Notification
+
+    rows = list(
+        Notification.objects.filter(type__in=["MODERATION_WARNING", "MODERATION_SUSPENSION"])
+        .order_by("-created_at")
+        .values("id", "user_id", "type", "title", "body", "created_at")[:limit]
+    )
+    user_ids = {row["user_id"] for row in rows}
+    users_by_id = {
+        u.id: u for u in User.objects.filter(id__in=user_ids).only("id", "email", "display_name", "phone")
+    }
+    results = []
+    for row in rows:
+        user = users_by_id.get(row["user_id"])
+        results.append({
+            "id": str(row["id"]),
+            "user_id": str(row["user_id"]),
+            "user_display_name": (user.display_name or user.email or user.phone) if user else None,
+            "type": row["type"],
+            "title": row["title"],
+            "body": row["body"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        })
+    return results
+
+
 class AuditTrailView(APIView):
     permission_classes = [IsAuthenticated, IsAdminControlUser]
 
@@ -55,7 +89,10 @@ class SuspiciousActivityView(APIView):
             queryset = queryset.filter(resolved=(resolved == "true"))
         queryset = queryset.order_by("-created_at")
         serializer = SuspiciousActivityFlagSerializer(queryset, many=True)
-        return Response(serializer.data)
+        return Response({
+            "flags": serializer.data,
+            "warning_notifications": _recent_warning_notifications(),
+        })
 
     def patch(self, request):
         flag_id = request.data.get("id")

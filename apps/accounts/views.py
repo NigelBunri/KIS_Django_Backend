@@ -4087,15 +4087,21 @@ class PasswordChangeView(APIView):
 # coerced/mistaken request had no recovery path at all.
 # ---------------------------------------------------------------------
 
-def schedule_account_deletion(user, *, request=None, actor=None, source: str) -> GDPRRequest:
+def schedule_account_deletion(
+    user, *, request=None, actor=None, source: str, grace_period: datetime.timedelta | None = None,
+) -> GDPRRequest:
     """
-    Deactivates + soft-deletes `user` and files the GDPRRequest that the
-    daily purge sweep uses to hard-delete them once the grace period ends.
-    Shared by the authenticated and public (logged-out) deletion endpoints
-    so the two don't drift into different actual behaviors.
+    Deactivates + soft-deletes `user` and files the GDPRRequest that
+    purge_accounts_past_grace_period_task uses to hard-delete them once the
+    grace period ends. Shared by the authenticated and public (logged-out)
+    self-service deletion endpoints, AND admin_control's violation-driven
+    AdminUserScheduleViolationDeletionView (a much shorter grace_period -
+    ACCOUNT_VIOLATION_DELETION_WARNING_HOURS, not
+    ACCOUNT_DELETION_GRACE_DAYS), so none of them drift into different
+    actual behaviors for what "scheduled for deletion" means.
     """
     now = timezone.now()
-    scheduled_for = now + datetime.timedelta(days=settings.ACCOUNT_DELETION_GRACE_DAYS)
+    scheduled_for = now + (grace_period or datetime.timedelta(days=settings.ACCOUNT_DELETION_GRACE_DAYS))
 
     with transaction.atomic():
         gdpr_request = GDPRRequest.objects.create(
@@ -4125,20 +4131,54 @@ def schedule_account_deletion(user, *, request=None, actor=None, source: str) ->
 
     try:
         from apps.notifications.services import create_notification
-        create_notification(
-            user_id=user.id,
-            type="account.deletion_scheduled",
-            title="Your account is scheduled for deletion",
-            body=(
-                f"We received a request to delete your KIS account. It will be "
-                f"permanently deleted on {scheduled_for.strftime('%Y-%m-%d')}. "
-                f"Log back in with your phone and password before then to cancel."
-            ),
-            context={"scheduled_for": scheduled_for.isoformat()},
+
+        if source == "admin_violation_review":
+            # This account is already suspended (is_active=False) from the
+            # violation that led here, so "log back in to cancel" - correct
+            # for the self-service path below - would be impossible/
+            # misleading guidance. Only an admin can cancel this one (see
+            # AdminUserRestoreView), and the short, hours-scale window needs
+            # an actual time, not just a date.
+            create_notification(
+                user_id=user.id,
+                type="account.deletion_scheduled",
+                title="Your account will be permanently deleted",
+                body=(
+                    "Your KIS account is scheduled for permanent deletion because of repeated "
+                    "or severe violations of our content rules. This will happen at "
+                    f"{scheduled_for.strftime('%Y-%m-%d %H:%M UTC')} unless the decision is "
+                    "reversed by our team before then."
+                ),
+                context={"scheduled_for": scheduled_for.isoformat()},
+                priority="HIGH",
+                channels=["IN_APP", "PUSH"],
+                dedup_key=f"account_violation_deletion_warning:{gdpr_request.id}",
+            )
+        else:
+            create_notification(
+                user_id=user.id,
+                type="account.deletion_scheduled",
+                title="Your account is scheduled for deletion",
+                body=(
+                    f"We received a request to delete your KIS account. It will be "
+                    f"permanently deleted on {scheduled_for.strftime('%Y-%m-%d')}. "
+                    f"Log back in with your phone and password before then to cancel."
+                ),
+                context={"scheduled_for": scheduled_for.isoformat()},
+            )
+    except Exception as exc:
+        # Never let a notification failure block the deletion itself, but
+        # it must still be visible somewhere an admin reviewing enforcement
+        # actually looks, not just a server log.
+        log_security_event(
+            actor,
+            "security.account.deletion_warning_notification_failed",
+            request=request,
+            severity="warning",
+            user_id=str(user.id),
+            source=source,
+            error=f"{type(exc).__name__}: {exc}"[:1000],
         )
-    except Exception:
-        # Never let a notification failure block the deletion itself.
-        pass
 
     return gdpr_request
 

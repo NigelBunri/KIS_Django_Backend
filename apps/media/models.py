@@ -389,12 +389,26 @@ class MediaSafetyScan(BaseEntity):
     policy_version = models.CharField(max_length=64, default="kis-christian-safety-v1")
     reason = models.CharField(max_length=256, blank=True)
     result = models.JSONField(default=dict, blank=True)
+    # A definitive AI block starts a 24h countdown to permanently delete the
+    # underlying file + its public content record (see apps.moderation.
+    # services.create_media_safety_alert_for_scan and apps.media.tasks.
+    # delete_blocked_media_task) - human approval is never required to take
+    # blocked content offline, only to reverse a block via appeal.
+    # deleted_at is set BEFORE the actual deletion runs (same tradeoff as
+    # apps.accounts.tasks.purge_accounts_past_grace_period: prefer
+    # under-deleting on a mid-task crash over any risk of double-processing)
+    # and is what makes the sweep idempotent/retry-safe - a redelivered or
+    # duplicate task run for the same scan sees deleted_at already set and
+    # skips it.
+    scheduled_deletion_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    deleted_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         indexes = [
             models.Index(fields=["context", "status"]),
             models.Index(fields=["owner", "status"]),
             models.Index(fields=["upload_id", "status"]),
+            models.Index(fields=["status", "scheduled_deletion_at", "deleted_at"]),
         ]
 
     def __str__(self):

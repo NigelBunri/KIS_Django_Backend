@@ -292,6 +292,41 @@ class AdminUserRestoreView(APIView):
             user.is_deleted = False
             user.save(update_fields=["status", "is_active", "is_deleted"])
 
+        if pending:
+            # A pending deletion is a strong enough signal (violation-driven
+            # or self-service) that a bare restore shouldn't be silent about
+            # what happens next - one more explicit warning before we stop
+            # tracking that this account was ever on the edge of deletion.
+            try:
+                from apps.notifications.services import create_notification
+                create_notification(
+                    user_id=user.id,
+                    type="account.deletion_cancelled",
+                    title="Your account has been restored",
+                    body=(
+                        "Your account's scheduled deletion has been cancelled and your account "
+                        "is active again. Further violations of KIS's content rules can result "
+                        "in account restriction, suspension, or permanent deletion."
+                    ),
+                    priority="HIGH",
+                    channels=["IN_APP", "PUSH"],
+                    dedup_key=f"account_restored_after_pending_deletion:{pending.id}",
+                )
+            except Exception as exc:
+                # Never let a notification failure block the restore
+                # itself, but it must still be visible somewhere an admin
+                # reviewing enforcement actually looks, not just a server
+                # log.
+                AuditLogger.log(
+                    actor=request.user,
+                    action_type="user.restore_notification_failed",
+                    target_app="accounts",
+                    target_model="User",
+                    target_pk=str(user.id),
+                    severity="warning",
+                    metadata={"error": f"{type(exc).__name__}: {exc}"[:1000]},
+                )
+
         AuditLogger.log(
             actor=request.user,
             action_type="user.restored",
@@ -301,6 +336,121 @@ class AdminUserRestoreView(APIView):
             metadata={"had_pending_deletion": bool(pending)},
         )
         return Response({"user": _serialize_user(user), "action": "restored"})
+
+
+class AdminUserScheduleViolationDeletionView(APIView):
+    """
+    POST /control/admin/users/<user_id>/schedule-violation-deletion/
+    An administrator has reviewed an account already in PENDING HUMAN
+    REVIEW (see apps.moderation.services.apply_ai_flag_consequence - status
+    "suspended" is that state) and decided it should be permanently
+    deleted. Reuses the same schedule_account_deletion machinery as
+    self-service deletion, with a much shorter grace_period
+    (ACCOUNT_VIOLATION_DELETION_WARNING_HOURS, default 3h) and its own
+    notification wording - see schedule_account_deletion's
+    source == "admin_violation_review" branch.
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "users.moderate"
+
+    def post(self, request, user_id):
+        import datetime
+
+        from django.conf import settings
+
+        from apps.accounts.views import schedule_account_deletion
+
+        user = _get_user_or_404(user_id)
+        if isinstance(user, Response):
+            return user
+
+        reason = str(request.data.get("reason", "")).strip() or "Repeated/severe content violations"
+        hours = int(getattr(settings, "ACCOUNT_VIOLATION_DELETION_WARNING_HOURS", 3))
+        gdpr_request = schedule_account_deletion(
+            user, request=request, actor=request.user, source="admin_violation_review",
+            grace_period=datetime.timedelta(hours=hours),
+        )
+
+        AuditLogger.log(
+            actor=request.user,
+            action_type="user.violation_deletion_scheduled",
+            target_app="accounts",
+            target_model="User",
+            target_pk=str(user.id),
+            severity="critical",
+            metadata={"reason": reason, "scheduled_for": gdpr_request.scheduled_for.isoformat(), "warning_hours": hours},
+        )
+        return Response({
+            "user": _serialize_user(user),
+            "action": "violation_deletion_scheduled",
+            "scheduled_for": gdpr_request.scheduled_for.isoformat(),
+        })
+
+
+class AdminUserViolationsView(APIView):
+    """
+    GET /control/admin/users/<user_id>/violations/
+    Everything an administrator needs to review an account flagged for
+    content violations - reuses the real UserReputation/ModerationAction/
+    Flag/GDPRRequest records rather than a second violation-tracking model.
+    Never returns the actual flagged media itself (use media-safety's own
+    scoped, signed-URL endpoint for that, one file at a time).
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "users.moderate"
+
+    def get(self, request, user_id):
+        from apps.accounts.models import GDPRRequest
+        from apps.media.models import MediaSafetyScan
+        from apps.moderation.models import ModerationAction, UserReputation
+
+        user = _get_user_or_404(user_id)
+        if isinstance(user, Response):
+            return user
+
+        reputation = UserReputation.objects.filter(user_id=user.id).first()
+        blocked_incidents = list(
+            MediaSafetyScan.objects.filter(owner_id=user.id, status="blocked")
+            .order_by("-created_at")
+            .values("id", "context", "mime_type", "created_at", "reason", "deleted_at")[:100]
+        )
+        for row in blocked_incidents:
+            row["id"] = str(row["id"])
+            row["created_at"] = row["created_at"].isoformat() if row["created_at"] else None
+            row["deleted_at"] = row["deleted_at"].isoformat() if row["deleted_at"] else None
+
+        warning_history = list(
+            ModerationAction.objects.filter(
+                performed_by_id="00000000-0000-0000-0000-000000000000",
+                action__in=["WARN", "SUSPEND", "REINSTATE"],
+                flag__target_id__in=MediaSafetyScan.objects.filter(owner_id=user.id).values("id"),
+            )
+            .order_by("-created_at")
+            .values("id", "action", "notes", "created_at", "auto_generated")[:100]
+        )
+        for row in warning_history:
+            row["id"] = str(row["id"])
+            row["created_at"] = row["created_at"].isoformat() if row["created_at"] else None
+
+        pending_deletion = (
+            GDPRRequest.objects.filter(user=user, type="account_deletion", status="pending")
+            .order_by("-created_at")
+            .values("id", "scheduled_for", "created_at")
+            .first()
+        )
+        if pending_deletion:
+            pending_deletion["id"] = str(pending_deletion["id"])
+            pending_deletion["scheduled_for"] = pending_deletion["scheduled_for"].isoformat()
+            pending_deletion["created_at"] = pending_deletion["created_at"].isoformat()
+
+        return Response({
+            "user": _serialize_user(user),
+            "violation_count": reputation.flags_received if reputation else 0,
+            "actions_taken": reputation.actions_taken if reputation else 0,
+            "blocked_incidents": blocked_incidents,
+            "warning_history": warning_history,
+            "pending_deletion": pending_deletion,
+        })
 
 
 class AdminUserTierChangeView(APIView):

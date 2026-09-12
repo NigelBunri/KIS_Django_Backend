@@ -196,16 +196,31 @@ def _serialize_broadcast_video_moderation(video_id: str) -> dict | None:
     }
 
 
+# Maps this admin surface's Pass/Pending/Block/Delete vocabulary onto
+# apps.moderation.services.apply_media_safety_action's STAFF_ACTIONS
+# ("approve"/"block"/"escalate"/...) - the REAL, already-live business
+# logic (strike counting, notifications, 24h-deletion scheduling, appeal-
+# compatible reversal) that this admin UI now drives, rather than a second,
+# parallel implementation of the same decisions.
+_ACTION_TO_STAFF_ACTION = {"pass": "approve", "pending": "escalate", "block": "block"}
+
+
 class AdminMediaSafetyModerateView(APIView):
     """
     POST /control/admin/media-safety/moderate/
     Body: {target_type: "broadcast_video", target_id: "<uuid>", action: "pass"|"pending"|"block"|"delete"}
 
     The single authoritative human-moderation action endpoint for public
-    broadcast content. Deliberately generic over target_type so it can grow
-    to cover more content types later without a new endpoint per type, but
-    only dispatches to types with a real gate wired up
-    (MODERATABLE_TARGET_TYPES) — never silently no-ops for one that isn't.
+    broadcast content. Resolves the MediaSafetyScan behind this content (via
+    the same resolution_target/resolution_id convention the scan itself
+    carries) and dispatches through apps.moderation.services.
+    apply_media_safety_action, so a Pass/Block here also applies the real
+    strike/notification/deletion-scheduling consequences - not a separate,
+    disconnected set of BroadcastVideo-only field writes. Falls back to
+    apps.broadcasts.moderation_gate directly only when no scan can be found
+    (e.g. an admin proactively acting on content with no linked scan at
+    all), which skips those scan-level consequences since there is no scan
+    to apply them to.
     """
     permission_classes = [IsAuthenticated, IsAdminControlUser]
     required_permission = "content.moderate"
@@ -231,23 +246,57 @@ class AdminMediaSafetyModerateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if target_type == "broadcast_video":
-            from apps.broadcasts.models import BroadcastVideo
-            from apps.broadcasts.moderation_gate import apply_moderation_decision, is_broadcast_eligible
+        from apps.broadcasts.models import BroadcastVideo
+        from apps.broadcasts.moderation_gate import apply_moderation_decision
+        from apps.media.models import MediaSafetyScan
+        from apps.moderation.services import apply_media_safety_action
 
-            try:
-                video = BroadcastVideo.objects.get(id=target_id)
-            except BroadcastVideo.DoesNotExist:
-                return Response({"detail": "Content not found."}, status=status.HTTP_404_NOT_FOUND)
-            apply_moderation_decision(video, action=action, actor=request.user, notes=notes)
-            video.refresh_from_db()
-            result_payload = {
-                "target_type": target_type,
-                "target_id": target_id,
-                "moderation": _serialize_broadcast_video_moderation(target_id),
-            }
-        else:  # pragma: no cover - unreachable, guarded above
-            return Response({"detail": "Unsupported target type."}, status=status.HTTP_400_BAD_REQUEST)
+        if not BroadcastVideo.objects.filter(id=target_id).exists():
+            return Response({"detail": "Content not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # scan.result is a JSONField - resolution_target/resolution_id are
+        # stored as plain strings there, so this is a value match, not an FK
+        # lookup. Most recent scan for this content, in case more than one
+        # exists (a re-upload/re-scan of the same content over time).
+        scan = (
+            MediaSafetyScan.objects.filter(
+                result__resolution_target=target_type, result__resolution_id=target_id,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+
+        if scan is not None and action in _ACTION_TO_STAFF_ACTION:
+            apply_media_safety_action(
+                scan, action=_ACTION_TO_STAFF_ACTION[action], actor=request.user, notes=notes, request=request,
+            )
+        elif scan is not None and action == "delete":
+            # "delete" has no direct STAFF_ACTIONS equivalent - applies the
+            # same confirmed-violation consequence as "block" (strike,
+            # notification), then additionally forces the deletion sweep to
+            # run on its NEXT pass instead of waiting the full
+            # MEDIA_BLOCKED_CONTENT_DELETION_HOURS window, since a human
+            # explicitly chose to delete now rather than merely block.
+            apply_media_safety_action(scan, action="block", actor=request.user, notes=notes, request=request)
+            from django.utils import timezone
+            scan.scheduled_deletion_at = timezone.now()
+            scan.save(update_fields=["scheduled_deletion_at", "updated_at"])
+            video = BroadcastVideo.objects.filter(id=target_id).first()
+            if video is not None:
+                apply_moderation_decision(video, action="delete", actor=request.user, notes=notes)
+        else:
+            # No linked scan at all - apply directly to the content. Skips
+            # the strike/notification/deletion-scheduling consequences
+            # above since there's no scan for them to attach to.
+            video = BroadcastVideo.objects.filter(id=target_id).first()
+            if video is not None:
+                apply_moderation_decision(video, action=action, actor=request.user, notes=notes)
+
+        result_payload = {
+            "target_type": target_type,
+            "target_id": target_id,
+            "moderation": _serialize_broadcast_video_moderation(target_id),
+        }
 
         AuditLogger.log(
             actor=request.user,
@@ -256,6 +305,6 @@ class AdminMediaSafetyModerateView(APIView):
             target_model=target_type,
             target_pk=target_id,
             severity="warning" if action in {"block", "delete"} else "info",
-            metadata={"notes": notes},
+            metadata={"notes": notes, "scan_id": str(scan.id) if scan else None},
         )
         return Response(result_payload)

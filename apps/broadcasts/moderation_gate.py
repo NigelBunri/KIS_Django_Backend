@@ -85,3 +85,42 @@ def apply_moderation_decision(video, *, action: str, actor, notes: str = "") -> 
         video.save(update_fields=["moderation_status", "moderation_reviewed_by", "is_active", "updated_at"])
     else:
         raise ValueError(f"Unknown moderation action: {action!r}")
+
+
+# target_type values (apps.media.tasks.ContentSafetyResolutionTarget) this
+# module knows how to resolve to a real model instance. Deliberately narrow
+# - apps.moderation.services and admin_control both dispatch through
+# resolve_and_apply_moderation_decision() below rather than each knowing how
+# to look up a BroadcastVideo directly, so adding a second content type
+# later (education_material, status_item, ...) only means adding one entry
+# here, not touching every caller.
+MODERATABLE_TARGET_TYPES = {"broadcast_video"}
+
+
+def resolve_and_apply_moderation_decision(target_type: str, target_id, *, action: str, actor, notes: str = "") -> bool:
+    """Resolves target_type/target_id (the same resolution_target/
+    resolution_id convention already stored on MediaSafetyScan.result by
+    apps.media.tasks) to a real content row and applies a moderation
+    decision to it. Returns False (no-op) for an unknown target_type or a
+    target_id that no longer resolves, rather than raising - a scan whose
+    underlying content was already hard-deleted by the 24h sweep is a
+    normal, expected state to encounter here, not an error."""
+    if target_type == "broadcast_video":
+        from .models import BroadcastVideo
+
+        video = BroadcastVideo.objects.filter(id=target_id).first()
+        if video is None:
+            return False
+        apply_moderation_decision(video, action=action, actor=actor, notes=notes)
+        return True
+    return False
+
+
+def apply_ai_block_takedown(target_type: str, target_id) -> bool:
+    """A definitive AI BLOCKED verdict is immediately sufficient to take
+    content offline on its own - unlike every other transition, this one
+    deliberately does NOT require a human actor. Reuses the same "block"
+    application as a manual admin block (moderation_status=BLOCKED,
+    is_active=False) so there is exactly one code path for "this content
+    is blocked", whether AI or a human decided it."""
+    return resolve_and_apply_moderation_decision(target_type, target_id, action="block", actor=None, notes="ai_auto_block")

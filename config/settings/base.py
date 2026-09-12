@@ -881,13 +881,28 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.notifications.tasks.compile_daily_digests",
         "schedule": 24 * 60 * 60,
     },
-    # Hard-deletes accounts whose ACCOUNT_DELETION_GRACE_DAYS window has
-    # elapsed (apps/accounts/tasks.py, apps/accounts/views.py
+    # Hard-deletes accounts whose scheduled-deletion window has elapsed
+    # (apps/accounts/tasks.py, apps/accounts/views.py
     # schedule_account_deletion). Deletion requests only deactivate the
-    # account immediately; this daily sweep is what actually purges it.
+    # account immediately; this sweep is what actually purges it. Every 15
+    # minutes rather than daily since the SAME GDPRRequest mechanism now
+    # also serves admin-initiated violation deletions with a 3-hour window
+    # (ACCOUNT_VIOLATION_DELETION_WARNING_HOURS, admin_control's
+    # AdminUserScheduleViolationDeletionView) - a daily sweep would let one
+    # of those sit for up to 24h past its 3-hour deadline.
     "purge-accounts-past-grace-period": {
         "task": "apps.accounts.tasks.purge_accounts_past_grace_period_task",
-        "schedule": 24 * 60 * 60,
+        "schedule": 15 * 60,
+    },
+    # Permanently deletes the file + public content record for anything an
+    # AI (or staff-confirmed) block scheduled for deletion
+    # MEDIA_BLOCKED_CONTENT_DELETION_HOURS ago (apps/media/tasks.py,
+    # apps/moderation/services.py's _takedown_and_schedule_deletion). The
+    # content is already taken offline immediately on block - this sweep is
+    # only the delayed, final purge.
+    "delete-blocked-media": {
+        "task": "apps.media.tasks.delete_blocked_media_task",
+        "schedule": 15 * 60,
     },
     # cleanup_expired_broadcast_items existed as a real, working function
     # and management command (apps/broadcasts/management/commands/
@@ -955,6 +970,16 @@ MEDIA_SAFETY_BLOCKED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_BLOCKED_EXTENSION
 # re-passed. Deliberately independent of MEDIA_SAFETY_* above, which govern
 # the AI scan itself, not the human approval layer built on top of it.
 BROADCAST_MODERATION_REVALIDATION_DAYS = int(os.environ.get("BROADCAST_MODERATION_REVALIDATION_DAYS", "90"))
+
+# A definitive AI block starts this countdown to permanent deletion of the
+# underlying file + its public content record (apps.moderation.services.
+# create_media_safety_alert_for_scan, apps.media.tasks.delete_blocked_media_task).
+MEDIA_BLOCKED_CONTENT_DELETION_HOURS = int(os.environ.get("MEDIA_BLOCKED_CONTENT_DELETION_HOURS", "24"))
+
+# Admin-initiated account deletion following a violation review (distinct
+# from the self-service ACCOUNT_DELETION_GRACE_DAYS window above, which is
+# measured in days) - see admin_control's AdminUserScheduleViolationDeletionView.
+ACCOUNT_VIOLATION_DELETION_WARNING_HOURS = int(os.environ.get("ACCOUNT_VIOLATION_DELETION_WARNING_HOURS", "3"))
 
 # Self-hosted NudeNet detection, extracted out of this process into its own
 # service (kis-content-safety). Off by default — with the flag off, the 5

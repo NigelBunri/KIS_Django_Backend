@@ -424,3 +424,73 @@ def _notify_nest_to_quarantine(object_key: str) -> None:
         # Best-effort — the MediaSafetyScan/Flag rows above are already the
         # source of truth for GO's review queue even if this call fails.
         pass
+
+
+# ---------------------------------------------------------------------------
+# Blocked-content permanent deletion — a definitive AI (or staff-confirmed)
+# block starts a MEDIA_BLOCKED_CONTENT_DELETION_HOURS countdown (default 24h,
+# see apps.moderation.services._takedown_and_schedule_deletion) to
+# permanently delete the underlying file and its public content record.
+# Human approval was never required to take the content offline (that
+# already happened immediately via apps.broadcasts.moderation_gate.
+# apply_ai_block_takedown) - this is only the delayed, final purge.
+# ---------------------------------------------------------------------------
+
+from django.utils import timezone
+
+_DELETE_TARGET_RESOLVERS = {}
+
+
+def _hard_delete_broadcast_video(target_id: str) -> None:
+    from apps.broadcasts.models import BroadcastVideo
+
+    BroadcastVideo.objects.filter(id=target_id).delete()
+
+
+_DELETE_TARGET_RESOLVERS["broadcast_video"] = _hard_delete_broadcast_video
+
+
+def delete_blocked_media() -> dict:
+    """Real logic behind delete_blocked_media_task - kept independently
+    testable/callable without Celery, matching the house pattern
+    (apps.accounts.tasks.purge_accounts_past_grace_period)."""
+    from .models import MediaSafetyScan
+
+    now = timezone.now()
+    due = MediaSafetyScan.objects.filter(
+        status="blocked", scheduled_deletion_at__lte=now, deleted_at__isnull=True,
+    )
+
+    deleted = 0
+    errors = 0
+    for scan in due:
+        try:
+            # Marked BEFORE the actual deletion - same tradeoff as the
+            # account-purge sweep: prefer under-deleting on a mid-task
+            # crash over any risk of double-processing. This is what makes
+            # a redelivered/duplicate task run for the same scan a no-op.
+            scan.deleted_at = now
+            scan.save(update_fields=["deleted_at", "updated_at"])
+
+            result = scan.result if isinstance(scan.result, dict) else {}
+            storage_path = str(result.get("storage_path") or scan.upload_id or "").strip()
+            if storage_path and default_storage.exists(storage_path):
+                default_storage.delete(storage_path)
+
+            target_type = str(result.get("resolution_target") or "")
+            target_id = str(result.get("resolution_id") or "")
+            resolver = _DELETE_TARGET_RESOLVERS.get(target_type)
+            if resolver and target_id:
+                resolver(target_id)
+
+            deleted += 1
+        except Exception:
+            errors += 1
+            logger.exception("Failed to permanently delete blocked media (scan_id=%s)", scan.id)
+
+    return {"deleted": deleted, "errors": errors}
+
+
+@shared_task
+def delete_blocked_media_task():
+    return delete_blocked_media()
