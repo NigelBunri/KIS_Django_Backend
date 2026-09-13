@@ -2802,13 +2802,15 @@ class CheckContact(APIView):
             User.objects
             .filter(Q(phone__in=all_phone_variants) | Q(phone_number__in=all_digit_variants))
             .exclude(id=request.user.id)
-            .only("id", "phone", "phone_number")
+            .only("id", "phone", "phone_number", "phone_country_code", "display_name")
         )
 
         # Build in-memory lookup maps from the query results
         phone_to_uid: dict[str, int] = {}
         digit_to_uid: dict[str, int] = {}
+        uid_to_user: dict[int, User] = {}
         for u in matched_users:
+            uid_to_user[u.id] = u
             if u.phone:
                 phone_to_uid[str(u.phone)] = u.id
             if u.phone_number:
@@ -2835,6 +2837,37 @@ class CheckContact(APIView):
                         break
 
             results[phone] = {"registered": user_id is not None, "user_id": user_id}
+
+        # This bulk endpoint is the code path every normal device-contact-sync
+        # actually goes through (UpdatesTab's audience picker, the main
+        # Contacts screen); the single-phone GET above is only reached via a
+        # sequential fallback that in practice almost never fires. Before this,
+        # ONLY that GET path persisted a UserContact row (via
+        # _record_contact_lookup) - meaning bulk sync, the dominant path,
+        # silently never wrote the rows that gate default-visibility status
+        # sharing (see StatusVisibility.CONTACTS in apps/statuses/services.py,
+        # can_view_status), regardless of how long two users had been
+        # messaging each other in chat (an entirely separate, Mongo-backed
+        # system with no relation to this table). A user could have a real,
+        # active chat with someone and still never see their status updates,
+        # because the sync flow that was supposed to establish "contact"
+        # never actually recorded it server-side. Reuse the same
+        # _record_contact_lookup upsert logic the GET path already uses (not
+        # a new bulk-optimized write) so both entry points share one tested
+        # upsert path and the UserContact(user, contact_phone) unique
+        # constraint is respected identically either way. Only persisting
+        # matches (registered numbers) here, not every unmatched phone in a
+        # batch of up to 500 - unmatched contacts don't affect status
+        # visibility (can_view_status requires contact_user__isnull=False)
+        # and recording them isn't this fix's concern.
+        for phone in phones:
+            user_id = results[phone]["user_id"]
+            if user_id is None:
+                continue
+            contact_user = uid_to_user.get(user_id)
+            if contact_user is None:
+                continue
+            self._record_contact_lookup(request.user, contact_user, phone, phone_to_variants.get(phone, []))
 
         return Response({"results": results})
 
