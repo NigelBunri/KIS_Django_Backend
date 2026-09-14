@@ -502,6 +502,35 @@ class StaffModerationOperationsQueueView(APIView):
         )
 
 
+def _notify_moderation_target(*, user_id, title: str, body: str, notif_type: str, dedup_key: str, actor, audit_meta: dict) -> None:
+    """Shared notify-the-affected-user step for StaffModerationOperationActionView's
+    flag/channel_moderation_record branches (email-system audit, Priority 2
+    discovery #2b: staff-driven moderation actions previously told the
+    affected user nothing at all, unlike the automated AI-strike pipeline's
+    equivalent WARN/SUSPEND notifications). Never lets a notification
+    failure block the moderation action itself, which has already been
+    applied and saved by the time this runs."""
+    try:
+        from apps.notifications.services import create_notification
+
+        create_notification(
+            user_id=user_id,
+            type=notif_type,
+            title=title,
+            body=body,
+            priority="HIGH",
+            channels=["IN_APP", "PUSH", "EMAIL"],
+            dedup_key=dedup_key,
+        )
+    except Exception as exc:
+        logger.warning("Moderation staff-action notification failed for user_id=%s: %s", user_id, exc)
+        from apps.accounts.models import AuditLog
+        AuditLog.log(
+            actor=actor, action="email.moderation_staff_action.failed",
+            meta={**audit_meta, "error": exc.__class__.__name__},
+        )
+
+
 class StaffModerationOperationActionView(APIView):
     permission_classes = [IsAdminUser]
 
@@ -522,6 +551,7 @@ class StaffModerationOperationActionView(APIView):
 
         if target_type == "flag":
             flag = models.Flag.objects.get(id=target_id)
+            was_actioned = action not in ("dismiss", "review")
             if action == "dismiss":
                 flag.status = "DISMISSED"
                 flag.resolved_at = timezone.now()
@@ -542,12 +572,36 @@ class StaffModerationOperationActionView(APIView):
                 metadata={"notes": notes[:2000], "flag_target_type": flag.target_type, "flag_target_id": str(flag.target_id)},
                 request=request,
             )
+            # Notify the affected user — a human moderator taking real
+            # action on a flag against them previously told them nothing at
+            # all, unlike the automated AI-strike pipeline (which already
+            # notifies on WARN/SUSPEND). Only on a real outcome (not
+            # dismiss/review, which leave nothing changed for them) and only
+            # for flag.target_type == "USER" (target_id IS the user
+            # directly, unambiguous) — Flag.target_type is otherwise
+            # genuinely polymorphic across producers with no single safe way
+            # to resolve "the owner" without per-type verification (POST is
+            # even used for MediaSafetyScan ids from one caller, ChannelContent
+            # ids from others) that's out of scope to guess at here.
+            if was_actioned and flag.target_type == "USER":
+                _notify_moderation_target(
+                    user_id=flag.target_id,
+                    title="A KIS moderator reviewed a report about you",
+                    body=(
+                        "A moderator reviewed a report on your account and took action. "
+                        f"{notes.strip() or 'Contact support if you have questions.'}"
+                    ),
+                    notif_type="MODERATION_STAFF_ACTION",
+                    dedup_key=f"moderation_staff_flag_action:{flag.id}",
+                    actor=request.user,
+                    audit_meta={"flag_id": str(flag.id)},
+                )
             return Response({"ok": True, "target_type": target_type, "result": serializers.FlagSerializer(flag).data})
 
         if target_type == "channel_moderation_record":
             if ChannelModerationRecord is None or ChannelModerationRecordSerializer is None:
                 return Response({"detail": "Channel moderation is unavailable."}, status=status.HTTP_400_BAD_REQUEST)
-            record = ChannelModerationRecord.objects.select_related("content", "comment").get(id=target_id)
+            record = ChannelModerationRecord.objects.select_related("content__channel", "comment").get(id=target_id)
             if action == "block":
                 if record.comment_id and ChannelContentComment is not None:
                     ChannelContentComment.objects.filter(id=record.comment_id).update(is_deleted=True)
@@ -578,6 +632,29 @@ class StaffModerationOperationActionView(APIView):
                 metadata={"record_id": str(record.id), "notes": notes[:2000]},
                 request=request,
             )
+            # Notify the content/comment owner — only on "block" (the
+            # adverse outcome: content actually removed). "approve"/
+            # "dismiss" leave the content up (nothing changed for the
+            # owner), "escalate" is still pending a final decision.
+            if action == "block":
+                owner_user_id = None
+                if record.comment_id and record.comment is not None:
+                    owner_user_id = record.comment.user_id
+                elif record.content_id and record.content is not None and record.content.channel is not None:
+                    owner_user_id = record.content.channel.owner_user_id
+                if owner_user_id:
+                    _notify_moderation_target(
+                        user_id=owner_user_id,
+                        title="Your content was removed — community guidelines",
+                        body=(
+                            "A moderator removed something you posted for violating KIS's "
+                            f"community guidelines. {notes.strip() or 'Contact support if you have questions.'}"
+                        ),
+                        notif_type="MODERATION_STAFF_ACTION",
+                        dedup_key=f"moderation_staff_channel_block:{record.id}",
+                        actor=request.user,
+                        audit_meta={"record_id": str(record.id)},
+                    )
             return Response({"ok": True, "target_type": target_type, "result": ChannelModerationRecordSerializer(record).data})
 
         if target_type == "chat_message_report":
