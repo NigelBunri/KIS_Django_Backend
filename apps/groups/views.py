@@ -154,6 +154,42 @@ class GroupViewSet(viewsets.ModelViewSet):
             GroupRole.MOD,
         )
 
+    def _reactivate_group_membership(self, group: Group, user, *, role=None):
+        """
+        Create-or-reactivate GroupMembership + ConversationMember for
+        (group, user). joined_at is restamped to now() only when actually
+        (re)activating from a nonexistent/left/banned state - never on a
+        redundant call against an already-active membership - so a rejoin
+        starts a new pre-join-history boundary (see the email/E2EE-history
+        audit: new members can never decrypt messages sent before they
+        joined, so an accurate joined_at is what lets the client draw that
+        boundary correctly across leave/rejoin cycles) without disturbing
+        an active member's real original join time.
+        """
+        role = role or GroupRole.MEMBER
+        membership, created = GroupMembership.objects.get_or_create(
+            group=group,
+            user=user,
+            defaults={"role": role},
+        )
+        if not created and (membership.left_at is not None or membership.is_banned):
+            membership.left_at = None
+            membership.is_banned = False
+            membership.joined_at = timezone.now()
+            membership.save(update_fields=["left_at", "is_banned", "joined_at"])
+
+        cm, cm_created = ConversationMember.objects.get_or_create(
+            conversation=group.conversation,
+            user=user,
+            defaults={"base_role": BaseConversationRole.MEMBER},
+        )
+        if not cm_created and cm.left_at is not None:
+            cm.left_at = None
+            cm.joined_at = timezone.now()
+            cm.save(update_fields=["left_at", "joined_at"])
+
+        return membership, cm
+
     def _community_access_all(self, community_id, user) -> bool:
         if not community_id:
             return False
@@ -290,24 +326,7 @@ class GroupViewSet(viewsets.ModelViewSet):
         if group.join_policy != GroupJoinPolicy.OPEN:
             return Response({"detail": "Group is not open to direct join."}, status=status.HTTP_400_BAD_REQUEST)
 
-        membership, _ = GroupMembership.objects.get_or_create(
-            group=group,
-            user=user,
-            defaults={"role": GroupRole.MEMBER},
-        )
-        if membership.left_at is not None:
-            membership.left_at = None
-            membership.is_banned = False
-            membership.save(update_fields=["left_at", "is_banned"])
-
-        cm, _ = ConversationMember.objects.get_or_create(
-            conversation=group.conversation,
-            user=user,
-            defaults={"base_role": BaseConversationRole.MEMBER},
-        )
-        if cm.left_at is not None:
-            cm.left_at = None
-            cm.save(update_fields=["left_at"])
+        membership, _cm = self._reactivate_group_membership(group, user)
 
         return Response(GroupMembershipSerializer(membership).data, status=status.HTTP_200_OK)
 
@@ -340,23 +359,8 @@ class GroupViewSet(viewsets.ModelViewSet):
         for target in users:
             if target.id == user.id:
                 continue
-            m, created = GroupMembership.objects.get_or_create(
-                group=group,
-                user=target,
-                defaults={"role": GroupRole.MEMBER},
-            )
-            if m.left_at is not None or m.is_banned:
-                m.left_at = None
-                m.is_banned = False
-                m.save(update_fields=["left_at", "is_banned"])
-            cm, _ = ConversationMember.objects.get_or_create(
-                conversation=group.conversation,
-                user=target,
-                defaults={"base_role": BaseConversationRole.MEMBER},
-            )
-            if cm.left_at is not None:
-                cm.left_at = None
-                cm.save(update_fields=["left_at"])
+            created = not GroupMembership.objects.filter(group=group, user=target).exists()
+            self._reactivate_group_membership(group, target)
             if group.community_id:
                 CommunityMembership.objects.update_or_create(
                     community_id=group.community_id,
@@ -429,17 +433,7 @@ class GroupViewSet(viewsets.ModelViewSet):
         join_req.reviewed_at = timezone.now()
         join_req.save(update_fields=["status", "reviewed_by", "reviewed_at"])
 
-        GroupMembership.objects.update_or_create(
-            group=group,
-            user=join_req.user,
-            defaults={"role": GroupRole.MEMBER, "left_at": None, "is_banned": False},
-        )
-
-        ConversationMember.objects.update_or_create(
-            conversation=group.conversation,
-            user=join_req.user,
-            defaults={"base_role": BaseConversationRole.MEMBER, "left_at": None},
-        )
+        self._reactivate_group_membership(group, join_req.user)
 
         return Response({"detail": "Approved."}, status=status.HTTP_200_OK)
 
@@ -481,7 +475,13 @@ class GroupViewSet(viewsets.ModelViewSet):
                 "expires_at": request.data.get("expires_at"),
             },
         )
-        GroupMembership.objects.filter(group=group, user_id=user_id).update(is_banned=True)
+        # left_at is stamped here too (not just is_banned) - previously a
+        # banned member's row kept left_at=None, leaving no recorded
+        # boundary timestamp for when the ban actually took effect. Must
+        # stay symmetric with unban() below, which restores it.
+        now = timezone.now()
+        GroupMembership.objects.filter(group=group, user_id=user_id).update(is_banned=True, left_at=now)
+        ConversationMember.objects.filter(conversation=group.conversation, user_id=user_id).update(left_at=now)
         return Response(GroupBanSerializer(ban).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="unban")
@@ -493,7 +493,17 @@ class GroupViewSet(viewsets.ModelViewSet):
 
         user_id = request.data.get("user_id")
         GroupBan.objects.filter(group=group, user_id=user_id).delete()
-        GroupMembership.objects.filter(group=group, user_id=user_id).update(is_banned=False)
+        # A reactivation, same semantics as a rejoin: restamp joined_at so
+        # the pre-join-history boundary reflects this (new) membership
+        # period, not whatever the member's original join date was before
+        # ban() above set left_at.
+        now = timezone.now()
+        GroupMembership.objects.filter(group=group, user_id=user_id).update(
+            is_banned=False, left_at=None, joined_at=now,
+        )
+        ConversationMember.objects.filter(conversation=group.conversation, user_id=user_id).update(
+            left_at=None, joined_at=now,
+        )
         return Response({"detail": "Unbanned."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get", "post"], url_path="invite-link")
@@ -539,14 +549,5 @@ class GroupViewSet(viewsets.ModelViewSet):
         if existing and existing.is_banned:
             return Response({"detail": "You are banned from this group."}, status=status.HTTP_403_FORBIDDEN)
 
-        GroupMembership.objects.update_or_create(
-            group=group,
-            user=request.user,
-            defaults={"role": GroupRole.MEMBER, "left_at": None, "is_banned": False},
-        )
-        ConversationMember.objects.get_or_create(
-            conversation=group.conversation,
-            user=request.user,
-            defaults={"base_role": BaseConversationRole.MEMBER},
-        )
+        self._reactivate_group_membership(group, request.user)
         return Response({"detail": "Joined successfully.", "group_id": str(group.id)})
