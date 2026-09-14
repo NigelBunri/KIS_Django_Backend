@@ -20586,13 +20586,50 @@ class ChannelLiveStreamGuestsView(APIView):
         user_id = request.data.get("user_id")
         email = str(request.data.get("email") or "")
         invited_user = get_object_or_404(User, id=user_id) if user_id else None
+        guest_role = str(request.data.get("role") or ChannelLiveStreamGuest.Role.GUEST)
         guest = ChannelLiveStreamGuest.objects.create(
             live_stream=live_stream,
             user=invited_user,
             email=email,
-            role=str(request.data.get("role") or ChannelLiveStreamGuest.Role.GUEST),
+            role=guest_role,
             invited_by=request.user,
         )
+        # Notify the invitee — previously this created the guest record and
+        # nothing else, so neither an external email invite nor an existing
+        # app user learned they'd been invited (email-system audit,
+        # Priority 2 discovery #4). Non-blocking: the guest slot itself is
+        # already created and returned regardless of email outcome.
+        if guest.email:
+            try:
+                inviter_name = (
+                    getattr(request.user, "display_name", None)
+                    or getattr(request.user, "username", None)
+                    or "A KIS member"
+                )
+                invite_url = request.build_absolute_uri(f"/broadcasts/live/join/{guest.invite_token}/")
+                from apps.notifications.email_service import send_livestream_guest_invite_email
+                if not send_livestream_guest_invite_email(
+                    to_email=guest.email,
+                    inviter_name=inviter_name,
+                    channel_name=live_stream.channel.display_name,
+                    stream_title=live_stream.title,
+                    role=guest_role,
+                    invite_url=invite_url,
+                    scheduled_start_at=(
+                        live_stream.scheduled_start_at.strftime("%B %d, %Y at %H:%M UTC")
+                        if live_stream.scheduled_start_at else None
+                    ),
+                ):
+                    logger.warning("Livestream guest invite email failed for guest_id=%s", guest.id)
+                    from apps.accounts.models import AuditLog as _GeneralAuditLog
+                    _GeneralAuditLog.log(actor=request.user, action="email.livestream_guest_invite.failed", meta={"guest_id": str(guest.id)})
+            except Exception as _exc:
+                logger.warning("Livestream guest invite email raised for guest_id=%s: %s", guest.id, _exc.__class__.__name__)
+                from apps.accounts.models import AuditLog as _GeneralAuditLog
+                _GeneralAuditLog.log(
+                    actor=request.user, action="email.livestream_guest_invite.failed",
+                    meta={"guest_id": str(guest.id), "error": _exc.__class__.__name__},
+                )
         return Response(
             ChannelLiveStreamGuestSerializer(guest, context={"request": request}).data,
             status=status.HTTP_201_CREATED,

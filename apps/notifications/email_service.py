@@ -116,6 +116,14 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
         "<p>{count} update(s) since your last visit:</p>"
         "<ul>{items_html}</ul>",
     ),
+    "livestream_guest_invite": (
+        "{inviter_name} invited you to join {stream_title} on KIS",
+        "<h2>You're invited to a livestream</h2>"
+        "<p><strong>{inviter_name}</strong> invited you as a <strong>{role}</strong> "
+        "on <strong>{channel_name}</strong>'s livestream: <strong>{stream_title}</strong>.</p>"
+        "{schedule_html}"
+        "<p><a href=\"{invite_url}\">Join the livestream</a></p>",
+    ),
 }
 
 
@@ -291,4 +299,30 @@ def send_digest_email(to_email: str, items: list[dict]) -> bool:
         body=lines,
         template_key="digest",
         context={"count": len(items), "items_html": items_html},
+    )
+
+
+def send_livestream_guest_invite_email(
+    to_email: str,
+    inviter_name: str,
+    channel_name: str,
+    stream_title: str,
+    role: str,
+    invite_url: str,
+    scheduled_start_at: str | None = None,
+) -> bool:
+    schedule_html = f"<p>Scheduled to start: <strong>{html.escape(scheduled_start_at)}</strong></p>" if scheduled_start_at else ""
+    return send_notification_email(
+        to_email=to_email,
+        title=f"{inviter_name} invited you to join {stream_title} on KIS",
+        body=f"{inviter_name} invited you as a {role} on {channel_name}'s livestream: {stream_title}. Join: {invite_url}",
+        template_key="livestream_guest_invite",
+        context={
+            "inviter_name": html.escape(inviter_name),
+            "channel_name": html.escape(channel_name),
+            "stream_title": html.escape(stream_title),
+            "role": html.escape(role),
+            "invite_url": invite_url,
+            "schedule_html": schedule_html,
+        },
     )
