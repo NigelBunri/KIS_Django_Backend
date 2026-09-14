@@ -14,11 +14,14 @@ test_account_reactivation.py; the actual purge in test_account_purge.py.
 Run:
   python3 manage.py test apps.accounts.test_public_account_deletion --keepdb -v 2
 """
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from apps.accounts.models import GDPRRequest
+from apps.notifications.models import Notification
 
 User = get_user_model()
 
@@ -116,3 +119,26 @@ class PublicAccountDeletionRequestTests(TestCase):
         self.assertFalse(self.user.is_active)
         other_user.refresh_from_db()
         self.assertTrue(other_user.is_active)
+
+    @patch("apps.notifications.email_service.send_notification_email", return_value=True)
+    def test_deletion_scheduled_notification_now_includes_email(self, mock_send):
+        # Email-system audit, discovery #1: this is the Apple/Google-required
+        # path for a user who's uninstalled the app — IN_APP/PUSH are both
+        # structurally unreachable here (no app, no token), so before this
+        # fix a public deletion request got zero confirmation of any kind.
+        self.user.email = "deleteme@example.com"
+        self.user.save(update_fields=["email"])
+
+        response = self.client.post(
+            URL,
+            {"phone": "+237670001234", "password": "CorrectPass123!", "confirm": "DELETE"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        notif = Notification.objects.get(user_id=self.user.id, type="account.deletion_scheduled")
+        channels = set(notif.deliveries.values_list("channel", flat=True))
+        self.assertIn("EMAIL", channels)
+        self.assertIn("IN_APP", channels)
+        mock_send.assert_called_once()
+        self.assertEqual(mock_send.call_args.kwargs["to_email"], "deleteme@example.com")

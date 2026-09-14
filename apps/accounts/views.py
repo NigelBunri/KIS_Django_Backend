@@ -4184,10 +4184,19 @@ def schedule_account_deletion(
                 ),
                 context={"scheduled_for": scheduled_for.isoformat()},
                 priority="HIGH",
-                channels=["IN_APP", "PUSH"],
+                channels=["IN_APP", "PUSH", "EMAIL"],
                 dedup_key=f"account_violation_deletion_warning:{gdpr_request.id}",
             )
         else:
+            # EMAIL matters most here, not least: source="public_delete_request"
+            # is the Apple/Google-required deletion path for a user who's
+            # uninstalled the app (see PublicAccountDeletionRequestView) — for
+            # that path specifically, IN_APP/PUSH are both structurally
+            # unreachable (no app, no push token), so without EMAIL a public
+            # deletion request got zero confirmation of any kind. Explicit
+            # rather than relying on create_notification's mandatory-channel
+            # fallback (which already covers IN_APP/PUSH by default) so EMAIL
+            # is clearly requested here rather than implicit.
             create_notification(
                 user_id=user.id,
                 type="account.deletion_scheduled",
@@ -4198,6 +4207,7 @@ def schedule_account_deletion(
                     f"Log back in with your phone and password before then to cancel."
                 ),
                 context={"scheduled_for": scheduled_for.isoformat()},
+                channels=["IN_APP", "PUSH", "EMAIL"],
             )
     except Exception as exc:
         # Never let a notification failure block the deletion itself, but

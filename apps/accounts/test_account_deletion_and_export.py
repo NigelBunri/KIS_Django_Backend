@@ -9,16 +9,53 @@ separately in test_public_account_deletion.py.
 Run:
   python3 manage.py test apps.accounts.test_account_deletion_and_export --keepdb -v 2
 """
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Device, GDPRRequest
+from apps.accounts.views import schedule_account_deletion
+from apps.notifications.models import Notification
 
 User = get_user_model()
 
 DELETE_URL = "/api/v1/auth/account/"
 EXPORT_URL = "/api/v1/auth/data-export/"
+
+
+class ScheduleAccountDeletionEmailChannelTests(TestCase):
+    """Email-system audit, discovery #1: schedule_account_deletion's
+    create_notification calls now request EMAIL alongside IN_APP/PUSH for
+    both sources — the admin-violation path (its own branch) and every
+    other source (authenticated self-service, public delete-request; both
+    share the same else branch)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            phone="+237670009998", password="CorrectPass123!", country="CM",
+            email="violationuser@example.com",
+        )
+
+    @patch("apps.notifications.email_service.send_notification_email", return_value=True)
+    def test_admin_violation_review_source_includes_email(self, mock_send):
+        schedule_account_deletion(self.user, source="admin_violation_review")
+
+        notif = Notification.objects.get(user_id=self.user.id, type="account.deletion_scheduled")
+        channels = set(notif.deliveries.values_list("channel", flat=True))
+        self.assertIn("EMAIL", channels)
+        mock_send.assert_called_once()
+        self.assertEqual(mock_send.call_args.kwargs["to_email"], "violationuser@example.com")
+
+    @patch("apps.notifications.email_service.send_notification_email", return_value=True)
+    def test_authenticated_self_service_source_includes_email(self, mock_send):
+        schedule_account_deletion(self.user, source="authenticated")
+
+        notif = Notification.objects.get(user_id=self.user.id, type="account.deletion_scheduled")
+        channels = set(notif.deliveries.values_list("channel", flat=True))
+        self.assertIn("EMAIL", channels)
+        mock_send.assert_called_once()
 
 
 class AuthenticatedAccountDeletionTests(TestCase):
