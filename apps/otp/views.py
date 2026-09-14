@@ -20,6 +20,8 @@ from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
 from rest_framework import status
 
+from apps.notifications.email_service import send_otp_email
+
 from .models import PhoneOTP
 
 logger = logging.getLogger(__name__)
@@ -158,8 +160,13 @@ def whatsapp_configured() -> bool:
     )
 
 def email_configured() -> bool:
+    """Whether the single email path (config.settings.production's
+    EMAIL_BACKEND selection — Resend when RESEND_API_KEY is set, SMTP
+    otherwise) actually has what it needs to send. Kept in sync with that
+    selection logic rather than checking a provider-specific setting, so
+    this stays correct regardless of which backend is currently active."""
     return bool(
-        getattr(settings, "SENDGRID_API_KEY", "") or
+        getattr(settings, "RESEND_API_KEY", "") or
         (getattr(settings, "EMAIL_HOST", "") and getattr(settings, "EMAIL_HOST_USER", ""))
     )
 
@@ -205,55 +212,6 @@ def send_sms_via_provider(phone: str, body: str) -> None:
         logger.info("SMS sent via Infobip to %s", _masked_phone(phone))
     except Exception as exc:
         logger.warning("Infobip SMS error for %s: %s", _masked_phone(phone), exc)
-
-def send_email_otp(to_email: str, code: str, purpose: str) -> bool:
-    """Send OTP via email. Returns True if sent, False if not configured or failed."""
-    subject = "KIS verification code"
-    body = f"Your KIS verification code is: {code}\n\nThis code expires in 5 minutes. Do not share it with anyone."
-    sendgrid_key = getattr(settings, "SENDGRID_API_KEY", "") or ""
-    if sendgrid_key:
-        try:
-            import urllib.request as _req
-            import json as _json
-            payload = _json.dumps({
-                "personalizations": [{"to": [{"email": to_email}]}],
-                "from": {"email": getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@kis.app")},
-                "subject": subject,
-                "content": [{"type": "text/plain", "value": body}],
-            }).encode("utf-8")
-            req = _req.Request(
-                "https://api.sendgrid.com/v3/mail/send",
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {sendgrid_key}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            with _req.urlopen(req, timeout=10) as resp:
-                if resp.status in (200, 202):
-                    logger.info("Email OTP sent via SendGrid to %s", to_email)
-                    return True
-        except Exception as exc:
-            logger.warning("SendGrid email failed for %s: %s", to_email, exc)
-    # Fallback: Django email backend
-    email_host = getattr(settings, "EMAIL_HOST", "") or ""
-    email_user = getattr(settings, "EMAIL_HOST_USER", "") or ""
-    if email_host and email_user:
-        try:
-            from django.core.mail import send_mail
-            send_mail(
-                subject=subject,
-                message=body,
-                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", email_user),
-                recipient_list=[to_email],
-                fail_silently=False,
-            )
-            logger.info("Email OTP sent via Django backend to %s", to_email)
-            return True
-        except Exception as exc:
-            logger.warning("Django email OTP failed for %s: %s", to_email, exc)
-    return False
 
 def send_whatsapp_otp(phone: str, code: str) -> bool:
     """
@@ -448,7 +406,7 @@ class OtpInitiateView(APIView):
             elif channel == "email":
                 user = _find_user_by_phone(phone, country)
                 if user and user.email:
-                    if not send_email_otp(user.email, code, purpose):
+                    if not send_otp_email(user.email, code, OTP_TTL_SECONDS // 60, purpose=purpose):
                         logger.warning("Email OTP delivery failed for %s", _masked_phone(phone))
             elif channel == "whatsapp":
                 if not send_whatsapp_otp(phone, code) and _debug_otp_logging_enabled():
@@ -681,7 +639,7 @@ class PasswordResetInitiateView(APIView):
         elif channel == "email":
             user = _find_user_by_phone(phone, country)
             if user and user.email:
-                send_email_otp(user.email, code, purpose)
+                send_otp_email(user.email, code, OTP_TTL_SECONDS // 60, purpose=purpose)
         elif channel == "whatsapp":
             sent = send_whatsapp_otp(phone, code)
             if not sent and _debug_otp_logging_enabled():

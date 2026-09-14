@@ -301,9 +301,6 @@ FIREBASE_SERVER_KEY = os.environ.get("FIREBASE_SERVER_KEY", "")
 # Debug-only OTP code logging. Keep false unless explicitly debugging locally.
 OTP_DEBUG_LOG_CODES = _env_bool("OTP_DEBUG_LOG_CODES", False)
 
-# SendGrid - transactional email (OTP, welcome, receipts)
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "").strip()
-
 # Infobip - SMS and WhatsApp OTP delivery
 INFOBIP_API_KEY = os.environ.get("INFOBIP_API_KEY", "").strip()
 INFOBIP_BASE = os.environ.get("INFOBIP_BASE", "").strip().rstrip("/")

@@ -18,10 +18,55 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
         "{title}",
         "<p>{body}</p>",
     ),
+    # One shared "code" visual per purpose, distinct copy per purpose — the
+    # audit's core finding was a single generic OTP email used for every
+    # purpose (same wording for a login code and a password-reset code).
+    # "otp" itself stays as a generic fallback for any purpose without its
+    # own entry below, rather than crashing/looking broken.
     "otp": (
         "Your KIS verification code: {code}",
         "<h2>Your verification code is <strong>{code}</strong></h2>"
         "<p>It expires in {ttl_minutes} minutes. Do not share this code.</p>",
+    ),
+    "otp_register": (
+        "Your KIS verification code: {code}",
+        "<h2>Welcome to KIS</h2>"
+        "<p>Use the code below to finish creating your account.</p>"
+        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
+        "<p>It expires in {ttl_minutes} minutes. If you didn't request this, "
+        "you can safely ignore this email.</p>",
+    ),
+    "otp_login": (
+        "Your KIS sign-in code: {code}",
+        "<h2>Sign in to KIS</h2>"
+        "<p>Use the code below to sign in.</p>"
+        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
+        "<p>It expires in {ttl_minutes} minutes. If this wasn't you, your "
+        "account is still safe — just ignore this email.</p>",
+    ),
+    "otp_web_login": (
+        "Your KIS web sign-in code: {code}",
+        "<h2>Sign in to KIS on the web</h2>"
+        "<p>Use the code below to sign in to KIS from your browser.</p>"
+        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
+        "<p>It expires in {ttl_minutes} minutes. If you didn't request this, "
+        "you can safely ignore this email.</p>",
+    ),
+    "otp_email_verify": (
+        "Verify your email for KIS: {code}",
+        "<h2>Verify your email</h2>"
+        "<p>Use the code below to confirm this email address belongs to you.</p>"
+        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
+        "<p>It expires in {ttl_minutes} minutes.</p>",
+    ),
+    "otp_reset": (
+        "Reset your KIS password",
+        "<h2>Password Reset</h2>"
+        "<p>Use the code below to reset your password.</p>"
+        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
+        "<p>It expires in {ttl_minutes} minutes. If you didn't request this, "
+        "someone may have mistyped your phone number — your password stays "
+        "unchanged unless this code is used.</p>",
     ),
     "payment_receipt": (
         "Payment confirmed — {amount} {currency}",
@@ -39,12 +84,6 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
         "You joined {tier_title} on {channel_name}",
         "<h2>Membership Confirmed</h2>"
         "<p>You are now a <strong>{tier_title}</strong> member of <strong>{channel_name}</strong>.</p>",
-    ),
-    "password_reset": (
-        "Reset your KIS password",
-        "<h2>Password Reset</h2>"
-        "<p>Your password reset code is: <strong>{code}</strong></p>"
-        "<p>It expires in {ttl_minutes} minutes.</p>",
     ),
     "device_recovery": (
         "KIS Account Recovery — device transfer code",
@@ -103,12 +142,26 @@ def send_notification_email(
         return False
 
 
-def send_otp_email(to_email: str, code: str, ttl_minutes: int = 5) -> bool:
+# Maps an OTP purpose (apps.otp.views.ALLOWED_PURPOSES) to its own branded
+# copy above. Deliberately not "reset" -> "otp_reset" implied by naming
+# alone — kept explicit so an unrecognized/future purpose falls back to the
+# generic "otp" template via .get() below instead of a KeyError.
+_OTP_PURPOSE_TEMPLATE_KEYS: dict[str, str] = {
+    "register": "otp_register",
+    "login": "otp_login",
+    "web_login": "otp_web_login",
+    "email_verify": "otp_email_verify",
+    "reset": "otp_reset",
+}
+
+
+def send_otp_email(to_email: str, code: str, ttl_minutes: int = 5, purpose: str = "login") -> bool:
+    template_key = _OTP_PURPOSE_TEMPLATE_KEYS.get(purpose, "otp")
     return send_notification_email(
         to_email=to_email,
         title=f"Your KIS verification code: {code}",
         body=f"Your code is {code}. Expires in {ttl_minutes} minutes.",
-        template_key="otp",
+        template_key=template_key,
         context={"code": code, "ttl_minutes": ttl_minutes},
     )
 
