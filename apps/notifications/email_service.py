@@ -85,6 +85,17 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
         "<h2>Membership Confirmed</h2>"
         "<p>You are now a <strong>{tier_title}</strong> member of <strong>{channel_name}</strong>.</p>",
     ),
+    "gift_membership": (
+        "{gifter_name} sent you a KIS membership gift!",
+        "<h2>You've received a gift 🎁</h2>"
+        "<p><strong>{gifter_name}</strong> gifted you a <strong>{tier_title}</strong> membership "
+        "on <strong>{channel_name}</strong>.</p>"
+        "{message_html}"
+        "<p>Open the KIS app, sign in (or create an account with this email address), then go to "
+        "<strong>Profile → Redeem Gift</strong> and enter this code:</p>"
+        "<h2 style=\"letter-spacing:2px;\">{redeem_code}</h2>"
+        "<p>This gift expires on {expires_at}.</p>",
+    ),
     "device_recovery": (
         "KIS Account Recovery — device transfer code",
         "<h2>Account Recovery</h2>"
@@ -202,6 +213,37 @@ def send_membership_email(to_email: str, tier_title: str, channel_name: str) -> 
         body=f"You are now a {tier_title} member of {channel_name}.",
         template_key="membership_joined",
         context={"tier_title": tier_title, "channel_name": channel_name},
+    )
+
+
+def send_gift_membership_email(
+    to_email: str,
+    gifter_name: str,
+    tier_title: str,
+    channel_name: str,
+    redeem_code: str,
+    expires_at: str,
+    message: str | None = None,
+) -> bool:
+    message_html = (
+        f'<p style="font-style:italic;">"{html.escape(message)}"</p>' if message else ""
+    )
+    return send_notification_email(
+        to_email=to_email,
+        title=f"{gifter_name} sent you a KIS membership gift!",
+        body=(
+            f"{gifter_name} gifted you a {tier_title} membership on {channel_name}. "
+            f"Redeem code: {redeem_code}. Expires {expires_at}."
+        ),
+        template_key="gift_membership",
+        context={
+            "gifter_name": html.escape(gifter_name),
+            "tier_title": html.escape(tier_title),
+            "channel_name": html.escape(channel_name),
+            "redeem_code": redeem_code,
+            "expires_at": expires_at,
+            "message_html": message_html,
+        },
     )
 
 

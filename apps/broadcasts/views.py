@@ -21039,7 +21039,7 @@ class ChannelMembershipGiftView(APIView):
 
     def post(self, request):
         tier_id = request.data.get("tier_id")
-        tier = get_object_or_404(ChannelMembershipTier, id=tier_id, is_active=True)
+        tier = get_object_or_404(ChannelMembershipTier.objects.select_related("channel"), id=tier_id, is_active=True)
         recipient_id = request.data.get("recipient_id")
         recipient = get_object_or_404(User, id=recipient_id) if recipient_id else None
         gift = ChannelMembershipGift.objects.create(
@@ -21050,6 +21050,38 @@ class ChannelMembershipGiftView(APIView):
             message=str(request.data.get("message") or "")[:300],
             expires_at=timezone.now() + timedelta(days=30),
         )
+        # Notify the recipient the gift exists — previously nothing ever
+        # emailed them (audit row 10: "Never fires. UI collects the
+        # recipient's email. Nothing ever emails them — no way to learn the
+        # gift exists."). Non-blocking: the gift record itself is already
+        # created and returned to the gifter regardless of email outcome.
+        if gift.recipient_email:
+            try:
+                gifter_name = (
+                    getattr(request.user, "display_name", None)
+                    or getattr(request.user, "username", None)
+                    or "A KIS member"
+                )
+                from apps.notifications.email_service import send_gift_membership_email
+                if not send_gift_membership_email(
+                    to_email=gift.recipient_email,
+                    gifter_name=gifter_name,
+                    tier_title=tier.title,
+                    channel_name=tier.channel.display_name,
+                    redeem_code=gift.redeem_token,
+                    expires_at=gift.expires_at.strftime("%B %d, %Y"),
+                    message=gift.message or None,
+                ):
+                    logger.warning("Gift membership email failed for gift_id=%s", gift.id)
+                    from apps.accounts.models import AuditLog as _GeneralAuditLog
+                    _GeneralAuditLog.log(actor=request.user, action="email.gift_membership.failed", meta={"gift_id": str(gift.id)})
+            except Exception as _exc:
+                logger.warning("Gift membership email raised for gift_id=%s: %s", gift.id, _exc.__class__.__name__)
+                from apps.accounts.models import AuditLog as _GeneralAuditLog
+                _GeneralAuditLog.log(
+                    actor=request.user, action="email.gift_membership.failed",
+                    meta={"gift_id": str(gift.id), "error": _exc.__class__.__name__},
+                )
         return Response(ChannelMembershipGiftSerializer(gift).data, status=status.HTTP_201_CREATED)
 
 
