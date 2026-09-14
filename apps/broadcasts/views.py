@@ -20150,7 +20150,7 @@ class ChannelMembershipView(APIView):
                     if not send_membership_email(
                         to_email=request.user.email,
                         tier_title=tier.title,
-                        channel_name=channel.name,
+                        channel_name=channel.display_name,
                     ):
                         from apps.accounts.models import AuditLog as _GeneralAuditLog
                         logger.warning("Membership email failed for user_id=%s channel_id=%s", request.user.id, channel.id)

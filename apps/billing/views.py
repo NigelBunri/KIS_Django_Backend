@@ -1635,10 +1635,40 @@ def reconcile_wallet_flutterwave_event(*, payload: dict) -> Response:
                     ).update(status=ChannelMembership.Status.ACTIVE, payment_reference=str(tx_ref or ""))
                 except Exception as _exc:
                     logger.warning("[FLW webhook] membership activation failed: %s", _exc)
+                else:
+                    # Send confirmation email — mirrors the Stripe webhook's
+                    # equivalent block exactly. This branch previously
+                    # activated the membership with no confirmation email
+                    # call at all (audit finding: row 09, "Inconsistent").
+                    # Kept in its own try/except so an email failure here is
+                    # never misattributed as an activation failure by the
+                    # except above.
+                    from django.contrib.auth import get_user_model as _get_user_model_mem
+                    _User_mem = _get_user_model_mem()
+                    _mem_user_obj = _User_mem.objects.filter(id=_user_id).first()
+                    if _mem_user_obj and getattr(_mem_user_obj, "email", None):
+                        try:
+                            from apps.broadcasts.models import ChannelMembership as _ChannelMembership
+                            membership = _ChannelMembership.objects.select_related("tier__channel").filter(id=_mem_id).first()
+                            if membership:
+                                from apps.notifications.email_service import send_membership_email
+                                if not send_membership_email(
+                                    to_email=_mem_user_obj.email,
+                                    tier_title=membership.tier.title,
+                                    channel_name=membership.tier.channel.display_name,
+                                ):
+                                    logger.warning("[FLW webhook] membership email failed for user_id=%s", _user_id)
+                                    AuditLog.log(actor=_mem_user_obj, action="email.membership.failed", meta={"membership_id": str(_mem_id)})
+                        except Exception as _mem_email_exc:
+                            logger.warning("[FLW webhook] membership email raised: %s", _mem_email_exc.__class__.__name__)
+                            AuditLog.log(
+                                actor=_mem_user_obj, action="email.membership.failed",
+                                meta={"membership_id": str(_mem_id), "error": _mem_email_exc.__class__.__name__},
+                            )
         # Send payment receipt email
         try:
             user_id = getattr(transaction_obj.user, "id", None) if transaction_obj.user else None
-            amount = transaction_obj.amount_cents
+            amount_cents = transaction_obj.amount_cents
             currency = str(data.get("currency") or "USD")
             from django.contrib.auth import get_user_model as _get_user_model
             _User = _get_user_model()
@@ -1647,7 +1677,7 @@ def reconcile_wallet_flutterwave_event(*, payload: dict) -> Response:
                 from apps.notifications.email_service import send_payment_receipt_email
                 if not send_payment_receipt_email(
                     to_email=_user_obj.email,
-                    amount=str(amount or ""),
+                    amount=f"{(amount_cents or 0) / 100:.2f}",
                     currency=str(currency or "USD"),
                     tx_ref=str(tx_ref or ""),
                 ):
@@ -2133,7 +2163,7 @@ class StripeWebhookView(APIView):
                                 if not send_membership_email(
                                     to_email=user_obj.email,
                                     tier_title=membership.tier.title,
-                                    channel_name=membership.tier.channel.name,
+                                    channel_name=membership.tier.channel.display_name,
                                 ):
                                     logger.warning("[Stripe] membership email failed for user_id=%s", user_id)
                                     AuditLog.log(actor=user_obj, action="email.membership.failed", meta={"membership_id": str(target_id)})

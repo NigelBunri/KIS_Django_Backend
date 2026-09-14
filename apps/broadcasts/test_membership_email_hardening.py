@@ -3,16 +3,19 @@ Phase 6: confirms a failed membership-confirmation email on the free-tier
 join path is now logged + audited instead of vanishing via bare
 `except: pass` (apps/broadcasts/views.py ChannelMembershipView.post).
 
-Also documents the same pre-existing `channel.name` bug found via
-apps/billing/test_stripe_email_hardening.py — BroadcastChannel has no
-`name` field/property, only `display_name`, so this send currently always
-raises AttributeError rather than reaching send_membership_email's mocked
-return value. Out of scope to fix here; see that file's docstring and the
-Phase 6 report for the full explanation.
+Email-system audit, Priority 2: this file used to document a real,
+separate bug (channel_name=channel.name — BroadcastChannel has no `name`
+field/property, only `display_name` — so the send always raised
+AttributeError before ever reaching send_membership_email). That's fixed
+now (channel.display_name), here and in the two billing.py webhook
+branches with the identical copy-paste mistake — this file's tests below
+now cover the real success path instead of documenting the bug.
 
 Run:
   python3 manage.py test apps.broadcasts.test_membership_email_hardening --keepdb -v 2
 """
+from unittest.mock import patch
+
 from django.test import TestCase, override_settings
 
 from apps.accounts.models import AuditLog, User
@@ -62,19 +65,31 @@ class FreeTierJoinMembershipEmailFailureVisibilityTests(TestCase):
             {"tier_id": str(self.tier.id)}, format="json",
         )
 
-    def test_free_tier_join_succeeds_even_though_the_confirmation_email_currently_fails(self):
+    def test_free_tier_join_succeeds(self):
         res = self._join()
 
         self.assertEqual(res.status_code, 201)
         self.assertTrue(res.data["joined"])
 
-    def test_membership_email_failure_is_logged_and_audited(self):
-        # Documents current real behavior (see module docstring): this
-        # currently always raises AttributeError building channel_name.
+    @patch("apps.notifications.email_service.send_membership_email", return_value=True)
+    def test_membership_email_now_sends_successfully_with_the_real_channel_name(self, mock_send):
+        # Regression test for the channel.name -> channel.display_name fix:
+        # previously this always raised AttributeError before ever calling
+        # send_membership_email at all.
+        res = self._join()
+
+        self.assertEqual(res.status_code, 201)
+        mock_send.assert_called_once()
+        self.assertEqual(mock_send.call_args.kwargs.get("channel_name"), "Free Tier Email Test Channel")
+        self.assertFalse(
+            AuditLog.objects.filter(actor_id=self.member.id, action="email.membership.failed").exists()
+        )
+
+    @patch("apps.notifications.email_service.send_membership_email", return_value=False)
+    def test_membership_email_failure_is_still_logged_and_audited(self, _mock_send):
         res = self._join()
 
         self.assertEqual(res.status_code, 201)
         entry = AuditLog.objects.filter(actor_id=self.member.id, action="email.membership.failed").first()
         self.assertIsNotNone(entry)
-        self.assertEqual(entry.meta.get("error"), "AttributeError")
         self.assertEqual(entry.meta.get("channel_id"), str(self.channel.id))

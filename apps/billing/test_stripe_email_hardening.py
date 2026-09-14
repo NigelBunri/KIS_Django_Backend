@@ -9,17 +9,16 @@ Stripe signature verification is mocked at its call site
 real — this test targets the email-failure-visibility fix, not Stripe's
 signing scheme.
 
-Also documents a pre-existing, separate bug this hardening surfaced (it
-was previously invisible behind a bare `except: pass`): the membership
-email branch builds `channel_name=membership.tier.channel.name`, but
-BroadcastChannel has no `name` field/property — only `display_name`. This
-means the membership-email attempt in this webhook currently raises
-AttributeError unconditionally, regardless of send_membership_email's own
-mocked return value. That's a real, separate bug flagged in the Phase 6
-report — out of scope to fix here (this phase hardens the email SEND path,
-not BroadcastChannel's attribute contract). The tests below assert the
-CURRENT actual behavior (an always-caught, always-logged, always-audited
-exception) rather than an unreachable "success" path for that branch.
+Email-system audit, Priority 2: this file used to document a pre-existing,
+separate bug this hardening surfaced (previously invisible behind a bare
+`except: pass`): the membership email branch built
+`channel_name=membership.tier.channel.name`, but BroadcastChannel has no
+`name` field/property — only `display_name` — so the membership-email
+attempt in this webhook unconditionally raised AttributeError, regardless
+of send_membership_email's own mocked return value. That's fixed now
+(channel.display_name), here and in the Flutterwave webhook branch and the
+free-tier join path with the identical copy-paste mistake — the test below
+now covers the real success path instead of documenting the bug.
 
 Run:
   python3 manage.py test apps.billing.test_stripe_email_hardening --keepdb -v 2
@@ -98,13 +97,25 @@ class StripeMembershipAndReceiptEmailFailureVisibilityTests(TestCase):
             AuditLog.objects.filter(actor_id=self.user.id, action="email.payment_receipt.failed").exists()
         )
 
-    def test_membership_email_currently_always_fails_due_to_the_pre_existing_channel_name_bug(self):
-        # Documents current real behavior — see module docstring. If/when
-        # BroadcastChannel.name (or the view's reference to it) is fixed,
-        # this test should be replaced with a real success-path test.
+    @patch("apps.notifications.email_service.send_membership_email", return_value=True)
+    def test_membership_email_now_sends_successfully_with_the_real_channel_name(self, mock_send):
+        # Regression test for the channel.name -> channel.display_name fix:
+        # previously this always raised AttributeError before ever calling
+        # send_membership_email at all.
+        res = self._post_stripe_webhook()
+
+        self.assertEqual(res.status_code, 200)
+        mock_send.assert_called_once()
+        self.assertEqual(mock_send.call_args.kwargs.get("channel_name"), "Stripe Email Test Channel")
+        self.assertFalse(
+            AuditLog.objects.filter(actor_id=self.user.id, action="email.membership.failed").exists()
+        )
+
+    @patch("apps.notifications.email_service.send_membership_email", return_value=False)
+    def test_membership_email_failure_is_still_logged_and_audited(self, _mock_send):
         res = self._post_stripe_webhook()
 
         self.assertEqual(res.status_code, 200)
         entry = AuditLog.objects.filter(actor_id=self.user.id, action="email.membership.failed").first()
         self.assertIsNotNone(entry)
-        self.assertEqual(entry.meta.get("error"), "AttributeError")
+        self.assertEqual(entry.meta.get("membership_id"), str(self.membership.id))
