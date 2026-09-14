@@ -1,7 +1,10 @@
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
 from apps.media.models import MediaSafetyScan
+from apps.notifications.models import Notification
 
 from . import models
 
@@ -193,6 +196,64 @@ class AiFlagConsequenceTests(APITestCase):
 
         reputation = models.UserReputation.objects.get(user_id=self.user.id)
         self.assertEqual(reputation.flags_received, 1)
+
+
+class ModerationStrikeEmailChannelTests(APITestCase):
+    """Email-system audit, Priority 2 discovery #2a: a SUSPEND-tier strike
+    sets user.is_active=False, logging the user out — IN_APP/PUSH alone
+    can silently never reach someone who isn't already in the app. EMAIL
+    was added to apply_ai_flag_consequence's create_notification call
+    alongside the existing channels."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            phone="+237670003100", password="TestPass123!", country="CM", email="strikeuser@example.com",
+        )
+
+    def _make_scan(self, **overrides):
+        defaults = dict(
+            owner=self.user,
+            upload_id="2026-01-01/uuid-photo.jpg",
+            context="chat",
+            original_name="photo.jpg",
+            mime_type="image/jpeg",
+            bytes=1234,
+            provider="nudenet",
+            status="blocked",
+            quarantine=True,
+            requires_review=False,
+            reason="nudenet_explicit:FEMALE_BREAST_EXPOSED",
+        )
+        defaults.update(overrides)
+        return MediaSafetyScan.objects.create(**defaults)
+
+    @patch("apps.notifications.email_service.send_notification_email", return_value=True)
+    def test_first_warning_strike_creates_an_email_delivery(self, mock_send):
+        from apps.moderation.services import create_media_safety_alert_for_scan
+
+        scan = self._make_scan()
+        create_media_safety_alert_for_scan(scan)
+
+        notif = Notification.objects.get(user_id=self.user.id, type="MODERATION_WARNING")
+        channels = set(notif.deliveries.values_list("channel", flat=True))
+        self.assertIn("EMAIL", channels)
+        mock_send.assert_called_once()
+        self.assertEqual(mock_send.call_args.kwargs["to_email"], "strikeuser@example.com")
+
+    @patch("apps.notifications.email_service.send_notification_email", return_value=True)
+    def test_sixth_suspension_strike_creates_an_email_delivery(self, mock_send):
+        from apps.moderation.services import create_media_safety_alert_for_scan
+
+        for _ in range(6):
+            scan = self._make_scan()
+            create_media_safety_alert_for_scan(scan)
+
+        notif = Notification.objects.get(user_id=self.user.id, type="MODERATION_SUSPENSION")
+        channels = set(notif.deliveries.values_list("channel", flat=True))
+        self.assertIn("EMAIL", channels)
+        # 5 warnings + 1 suspension email, one per strike.
+        self.assertEqual(mock_send.call_count, 6)
 
 
 class StrikeIdempotencyTests(APITestCase):

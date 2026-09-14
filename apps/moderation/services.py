@@ -217,7 +217,12 @@ def apply_ai_flag_consequence(scan: MediaSafetyScan, flag: "models.Flag | None")
             title=title,
             body=body,
             priority="HIGH",
-            channels=["IN_APP", "PUSH"],
+            # EMAIL added alongside IN_APP/PUSH (email-system audit, Priority
+            # 2 discovery item #2a): a SUSPEND-tier strike sets
+            # user.is_active=False above, logging them out — IN_APP/PUSH
+            # alone can silently never reach someone who doesn't already
+            # have the app open, same reachability gap as account deletion.
+            channels=["IN_APP", "PUSH", "EMAIL"],
             # One notification per confirmed-violation scan, never more -
             # a retried/duplicate call for the same scan is already turned
             # away by the strike_applied guard above, but this is a second,
