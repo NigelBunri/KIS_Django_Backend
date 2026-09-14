@@ -189,13 +189,11 @@ def compile_and_send_digests(period_start_iso: str, period_end_iso: str):
         user_obj = _User.objects.filter(id=uid).first()
         email_addr = getattr(user_obj, "email", None) if user_obj else None
         if email_addr:
-            from apps.notifications.email_service import send_notification_email
-            lines = "\n".join(f"• {n['title']}: {n['summary']}" for n in payload[:20])
-            if not send_notification_email(
-                to_email=email_addr,
-                title=f"Your KIS digest — {len(payload)} update(s)",
-                body=lines,
-            ):
+            from apps.notifications.email_service import send_digest_email
+            if send_digest_email(to_email=email_addr, items=payload[:20]):
+                digest.sent_at = timezone.now()
+                digest.save(update_fields=["sent_at", "updated_at"])
+            else:
                 logger.warning("Digest email failed for user_id=%s digest_id=%s", uid, digest.id)
     return True
 

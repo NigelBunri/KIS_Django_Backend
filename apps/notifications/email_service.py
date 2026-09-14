@@ -110,6 +110,12 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
         "<strong>{website_name}</strong> ({page_title}).</p>"
         "<div>{fields_html}</div>",
     ),
+    "digest": (
+        "Your KIS digest — {count} update(s)",
+        "<h2>Your KIS Digest</h2>"
+        "<p>{count} update(s) since your last visit:</p>"
+        "<ul>{items_html}</ul>",
+    ),
 }
 
 
@@ -264,4 +270,25 @@ def send_website_form_notification_email(
             "form_title": form_title,
             "fields_html": fields_html,
         },
+    )
+
+
+def send_digest_email(to_email: str, items: list[dict]) -> bool:
+    """items: [{"title": str, "summary": str}, ...]. Builds a real <ul> for
+    the HTML part — the previous digest send passed a "\\n".join(...)
+    plain-text blob as `body` straight into the generic "default" template
+    (a single <p>{body}</p>), and HTML collapses literal newlines, so every
+    digest email rendered as one run-on line instead of a list."""
+    items_html = "".join(
+        f"<li><strong>{html.escape(str(item.get('title') or ''))}:</strong> "
+        f"{html.escape(str(item.get('summary') or ''))}</li>"
+        for item in items
+    )
+    lines = "\n".join(f"• {item.get('title')}: {item.get('summary')}" for item in items)
+    return send_notification_email(
+        to_email=to_email,
+        title=f"Your KIS digest — {len(items)} update(s)",
+        body=lines,
+        template_key="digest",
+        context={"count": len(items), "items_html": items_html},
     )
