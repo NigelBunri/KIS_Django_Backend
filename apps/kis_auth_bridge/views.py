@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
 
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework import status
@@ -23,7 +25,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.models import AuditLog, Device, User
+from apps.accounts.security_events import log_security_event
 from apps.accounts.views import issue_tokens_for_user, revoke_device_session
+from apps.chat.internal_signing import verify_internal_request
 
 from .exchange_client import ExchangeError, redeem_authorization_code
 
@@ -31,6 +35,18 @@ logger = logging.getLogger("security.kis_auth_bridge")
 
 GENERIC_ERROR = "We could not complete this authentication request."
 CLIENT_ID = "kis-django"
+
+# Known-safe event types only — an unrecognized value is logged with a
+# generic action name rather than trusting arbitrary caller-supplied text
+# into the audit log's action field.
+_ALLOWED_EVENT_TYPES = {
+    "oauth.callback_succeeded",
+    "oauth.callback_failed",
+    "oauth.identity_not_linked",
+    "oauth.cancelled",
+    "exchange.succeeded",
+    "exchange.failed",
+}
 
 
 class KisAuthRecoveryCompleteView(APIView):
@@ -73,7 +89,7 @@ class KisAuthRecoveryCompleteView(APIView):
 
         try:
             user = User.objects.get(id=verified.kis_user_id, is_active=True)
-        except (User.DoesNotExist, ValueError, TypeError):
+        except (User.DoesNotExist, ValueError, TypeError, ValidationError):
             # Same generic message as "invalid recovery token" in the
             # legacy flow — never confirms/denies a specific account exists.
             return Response({"detail": GENERIC_ERROR}, status=status.HTTP_400_BAD_REQUEST)
@@ -154,3 +170,69 @@ class KisAuthRecoveryCompleteView(APIView):
                 },
             }
         )
+
+
+class KisAuthSecurityEventView(APIView):
+    """
+    POST api/v1/kis-auth/security-event/
+    Server-to-server only — HMAC-signed callers (kis-auth) only, verified
+    here directly rather than through require_internal_auth (that helper
+    is hardcoded to DJANGO_INTERNAL_TOKEN, the Nest<->Django secret; this
+    channel uses its own distinct KISAUTH_INTERNAL_HMAC_SECRET).
+
+    Best-effort audit forwarding (Phase 2 §16): lands kis-auth's own
+    security events in Django's existing log_security_event() so an
+    operator has one place to look, instead of two databases that can
+    disagree. This endpoint accepting/rejecting an event has no bearing
+    on whether the auth operation it describes succeeded — that decision
+    was already made, on kis-auth's side, before this call happened.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        secret = os.environ.get("KISAUTH_INTERNAL_HMAC_SECRET", "").strip()
+        if not secret:
+            # Not configured — nothing to verify against, so nothing can
+            # be trusted. Same posture as internal_signatures_required()
+            # in production: fail closed, not open.
+            return Response({"detail": "not configured"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        signed, reason = verify_internal_request(request, secret)
+        if not signed:
+            logger.warning("kis_auth_bridge.security_event.signature_invalid", extra={"reason": reason})
+            return Response({"detail": "invalid signature"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        event_type = str(request.data.get("event_type") or "").strip()
+        if event_type not in _ALLOWED_EVENT_TYPES:
+            event_type = "unknown"
+        outcome = str(request.data.get("outcome") or "").strip() or "unknown"
+        kis_user_id = request.data.get("kis_user_id")
+        client_id = request.data.get("client_id")
+        reason_field = request.data.get("reason")
+        ip = request.data.get("ip")
+        metadata = request.data.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        actor = None
+        if kis_user_id:
+            try:
+                actor = User.objects.filter(id=kis_user_id).first()
+            except (ValueError, TypeError, ValidationError):
+                actor = None
+
+        severity = "warning" if outcome == "failure" else "info"
+        log_security_event(
+            actor,
+            f"security.kis_auth.{event_type}",
+            severity=severity,
+            outcome=outcome,
+            client_id=client_id,
+            reason=reason_field,
+            source_ip=ip,
+            **{f"meta_{k}": v for k, v in list(metadata.items())[:20]},  # bounded — never an unbounded caller-controlled payload
+        )
+
+        return Response({"ok": True}, status=status.HTTP_201_CREATED)
