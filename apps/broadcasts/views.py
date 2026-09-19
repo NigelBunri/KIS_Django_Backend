@@ -20081,7 +20081,7 @@ class ChannelMembershipView(APIView):
                 result = create_checkout_session(
                     amount_cents=tier.price_cents,
                     currency=tier.currency,
-                    product_name=f"{tier.title} — {channel.name}",
+                    product_name=f"{tier.title} — {channel.display_name}",
                     success_url=redirect_url or f"{base_url}/membership/success",
                     cancel_url=redirect_url or f"{base_url}/membership/cancel",
                     target_type="channel_membership",
@@ -20098,20 +20098,22 @@ class ChannelMembershipView(APIView):
             else:
                 # Flutterwave
                 from apps.billing.views import _flutterwave_payment_link, _flutterwave_headers
+                from apps.billing.models import WalletTransaction
                 from django.conf import settings as _s
                 base_url = getattr(_s, "KIS_PUBLIC_WEB_BASE_URL", "https://kis.app")
+                mem_tx_ref = f"KIS-MEM-{membership.id}"
                 flw_payload = {
-                    "tx_ref": f"KIS-MEM-{membership.id}",
+                    "tx_ref": mem_tx_ref,
                     "amount": str(tier.price_cents / 100),
                     "currency": tier.currency,
                     "redirect_url": redirect_url or f"{base_url}/membership/success",
                     "customer": {
                         "email": getattr(request.user, "email", "") or "",
-                        "name": request.user.get_full_name() or str(request.user.username or ""),
+                        "name": getattr(request.user, "display_name", None) or str(request.user.username or ""),
                     },
                     "customizations": {
-                        "title": f"{tier.title} — {channel.name}",
-                        "description": tier.description or f"Membership tier for {channel.name}",
+                        "title": f"{tier.title} — {channel.display_name}",
+                        "description": tier.description or f"Membership tier for {channel.display_name}",
                     },
                     "meta": {
                         "target_type": "channel_membership",
@@ -20119,6 +20121,24 @@ class ChannelMembershipView(APIView):
                         "user_id": str(request.user.id),
                     },
                 }
+                # The Flutterwave webhook (reconcile_wallet_flutterwave_event
+                # in apps.billing.views) only reconciles a tx_ref it can
+                # find as an existing WalletTransaction row. Without this,
+                # the webhook 404s on "unknown transaction" the moment a
+                # member actually pays via Flutterwave, and the membership
+                # never leaves pending_payment regardless of what
+                # Flutterwave itself reports - this join flow was
+                # previously unreachable end-to-end for that provider.
+                WalletTransaction.objects.create(
+                    user=request.user,
+                    provider="flutterwave",
+                    method="card",
+                    amount_cents=tier.price_cents,
+                    currency=tier.currency,
+                    status="pending",
+                    tx_ref=mem_tx_ref,
+                    meta=flw_payload["meta"],
+                )
                 try:
                     result = _flutterwave_payment_link(flw_payload)
                     payment_url = (result or {}).get("data", {}).get("link") or ""
@@ -21079,12 +21099,117 @@ class ChannelMembershipGiftView(APIView):
         tier = get_object_or_404(ChannelMembershipTier.objects.select_related("channel"), id=tier_id, is_active=True)
         recipient_id = request.data.get("recipient_id")
         recipient = get_object_or_404(User, id=recipient_id) if recipient_id else None
+        recipient_email = str(request.data.get("recipient_email") or "")
+        message = str(request.data.get("message") or "")[:300]
+
+        if tier.price_cents > 0:
+            # Paid tier — create the gift in AWAITING_PAYMENT (not yet
+            # redeemable, recipient not yet emailed) and initiate payment,
+            # mirroring ChannelMembershipView.post()'s own paid branch.
+            # The webhook (apps.billing.views) flips this to PENDING and
+            # sends the recipient email once the gifter's charge clears -
+            # never here, since nobody has actually paid yet at this point.
+            gift = ChannelMembershipGift.objects.create(
+                tier=tier,
+                gifter=request.user,
+                recipient=recipient,
+                recipient_email=recipient_email,
+                message=message,
+                status=ChannelMembershipGift.Status.AWAITING_PAYMENT,
+                expires_at=timezone.now() + timedelta(days=30),
+            )
+            payment_provider = str(request.data.get("payment_provider") or "flutterwave").lower().strip()
+            redirect_url = str(request.data.get("redirect_url") or "").strip()
+
+            if payment_provider == "stripe":
+                from apps.billing.stripe_payments import is_configured as stripe_configured, create_checkout_session
+                if not stripe_configured():
+                    gift.delete()
+                    return Response({"error": "Stripe is not configured."}, status=503)
+                from django.conf import settings as _s
+                base_url = getattr(_s, "KIS_PUBLIC_WEB_BASE_URL", "https://kis.app")
+                result = create_checkout_session(
+                    amount_cents=tier.price_cents,
+                    currency=tier.currency,
+                    product_name=f"Gift: {tier.title} — {tier.channel.display_name}",
+                    success_url=redirect_url or f"{base_url}/membership/gift/success",
+                    cancel_url=redirect_url or f"{base_url}/membership/gift/cancel",
+                    target_type="channel_membership_gift",
+                    target_id=str(gift.id),
+                    user_id=str(request.user.id),
+                )
+                return Response({
+                    "payment_required": True,
+                    "payment_provider": "stripe",
+                    "checkout_url": result["checkout_url"],
+                    "gift_id": str(gift.id),
+                    "tier_id": str(tier.id),
+                }, status=202)
+            else:
+                # Flutterwave
+                from apps.billing.views import _flutterwave_payment_link
+                from apps.billing.models import WalletTransaction
+                from django.conf import settings as _s
+                base_url = getattr(_s, "KIS_PUBLIC_WEB_BASE_URL", "https://kis.app")
+                tx_ref = f"KIS-GIFT-{gift.id}"
+                flw_payload = {
+                    "tx_ref": tx_ref,
+                    "amount": str(tier.price_cents / 100),
+                    "currency": tier.currency,
+                    "redirect_url": redirect_url or f"{base_url}/membership/gift/success",
+                    "customer": {
+                        "email": getattr(request.user, "email", "") or "",
+                        "name": getattr(request.user, "display_name", None) or str(request.user.username or ""),
+                    },
+                    "customizations": {
+                        "title": f"Gift: {tier.title} — {tier.channel.display_name}",
+                        "description": tier.description or f"Gifted membership for {tier.channel.display_name}",
+                    },
+                    "meta": {
+                        "target_type": "channel_membership_gift",
+                        "target_id": str(gift.id),
+                        "user_id": str(request.user.id),
+                    },
+                }
+                # The Flutterwave webhook (reconcile_wallet_flutterwave_event
+                # in apps.billing.views) only reconciles a tx_ref it can
+                # find as an existing WalletTransaction row - without
+                # creating this here, the webhook would 404 on "unknown
+                # transaction" the moment the gifter actually pays, and the
+                # gift would sit in AWAITING_PAYMENT forever regardless of
+                # what Flutterwave itself reports. Created before the link
+                # request so the row exists even if that request fails.
+                WalletTransaction.objects.create(
+                    user=request.user,
+                    provider="flutterwave",
+                    method="card",
+                    amount_cents=tier.price_cents,
+                    currency=tier.currency,
+                    status="pending",
+                    tx_ref=tx_ref,
+                    meta=flw_payload["meta"],
+                )
+                try:
+                    result = _flutterwave_payment_link(flw_payload)
+                    payment_url = (result or {}).get("data", {}).get("link") or ""
+                except Exception as exc:
+                    logger.warning("[GiftMembership] Flutterwave link failed: %s", exc)
+                    payment_url = ""
+                return Response({
+                    "payment_required": True,
+                    "payment_provider": "flutterwave",
+                    "payment_url": payment_url,
+                    "gift_id": str(gift.id),
+                    "tier_id": str(tier.id),
+                }, status=202)
+
+        # Free tier — nothing to pay, so activate the gift immediately.
         gift = ChannelMembershipGift.objects.create(
             tier=tier,
             gifter=request.user,
             recipient=recipient,
-            recipient_email=str(request.data.get("recipient_email") or ""),
-            message=str(request.data.get("message") or "")[:300],
+            recipient_email=recipient_email,
+            message=message,
             expires_at=timezone.now() + timedelta(days=30),
         )
         # Notify the recipient the gift exists — previously nothing ever
@@ -21126,12 +21251,18 @@ class ChannelMembershipGiftRedeemView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, token):
-        gift = get_object_or_404(ChannelMembershipGift, redeem_token=token, status=ChannelMembershipGift.Status.PENDING)
+        gift = get_object_or_404(ChannelMembershipGift.objects.select_related("tier__channel"), redeem_token=token)
+        if gift.status == ChannelMembershipGift.Status.AWAITING_PAYMENT:
+            raise ValidationError({"detail": "The gifter hasn't completed payment for this gift yet."})
+        if gift.status == ChannelMembershipGift.Status.REDEEMED:
+            raise ValidationError({"detail": "This gift has already been redeemed."})
+        if gift.status in (ChannelMembershipGift.Status.CANCELLED, ChannelMembershipGift.Status.EXPIRED):
+            raise ValidationError({"detail": "This gift is no longer available."})
         if gift.expires_at and gift.expires_at < timezone.now():
             gift.status = ChannelMembershipGift.Status.EXPIRED
             gift.save(update_fields=["status"])
             raise ValidationError({"detail": "This gift has expired."})
-        ChannelMembership.objects.get_or_create(
+        membership, _created = ChannelMembership.objects.get_or_create(
             user=request.user,
             tier=gift.tier,
             defaults={"status": ChannelMembership.Status.ACTIVE, "expires_at": timezone.now() + timedelta(days=30)},
@@ -21139,7 +21270,13 @@ class ChannelMembershipGiftRedeemView(APIView):
         gift.status = ChannelMembershipGift.Status.REDEEMED
         gift.recipient = request.user
         gift.redeemed_at = timezone.now()
-        gift.save(update_fields=["status", "recipient", "redeemed_at"])
+        # Repurposed post-redemption: the gift's own expires_at was its
+        # "redeem by" deadline, which is moot once redeemed. Swapping it
+        # for the resulting membership's real expiry so the confirmation
+        # screen (GiftMembershipRedeem.tsx) shows when the ACTIVATED
+        # membership actually lapses, not the deadline that already passed.
+        gift.expires_at = membership.expires_at
+        gift.save(update_fields=["status", "recipient", "redeemed_at", "expires_at"])
         return Response(ChannelMembershipGiftSerializer(gift).data)
 
 

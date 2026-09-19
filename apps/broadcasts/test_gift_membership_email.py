@@ -39,8 +39,14 @@ class GiftMembershipEmailTests(TestCase):
             owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.gifter.id, owner_user=self.gifter,
             handle="gift-email-test-channel", display_name="Gift Email Test Channel",
         )
+        # Free tier deliberately - this file tests the email leg, which
+        # only fires immediately for free-tier gifts. Paid-tier gifts
+        # defer the recipient email until payment is confirmed (see
+        # test_gift_membership_payment.py), so a price_cents>0 fixture
+        # here would make every "email sent on creation" assertion below
+        # false for the very case they're meant to test.
         self.tier = ChannelMembershipTier.objects.create(
-            channel=self.channel, title="Supporter", price_cents=500, currency="USD", is_active=True,
+            channel=self.channel, title="Supporter", price_cents=0, currency="USD", is_active=True,
         )
         tokens = issue_tokens_for_user(self.gifter, device_id=DEVICE_ID)
         self.client = APIClient()

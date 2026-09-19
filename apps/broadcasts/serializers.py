@@ -2815,16 +2815,20 @@ class ChannelLiveStreamTargetSerializer(serializers.ModelSerializer):
 
 class ChannelMembershipGiftSerializer(serializers.ModelSerializer):
     tier_title = serializers.SerializerMethodField()
+    channel_name = serializers.SerializerMethodField()
     gifter_display = serializers.SerializerMethodField()
 
     class Meta:
         model = ChannelMembershipGift
-        fields = ["id", "tier", "tier_title", "gifter", "gifter_display", "recipient",
+        fields = ["id", "tier", "tier_title", "channel_name", "gifter", "gifter_display", "recipient",
                   "recipient_email", "message", "status", "expires_at", "redeemed_at", "created_at"]
         read_only_fields = ["id", "gifter", "status", "redeemed_at", "redeem_token", "created_at"]
 
     def get_tier_title(self, obj):
         return getattr(obj.tier, "title", "")
+
+    def get_channel_name(self, obj):
+        return getattr(getattr(obj.tier, "channel", None), "display_name", "")
 
     def get_gifter_display(self, obj):
         return (getattr(getattr(obj.gifter, "profile", None), "display_name", None)

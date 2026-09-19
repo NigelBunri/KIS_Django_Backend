@@ -1665,6 +1665,56 @@ def reconcile_wallet_flutterwave_event(*, payload: dict) -> Response:
                                 actor=_mem_user_obj, action="email.membership.failed",
                                 meta={"membership_id": str(_mem_id), "error": _mem_email_exc.__class__.__name__},
                             )
+        elif _meta.get("target_type") == "channel_membership_gift":
+            _gift_id = _meta.get("target_id")
+            _gifter_id = _meta.get("user_id")
+            if _gift_id and _gifter_id:
+                try:
+                    from apps.broadcasts.models import ChannelMembershipGift
+                    updated = ChannelMembershipGift.objects.filter(
+                        id=_gift_id, gifter_id=_gifter_id, status=ChannelMembershipGift.Status.AWAITING_PAYMENT,
+                    ).update(status=ChannelMembershipGift.Status.PENDING, payment_reference=str(tx_ref or ""))
+                except Exception as _exc:
+                    logger.warning("[FLW webhook] gift membership activation failed: %s", _exc)
+                else:
+                    # Only now - payment confirmed - does the recipient
+                    # learn the gift exists, mirroring the free-tier email
+                    # in ChannelMembershipGiftView.post() but deferred
+                    # until there's an actual paid-for gift to tell them
+                    # about.
+                    if updated:
+                        from django.contrib.auth import get_user_model as _get_user_model_gift
+                        _User_gift = _get_user_model_gift()
+                        _gifter_obj = _User_gift.objects.filter(id=_gifter_id).first()
+                        try:
+                            from apps.broadcasts.models import ChannelMembershipGift as _ChannelMembershipGift
+                            gift = _ChannelMembershipGift.objects.select_related("tier__channel", "gifter").filter(id=_gift_id).first()
+                            if gift and gift.recipient_email:
+                                gifter_name = (
+                                    getattr(gift.gifter, "display_name", None)
+                                    or getattr(gift.gifter, "username", None)
+                                    or "A KIS member"
+                                )
+                                from apps.notifications.email_service import send_gift_membership_email
+                                if not send_gift_membership_email(
+                                    to_email=gift.recipient_email,
+                                    gifter_name=gifter_name,
+                                    tier_title=gift.tier.title,
+                                    channel_name=gift.tier.channel.display_name,
+                                    redeem_code=gift.redeem_token,
+                                    expires_at=gift.expires_at.strftime("%B %d, %Y") if gift.expires_at else "",
+                                    message=gift.message or None,
+                                ):
+                                    logger.warning("[FLW webhook] gift membership email failed for gift_id=%s", _gift_id)
+                                    if _gifter_obj:
+                                        AuditLog.log(actor=_gifter_obj, action="email.gift_membership.failed", meta={"gift_id": str(_gift_id)})
+                        except Exception as _gift_email_exc:
+                            logger.warning("[FLW webhook] gift membership email raised: %s", _gift_email_exc.__class__.__name__)
+                            if _gifter_obj:
+                                AuditLog.log(
+                                    actor=_gifter_obj, action="email.gift_membership.failed",
+                                    meta={"gift_id": str(_gift_id), "error": _gift_email_exc.__class__.__name__},
+                                )
         # Send payment receipt email
         try:
             user_id = getattr(transaction_obj.user, "id", None) if transaction_obj.user else None
@@ -2175,6 +2225,55 @@ class StripeWebhookView(APIView):
                             )
                 except Exception as exc:
                     logger.warning("[Stripe] membership activation failed: %s", exc)
+            # Activate a gift membership if this was a gift payment - same
+            # AWAITING_PAYMENT -> PENDING transition as the Flutterwave
+            # webhook above, and the recipient is only emailed here, once
+            # the gifter's charge has actually cleared.
+            elif target_type == "channel_membership_gift" and target_id and user_id:
+                try:
+                    from apps.broadcasts.models import ChannelMembershipGift
+                    gift_updated = ChannelMembershipGift.objects.filter(
+                        id=target_id,
+                        gifter_id=user_id,
+                        status=ChannelMembershipGift.Status.AWAITING_PAYMENT,
+                    ).update(
+                        status=ChannelMembershipGift.Status.PENDING,
+                        payment_reference=intent_id,
+                    )
+                    if gift_updated:
+                        from django.contrib.auth import get_user_model
+                        _User = get_user_model()
+                        gifter_obj = _User.objects.filter(id=user_id).first()
+                        try:
+                            gift = ChannelMembershipGift.objects.select_related("tier__channel", "gifter").filter(id=target_id).first()
+                            if gift and gift.recipient_email:
+                                gifter_name = (
+                                    getattr(gift.gifter, "display_name", None)
+                                    or getattr(gift.gifter, "username", None)
+                                    or "A KIS member"
+                                )
+                                from apps.notifications.email_service import send_gift_membership_email
+                                if not send_gift_membership_email(
+                                    to_email=gift.recipient_email,
+                                    gifter_name=gifter_name,
+                                    tier_title=gift.tier.title,
+                                    channel_name=gift.tier.channel.display_name,
+                                    redeem_code=gift.redeem_token,
+                                    expires_at=gift.expires_at.strftime("%B %d, %Y") if gift.expires_at else "",
+                                    message=gift.message or None,
+                                ):
+                                    logger.warning("[Stripe] gift membership email failed for gift_id=%s", target_id)
+                                    if gifter_obj:
+                                        AuditLog.log(actor=gifter_obj, action="email.gift_membership.failed", meta={"gift_id": str(target_id)})
+                        except Exception as _gift_email_exc:
+                            logger.warning("[Stripe] gift membership email raised: %s", _gift_email_exc.__class__.__name__)
+                            if gifter_obj:
+                                AuditLog.log(
+                                    actor=gifter_obj, action="email.gift_membership.failed",
+                                    meta={"gift_id": str(target_id), "error": _gift_email_exc.__class__.__name__},
+                                )
+                except Exception as exc:
+                    logger.warning("[Stripe] gift membership activation failed: %s", exc)
             # Send payment receipt email
             try:
                 from django.contrib.auth import get_user_model

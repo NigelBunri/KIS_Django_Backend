@@ -3749,6 +3749,11 @@ class ChannelLiveStreamTarget(models.Model):
 # ─── Gift Memberships ─────────────────────────────────────────────────────────
 class ChannelMembershipGift(models.Model):
     class Status(models.TextChoices):
+        # Paid tiers start here until the gifter's payment webhook confirms
+        # the charge - the recipient is never emailed and the token can't
+        # be redeemed while a gift sits in this state. Free tiers (price
+        # 0) skip straight to PENDING since there's nothing to pay.
+        AWAITING_PAYMENT = "awaiting_payment", "Awaiting payment"
         PENDING = "pending", "Pending"
         REDEEMED = "redeemed", "Redeemed"
         EXPIRED = "expired", "Expired"
