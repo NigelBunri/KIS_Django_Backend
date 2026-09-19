@@ -148,10 +148,20 @@ if _env_bool("USE_X_FORWARDED_PROTO", False):
 # the requirement.
 KIS_PHONE_VERIFICATION_ENABLED = _env_bool("KIS_PHONE_VERIFICATION_ENABLED", False)
 
-# Email provider - Resend (HTTP API). See config/settings/production.py for
-# how this selects EMAIL_BACKEND; local/test environments never send real
-# email regardless (console backend / eager test settings), so this is safe
-# to leave blank there.
+# SMS/WhatsApp OTP + notification channels — disabled by default while email
+# (via Resend) is the only active delivery channel. Both channels' code
+# (apps/otp/views.py, apps/notifications/tasks.py) still exists behind
+# Infobip, but sms_configured()/whatsapp_configured() require these flags to
+# be true in addition to Infobip credentials, so Infobip is never actually
+# called until someone deliberately re-enables one of these.
+SMS_CHANNEL_ENABLED = _env_bool("SMS_CHANNEL_ENABLED", False)
+WHATSAPP_CHANNEL_ENABLED = _env_bool("WHATSAPP_CHANNEL_ENABLED", False)
+
+# Email provider - Resend (HTTP API), the single unified email system for
+# every outbound email. See config/settings/production.py for how this
+# selects EMAIL_BACKEND; local/test environments never send real email
+# regardless (console backend / eager test settings), so this is safe to
+# leave blank there.
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
 
 # Payments / Wallet

@@ -138,25 +138,18 @@ class VerifyEmailLaunchCommandTests(TestCase):
         names = [c["name"] for c in payload["checks"]]
         self.assertNotIn("EMAIL_HOST_USER", names)
 
-    def test_smtp_backend_with_missing_credentials_fails(self):
-        with override_settings(EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend"), \
-             patch.dict("os.environ", {"EMAIL_HOST": "", "EMAIL_HOST_USER": "", "EMAIL_HOST_PASSWORD": ""}):
+    def test_no_smtp_checks_are_ever_emitted(self):
+        # Resend is the only email path now — there is no SMTP fallback to
+        # check credentials for, regardless of what EMAIL_BACKEND is set to.
+        with override_settings(EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend"):
             out = StringIO()
             call_command("verify_email_launch", "--json", stdout=out)
             payload = json.loads(out.getvalue())
 
-        self.assertFalse(payload["ready"])
-        host_check = next(c for c in payload["checks"] if c["name"] == "EMAIL_HOST_USER")
-        self.assertEqual(host_check["state"], "fail")
-
-    def test_smtp_backend_with_full_credentials_passes(self):
-        with override_settings(EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend"), \
-             patch.dict("os.environ", {"EMAIL_HOST": "smtp.example.com", "EMAIL_HOST_USER": "u", "EMAIL_HOST_PASSWORD": "p"}):
-            out = StringIO()
-            call_command("verify_email_launch", "--json", stdout=out)
-            payload = json.loads(out.getvalue())
-
-        self.assertTrue(payload["ready"])
+        names = [c["name"] for c in payload["checks"]]
+        self.assertNotIn("EMAIL_HOST", names)
+        self.assertNotIn("EMAIL_HOST_USER", names)
+        self.assertNotIn("EMAIL_HOST_PASSWORD", names)
 
     def test_resend_key_present_but_wrong_backend_fails_consistency_check(self):
         with override_settings(RESEND_API_KEY="a-key", EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend"):

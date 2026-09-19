@@ -90,21 +90,17 @@ CACHES = {
     }
 }
 
-# Email: Resend (HTTP API) when RESEND_API_KEY is configured, otherwise the
-# previous SMTP path — no forced cutover. Deliberately not a hard
-# ImproperlyConfigured failure if neither is set: unlike DATABASE_URL/
-# REDIS_URL, a missing email provider degrades one notification channel,
-# not the whole app; verify_email_launch is the explicit opt-in guardrail
-# for confirming it's actually production-ready before relying on it.
-if RESEND_API_KEY:
-    EMAIL_BACKEND = "apps.notifications.resend_backend.ResendEmailBackend"
-else:
-    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-EMAIL_HOST = os.environ.get("EMAIL_HOST")
-EMAIL_PORT = os.environ.get("EMAIL_PORT", 587)
-EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER")
-EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD")
-EMAIL_USE_TLS = True
+# Email: Resend (HTTP API) is the single, unified email system — no SMTP
+# fallback path. Every outbound email (OTP, receipts, notifications, etc.)
+# goes through apps.notifications.email_service, which is the one
+# integration point to swap when this becomes its own microservice.
+# Deliberately not a hard ImproperlyConfigured failure if RESEND_API_KEY
+# isn't set yet: unlike DATABASE_URL/REDIS_URL, a missing email provider
+# degrades gracefully per-send (logged, caught in email_service) rather
+# than crashing the whole app; verify_email_launch is the explicit
+# opt-in guardrail for confirming it's actually production-ready before
+# relying on it.
+EMAIL_BACKEND = "apps.notifications.resend_backend.ResendEmailBackend"
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@example.com")
 
 # Logging: structured and less verbose

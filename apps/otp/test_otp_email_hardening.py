@@ -19,12 +19,10 @@ from apps.notifications import email_service
 from apps.otp import views as otp_views
 
 OVERRIDE_CODE = "676139"
-# email_configured() checks RESEND_API_KEY or (EMAIL_HOST and
-# EMAIL_HOST_USER) — neither is set in local/test settings (only
-# production.py defines EMAIL_HOST/EMAIL_HOST_USER), so the email channel
-# is otherwise unavailable and every request below would 400 before
-# reaching the code this file actually tests.
-_EMAIL_AVAILABLE = override_settings(EMAIL_HOST="smtp.example.com", EMAIL_HOST_USER="test-user")
+# email_configured() checks RESEND_API_KEY, which isn't set in local/test
+# settings, so the email channel is otherwise unavailable and every request
+# below would 400 before reaching the code this file actually tests.
+_EMAIL_AVAILABLE = override_settings(RESEND_API_KEY="test-resend-key")
 
 
 @_EMAIL_AVAILABLE
@@ -147,14 +145,42 @@ class SendOtpEmailTemplateTests(TestCase):
 
 
 class EmailConfiguredTests(TestCase):
-    @override_settings(RESEND_API_KEY="a-key", EMAIL_HOST="", EMAIL_HOST_USER="")
-    def test_true_when_resend_key_set_even_without_smtp_creds(self):
+    @override_settings(RESEND_API_KEY="a-key")
+    def test_true_when_resend_key_set(self):
         self.assertTrue(otp_views.email_configured())
 
-    @override_settings(RESEND_API_KEY="", EMAIL_HOST="smtp.example.com", EMAIL_HOST_USER="u")
-    def test_true_when_smtp_host_and_user_set(self):
-        self.assertTrue(otp_views.email_configured())
-
-    @override_settings(RESEND_API_KEY="", EMAIL_HOST="", EMAIL_HOST_USER="")
-    def test_false_when_nothing_configured(self):
+    @override_settings(RESEND_API_KEY="")
+    def test_false_when_resend_key_not_set(self):
         self.assertFalse(otp_views.email_configured())
+
+
+class SmsWhatsappDisabledTests(TestCase):
+    """SMS/WhatsApp are disabled by default regardless of Infobip creds —
+    email (Resend) is the single active OTP channel until one of these
+    flags is deliberately re-enabled."""
+
+    @override_settings(SMS_CHANNEL_ENABLED=False, INFOBIP_API_KEY="key", INFOBIP_BASE="https://example.infobip.com")
+    def test_sms_stays_disabled_even_with_infobip_credentials(self):
+        self.assertFalse(otp_views.sms_configured())
+
+    @override_settings(SMS_CHANNEL_ENABLED=True, INFOBIP_API_KEY="key", INFOBIP_BASE="https://example.infobip.com")
+    def test_sms_enabled_when_flag_and_credentials_both_set(self):
+        self.assertTrue(otp_views.sms_configured())
+
+    @override_settings(
+        WHATSAPP_CHANNEL_ENABLED=False,
+        INFOBIP_API_KEY="key",
+        INFOBIP_BASE="https://example.infobip.com",
+        WHATSAPP_SENDER_NUMBER="447700900000",
+    )
+    def test_whatsapp_stays_disabled_even_with_infobip_credentials(self):
+        self.assertFalse(otp_views.whatsapp_configured())
+
+    @override_settings(
+        WHATSAPP_CHANNEL_ENABLED=True,
+        INFOBIP_API_KEY="key",
+        INFOBIP_BASE="https://example.infobip.com",
+        WHATSAPP_SENDER_NUMBER="447700900000",
+    )
+    def test_whatsapp_enabled_when_flag_and_credentials_both_set(self):
+        self.assertTrue(otp_views.whatsapp_configured())

@@ -147,28 +147,29 @@ def _override_otp_active(code: str) -> bool:
     return hmac.compare_digest(code, override_code)
 
 def sms_configured() -> bool:
+    """SMS is disabled by default regardless of Infobip credentials — see
+    SMS_CHANNEL_ENABLED. Email (Resend) is the active channel for now."""
     return bool(
+        getattr(settings, "SMS_CHANNEL_ENABLED", False) and
         getattr(settings, "INFOBIP_API_KEY", "") and
         getattr(settings, "INFOBIP_BASE", "")
     )
 
 def whatsapp_configured() -> bool:
+    """WhatsApp is disabled by default regardless of Infobip credentials —
+    see WHATSAPP_CHANNEL_ENABLED. Email (Resend) is the active channel for
+    now."""
     return bool(
+        getattr(settings, "WHATSAPP_CHANNEL_ENABLED", False) and
         getattr(settings, "INFOBIP_API_KEY", "") and
         getattr(settings, "INFOBIP_BASE", "") and
         getattr(settings, "WHATSAPP_SENDER_NUMBER", "")
     )
 
 def email_configured() -> bool:
-    """Whether the single email path (config.settings.production's
-    EMAIL_BACKEND selection — Resend when RESEND_API_KEY is set, SMTP
-    otherwise) actually has what it needs to send. Kept in sync with that
-    selection logic rather than checking a provider-specific setting, so
-    this stays correct regardless of which backend is currently active."""
-    return bool(
-        getattr(settings, "RESEND_API_KEY", "") or
-        (getattr(settings, "EMAIL_HOST", "") and getattr(settings, "EMAIL_HOST_USER", ""))
-    )
+    """Whether the single email path (Resend, via
+    config.settings.production's EMAIL_BACKEND) has what it needs to send."""
+    return bool(getattr(settings, "RESEND_API_KEY", ""))
 
 def send_sms_via_provider(phone: str, body: str) -> None:
     """Send SMS OTP via Infobip SMS API. Silently skips if not configured."""
@@ -336,7 +337,7 @@ class OtpInitiateView(APIView):
         phone_raw = (request.data.get("phone") or "").strip()
         phone = normalize_phone_input(phone_raw, country)
         purpose = (request.data.get("purpose") or "register").strip()
-        channel = (request.data.get("channel") or "sms").strip()
+        channel = (request.data.get("channel") or "email").strip()
 
         if not phone:
             return Response({"success": False, "message": "phone required"}, status=400)
@@ -603,7 +604,7 @@ class PasswordResetInitiateView(APIView):
             return Response({"success": False, "message": "phone required"}, status=400)
 
         purpose = "reset"
-        channel = (request.data.get("channel") or "sms").strip()
+        channel = (request.data.get("channel") or "email").strip()
         if channel not in ALLOWED_CHANNELS:
             return Response({"success": False, "message": "invalid channel"}, status=400)
 

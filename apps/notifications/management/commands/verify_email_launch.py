@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
@@ -10,14 +9,6 @@ from django.utils.module_loading import import_string
 
 def _setting_text(name: str) -> str:
     return str(getattr(settings, name, "") or "").strip()
-
-
-def _env_text(name: str) -> str:
-    # Deliberately reads the raw environment variable, not the resolved
-    # Django setting — Django ships its own global default for EMAIL_HOST
-    # ('localhost'), so settings.EMAIL_HOST is truthy even when nobody
-    # configured anything, which would make a presence check falsely pass.
-    return os.environ.get(name, "").strip()
 
 
 class Command(BaseCommand):
@@ -36,7 +27,7 @@ class Command(BaseCommand):
         checks.append({
             "name": "RESEND_API_KEY",
             "state": "pass" if resend_key_present else "warn",
-            "detail": "presence checked only; value is never printed" if resend_key_present else "not set — falling back to SMTP (see EMAIL_HOST checks below)",
+            "detail": "presence checked only; value is never printed" if resend_key_present else "not set — Resend is the only email path; sends will fail gracefully (logged, no crash) until this is configured",
         })
 
         try:
@@ -53,26 +44,15 @@ class Command(BaseCommand):
                 "detail": f"{backend_path} failed to import: {exc.__class__.__name__}",
             })
 
+        # Only a launch blocker once RESEND_API_KEY is actually set — local/
+        # test environments intentionally run the console backend regardless
+        # (see config/settings/local.py), which isn't a problem there.
         if resend_key_present:
             checks.append({
                 "name": "resend_backend_selected",
                 "state": "pass" if backend_path.endswith("ResendEmailBackend") else "fail",
-                "detail": "RESEND_API_KEY is set but EMAIL_BACKEND is not the Resend backend" if not backend_path.endswith("ResendEmailBackend") else "consistent",
+                "detail": "consistent" if backend_path.endswith("ResendEmailBackend") else f"EMAIL_BACKEND is '{backend_path}', expected the Resend backend",
             })
-        elif backend_path == "django.core.mail.backends.smtp.EmailBackend":
-            # SMTP is the active path only when Resend isn't configured AND
-            # EMAIL_BACKEND actually resolves to the SMTP backend — e.g.
-            # local dev uses the console backend regardless, where these
-            # would be irrelevant noise. Checked against the raw env var,
-            # not settings.EMAIL_HOST, since Django's own global default
-            # ('localhost') would otherwise make this falsely pass.
-            for name in ("EMAIL_HOST", "EMAIL_HOST_USER", "EMAIL_HOST_PASSWORD"):
-                present = bool(_env_text(name))
-                checks.append({
-                    "name": name,
-                    "state": "pass" if present else "fail",
-                    "detail": "configured" if present else "not set — SMTP sends will fail immediately",
-                })
 
         from_email = _setting_text("DEFAULT_FROM_EMAIL")
         checks.append({

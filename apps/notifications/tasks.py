@@ -132,9 +132,12 @@ def process_notification_delivery(self, notification_id):
                     from django.conf import settings as _s
                     api_key = getattr(_s, "INFOBIP_API_KEY", "") or ""
                     base = getattr(_s, "INFOBIP_BASE", "") or ""
-                    if not api_key or not base:
+                    # SMS is disabled by default (SMS_CHANNEL_ENABLED) while
+                    # email via Resend is the single active channel — this
+                    # check is deliberate policy, not just missing credentials.
+                    if not getattr(_s, "SMS_CHANNEL_ENABLED", False) or not api_key or not base:
                         delivery.status = "PENDING"
-                        delivery.last_error = "SMS provider not configured."
+                        delivery.last_error = "SMS channel is currently disabled."
                         delivery.save(update_fields=["status", "last_error", "updated_at"])
                         continue
                     url = f"{base.rstrip('/')}/sms/2/text/advanced"

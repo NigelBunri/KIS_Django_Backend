@@ -1,8 +1,14 @@
 """
 Email delivery service for KIS notifications.
-Uses Django's configured EMAIL_HOST (SMTP). Works with any SMTP provider:
-SendGrid, Mailgun, AWS SES, Postfix, etc. Set EMAIL_HOST / EMAIL_HOST_USER /
-EMAIL_HOST_PASSWORD / DEFAULT_FROM_EMAIL in .env.
+
+This module is the single, unified entry point for every outbound email in
+the app — OTP codes, receipts, welcome/digest/invite mail, generic
+notification-channel email, all of it goes through send_notification_email()
+below. Production sends via Resend's HTTP API (config/settings/production.py
+sets EMAIL_BACKEND to apps.notifications.resend_backend.ResendEmailBackend);
+this is the one seam to repoint if email delivery moves out to its own
+microservice later. Do not add a second, parallel way to send email —
+route it through here instead.
 """
 from __future__ import annotations
 
