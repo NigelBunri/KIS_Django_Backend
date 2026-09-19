@@ -274,6 +274,7 @@ urlpatterns = [
     # logic. The app remains installed (migrations/table access preserved
     # for any existing data) but is no longer part of the public API surface.
     path("api/v1/", include("apps.otp.urls")),
+    path("api/v1/kis-auth/", include("apps.kis_auth_bridge.urls")),
     path("api/v1/", include("apps.chat.urls", namespace="chat-root")),
     path("api/v1/partners/", include("apps.partners.urls", namespace="partners")),
     path("api/v1/websites/", include("apps.websites.urls", namespace="websites")),
