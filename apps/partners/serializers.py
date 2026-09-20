@@ -1168,6 +1168,51 @@ class PartnerIntegrationSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "partner", "created_at", "updated_at"]
 
+    def _merged_config(self, attrs):
+        # On a partial update (PATCH), `attrs["config"]` is only the
+        # fields the caller is changing - e.g. a client rotating the
+        # issuer without resending a secret it was never shown back
+        # (see to_representation's redaction). Merge onto the existing
+        # stored config so neither validation nor the actual save ever
+        # mistakes "field omitted because unchanged" for "field cleared".
+        existing = dict(getattr(self.instance, "config", None) or {}) if self.instance else {}
+        if "config" in attrs:
+            existing.update(attrs["config"] or {})
+        return existing
+
+    def validate(self, attrs):
+        # Enabling an integration with an incomplete config would fail
+        # silently at OIDC-callback / SCIM-request time instead of at
+        # save time - reject it here so the admin who flips the switch
+        # gets the error, not a confused end user mid-login.
+        kind = attrs.get("kind") or getattr(self.instance, "kind", None)
+        is_enabled = attrs.get("is_enabled")
+        if is_enabled is None:
+            is_enabled = getattr(self.instance, "is_enabled", False)
+        config = self._merged_config(attrs)
+
+        if is_enabled and kind == PartnerIntegration.KIND_SSO:
+            missing = [f for f in ("issuer", "client_id", "client_secret") if not config.get(f)]
+            if missing:
+                raise serializers.ValidationError(
+                    {"config": f"SSO config is missing required field(s): {', '.join(missing)}."}
+                )
+        if is_enabled and kind == PartnerIntegration.KIND_SCIM:
+            missing = [f for f in ("base_url", "token") if not config.get(f)]
+            if missing:
+                raise serializers.ValidationError(
+                    {"config": f"SCIM config is missing required field(s): {', '.join(missing)}."}
+                )
+        return attrs
+
+    def update(self, instance, validated_data):
+        # Merge, don't replace - a PATCH that only sends {"issuer": "..."}
+        # must not wipe out an already-stored client_secret/token the
+        # caller was never shown back in cleartext to resend.
+        if "config" in validated_data:
+            validated_data["config"] = self._merged_config(validated_data)
+        return super().update(instance, validated_data)
+
     def to_representation(self, instance):
         payload = super().to_representation(instance)
         payload["config"] = redact_partner_sensitive_payload(payload.get("config"))

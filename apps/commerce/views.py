@@ -739,9 +739,18 @@ class ShopViewSet(viewsets.ModelViewSet):
 
     def get_object(self):
         obj = super().get_object()
-        if self.request.method not in permissions.SAFE_METHODS:
-            if not _provider_can_manage_shop(self.request.user, obj) and not self.request.user.is_staff:
-                raise PermissionDenied("Only shop owners, team managers, partner managers, or staff can modify shops.")
+        # Applies to GET too, not just writes - ShopSerializer is
+        # fields = '__all__' and carries payout/financial fields
+        # (stripe_account_id, payout_account_name, payout_bank_last4,
+        # flutterwave_subaccount_id). get_queryset() only filters the
+        # *list* action to active-or-own shops; a direct GET by id here
+        # bypassed that entirely and returned any shop's full financial
+        # record to any authenticated caller who knew/guessed its UUID.
+        # Public shop browsing already has its own safe path -
+        # PublicShopDetailView + PublicShopSerializer - so this route
+        # should never have been reachable by non-owners at all.
+        if not _provider_can_manage_shop(self.request.user, obj) and not self.request.user.is_staff:
+            raise PermissionDenied("Only shop owners, team managers, partner managers, or staff can view or modify this shop.")
         return obj
 
     def perform_create(self, serializer):

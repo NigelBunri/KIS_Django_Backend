@@ -533,3 +533,109 @@ class PartnerAllTasksApiTests(TasksTestBase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data["tasks"]), 1)
         self.assertEqual(response.data["tasks"][0]["title"], "Unassigned")
+
+
+class TaskMultiAssigneeApiTests(TasksTestBase):
+    def test_create_with_additional_collaborators(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            self._list_create_url(),
+            {
+                "title": "Team effort",
+                "assigned_to_id": str(self.member.id),
+                "assignee_ids": [str(self.other_member.id)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        task = Task.objects.get(id=response.data["id"])
+        self.assertEqual(list(task.assignees.all()), [self.other_member])
+        self.assertEqual(response.data["assignees"][0]["id"], str(self.other_member.id))
+
+    def test_collaborator_can_start_and_submit_without_being_primary_assignee(self):
+        task = self._create_task(assigned_to=self.member)
+        task.assignees.set([self.other_member])
+        self.client.force_authenticate(self.other_member)
+
+        start_resp = self.client.post(self._task_url(task, "status/"), {"status": "in_progress"}, format="json")
+        self.assertEqual(start_resp.status_code, status.HTTP_200_OK, start_resp.data)
+
+        submit_resp = self.client.post(self._task_url(task, "submit/"), {}, format="json")
+        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK, submit_resp.data)
+
+    def test_channel_member_who_is_not_assignee_or_collaborator_cannot_submit(self):
+        third_member = User.objects.create_user(phone="+237671100005", country="CM", password="pass1234")
+        PartnerMembership.objects.create(
+            partner=self.partner, user=third_member, role="member", status=PartnerMembershipStatus.MEMBER,
+        )
+        task = self._create_task(assigned_to=self.member)
+        task.assignees.set([self.other_member])
+        self.client.force_authenticate(third_member)
+
+        response = self.client.post(self._task_url(task, "submit/"), {}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_reassign_can_replace_the_collaborator_set(self):
+        task = self._create_task(assigned_to=self.member)
+        task.assignees.set([self.other_member])
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            self._task_url(task, "assign/"),
+            {"assigned_to_id": str(self.member.id), "assignee_ids": []},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        task.refresh_from_db()
+        self.assertEqual(list(task.assignees.all()), [])
+
+    def test_my_tasks_includes_collaborator_assignments(self):
+        task = self._create_task(title="Solo task", assigned_to=self.owner)
+        collab_task = self._create_task(title="Collab task", assigned_to=self.owner)
+        collab_task.assignees.set([self.other_member])
+        self.client.force_authenticate(self.other_member)
+
+        response = self.client.get(f"/api/v1/partners/{self.partner.id}/tasks/mine/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        titles = {t["title"] for t in response.data["tasks"]}
+        self.assertEqual(titles, {"Collab task"})
+
+
+class TaskSubtaskApiTests(TasksTestBase):
+    def test_create_a_subtask_under_a_parent_task(self):
+        parent = self._create_task(title="Parent task")
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            self._list_create_url(),
+            {"title": "Subtask one", "parent_task_id": str(parent.id)},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        subtask = Task.objects.get(id=response.data["id"])
+        self.assertEqual(subtask.parent_task_id, parent.id)
+
+        parent_detail = self.client.get(self._task_url(parent))
+        self.assertEqual(parent_detail.data["subtask_count"], 1)
+        self.assertEqual(parent_detail.data["subtasks"][0]["title"], "Subtask one")
+
+    def test_parent_task_must_be_in_the_same_channel(self):
+        other_channel_conversation = Conversation.objects.create(type=ConversationType.CHANNEL, created_by=self.owner)
+        other_channel = Channel.objects.create(
+            partner=self.partner, name="other", slug="other", owner=self.owner, conversation=other_channel_conversation,
+        )
+        parent = self._create_task(title="Parent in other channel", channel=other_channel)
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.post(
+            self._list_create_url(),
+            {"title": "Wrong-channel subtask", "parent_task_id": str(parent.id)},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

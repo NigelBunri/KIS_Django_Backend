@@ -3957,6 +3957,87 @@ class QuickLockPinVerifyView(APIView):
 # GDPR Data Export
 # ---------------------------------------------------------------------
 
+def collect_user_export_data(user, request=None) -> dict:
+    """
+    The actual GDPR Art. 20 export payload - shared by the self-service
+    DataExportView below and admin_control's AdminUserDataExportView, so
+    an admin-triggered export never drifts out of sync with what a user
+    can pull for themselves.
+
+    NOT a claim of full GDPR Art. 20 completeness: chat messages, channel
+    content, comments, reactions, and moderation history still live
+    outside this function's reach (chat is Nest/Mongo, not Django) and
+    are excluded pending a dedicated export pass over those apps/services -
+    same honest scope this endpoint has always had.
+    """
+    from apps.accounts.serializers import ProfileSerializer
+    profile = getattr(user, 'profile', None)
+
+    user_data = {
+        'id': str(user.id),
+        'phone': None if user.phone_is_placeholder else user.phone,
+        'email': user.email,
+        'username': user.username,
+        'display_name': user.display_name,
+        'country': user.country,
+        'tier': user.tier,
+        'status': user.status,
+        'locale': user.locale,
+        'timezone': user.timezone,
+        'email_verified': user.email_verified,
+        'created_at': user.created_at.isoformat() if hasattr(user, 'created_at') and user.created_at else None,
+        'last_login_at': user.last_login_at.isoformat() if user.last_login_at else None,
+    }
+
+    profile_data = None
+    if profile:
+        try:
+            profile_data = ProfileSerializer(profile, context={'request': request}).data
+        except Exception:
+            profile_data = {'id': str(profile.pk)}
+
+    testimonies_data = []
+    try:
+        from apps.testimony.models import UserTestimony
+        testimonies_data = [
+            {
+                'id': str(t.id),
+                'category': t.category,
+                'title': t.title,
+                'story': t.story,
+                'is_available': t.is_available,
+                'created_at': t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in UserTestimony.objects.filter(user=user)
+        ]
+    except Exception:
+        logger.exception("collect_user_export_data: failed to collect testimonies for user %s", user.id)
+
+    broadcasts_data = []
+    try:
+        from apps.broadcasts.models import BroadcastItem
+        broadcasts_data = [
+            {
+                'id': str(b.id),
+                'source_type': b.source_type,
+                'source_id': b.source_id,
+                'broadcasted_at': b.broadcasted_at.isoformat() if b.broadcasted_at else None,
+                'expires_at': b.expires_at.isoformat() if b.expires_at else None,
+            }
+            for b in BroadcastItem.objects.filter(broadcasted_by=user, is_deleted=False)
+        ]
+    except Exception:
+        logger.exception("collect_user_export_data: failed to collect broadcasts for user %s", user.id)
+
+    return {
+        'exported_at': timezone.now().isoformat(),
+        'user': user_data,
+        'profile': profile_data,
+        'testimonies': testimonies_data,
+        'broadcasts': broadcasts_data,
+    }
+
+
 class DataExportView(APIView):
     """
     GET /api/v1/auth/data-export/
@@ -3966,79 +4047,7 @@ class DataExportView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request):
-        from apps.accounts.serializers import ProfileSerializer
-        user = request.user
-        profile = getattr(user, 'profile', None)
-
-        user_data = {
-            'id': str(user.id),
-            'phone': user.phone,
-            'email': user.email,
-            'username': user.username,
-            'display_name': user.display_name,
-            'country': user.country,
-            'tier': user.tier,
-            'status': user.status,
-            'locale': user.locale,
-            'timezone': user.timezone,
-            'email_verified': user.email_verified,
-            'created_at': user.created_at.isoformat() if hasattr(user, 'created_at') and user.created_at else None,
-            'last_login_at': user.last_login_at.isoformat() if user.last_login_at else None,
-        }
-
-        profile_data = None
-        if profile:
-            try:
-                profile_data = ProfileSerializer(profile, context={'request': request}).data
-            except Exception:
-                profile_data = {'id': str(profile.pk)}
-
-        # Widened beyond user+profile to also cover testimonies and
-        # broadcasts the user directly authored - the two other content
-        # types clearly and unambiguously owned by a single user FK.
-        # NOT a claim of full GDPR Art. 20 completeness: chat messages,
-        # channel content, comments, reactions, and moderation history are
-        # still excluded pending a dedicated export pass over those apps.
-        testimonies_data = []
-        try:
-            from apps.testimony.models import UserTestimony
-            testimonies_data = [
-                {
-                    'id': str(t.id),
-                    'category': t.category,
-                    'title': t.title,
-                    'story': t.story,
-                    'is_available': t.is_available,
-                    'created_at': t.created_at.isoformat() if t.created_at else None,
-                }
-                for t in UserTestimony.objects.filter(user=user)
-            ]
-        except Exception:
-            logger.exception("DataExportView: failed to collect testimonies for user %s", user.id)
-
-        broadcasts_data = []
-        try:
-            from apps.broadcasts.models import BroadcastItem
-            broadcasts_data = [
-                {
-                    'id': str(b.id),
-                    'source_type': b.source_type,
-                    'source_id': b.source_id,
-                    'broadcasted_at': b.broadcasted_at.isoformat() if b.broadcasted_at else None,
-                    'expires_at': b.expires_at.isoformat() if b.expires_at else None,
-                }
-                for b in BroadcastItem.objects.filter(broadcasted_by=user, is_deleted=False)
-            ]
-        except Exception:
-            logger.exception("DataExportView: failed to collect broadcasts for user %s", user.id)
-
-        return Response({
-            'exported_at': timezone.now().isoformat(),
-            'user': user_data,
-            'profile': profile_data,
-            'testimonies': testimonies_data,
-            'broadcasts': broadcasts_data,
-        })
+        return Response(collect_user_export_data(request.user, request=request))
 
 
 # ---------------------------------------------------------------------

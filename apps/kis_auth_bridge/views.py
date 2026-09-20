@@ -32,6 +32,7 @@ from apps.accounts.security_events import log_security_event
 from apps.accounts.serializers import UserCreateSerializer
 from apps.accounts.views import issue_tokens_for_user, revoke_device_session
 from apps.chat.internal_signing import verify_internal_request
+from apps.partners.models import Partner, PartnerIntegration
 
 from .exchange_client import (
     ExchangeError,
@@ -323,16 +324,38 @@ class KisAuthRegistrationCompleteView(APIView):
             logger.info("kis_auth_bridge.registration.exchange_failed")
             return Response({"detail": GENERIC_ERROR}, status=status.HTTP_400_BAD_REQUEST)
 
-        serializer_data = {
-            "password": secrets.token_urlsafe(32),
-            "password2": None,
-            "display_name": request.data.get("display_name", ""),
-            "phone": request.data.get("phone", ""),
-            "phone_country_code": request.data.get("phone_country_code", ""),
-            "phone_number": request.data.get("phone_number", ""),
-            "country": request.data.get("country", ""),
-            "date_of_birth": request.data.get("date_of_birth"),
-        }
+        is_enterprise_sso = verified.purpose == "enterprise_sso_registration"
+
+        if is_enterprise_sso:
+            # No phone exists for an IdP-federated account - synthesize a
+            # unique placeholder instead of reading one from the request.
+            # "999" is unassigned by the ITU, so it can't collide with (or
+            # be mistaken for) a real calling code. Global uniqueness of
+            # `phone` is still enforced by the DB constraint; a collision
+            # here just retries via the existing IntegrityError handling
+            # below, same as a Google email collision would.
+            placeholder_number = f"{secrets.randbelow(10**9):09d}"
+            serializer_data = {
+                "password": secrets.token_urlsafe(32),
+                "password2": None,
+                "display_name": request.data.get("display_name", ""),
+                "phone": "",
+                "phone_country_code": "999",
+                "phone_number": placeholder_number,
+                "country": request.data.get("country", ""),
+                "date_of_birth": request.data.get("date_of_birth"),
+            }
+        else:
+            serializer_data = {
+                "password": secrets.token_urlsafe(32),
+                "password2": None,
+                "display_name": request.data.get("display_name", ""),
+                "phone": request.data.get("phone", ""),
+                "phone_country_code": request.data.get("phone_country_code", ""),
+                "phone_number": request.data.get("phone_number", ""),
+                "country": request.data.get("country", ""),
+                "date_of_birth": request.data.get("date_of_birth"),
+            }
         serializer_data["password2"] = serializer_data["password"]
 
         serializer = UserCreateSerializer(data=serializer_data)
@@ -358,19 +381,23 @@ class KisAuthRegistrationCompleteView(APIView):
                         provider_subject=verified.provider_subject,
                         provider_email=verified.provider_email,
                         provider_email_verified=verified.provider_email_verified,
+                        provider=verified.provider,
                     )
                 except ExchangeError:
                     logger.exception("kis_auth_bridge.registration.link_failed")
                     transaction.set_rollback(True)
                     return Response({"detail": GENERIC_ERROR}, status=status.HTTP_400_BAD_REQUEST)
 
-                # Google is the actual credential — this account should
-                # never be reachable through the password-login path.
+                # The IdP (Google, or an enterprise OIDC provider) is the
+                # actual credential — this account should never be
+                # reachable through the password-login path.
                 user.set_unusable_password()
                 if verified.provider_email and verified.provider_email_verified:
                     user.email = verified.provider_email
                     user.email_verified = True
-                user.save(update_fields=["password", "email", "email_verified"])
+                if is_enterprise_sso:
+                    user.phone_is_placeholder = True
+                user.save(update_fields=["password", "email", "email_verified", "phone_is_placeholder"])
 
                 now = timezone.now()
                 Device.objects.update_or_create(
@@ -405,7 +432,11 @@ class KisAuthRegistrationCompleteView(APIView):
         AuditLog.log(
             actor=user,
             action="account.kis_auth_registration",
-            meta={"provider_email_verified": verified.provider_email_verified},
+            meta={
+                "provider_email_verified": verified.provider_email_verified,
+                "provider": verified.provider,
+                "partner_slug": verified.partner_slug,
+            },
         )
 
         return Response(
@@ -415,7 +446,8 @@ class KisAuthRegistrationCompleteView(APIView):
                 "token_type": "Bearer",
                 "user": {
                     "id": user.id,
-                    "phone": getattr(user, "phone", None),
+                    "phone": None if is_enterprise_sso else getattr(user, "phone", None),
+                    "phone_is_placeholder": is_enterprise_sso,
                     "status": getattr(user, "status", "active"),
                 },
             },
@@ -487,3 +519,66 @@ class KisAuthSecurityEventView(APIView):
         )
 
         return Response({"ok": True}, status=status.HTTP_201_CREATED)
+
+
+class KisAuthSsoConfigView(APIView):
+    """
+    GET api/v1/kis-auth/sso-config/?partner_slug=<slug>
+
+    Server-to-server only, same posture as KisAuthSecurityEventView:
+    verified via verify_internal_request() against
+    KISAUTH_INTERNAL_HMAC_SECRET, fail-closed if that secret isn't
+    configured. This is the ONLY place a PartnerIntegration's OIDC
+    client_secret is ever returned un-redacted — every client-facing path
+    (PartnerIntegrationSerializer) redacts it. kis-auth uses this to
+    resolve which IdP to send a user to for /oauth/enterprise/<slug>/start
+    and to verify the ID token it gets back.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        secret = os.environ.get("KISAUTH_INTERNAL_HMAC_SECRET", "").strip()
+        if not secret:
+            return Response({"detail": "not configured"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        signed, reason = verify_internal_request(request, secret)
+        if not signed:
+            logger.warning("kis_auth_bridge.sso_config.signature_invalid", extra={"reason": reason})
+            return Response({"detail": "invalid signature"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        partner_slug = str(request.query_params.get("partner_slug") or "").strip()
+        if not partner_slug:
+            return Response({"detail": "partner_slug is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        partner = Partner.objects.filter(slug=partner_slug).first()
+        if not partner:
+            return Response({"detail": "unknown partner"}, status=status.HTTP_404_NOT_FOUND)
+
+        integration = PartnerIntegration.objects.filter(
+            partner=partner, kind=PartnerIntegration.KIND_SSO, is_enabled=True
+        ).first()
+        if not integration:
+            return Response({"detail": "sso not configured for this partner"}, status=status.HTTP_404_NOT_FOUND)
+
+        config = integration.config or {}
+        required = ("issuer", "client_id", "client_secret")
+        if any(not config.get(field) for field in required):
+            logger.error(
+                "kis_auth_bridge.sso_config.incomplete", extra={"partner_slug": partner_slug}
+            )
+            return Response({"detail": "sso misconfigured for this partner"}, status=status.HTTP_409_CONFLICT)
+
+        return Response(
+            {
+                "partner_id": str(partner.id),
+                "partner_slug": partner.slug,
+                "provider": integration.provider or "oidc",
+                "issuer": config.get("issuer"),
+                "client_id": config.get("client_id"),
+                "client_secret": config.get("client_secret"),
+                "discovery_url": config.get("discovery_url") or None,
+            },
+            status=status.HTTP_200_OK,
+        )

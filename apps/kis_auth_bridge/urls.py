@@ -6,6 +6,7 @@ from .views import (
     KisAuthRecoveryCompleteView,
     KisAuthRegistrationCompleteView,
     KisAuthSecurityEventView,
+    KisAuthSsoConfigView,
 )
 
 app_name = "kis_auth_bridge"
@@ -16,4 +17,5 @@ urlpatterns = [
     path("link/complete/", KisAuthLinkCompleteView.as_view(), name="link-complete"),
     path("registration/complete/", KisAuthRegistrationCompleteView.as_view(), name="registration-complete"),
     path("security-event/", KisAuthSecurityEventView.as_view(), name="security-event"),
+    path("sso-config/", KisAuthSsoConfigView.as_view(), name="sso-config"),
 ]

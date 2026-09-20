@@ -42,9 +42,18 @@ class ModelDataView(APIView):
     """Dynamic CRUD controller for any Django model."""
 
     permission_classes = [IsAuthenticated, IsAdminControlUser]
-    required_permission = "crud.read"
     required_app_label = "admin_control"
-    required_permission = "crud.read"
+
+    @property
+    def required_permission(self):
+        # Was a single "crud.read" assigned to both class attributes
+        # (the second silently shadowed the first) - meaning a role
+        # granted only read access to a model could still bulk
+        # soft/hard-delete or restore it via POST. IsAdminControlUser
+        # reads this attribute per-request (self.request is already set
+        # by the time permissions run), so GET and POST now require
+        # distinct permissions.
+        return "crud.write" if self.request.method == "POST" else "crud.read"
 
     def _resolve(self, app_label: str, model_name: str):
         try:
@@ -115,13 +124,14 @@ class ModelDataView(APIView):
         ids = request.data.get("ids", [])
         if not isinstance(ids, list) or not ids:
             raise ValidationError("Provide a list of primary keys in `ids`.")
-        affected = bulk_action(model, action, ids)
+        partner_id = request.data.get("partner_id") or None
+        affected = bulk_action(model, action, ids, partner_id=partner_id)
         AuditLogger.log(
             actor=request.user if request.user and request.user.is_authenticated else None,
             action_type=f"crud.bulk_action.{action}",
             target_app=app_label,
             target_model=model_name,
-            metadata={"ids": ids},
+            metadata={"ids": ids, "partner_id": partner_id},
         )
         AdminCacheService.invalidate_model(app_label, model_name)
         AdminCacheService.invalidate_micro()

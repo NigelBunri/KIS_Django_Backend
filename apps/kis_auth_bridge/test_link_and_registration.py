@@ -194,6 +194,7 @@ class KisAuthRegistrationTests(TestCase):
             provider_subject=verified.provider_subject,
             provider_email=verified.provider_email,
             provider_email_verified=verified.provider_email_verified,
+            provider=verified.provider,
         )
 
         device = Device.objects.get(user=user, device_id="new-registration-device")
@@ -252,3 +253,63 @@ class KisAuthRegistrationTests(TestCase):
             )
         self.assertEqual(second.status_code, 400)
         self.assertEqual(User.objects.filter(email=verified.provider_email).count(), 1)
+
+
+@override_settings(
+    SECURE_SSL_REDIRECT=False, KIS_AUTH_ENABLED=True, KIS_AUTH_REGISTRATION_ENABLED=True
+)
+class KisAuthEnterpriseSsoRegistrationTests(TestCase):
+    """The enterprise-SSO JIT path: no phone in the request at all, since
+    an IdP-federated account has no phone number to submit."""
+
+    def setUp(self):
+        self.client_api = APIClient()
+        self.body = {
+            "registration_code": "some-code",
+            "redirect_uri": "https://kis.app/auth/registration-callback",
+            "device_id": "enterprise-sso-device",
+            "device_name": "Work Laptop",
+            "platform": "web",
+        }
+
+    def _post(self, **overrides):
+        body = {**self.body, **overrides}
+        return self.client_api.post(REGISTRATION_URL, body, format="json")
+
+    def test_creates_a_placeholder_phone_account_with_no_phone_in_the_request(self):
+        verified = _verified_registration(
+            purpose="enterprise_sso_registration",
+            provider="oidc",
+            partner_slug="acme-corp",
+            provider_email="employee@acme-corp.example",
+        )
+        with (
+            patch("apps.kis_auth_bridge.views.redeem_registration_ticket", return_value=verified),
+            patch("apps.kis_auth_bridge.views.link_identity_server_to_server") as mock_link,
+        ):
+            resp = self._post()
+
+        self.assertEqual(resp.status_code, 201)
+        body = resp.json()
+        self.assertIsNone(body["user"]["phone"])
+        self.assertTrue(body["user"]["phone_is_placeholder"])
+
+        user = User.objects.get(id=body["user"]["id"])
+        self.assertTrue(user.phone_is_placeholder)
+        self.assertTrue(user.phone)  # a placeholder value was synthesized, not left blank
+        self.assertFalse(user.has_usable_password())
+        self.assertEqual(user.email, verified.provider_email)
+
+        mock_link.assert_called_once_with(
+            kis_user_id=str(user.id),
+            provider_subject=verified.provider_subject,
+            provider_email=verified.provider_email,
+            provider_email_verified=verified.provider_email_verified,
+            provider="oidc",
+        )
+
+    def test_ordinary_google_registration_is_unaffected(self):
+        # Same view, default purpose - existing behavior must be untouched.
+        verified = _verified_registration()
+        self.assertEqual(verified.provider, "google")
+        self.assertIsNone(verified.partner_slug)

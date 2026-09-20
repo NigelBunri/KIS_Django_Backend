@@ -46,17 +46,35 @@ class VerifiedAuthorization:
     provider_email_verified: bool
 
 
+#: Registration purposes Django will actually complete an account for.
+#: "registration" is the original Google JIT flow; "enterprise_sso_registration"
+#: is an IdP-federated (OIDC) JIT signup with no phone number available -
+#: KisAuthRegistrationCompleteView branches on this to synthesize a
+#: placeholder phone instead of requiring one from the request body.
+REGISTRATION_PURPOSES = {"registration", "enterprise_sso_registration"}
+
+
 @dataclass(frozen=True)
 class VerifiedRegistration:
     """Deliberately has no kis_user_id/auth_identity_id — a registration
     ticket is issued before any KIS account or linked identity exists.
     provider_subject is what Django uses, immediately after creating the
-    User, to call kis-auth's link endpoint and associate the two."""
+    User, to call kis-auth's link endpoint and associate the two.
+
+    provider/partner_slug default to the original Google flow's implicit
+    values so existing tickets (minted before these claims existed) keep
+    decoding the same way. For enterprise_sso_registration, kis-auth sets
+    provider="oidc" and partner_slug to the tenant the IdP config belongs
+    to - partner_slug makes the (provider, provider_subject) identity key
+    unique across tenants whose upstream IdPs could otherwise mint
+    colliding `sub` values."""
 
     purpose: str
     provider_subject: str
     provider_email: str | None
     provider_email_verified: bool
+    provider: str = "google"
+    partner_slug: str | None = None
 
 
 def _base_url() -> str:
@@ -208,14 +226,17 @@ def redeem_registration_ticket(
 
     purpose = payload.get("purpose")
     provider_subject = payload.get("provider_subject")
-    if purpose != "registration" or not provider_subject:
+    if purpose not in REGISTRATION_PURPOSES or not provider_subject:
         raise ExchangeError("jwt missing required claims")
 
+    partner_slug = payload.get("partner_slug")
     return VerifiedRegistration(
         purpose=str(purpose),
         provider_subject=str(provider_subject),
         provider_email=payload.get("provider_email"),
         provider_email_verified=bool(payload.get("provider_email_verified", False)),
+        provider=str(payload.get("provider") or "google"),
+        partner_slug=str(partner_slug) if partner_slug else None,
     )
 
 

@@ -192,8 +192,28 @@ def base_queryset(model: Model, include_deleted: bool = False) -> models.QuerySe
     return qs
 
 
-def bulk_action(model: Model, action: str, ids: Iterable) -> int:
+def model_has_partner_field(model: Model) -> bool:
+    try:
+        model._meta.get_field("partner")
+        return True
+    except FieldDoesNotExist:
+        return False
+
+
+def bulk_action(model: Model, action: str, ids: Iterable, partner_id: Optional[str] = None) -> int:
     qs = model.objects.filter(pk__in=ids)
+    if partner_id is not None:
+        # Lets an admin console scoped to one organization run bulk
+        # actions without risk of an id list that (by typo or malice)
+        # reaches into another partner's rows - previously this had zero
+        # tenant awareness and would act on whichever ids were given,
+        # platform-wide. Callers that don't pass partner_id are unchanged
+        # (platform-wide superadmin bulk ops still work as before).
+        if not model_has_partner_field(model):
+            raise PermissionDenied(
+                f"{model._meta.app_label}.{model._meta.model_name} has no partner field to scope by."
+            )
+        qs = qs.filter(partner_id=partner_id)
     if action == "soft_delete" and hasattr(model, "is_deleted"):
         return qs.update(is_deleted=True)
     if action == "restore" and hasattr(model, "is_deleted"):

@@ -211,6 +211,12 @@ class User(AbstractBaseUser, PermissionsMixin, BaseEntity):
     phone = models.CharField(unique=True, max_length=50, blank=True, null=True)
     phone_country_code = models.CharField(max_length=12, blank=True, null=True, db_index=True)
     phone_number = models.CharField(max_length=32, blank=True, null=True, db_index=True)
+    # True only for accounts JIT-provisioned via an enterprise IdP
+    # (SSO/SCIM), which have no real phone number - `phone` holds a
+    # synthesized, globally-unique placeholder so USERNAME_FIELD keeps
+    # working, but nothing should ever display it as a real contact
+    # number or send an OTP to it.
+    phone_is_placeholder = models.BooleanField(default=False)
     tier = models.CharField(max_length=50, default="Free", db_index=True)
     status = models.CharField(max_length=50, default="active")
     locale = models.CharField(max_length=20, default="en")

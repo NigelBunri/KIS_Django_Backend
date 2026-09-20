@@ -1014,6 +1014,49 @@ class ShopLandingPageSystemTests(APITestCase):
         self.assertEqual(landing['testimonials'][0]['quote'], 'This shop always delivers.')
 
 
+class ShopDetailAccessControlTests(APITestCase):
+    """ShopViewSet.get_object() previously only enforced the owner/manager
+    check for non-safe methods, so GET /shops/<id>/ - which uses
+    ShopSerializer (fields = '__all__', including stripe_account_id,
+    payout_account_name, payout_bank_last4, flutterwave_subaccount_id) -
+    was reachable by any authenticated stranger who knew/guessed a shop's
+    UUID. Public shop browsing has its own safe path
+    (PublicShopDetailView + PublicShopSerializer); this route should never
+    have been open."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            phone='5553334444', username='shop_access_owner', password='secret', country='NG',
+        )
+        self.stranger = User.objects.create_user(
+            phone='5553334445', username='shop_access_stranger', password='secret', country='NG',
+        )
+        self.shop = Shop.objects.create(
+            owner=self.owner,
+            name='Private Financials Shop',
+            slug='private-financials-shop',
+            status=Shop.STATUS_ACTIVE,
+            stripe_account_id='acct_should_never_leak',
+            payout_bank_last4='4242',
+        )
+
+    def test_owner_can_view_full_shop_detail(self):
+        self.client.force_authenticate(user=self.owner)
+        resp = self.client.get(f'/api/v1/commerce/shops/{self.shop.id}/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['stripe_account_id'], 'acct_should_never_leak')
+
+    def test_unrelated_authenticated_user_cannot_view_shop_financials(self):
+        self.client.force_authenticate(user=self.stranger)
+        resp = self.client.get(f'/api/v1/commerce/shops/{self.shop.id}/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_anonymous_user_cannot_view_shop_financials(self):
+        resp = self.client.get(f'/api/v1/commerce/shops/{self.shop.id}/')
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+
 class ShopCreateApiTests(APITestCase):
     """ShopSerializer.create() previously never popped landing_page/the
     landing visibility fields before calling Shop.objects.create() (unlike

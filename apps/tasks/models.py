@@ -83,8 +83,22 @@ class Task(BaseEntity):
     description = models.TextField(blank=True, default="")
 
     created_by = models.ForeignKey(USER, on_delete=models.SET_NULL, null=True, related_name="tasks_created")
+    # Primary assignee - kept for backward compatibility with every
+    # existing serializer/filter/permission-check ("am I the assignee")
+    # built around a single user. `assignees` is additive: a task with
+    # collaborators has assigned_to as the first among them, plus the
+    # rest in this M2M. A task with no collaborators just has assigned_to
+    # and an empty assignees set - nothing depends on assignees being
+    # non-empty.
     assigned_to = models.ForeignKey(
         USER, on_delete=models.SET_NULL, null=True, blank=True, related_name="tasks_assigned",
+    )
+    assignees = models.ManyToManyField(
+        USER, blank=True, related_name="tasks_assigned_multi",
+        help_text="Additional collaborators beyond assigned_to (the primary assignee).",
+    )
+    parent_task = models.ForeignKey(
+        "self", on_delete=models.CASCADE, null=True, blank=True, related_name="subtasks",
     )
 
     status = models.CharField(max_length=24, choices=TaskStatus.choices, default=TaskStatus.NOT_STARTED, db_index=True)

@@ -253,6 +253,56 @@ class AdminUserDeleteView(APIView):
         })
 
 
+class AdminUserDataExportView(APIView):
+    """
+    GET /control/admin/users/<user_id>/data-export/
+    Runs a GDPR Art. 20 export on a user's behalf (a legal hold, a
+    regulator request, an employee offboarding under an enterprise
+    customer's SSO/SCIM-provisioned org) - the self-service
+    apps.accounts.views.DataExportView only ever operates on
+    request.user, so there was previously no admin console path to run
+    this for someone else at all.
+
+    Deliberately synchronous, like the self-service endpoint it reuses -
+    the underlying query set is the same size/cost either way, so making
+    this one async would add delivery/storage complexity (where would the
+    result live for later retrieval?) without a real benefit. Files a
+    GDPRRequest(type="data_export") purely as a durable audit record of
+    who exported what and when; nothing reads it back or purges from it -
+    unlike account_deletion's grace-period row, this one is a receipt,
+    not a queue entry.
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "users.export"
+
+    def get(self, request, user_id):
+        from apps.accounts.models import GDPRRequest
+        from apps.accounts.views import collect_user_export_data
+
+        user = _get_user_or_404(user_id)
+        if isinstance(user, Response):
+            return user
+
+        export_payload = collect_user_export_data(user, request=request)
+
+        GDPRRequest.objects.create(
+            user=user,
+            type="data_export",
+            status="completed",
+            completed_at=timezone.now(),
+        )
+        AuditLogger.log(
+            actor=request.user,
+            action_type="user.data_exported",
+            target_app="accounts",
+            target_model="User",
+            target_pk=str(user.id),
+            severity="warning",
+            metadata={"reason": str(request.query_params.get("reason", "")).strip()},
+        )
+        return Response(export_payload)
+
+
 class AdminUserRestoreView(APIView):
     """
     POST /control/admin/users/<user_id>/restore/
@@ -565,6 +615,132 @@ class AdminDeviceWipeAllView(APIView):
             metadata=result,
         )
         return Response({"action": "devices_wiped_all", **result})
+
+
+class AdminUserBulkActionView(APIView):
+    """
+    POST /control/admin/users/bulk/
+    Body: {action: "ban"|"suspend"|"unban"|"block"|"restore"|"set_tier",
+           user_ids: [...], reason?: str, tier?: str (set_tier only)}
+
+    Every existing user-moderation view in this file operates on exactly
+    one user_id at a time - deliberately NOT built on
+    crud_engine.bulk_action (the generic soft_delete/restore/hard_delete
+    engine), since moderation needs bespoke per-action side effects
+    (block also revokes every device session; ban/suspend just flips
+    status) that a generic engine can't express. This reruns each
+    existing single-user operation's exact logic per id, in a loop, so a
+    bulk call behaves identically to doing it one-by-one - including one
+    AuditLogger entry per affected user, not one entry for the whole
+    batch, so the audit trail stays exactly as granular as today's
+    single-user actions. A failure on one id (already-deleted user, bad
+    id, etc.) is collected and reported rather than aborting the whole
+    batch.
+    """
+    permission_classes = [IsAuthenticated, IsAdminControlUser]
+    required_permission = "users.moderate"
+
+    _ACTIONS = {"ban", "suspend", "unban", "block", "restore", "set_tier"}
+    MAX_BATCH = 500
+
+    def post(self, request):
+        from apps.accounts.models import Device
+        from apps.accounts.tiers import TIER_HIERARCHY
+        from apps.accounts.views import revoke_device_session, schedule_account_deletion
+
+        action = str(request.data.get("action", "")).strip()
+        if action not in self._ACTIONS:
+            return Response(
+                {"detail": f"action must be one of {sorted(self._ACTIONS)}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        user_ids = request.data.get("user_ids")
+        if not isinstance(user_ids, list) or not user_ids:
+            return Response({"detail": "Provide a list of user ids in `user_ids`."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(user_ids) > self.MAX_BATCH:
+            return Response(
+                {"detail": f"Batch too large - max {self.MAX_BATCH} ids per call."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reason = str(request.data.get("reason", "")).strip() or "Bulk admin action"
+        resolved_tier = None
+        if action == "set_tier":
+            canonical = {t.lower(): t for t in TIER_HIERARCHY}
+            resolved_tier = canonical.get(str(request.data.get("tier", "")).strip().lower())
+            if not resolved_tier:
+                return Response(
+                    {"detail": f"Unknown tier. Valid options: {list(canonical.values())}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        succeeded: list[str] = []
+        failed: list[dict] = []
+        for raw_id in user_ids:
+            user_id = str(raw_id)
+            try:
+                result = _get_user_or_404(user_id)
+                if isinstance(result, Response):
+                    failed.append({"user_id": user_id, "detail": "not found"})
+                    continue
+                user = result
+
+                if action == "ban":
+                    user.status = "banned"
+                    user.save(update_fields=["status"])
+                    audit_action, severity = "user.banned", "warning"
+                elif action == "suspend":
+                    user.status = "suspended"
+                    user.save(update_fields=["status"])
+                    audit_action, severity = "user.suspended", "warning"
+                elif action == "unban":
+                    user.status = "active"
+                    user.save(update_fields=["status"])
+                    audit_action, severity = "user.unbanned", "info"
+                elif action == "block":
+                    user.status = "blocked"
+                    user.is_active = False
+                    user.save(update_fields=["status", "is_active"])
+                    for device in Device.objects.filter(user=user, revoked_at__isnull=True):
+                        revoke_device_session(user, device, reason="account_blocked_by_admin", request=request)
+                    audit_action, severity = "user.blocked", "warning"
+                elif action == "restore":
+                    user.status = "active"
+                    user.is_active = True
+                    user.is_deleted = False
+                    user.save(update_fields=["status", "is_active", "is_deleted"])
+                    audit_action, severity = "user.restored", "info"
+                else:  # set_tier
+                    old_tier = user.tier
+                    user.tier = resolved_tier
+                    user.save(update_fields=["tier"])
+                    audit_action, severity = "user.tier_changed", "info"
+
+                AuditLogger.log(
+                    actor=request.user,
+                    action_type=audit_action,
+                    target_app="accounts",
+                    target_model="User",
+                    target_pk=str(user.id),
+                    severity=severity,
+                    metadata={"reason": reason, "bulk": True}
+                    if action != "set_tier"
+                    else {"from": old_tier, "to": resolved_tier, "bulk": True},
+                )
+                succeeded.append(user_id)
+            except Exception as exc:  # noqa: BLE001 - one bad row must not sink the whole batch
+                failed.append({"user_id": user_id, "detail": str(exc)})
+
+        AuditLogger.log(
+            actor=request.user,
+            action_type=f"users.bulk_{action}",
+            severity="warning",
+            metadata={"requested": len(user_ids), "succeeded": len(succeeded), "failed": len(failed)},
+        )
+        return Response(
+            {"action": action, "succeeded": succeeded, "failed": failed},
+            status=status.HTTP_200_OK,
+        )
 
 
 class AdminPlatformStatsView(APIView):

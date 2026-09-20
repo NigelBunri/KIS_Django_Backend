@@ -2,6 +2,7 @@
 import csv
 import json
 import os
+import requests
 from datetime import timedelta
 
 from django.conf import settings
@@ -2158,6 +2159,56 @@ class PartnerViewSet(viewsets.ModelViewSet):
             request=request,
         )
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"integrations/(?P<integration_id>[^/.]+)/test",
+    )
+    def integrations_test(self, request, pk=None, integration_id=None):
+        """Best-effort, read-only reachability check for an SSO config -
+        fetches the IdP's OIDC discovery document and confirms its issuer
+        matches what was configured. Does NOT attempt a login; that only
+        becomes possible once kis-auth's enterprise OIDC bridge is live.
+        Purely a "did I typo the issuer/discovery URL" sanity check."""
+        partner = self.get_object()
+        self._require_partner_feature(partner, "partner_integrations")
+        self._require_permission(partner, request.user, "partner.integrations.manage")
+        integration = PartnerIntegration.objects.filter(id=integration_id, partner=partner).first()
+        if not integration:
+            return Response({"detail": "Integration not found."}, status=status.HTTP_404_NOT_FOUND)
+        if integration.kind != PartnerIntegration.KIND_SSO:
+            return Response({"detail": "Only SSO integrations can be tested."}, status=status.HTTP_400_BAD_REQUEST)
+
+        config = integration.config or {}
+        issuer = str(config.get("issuer") or "").rstrip("/")
+        if not issuer:
+            return Response({"ok": False, "detail": "No issuer configured."}, status=status.HTTP_200_OK)
+        discovery_url = str(config.get("discovery_url") or "") or f"{issuer}/.well-known/openid-configuration"
+
+        try:
+            resp = requests.get(discovery_url, timeout=5)
+            resp.raise_for_status()
+            document = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            return Response(
+                {"ok": False, "detail": f"Could not reach discovery document: {exc}"},
+                status=status.HTTP_200_OK,
+            )
+
+        document_issuer = str(document.get("issuer") or "").rstrip("/")
+        if document_issuer != issuer:
+            return Response(
+                {
+                    "ok": False,
+                    "detail": f"Discovery document issuer ({document_issuer!r}) does not match configured issuer.",
+                },
+                status=status.HTTP_200_OK,
+            )
+        return Response(
+            {"ok": True, "detail": "Discovery document reachable and issuer matches."},
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["get", "post"], url_path="webhooks")
     def webhooks(self, request, pk=None):

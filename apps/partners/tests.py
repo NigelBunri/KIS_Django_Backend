@@ -200,6 +200,80 @@ class PartnerApiTests(TestCase):
         self.assertEqual(audit_payload["metadata"]["webhook_secret"], "[redacted]")
         self.assertEqual(audit_payload["metadata"]["safe"], "ok")
 
+    def test_enabling_sso_integration_requires_a_complete_oidc_config(self):
+        partner = self._create_partner()
+        serializer = PartnerIntegrationSerializer(
+            data={
+                "kind": PartnerIntegration.KIND_SSO,
+                "provider": "oidc",
+                "is_enabled": True,
+                "config": {"issuer": "https://acme.okta.com"},
+            }
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("config", serializer.errors)
+
+    def test_enabling_sso_integration_with_complete_config_is_valid(self):
+        serializer = PartnerIntegrationSerializer(
+            data={
+                "kind": PartnerIntegration.KIND_SSO,
+                "provider": "oidc",
+                "is_enabled": True,
+                "config": {
+                    "issuer": "https://acme.okta.com",
+                    "client_id": "abc123",
+                    "client_secret": "shh",
+                },
+            }
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def test_disabled_sso_integration_does_not_require_a_config(self):
+        # A partner should be able to save a draft/incomplete config while
+        # it's still off - only flipping is_enabled=True forces completeness.
+        serializer = PartnerIntegrationSerializer(
+            data={
+                "kind": PartnerIntegration.KIND_SSO,
+                "provider": "oidc",
+                "is_enabled": False,
+                "config": {},
+            }
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def test_patching_one_config_field_does_not_erase_the_stored_secret(self):
+        partner = self._create_partner()
+        integration = PartnerIntegration.objects.create(
+            partner=partner,
+            kind=PartnerIntegration.KIND_SSO,
+            provider="oidc",
+            is_enabled=True,
+            config={"issuer": "https://old.okta.com", "client_id": "abc", "client_secret": "real-secret"},
+        )
+        # Simulates the RN client rotating just the issuer after a GET
+        # returned client_secret as "[redacted]" - it must never resend
+        # that literal string as the new secret.
+        serializer = PartnerIntegrationSerializer(
+            integration, data={"config": {"issuer": "https://new.okta.com"}}, partial=True
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        serializer.save()
+        integration.refresh_from_db()
+        self.assertEqual(integration.config["issuer"], "https://new.okta.com")
+        self.assertEqual(integration.config["client_secret"], "real-secret")
+
+    def test_enabling_scim_integration_requires_base_url_and_token(self):
+        serializer = PartnerIntegrationSerializer(
+            data={
+                "kind": PartnerIntegration.KIND_SCIM,
+                "provider": "okta",
+                "is_enabled": True,
+                "config": {"base_url": "https://acme.okta.com/scim"},
+            }
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("config", serializer.errors)
+
     def test_partner_verification_start_creates_central_case_with_safe_metadata(self):
         partner = self._create_partner()
         self.client.force_authenticate(self.owner)

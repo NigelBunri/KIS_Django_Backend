@@ -70,18 +70,20 @@ class TaskActivityLogSerializer(serializers.ModelSerializer):
 
 class TaskListSerializer(serializers.ModelSerializer):
     assigned_to = TaskUserSummarySerializer(read_only=True)
+    assignees = TaskUserSummarySerializer(many=True, read_only=True)
     created_by = TaskUserSummarySerializer(read_only=True)
     channel_name = serializers.CharField(source="channel.name", read_only=True)
     attachment_count = serializers.IntegerField(read_only=True, source="attachments.count")
     comment_count = serializers.IntegerField(read_only=True, source="comments.count")
+    subtask_count = serializers.IntegerField(read_only=True, source="subtasks.count")
     is_overdue = serializers.SerializerMethodField()
 
     class Meta:
         model = Task
         fields = [
             "id", "partner", "channel", "channel_name", "title", "status", "priority",
-            "assigned_to", "created_by", "due_at", "created_at", "updated_at",
-            "attachment_count", "comment_count", "is_overdue",
+            "assigned_to", "assignees", "created_by", "parent_task", "due_at", "created_at", "updated_at",
+            "attachment_count", "comment_count", "subtask_count", "is_overdue",
         ]
 
     def get_is_overdue(self, obj):
@@ -95,11 +97,12 @@ class TaskDetailSerializer(TaskListSerializer):
     attachments = TaskAttachmentSerializer(many=True, read_only=True)
     comments = TaskCommentSerializer(many=True, read_only=True)
     activity = TaskActivityLogSerializer(many=True, read_only=True)
+    subtasks = TaskListSerializer(many=True, read_only=True)
 
     class Meta(TaskListSerializer.Meta):
         fields = TaskListSerializer.Meta.fields + [
             "description", "review_note", "started_at", "submitted_at",
-            "reviewed_at", "completed_at", "attachments", "comments", "activity",
+            "reviewed_at", "completed_at", "attachments", "comments", "activity", "subtasks",
         ]
 
 
@@ -107,11 +110,17 @@ class TaskCreateSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=255)
     description = serializers.CharField(required=False, allow_blank=True, default="")
     assigned_to_id = serializers.UUIDField(required=False, allow_null=True)
+    # Additional collaborators beyond assigned_to (the primary assignee) -
+    # see Task.assignees' docstring.
+    assignee_ids = serializers.ListField(
+        child=serializers.UUIDField(), required=False, allow_empty=True, default=list,
+    )
     priority = serializers.ChoiceField(choices=TaskPriority.choices, required=False, default=TaskPriority.MEDIUM)
     due_at = serializers.DateTimeField(required=False, allow_null=True)
     reference_asset_ids = serializers.ListField(
         child=serializers.UUIDField(), required=False, allow_empty=True, default=list,
     )
+    parent_task_id = serializers.UUIDField(required=False, allow_null=True)
 
 
 class TaskUpdateSerializer(serializers.Serializer):
@@ -123,6 +132,13 @@ class TaskUpdateSerializer(serializers.Serializer):
 
 class TaskAssignSerializer(serializers.Serializer):
     assigned_to_id = serializers.UUIDField(allow_null=True)
+    # Optional - when omitted, the existing collaborator set (assignees)
+    # is left untouched; when present, it REPLACES the set entirely
+    # (matching how assigned_to_id itself is always a full replace, not
+    # an add/remove delta).
+    assignee_ids = serializers.ListField(
+        child=serializers.UUIDField(), required=False,
+    )
     note = serializers.CharField(required=False, allow_blank=True, default="")
 
 

@@ -25,6 +25,8 @@ from admin_control.views import (
     AdminUserUnbanView,
     AdminUserBlockView,
     AdminUserDeleteView,
+    AdminUserDataExportView,
+    AdminUserBulkActionView,
     AdminUserRestoreView,
     AdminUserScheduleViolationDeletionView,
     AdminUserViolationsView,
@@ -82,11 +84,13 @@ urlpatterns = [
     # ── User management ───────────────────────────────────────────────────
     path("users/", AdminUserListView.as_view(), name="admin-users-list"),
     path("users/platform-stats/", AdminPlatformStatsView.as_view(), name="admin-platform-stats"),
+    path("users/bulk/", AdminUserBulkActionView.as_view(), name="admin-user-bulk"),
     path("users/<str:user_id>/", AdminUserDetailView.as_view(), name="admin-user-detail"),
     path("users/<str:user_id>/ban/", AdminUserBanView.as_view(), name="admin-user-ban"),
     path("users/<str:user_id>/unban/", AdminUserUnbanView.as_view(), name="admin-user-unban"),
     path("users/<str:user_id>/block/", AdminUserBlockView.as_view(), name="admin-user-block"),
     path("users/<str:user_id>/delete/", AdminUserDeleteView.as_view(), name="admin-user-delete"),
+    path("users/<str:user_id>/data-export/", AdminUserDataExportView.as_view(), name="admin-user-data-export"),
     path("users/<str:user_id>/restore/", AdminUserRestoreView.as_view(), name="admin-user-restore"),
     path(
         "users/<str:user_id>/schedule-violation-deletion/",

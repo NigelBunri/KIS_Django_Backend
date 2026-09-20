@@ -77,6 +77,17 @@ def _require_task_manage(partner: Partner, user) -> None:
         raise PermissionDenied("Not allowed to manage tasks in this organization.")
 
 
+def _is_assignee(task: Task, user) -> bool:
+    """True for the primary assignee OR any collaborator in `assignees` -
+    every self-service permission check ("can this user submit/start
+    this task") should use this rather than comparing assigned_to_id
+    directly, now that a task can have collaborators beyond its primary
+    assignee."""
+    if task.assigned_to_id == getattr(user, "id", None):
+        return True
+    return task.assignees.filter(id=user.id).exists()
+
+
 def _get_task_for_user(task_id, user) -> Task:
     task = get_object_or_404(Task.objects.select_related("partner", "channel"), id=task_id, is_deleted=False)
     _require_channel_access(task.channel, user)
@@ -114,7 +125,8 @@ class TaskChannelListCreateView(APIView):
             qs = qs.filter(status=status_filter)
         assignee_filter = request.query_params.get("assigned_to")
         if assignee_filter == "me":
-            qs = qs.filter(assigned_to=request.user)
+            from django.db.models import Q as DQ
+            qs = qs.filter(DQ(assigned_to=request.user) | DQ(assignees=request.user)).distinct()
         elif assignee_filter:
             qs = qs.filter(assigned_to_id=assignee_filter)
 
@@ -137,6 +149,18 @@ class TaskChannelListCreateView(APIView):
             if not assignee:
                 raise ValidationError({"assigned_to_id": "User not found."})
 
+        collaborator_ids = data.get("assignee_ids") or []
+        collaborators = list(User.objects.filter(id__in=collaborator_ids)) if collaborator_ids else []
+        if len(collaborators) != len(set(collaborator_ids)):
+            raise ValidationError({"assignee_ids": "One or more users not found."})
+
+        parent_task = None
+        parent_task_id = data.get("parent_task_id")
+        if parent_task_id:
+            parent_task = Task.objects.filter(id=parent_task_id, channel=channel, is_deleted=False).first()
+            if not parent_task:
+                raise ValidationError({"parent_task_id": "Parent task not found in this channel."})
+
         reference_ids = data.get("reference_asset_ids") or []
         owned_reference_assets = list(MediaAsset.objects.filter(id__in=reference_ids, owner=request.user))
         for asset in owned_reference_assets:
@@ -157,7 +181,10 @@ class TaskChannelListCreateView(APIView):
                 assigned_to=assignee,
                 priority=data.get("priority") or "medium",
                 due_at=data.get("due_at"),
+                parent_task=parent_task,
             )
+            if collaborators:
+                task.assignees.set(collaborators)
             _log_activity(task, request.user, TaskActivityLog.EventType.CREATED, to_status=task.status)
             if assignee:
                 _log_activity(
@@ -233,6 +260,13 @@ class TaskAssignView(APIView):
         task.assigned_to = new_assignee
         task.save(update_fields=["assigned_to", "updated_at"])
 
+        if "assignee_ids" in serializer.validated_data:
+            collaborator_ids = serializer.validated_data["assignee_ids"]
+            collaborators = list(User.objects.filter(id__in=collaborator_ids))
+            if len(collaborators) != len(set(collaborator_ids)):
+                raise ValidationError({"assignee_ids": "One or more users not found."})
+            task.assignees.set(collaborators)
+
         event_type = (
             TaskActivityLog.EventType.REASSIGNED if previous_assignee else TaskActivityLog.EventType.ASSIGNED
         )
@@ -255,7 +289,7 @@ class TaskSubmitView(APIView):
 
     def post(self, request, task_id):
         task = _get_task_for_user(task_id, request.user)
-        if task.assigned_to_id != request.user.id:
+        if not _is_assignee(task, request.user):
             raise PermissionDenied("Only the assignee can submit this task.")
         if task.status not in (TaskStatus.NOT_STARTED, TaskStatus.IN_PROGRESS, TaskStatus.REDO):
             raise ValidationError({"detail": f"Cannot submit a task in status '{task.status}'."})
@@ -323,7 +357,7 @@ class TaskStatusView(APIView):
             # Assignee self-service "start work" — the one member-initiated
             # transition this view also accepts, since it's not a review
             # decision and doesn't belong behind the admin-only gate below.
-            if task.assigned_to_id != request.user.id:
+            if not _is_assignee(task, request.user):
                 raise PermissionDenied("Only the assignee can start work on this task.")
             if TaskStatus.IN_PROGRESS not in MEMBER_ALLOWED_TRANSITIONS.get(task.status, set()):
                 raise ValidationError({"detail": f"Cannot move from '{task.status}' to 'in_progress'."})
@@ -439,9 +473,15 @@ class PartnerMyTasksView(APIView):
         partner = _get_partner_with_feature(partner_id)
         if not partner_user_can_access(partner, request.user):
             raise PermissionDenied("Not allowed to view this organization's tasks.")
+        from django.db.models import Q as DQ
+
         qs = (
-            Task.objects.filter(partner=partner, assigned_to=request.user, is_deleted=False)
+            Task.objects.filter(
+                DQ(assigned_to=request.user) | DQ(assignees=request.user),
+                partner=partner, is_deleted=False,
+            )
             .select_related("assigned_to", "created_by", "channel")
+            .distinct()
         )
         status_filter = request.query_params.get("status")
         if status_filter:
