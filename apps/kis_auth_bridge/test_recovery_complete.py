@@ -34,7 +34,11 @@ def _verified(**overrides):
     return VerifiedAuthorization(**defaults)
 
 
-@override_settings(SECURE_SSL_REDIRECT=False)
+@override_settings(
+    SECURE_SSL_REDIRECT=False,
+    KIS_AUTH_ENABLED=True,
+    KIS_AUTH_RECOVERY_ENABLED=True,
+)
 class KisAuthRecoveryCompleteTests(TestCase):
     def setUp(self):
         self.client_api = APIClient()

@@ -148,6 +148,21 @@ if _env_bool("USE_X_FORWARDED_PROTO", False):
 # the requirement.
 KIS_PHONE_VERIFICATION_ENABLED = _env_bool("KIS_PHONE_VERIFICATION_ENABLED", False)
 
+# KIS Auth (Google-backed identity/recovery) rollout gates. All default
+# False — the kis_auth_bridge endpoints exist once deployed regardless
+# (gated only by whether KISAUTH_INTERNAL_HMAC_SECRET is configured, which
+# fails closed), but these give an explicit, reversible staged-rollout
+# switch independent of that, matching the mobile app's own
+# KIS_AUTH_RECOVERY_ENABLED flag naming.
+KIS_AUTH_ENABLED = _env_bool("KIS_AUTH_ENABLED", False)
+KIS_AUTH_REGISTRATION_ENABLED = _env_bool("KIS_AUTH_REGISTRATION_ENABLED", False)
+KIS_AUTH_RECOVERY_ENABLED = _env_bool("KIS_AUTH_RECOVERY_ENABLED", False)
+# Gates "Link Google Account" (Settings) specifically — separate from
+# RECOVERY because linking is a prerequisite capability recovery depends
+# on, not the same user journey; you may want accounts linking ahead of
+# turning recovery on for anyone.
+KIS_AUTH_LINK_ENABLED = _env_bool("KIS_AUTH_LINK_ENABLED", False)
+
 # SMS/WhatsApp OTP + notification channels — disabled by default while email
 # (via Resend) is the only active delivery channel. Both channels' code
 # (apps/otp/views.py, apps/notifications/tasks.py) still exists behind

@@ -46,6 +46,19 @@ class VerifiedAuthorization:
     provider_email_verified: bool
 
 
+@dataclass(frozen=True)
+class VerifiedRegistration:
+    """Deliberately has no kis_user_id/auth_identity_id — a registration
+    ticket is issued before any KIS account or linked identity exists.
+    provider_subject is what Django uses, immediately after creating the
+    User, to call kis-auth's link endpoint and associate the two."""
+
+    purpose: str
+    provider_subject: str
+    provider_email: str | None
+    provider_email_verified: bool
+
+
 def _base_url() -> str:
     return os.environ.get("KISAUTH_BASE_URL", "").rstrip("/")
 
@@ -137,3 +150,124 @@ def redeem_authorization_code(
         provider_email=payload.get("provider_email"),
         provider_email_verified=bool(payload.get("provider_email_verified", False)),
     )
+
+
+def redeem_registration_ticket(
+    *, code: str, client_id: str, redirect_uri: str
+) -> VerifiedRegistration:
+    """Same HMAC-signed request + JWKS-verified response shape as
+    redeem_authorization_code, against the separate registration-exchange
+    endpoint — the JWT here carries provider_subject instead of sub, since
+    no KIS account exists yet at this point."""
+    secret = os.environ.get("KISAUTH_INTERNAL_HMAC_SECRET", "").strip()
+    if not secret:
+        raise ExchangeError("KISAUTH_INTERNAL_HMAC_SECRET not configured")
+
+    base = _base_url()
+    if not base:
+        raise ExchangeError("KISAUTH_BASE_URL not configured")
+
+    path = "/internal/v1/registration/exchange"
+    body = {"code": code, "client_id": client_id, "redirect_uri": redirect_uri}
+    headers = sign_internal_request("POST", path, body=body, secret=secret)
+    if not headers:
+        raise ExchangeError("failed to sign internal request")
+    headers["Content-Type"] = "application/json"
+
+    try:
+        response = requests.post(
+            f"{base}{path}", json=body, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS
+        )
+    except requests.RequestException:
+        logger.exception("kis_auth_bridge.registration_exchange_request_failed")
+        raise ExchangeError("exchange request failed") from None
+
+    if response.status_code != 201:
+        logger.warning(
+            "kis_auth_bridge.registration_exchange_rejected",
+            extra={"status_code": response.status_code},
+        )
+        raise ExchangeError(f"exchange rejected: {response.status_code}")
+
+    token = (response.json() or {}).get("token")
+    if not token:
+        raise ExchangeError("exchange response missing token")
+
+    try:
+        signing_key = _get_jwk_client().get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            issuer=ISSUER,
+            audience=client_id,
+        )
+    except jwt.PyJWTError:
+        logger.exception("kis_auth_bridge.registration_jwt_verification_failed")
+        raise ExchangeError("jwt verification failed") from None
+
+    purpose = payload.get("purpose")
+    provider_subject = payload.get("provider_subject")
+    if purpose != "registration" or not provider_subject:
+        raise ExchangeError("jwt missing required claims")
+
+    return VerifiedRegistration(
+        purpose=str(purpose),
+        provider_subject=str(provider_subject),
+        provider_email=payload.get("provider_email"),
+        provider_email_verified=bool(payload.get("provider_email_verified", False)),
+    )
+
+
+def link_identity_server_to_server(
+    *,
+    kis_user_id: str,
+    provider_subject: str,
+    provider_email: str | None,
+    provider_email_verified: bool,
+    provider: str = "google",
+) -> None:
+    """Direct server-to-server call to kis-auth's /internal/v1/identity/link
+    — used only right after registration, where Google auth already
+    happened (proven by the registration ticket having existed at all) and
+    there's no browser round trip left to attach a link-purpose OAuth flow
+    to. Raises ExchangeError on any failure, including a 409 conflict
+    (this provider_subject or kis_user_id already linked to something
+    else) — the caller decides how to surface that."""
+    secret = os.environ.get("KISAUTH_INTERNAL_HMAC_SECRET", "").strip()
+    if not secret:
+        raise ExchangeError("KISAUTH_INTERNAL_HMAC_SECRET not configured")
+
+    base = _base_url()
+    if not base:
+        raise ExchangeError("KISAUTH_BASE_URL not configured")
+
+    path = "/internal/v1/identity/link"
+    body = {
+        "provider": provider,
+        "provider_subject": provider_subject,
+        "kis_user_id": kis_user_id,
+        "provider_email": provider_email,
+        "provider_email_verified": provider_email_verified,
+    }
+    headers = sign_internal_request("POST", path, body=body, secret=secret)
+    if not headers:
+        raise ExchangeError("failed to sign internal request")
+    headers["Content-Type"] = "application/json"
+
+    try:
+        response = requests.post(
+            f"{base}{path}", json=body, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS
+        )
+    except requests.RequestException:
+        logger.exception("kis_auth_bridge.identity_link_request_failed")
+        raise ExchangeError("identity link request failed") from None
+
+    if response.status_code == 409:
+        raise ExchangeError("identity already linked")
+    if response.status_code != 201:
+        logger.warning(
+            "kis_auth_bridge.identity_link_rejected",
+            extra={"status_code": response.status_code},
+        )
+        raise ExchangeError(f"identity link rejected: {response.status_code}")
