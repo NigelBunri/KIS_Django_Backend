@@ -4064,6 +4064,19 @@ class PasswordChangeView(APIView):
             )
 
         user = request.user
+        if not user.has_usable_password():
+            # A KIS-Auth-registered account has no password to prove
+            # knowledge of (Google is the credential) — check_password()
+            # would always return False here regardless of what's typed,
+            # and "Current password is incorrect" would be actively
+            # misleading about why. The real recovery path for this case
+            # is unaffected: phone-OTP password reset (PasswordResetView)
+            # sets a new password via identity proof, not knowledge of an
+            # old one, so it works the same for these accounts as any other.
+            return Response(
+                {"detail": "This account doesn't use a password — it's signed in with Google. Use 'Forgot password' if you want to set one."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if not user.check_password(current):
             return Response(
                 {"detail": "Current password is incorrect."},

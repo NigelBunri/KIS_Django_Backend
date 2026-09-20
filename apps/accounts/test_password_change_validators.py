@@ -76,3 +76,25 @@ class PasswordChangeValidatorTests(TestCase):
     def test_missing_fields_rejected(self):
         res = self.client.post("/api/v1/auth/password/change/", {}, format="json")
         self.assertEqual(res.status_code, 400)
+
+    def test_google_only_account_gets_a_clear_message_not_wrong_password(self):
+        # A KIS-Auth-registered account has set_unusable_password() called
+        # on it (apps/kis_auth_bridge/views.py) — check_password() would
+        # always return False here no matter what's typed, so this must be
+        # caught explicitly rather than falling through to the generic
+        # "incorrect" message, which would be actively misleading about why.
+        google_user = User.objects.create(
+            phone="+237699200103", country="CM", username="google_only_user",
+        )
+        google_user.set_unusable_password()
+        google_user.save(update_fields=["password"])
+        client = APIClient()
+        client.force_authenticate(google_user)
+        res = client.post("/api/v1/auth/password/change/", {
+            "current_password": "anything-at-all",
+            "new_password": "Kingdom-Impact-2026!",
+        }, format="json")
+        self.assertEqual(res.status_code, 400)
+        detail = str(res.data.get("detail", "")).lower()
+        self.assertIn("google", detail)
+        self.assertNotIn("incorrect", detail)
