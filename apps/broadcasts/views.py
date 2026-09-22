@@ -15957,6 +15957,12 @@ class ChannelLiveStreamListCreateView(APIView):
                 "provider_calls_enabled": _live_provider_sandbox_enabled(),
                 "raw_stream_key_returned": False,
                 **({"provider_raw": merged.get("raw")} if merged.get("raw") else {}),
+                # whip_url is in _reserved_live_stream_metadata_keys above (so
+                # clients can never set it) but was never actually persisted
+                # from the provider response until now - ChannelLiveStreamWhipView
+                # reads stream.metadata["whip_url"], so a provider (e.g.
+                # KisVideoLiveProvider) returning one needs it stored here.
+                **({"whip_url": merged.get("whip_url")} if merged.get("whip_url") else {}),
                 **_safe_user_metadata,
             },
             created_by=request.user,
@@ -21053,6 +21059,25 @@ class ChannelContentProductDetailView(APIView):
 
 
 # ─── SimulCast Targets ────────────────────────────────────────────────────────
+def _sync_live_stream_targets(live_stream) -> None:
+    """Best-effort push of the current simulcast target list to the live
+    provider (only kisvideo supports this - Mux streams have no
+    sync_targets method, so getattr() silently no-ops for them). Relay
+    sync failing must never block target CRUD itself - the DB row is
+    already the source of truth, and a broadcaster can retry/toggle a
+    target again if the relay side didn't pick it up."""
+    from .live_stream_providers import get_live_stream_provider
+
+    lsp = get_live_stream_provider(live_stream.provider)
+    sync = getattr(lsp, "sync_targets", None)
+    if not sync:
+        return
+    try:
+        sync(live_stream.provider_stream_id, live_stream.simulcast_targets.all())
+    except Exception:
+        logger.warning("[live-targets] sync_targets failed for stream %s", live_stream.id, exc_info=True)
+
+
 class ChannelLiveStreamTargetsView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -21074,6 +21099,7 @@ class ChannelLiveStreamTargetsView(APIView):
         ser = ChannelLiveStreamTargetSerializer(data=data)
         ser.is_valid(raise_exception=True)
         target = ser.save(live_stream=live_stream, stream_key=str(request.data.get("stream_key") or ""))
+        _sync_live_stream_targets(live_stream)
         return Response(ChannelLiveStreamTargetSerializer(target).data, status=status.HTTP_201_CREATED)
 
 
@@ -21087,6 +21113,7 @@ class ChannelLiveStreamTargetDetailView(APIView):
             raise PermissionDenied()
         target = get_object_or_404(ChannelLiveStreamTarget, id=target_id, live_stream=live_stream)
         target.delete()
+        _sync_live_stream_targets(live_stream)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
