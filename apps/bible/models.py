@@ -607,6 +607,11 @@ class BibleCourseEnrollment(models.Model):
     progress_percent = models.PositiveIntegerField(default=0)
     is_paid = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Added because BibleCourseViewSet.certificate() has always read this
+    # field to gate/date the certificate PDF, but it was never defined on
+    # this model — the certificate endpoint has been unreachable (500 on
+    # any completed course) since it was written. See views.py:certificate.
+    completed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         unique_together = ("user", "course")

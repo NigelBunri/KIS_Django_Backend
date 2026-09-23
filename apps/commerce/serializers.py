@@ -614,6 +614,14 @@ class LandingVisibilityField(serializers.BooleanField):
         self.attr_name = attr_name
         kwargs.setdefault('required', False)
         kwargs.setdefault('default', None)
+        # BooleanField.__init__ copies `default` onto `default_empty_html`
+        # whenever it's not DRF's `empty` sentinel — so default=None here
+        # silently turned "field omitted" into "field is None", which then
+        # failed BooleanField's own null check unless allow_null is also
+        # set. Without this, EVERY multipart shop create/update (the
+        # mobile app never sends these fields) 400s with "This field may
+        # not be null." on all four landing_* fields.
+        kwargs.setdefault('allow_null', True)
         super().__init__(**kwargs)
 
     def get_attribute(self, instance):

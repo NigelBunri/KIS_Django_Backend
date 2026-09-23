@@ -287,7 +287,7 @@ class KisAuthRegistrationCompleteView(APIView):
     ticket IS the proof (it could only exist because kis-auth's OAuth
     callback verified a real Google sign-in moments earlier). Body:
     { registration_code, redirect_uri, phone, phone_country_code,
-      phone_number, country?, display_name?, date_of_birth?,
+      phone_number, country?, display_name?, date_of_birth?, referral_code?,
       device_id, device_name?, platform? }
 
     Reuses UserCreateSerializer as-is for every phone/age/country
@@ -312,6 +312,7 @@ class KisAuthRegistrationCompleteView(APIView):
         device_id = str(request.data.get("device_id") or "").strip()
         device_name = (str(request.data.get("device_name") or "").strip()) or None
         platform = str(request.data.get("platform") or "unknown").strip()
+        referral_code = str(request.data.get("referral_code") or "").strip()
 
         if not code or not redirect_uri or not device_id:
             return Response({"detail": GENERIC_ERROR}, status=status.HTTP_400_BAD_REQUEST)
@@ -323,6 +324,25 @@ class KisAuthRegistrationCompleteView(APIView):
         except ExchangeError:
             logger.info("kis_auth_bridge.registration.exchange_failed")
             return Response({"detail": GENERIC_ERROR}, status=status.HTTP_400_BAD_REQUEST)
+
+        # The DB-level unique constraint on User.email would catch this too
+        # (as an IntegrityError, below), but that path can't tell the caller
+        # anything actionable. Check up front so someone whose Google email
+        # already belongs to a password-registered account gets pointed at
+        # logging in + linking Google from Settings instead of a dead-end
+        # "please retry" that will fail identically every time.
+        if (
+            verified.provider_email
+            and verified.provider_email_verified
+            and User.objects.filter(email__iexact=verified.provider_email).exists()
+        ):
+            return Response(
+                {
+                    "detail": "An account already exists for this email. Log in and link Google from Settings instead.",
+                    "code": "account_already_exists",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
 
         is_enterprise_sso = verified.purpose == "enterprise_sso_registration"
 
@@ -368,6 +388,13 @@ class KisAuthRegistrationCompleteView(APIView):
         try:
             with transaction.atomic():
                 user = serializer.save()
+
+                if referral_code:
+                    from apps.referrals.services import register_referral
+
+                    register_referral(
+                        referred_user=user, referral_code=referral_code, device_id=device_id
+                    )
 
                 # Attempt the link FIRST, before any further writes to this
                 # user — a conflict here (e.g. a race between two

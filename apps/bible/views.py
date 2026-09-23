@@ -1219,6 +1219,114 @@ def require_manage_course(user, course: BibleCourse):
         raise PermissionDenied("You do not have permission to manage this course.")
 
 
+# Courses whose BibleCourse.level is set to this marker enforce strict,
+# sequential locking at two levels: within a module, day N (lesson order > 1
+# within that module) stays locked until day N-1's quiz is passed; across
+# modules, module N (order > 1) stays locked until every lesson in every
+# earlier module has a passing BibleQuizAttempt. Used by "The 12 Pillars of
+# the Christian Faith" so neither a day nor a doctrine can be skipped ahead
+# of without passing what comes before it.
+SEQUENTIAL_LOCK_LEVEL = "sequential-locked"
+
+
+def _quiz_passed(user, quiz) -> bool:
+    if not quiz or not user or not getattr(user, "is_authenticated", False):
+        return False
+    return BibleQuizAttempt.objects.filter(user=user, quiz=quiz, passed=True).exists()
+
+
+def lesson_is_completed(user, lesson: "BibleLesson") -> bool:
+    """True if `lesson`'s (day's) quiz has a passing attempt from `user`."""
+    quiz = BibleQuiz.objects.filter(lesson=lesson).first()
+    return _quiz_passed(user, quiz)
+
+
+def module_is_completed(user, module: "BibleCourseModule") -> bool:
+    """True if every lesson (day) in `module` (doctrine) has a passing attempt from `user`."""
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    lessons = list(BibleLesson.objects.filter(module=module))
+    if not lessons:
+        return False
+    return all(lesson_is_completed(user, lesson) for lesson in lessons)
+
+
+def is_module_locked(user, module: "BibleCourseModule") -> bool:
+    """True if `module` (doctrine) is not yet unlocked for `user` under sequential locking."""
+    course = module.course
+    if course.level != SEQUENTIAL_LOCK_LEVEL:
+        return False
+    if module.order <= 1:
+        return False
+    if not user or not getattr(user, "is_authenticated", False):
+        return True
+    prior_modules = BibleCourseModule.objects.filter(course=course, order__lt=module.order)
+    for prior in prior_modules:
+        if not module_is_completed(user, prior):
+            return True
+    return False
+
+
+def is_lesson_locked(user, lesson: "BibleLesson") -> bool:
+    """True if `lesson` (day) is not yet unlocked for `user` under sequential locking."""
+    if not lesson.module:
+        return False
+    course = lesson.module.course
+    if course.level != SEQUENTIAL_LOCK_LEVEL:
+        return False
+    if is_module_locked(user, lesson.module):
+        return True
+    if not user or not getattr(user, "is_authenticated", False):
+        # Module-level check already passed (module unlocked, e.g. order 1),
+        # but with no user we can't confirm any prior day was completed —
+        # only that module's very first day is safe to expose.
+        first = BibleLesson.objects.filter(module=lesson.module).order_by("order").first()
+        return not (first and first.id == lesson.id)
+    siblings = list(BibleLesson.objects.filter(module=lesson.module).order_by("order"))
+    idx = next((i for i, sibling in enumerate(siblings) if sibling.id == lesson.id), None)
+    if idx is None or idx == 0:
+        return False
+    return not lesson_is_completed(user, siblings[idx - 1])
+
+
+def _record_sequential_course_progress(user, course: "BibleCourse") -> None:
+    """
+    After a passing day-quiz attempt on a SEQUENTIAL_LOCK_LEVEL course, update
+    the user's enrollment progress and — once every day in every doctrine is
+    passed — mark the course completed and issue a certificate credential,
+    wiring the existing certificate machinery (apps/bible/certificates.py,
+    BibleCourseViewSet.certificate) up to day/doctrine completion.
+    """
+    total_lessons = BibleLesson.objects.filter(course=course).count()
+    if not total_lessons:
+        return
+    completed_lessons = (
+        BibleQuizAttempt.objects.filter(user=user, passed=True, quiz__course=course)
+        .values_list("quiz__lesson_id", flat=True)
+        .distinct()
+        .count()
+    )
+    percent = min(100, int(round(100 * completed_lessons / total_lessons)))
+    enrollment, _ = BibleCourseEnrollment.objects.get_or_create(
+        user=user, course=course, defaults={"status": "active"}
+    )
+    enrollment.progress_percent = percent
+    update_fields = ["progress_percent"]
+    if percent >= 100:
+        enrollment.status = "completed"
+        update_fields.append("status")
+        if not enrollment.completed_at:
+            enrollment.completed_at = timezone.now()
+            update_fields.append("completed_at")
+        if not hasattr(enrollment, "credential"):
+            BibleCourseCredential.objects.create(
+                enrollment=enrollment,
+                badge_name=f"{course.title} Certificate",
+                share_token=secrets.token_hex(24),
+            )
+    enrollment.save(update_fields=update_fields)
+
+
 class BibleCourseViewSet(viewsets.ModelViewSet):
     permission_classes = [AllowAny]
     serializer_class = BibleCourseSerializer
@@ -1408,6 +1516,13 @@ class BibleLessonViewSet(viewsets.ModelViewSet):
             return [AllowAny()]
         return [IsAuthenticated()]
 
+    def retrieve(self, request, *args, **kwargs):
+        lesson = self.get_object()
+        if lesson.module and is_lesson_locked(request.user, lesson):
+            raise PermissionDenied("Complete the previous day's test before unlocking this one.")
+        serializer = self.get_serializer(lesson)
+        return Response(serializer.data)
+
     def perform_create(self, serializer):
         course = serializer.validated_data.get("course")
         if course and course.partner and not can_manage_partner_courses(self.request.user, course.partner):
@@ -1591,10 +1706,19 @@ class BibleQuizViewSet(viewsets.ModelViewSet):
             require_manage_course(self.request.user, course)
         serializer.save()
 
+    def retrieve(self, request, *args, **kwargs):
+        quiz = self.get_object()
+        if quiz.lesson and quiz.lesson.module and is_lesson_locked(request.user, quiz.lesson):
+            raise PermissionDenied("Complete the previous day's test before unlocking this one.")
+        serializer = self.get_serializer(quiz)
+        return Response(serializer.data)
+
     @action(detail=True, methods=["post"], url_path="submit")
     def submit(self, request, pk=None):
         quiz = self.get_object()
         require_course_access(request.user, quiz.course)
+        if quiz.lesson and quiz.lesson.module and is_lesson_locked(request.user, quiz.lesson):
+            raise PermissionDenied("Complete the previous day's test before unlocking this one.")
         attempts_used = BibleQuizAttempt.objects.filter(user=request.user, quiz=quiz).count()
         if quiz.attempts_allowed and attempts_used >= quiz.attempts_allowed:
             return Response({"detail": "Attempts limit reached."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1607,8 +1731,12 @@ class BibleQuizViewSet(viewsets.ModelViewSet):
             if not user_answer:
                 continue
             if question.kind in ["single_choice", "multiple_choice", "true_false"]:
-                selected_ids = user_answer.get("choices") or []
-                correct_ids = list(question.choices.filter(is_correct=True).values_list("id", flat=True))
+                # IDs arrive as strings over JSON; DB values are ints/UUIDs —
+                # compare as strings on both sides or every submission grades as 0.
+                selected_ids = [str(c) for c in (user_answer.get("choices") or [])]
+                correct_ids = [
+                    str(c) for c in question.choices.filter(is_correct=True).values_list("id", flat=True)
+                ]
                 if question.kind == "single_choice":
                     if selected_ids and selected_ids[0] in correct_ids:
                         score += question.points
@@ -1635,6 +1763,8 @@ class BibleQuizViewSet(viewsets.ModelViewSet):
             answers=answers,
             completed_at=timezone.now(),
         )
+        if passed and quiz.course.level == SEQUENTIAL_LOCK_LEVEL:
+            _record_sequential_course_progress(request.user, quiz.course)
         return Response(BibleQuizAttemptSerializer(attempt).data, status=status.HTTP_200_OK)
 
 

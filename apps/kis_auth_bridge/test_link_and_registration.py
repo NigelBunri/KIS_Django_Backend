@@ -169,6 +169,33 @@ class KisAuthRegistrationTests(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(User.objects.filter(email=verified.provider_email).exists())
 
+    def test_rejects_registration_for_an_email_already_owned_by_a_password_account(self):
+        # A person who registered the old (password) way, then tries to
+        # register fresh via Google using an account whose email matches,
+        # must be told to log in + link Google — not get a silent second
+        # account (User.email has no serializer-level uniqueness check,
+        # only a DB-level one with an unhelpful generic error).
+        existing = User.objects.create(
+            phone="+237600000097",
+            username="existing_password_user",
+            email="newuser@example.com",
+            email_verified=True,
+            status="active",
+            is_active=True,
+        )
+        verified = _verified_registration(provider_email=existing.email)
+        with patch(
+            "apps.kis_auth_bridge.views.redeem_registration_ticket", return_value=verified
+        ) as mock_redeem, patch(
+            "apps.kis_auth_bridge.views.link_identity_server_to_server"
+        ) as mock_link:
+            resp = self._post()
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "account_already_exists")
+        mock_redeem.assert_called_once()
+        mock_link.assert_not_called()
+        self.assertEqual(User.objects.filter(email=existing.email).count(), 1)
+
     def test_successful_registration_creates_a_linked_unusable_password_account(self):
         verified = _verified_registration()
         with (
@@ -203,6 +230,32 @@ class KisAuthRegistrationTests(TestCase):
         entry = AuditLog.objects.filter(actor_id=user.id, action="account.kis_auth_registration").first()
         self.assertIsNotNone(entry)
 
+    def test_referral_code_is_applied_same_as_password_registration(self):
+        # RegisterView wires referral_code into register_referral(); this
+        # view previously didn't even though RegisterScreen already
+        # collects a referral code for the Google flow too.
+        from apps.referrals.models import Referral, ReferralCode
+
+        referrer = User.objects.create(
+            phone="+237600000096", username="referrer_user", status="active", is_active=True
+        )
+        code_record = ReferralCode.get_or_create_for_user(referrer)
+
+        verified = _verified_registration()
+        with (
+            patch(
+                "apps.kis_auth_bridge.views.redeem_registration_ticket", return_value=verified
+            ),
+            patch("apps.kis_auth_bridge.views.link_identity_server_to_server"),
+        ):
+            resp = self._post(referral_code=code_record.code)
+
+        self.assertEqual(resp.status_code, 201)
+        user = User.objects.get(id=resp.json()["user"]["id"])
+        referral = Referral.objects.filter(referred_user=user).first()
+        self.assertIsNotNone(referral)
+        self.assertEqual(referral.referrer_id, referrer.id)
+
     def test_a_failed_link_call_rolls_back_the_new_account(self):
         # If kis-auth can't link the freshly created account (e.g. this
         # Google identity got linked to someone else in a race), there
@@ -223,12 +276,12 @@ class KisAuthRegistrationTests(TestCase):
         self.assertFalse(User.objects.filter(email=verified.provider_email).exists())
 
     def test_already_registered_google_identity_does_not_get_a_second_account(self):
-        # Belt-and-suspenders check mirroring kis-auth's own
-        # already_registered branch — if a caller somehow reaches this
-        # view twice with tickets for the same provider_subject, the
-        # second registration's link call fails (409 -> ExchangeError from
-        # kis-auth's real unique constraint) and must roll back cleanly,
-        # not leave two half-created accounts.
+        # If a caller somehow reaches this view twice with tickets for the
+        # same provider_subject, the second attempt's verified_email now
+        # matches an existing User (created by the first call) — the
+        # proactive email-collision guard catches this before even
+        # attempting the link call, rather than relying on the link call
+        # itself to fail and trigger a rollback.
         verified = _verified_registration()
         with (
             patch(
@@ -246,13 +299,36 @@ class KisAuthRegistrationTests(TestCase):
             patch(
                 "apps.kis_auth_bridge.views.link_identity_server_to_server",
                 side_effect=ExchangeError("identity already linked"),
-            ),
+            ) as mock_link,
         ):
             second = self._post(
                 phone="+237600000098", phone_number="600000098", device_id="another-device"
             )
-        self.assertEqual(second.status_code, 400)
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.json()["code"], "account_already_exists")
+        mock_link.assert_not_called()
         self.assertEqual(User.objects.filter(email=verified.provider_email).count(), 1)
+
+    def test_a_failed_link_call_for_a_distinct_identity_still_rolls_back(self):
+        # Companion to the email-collision test above: this covers the
+        # case the proactive email guard does NOT catch — a link failure
+        # for a genuinely different, not-yet-registered email (e.g. two
+        # concurrent registration attempts for the same provider_subject
+        # racing each other, each with a ticket kis-auth considers valid
+        # until one of them wins the link). Must still roll back cleanly.
+        verified = _verified_registration(provider_email="racer@example.com")
+        with (
+            patch(
+                "apps.kis_auth_bridge.views.redeem_registration_ticket", return_value=verified
+            ),
+            patch(
+                "apps.kis_auth_bridge.views.link_identity_server_to_server",
+                side_effect=ExchangeError("conflict"),
+            ),
+        ):
+            resp = self._post()
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(User.objects.filter(email=verified.provider_email).exists())
 
 
 @override_settings(

@@ -514,9 +514,24 @@ class BibleContentAuditLogSerializer(serializers.ModelSerializer):
 
 
 class BibleCourseModuleSerializer(serializers.ModelSerializer):
+    is_locked = serializers.SerializerMethodField()
+    is_completed = serializers.SerializerMethodField()
+
     class Meta:
         model = BibleCourseModule
-        fields = ["id", "course", "title", "summary", "order"]
+        fields = ["id", "course", "title", "summary", "order", "is_locked", "is_completed"]
+
+    def get_is_locked(self, obj):
+        from .views import is_module_locked
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return is_module_locked(user, obj)
+
+    def get_is_completed(self, obj):
+        from .views import module_is_completed
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return module_is_completed(user, obj)
 
 
 class BibleCourseTrackItemSerializer(serializers.ModelSerializer):
@@ -683,6 +698,8 @@ class BibleLessonSerializer(serializers.ModelSerializer):
     comment_count = serializers.SerializerMethodField()
     viewer_reaction = serializers.SerializerMethodField()
     last_position_ms = serializers.SerializerMethodField()
+    is_locked = serializers.SerializerMethodField()
+    is_completed = serializers.SerializerMethodField()
 
     class Meta:
         model = BibleLesson
@@ -708,7 +725,21 @@ class BibleLessonSerializer(serializers.ModelSerializer):
             "comment_count",
             "viewer_reaction",
             "last_position_ms",
+            "is_locked",
+            "is_completed",
         ]
+
+    def _viewer(self):
+        request = self.context.get("request")
+        return getattr(request, "user", None)
+
+    def get_is_locked(self, obj):
+        from .views import is_lesson_locked
+        return is_lesson_locked(self._viewer(), obj)
+
+    def get_is_completed(self, obj):
+        from .views import lesson_is_completed
+        return lesson_is_completed(self._viewer(), obj)
 
     def get_completed(self, obj):
         request = self.context.get("request")
