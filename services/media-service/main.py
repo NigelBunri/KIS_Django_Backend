@@ -2,10 +2,19 @@
 import io
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response
-from rembg import remove
+from rembg import remove, new_session
 from PIL import Image
 
 app = FastAPI(title="Media Service - Background Removal")
+
+# Pinned to the lightweight, well-tested general-purpose model. rembg's own
+# default model changed to "bria-rmbg-2.0" (~1GB) in newer releases — left
+# unpinned, every fresh container would need a multi-minute download on its
+# very first request (or fail outright if egress to GitHub is blocked).
+# Baked into the image at build time (see Dockerfile) so no network access
+# is needed at runtime at all. Created once at import time, not per
+# request — loading the model is the expensive part.
+_session = new_session("u2net")
 
 @app.get("/")
 async def health_check():
@@ -26,7 +35,7 @@ async def process_background_removal(image: UploadFile = File(...)):
         input_image = Image.open(io.BytesIO(contents)).convert("RGBA")
 
         # Remove background using rembg
-        output_image = remove(input_image)
+        output_image = remove(input_image, session=_session)
 
         # Dump result to bytes
         buf = io.BytesIO()
