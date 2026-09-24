@@ -154,3 +154,28 @@ class DeviceBoundJWTAuthenticationAllowPhoneLookup(DeviceBoundJWTAuthentication)
             if phone_lookup:
                 return None
             raise
+
+
+class OptionalDeviceBoundJWTAuthentication(DeviceBoundJWTAuthentication):
+    """Same identity check as DeviceBoundJWTAuthentication, but every
+    failure (missing/expired/invalid token, wrong or revoked device) falls
+    through to an anonymous request instead of rejecting it outright.
+
+    For a genuinely public, AllowAny endpoint that ALSO wants to recognize
+    "is this caller the owner of the specific row being requested" when a
+    good token happens to be present (e.g. BroadcastVideoStreamView letting
+    a creator preview their own still-pending-moderation upload), plain
+    authentication_classes = [] can never populate request.user at all, so
+    that owner check is permanently unreachable. Swapping in a REQUIRED
+    DeviceBoundJWTAuthentication instead would fix that, but would also
+    turn a stale/expired token accompanying an otherwise-fine anonymous
+    request into a hard 401 - a regression for public content that worked
+    a moment ago. This authenticator only ever ADDS the possibility of
+    being recognized as a specific user; it never subtracts from what an
+    anonymous request could already do."""
+
+    def authenticate(self, request):
+        try:
+            return super().authenticate(request)
+        except AuthenticationFailed:
+            return None

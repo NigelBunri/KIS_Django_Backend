@@ -53,6 +53,7 @@ from apps.communities.models import (
 )
 from apps.accounts.models import Profile, User
 from apps.accounts.feature_gate import require_feature
+from apps.accounts.jwt_auth import OptionalDeviceBoundJWTAuthentication
 from common.url_safety import is_safe_external_url
 from apps.accounts.responsible_feed import get_today_feed_status
 from apps.accounts.tiers import get_platform_commission_pct, get_user_tier_features, normalize_limit_value
@@ -9312,7 +9313,16 @@ def _iter_file_range(file_path: str, start: int, length: int, chunk_size: int = 
 
 class BroadcastVideoStreamView(APIView):
     permission_classes = [AllowAny]
-    authentication_classes = []
+    # A REQUIRED authenticator here would turn a stale/expired token
+    # attached to an otherwise-fine anonymous request into a hard 401 for
+    # public content; authentication_classes = [] avoids that but also
+    # means request.user can never be anyone but AnonymousUser, which
+    # silently breaks the "creator previewing their own pending upload"
+    # exception below - every fresh upload 404s for its own creator until
+    # a moderator passes it. OptionalDeviceBoundJWTAuthentication is the
+    # middle ground: a good token IS recognized, a missing/bad one falls
+    # through to anonymous instead of rejecting the request.
+    authentication_classes = [OptionalDeviceBoundJWTAuthentication]
 
     def get(self, request, video_id):
         from .moderation_gate import is_broadcast_eligible
