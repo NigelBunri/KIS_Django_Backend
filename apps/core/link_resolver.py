@@ -1,6 +1,8 @@
 """
-Public, unauthenticated resolver for KIS's shareable "join" deep links
-(https://kingdomimpactventures.org/join/<type>/<token>). Used by:
+Public, unauthenticated resolver for KIS's shareable deep links -
+"join" links (https://kingdomimpactventures.org/join/<type>/<token>) plus
+the standalone /gift/<token> and /live-guest/<token> links added by the
+comms-migration share-link reachability fix (Sep 2026). Used by:
 
   - The website's own /join/[type]/[token] landing page, to show a safe
     preview ("Join Kingdom Youth community") and an "Open in KIS" button
@@ -27,7 +29,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-SUPPORTED_TYPES = {"call", "broadcast-call", "group", "community", "partner", "contact", "referral"}
+SUPPORTED_TYPES = {"call", "broadcast-call", "group", "community", "partner", "contact", "referral", "gift", "live-guest"}
 
 
 def _not_found():
@@ -153,6 +155,74 @@ def _resolve_referral(token: str):
     })
 
 
+def _resolve_gift(token: str):
+    """Comms migration (Sep 2026): share-link reachability fix. Read-only
+    preview for the website's /gift/[token] landing page - never redeems
+    anything (that stays ChannelMembershipGiftRedeemView's job, unchanged,
+    authenticated, in-app only) and never exposes recipient_email, the
+    gifter's contact info, or anything beyond what's already implied by
+    holding the token itself. Status checks mirror
+    ChannelMembershipGiftRedeemView's own rules so the preview doesn't
+    drift from what redeeming would actually do, but this function itself
+    performs no writes."""
+    from django.utils import timezone
+    from apps.broadcasts.models import ChannelMembershipGift
+
+    gift = ChannelMembershipGift.objects.select_related("tier__channel", "gifter").filter(redeem_token=token).first()
+    if not gift:
+        return _not_found()
+    if gift.status == ChannelMembershipGift.Status.AWAITING_PAYMENT:
+        return Response({"status": "revoked", "detail": "The gifter hasn't completed payment for this gift yet."}, status=410)
+    if gift.status == ChannelMembershipGift.Status.REDEEMED:
+        return Response({"status": "revoked", "detail": "This gift has already been redeemed."}, status=410)
+    if gift.status == ChannelMembershipGift.Status.CANCELLED:
+        return Response({"status": "revoked", "detail": "This gift is no longer available."}, status=410)
+    if gift.status == ChannelMembershipGift.Status.EXPIRED or (gift.expires_at and gift.expires_at < timezone.now()):
+        return Response({"status": "expired", "detail": "This gift has expired."}, status=410)
+    gifter_name = (
+        getattr(gift.gifter, "display_name", None)
+        or getattr(gift.gifter, "username", None)
+        or "A KIS member"
+    )
+    return Response({
+        "status": "ok",
+        "type": "gift",
+        "name": gift.tier.channel.display_name,
+        "description": f"{gifter_name} sent you a {gift.tier.title} membership.",
+    })
+
+
+def _resolve_live_guest(token: str):
+    """Same read-only preview contract as _resolve_gift, for the website's
+    /live-guest/[token] landing page. Mirrors
+    ChannelLiveStreamGuestRedeemView's own status/expiry rules without
+    performing any writes or touching redemption itself."""
+    from datetime import timedelta
+    from django.utils import timezone
+    from apps.broadcasts.models import ChannelLiveStreamGuest
+
+    guest = ChannelLiveStreamGuest.objects.select_related("live_stream__channel", "invited_by").filter(invite_token=token).first()
+    if not guest:
+        return _not_found()
+    if guest.status in (ChannelLiveStreamGuest.Status.DECLINED, ChannelLiveStreamGuest.Status.REMOVED):
+        return Response({"status": "revoked", "detail": "This invitation is no longer available."}, status=410)
+    if guest.live_stream.status in ("ended", "cancelled"):
+        return Response({"status": "expired", "detail": "This livestream has already ended."}, status=410)
+    if timezone.now() - guest.created_at > timedelta(days=30):
+        return Response({"status": "expired", "detail": "This invitation link has expired."}, status=410)
+    inviter_name = (
+        getattr(guest.invited_by, "display_name", None)
+        or getattr(guest.invited_by, "username", None)
+        or "A KIS member"
+    )
+    return Response({
+        "status": "ok",
+        "type": "live-guest",
+        "name": guest.live_stream.channel.display_name,
+        "description": f"{inviter_name} invited you to join {guest.live_stream.title} as a {guest.get_role_display().lower()}.",
+    })
+
+
 def _resolve_call(token: str, link_type: str):
     # No server-side validity check here on purpose (see module docstring)
     # - Django doesn't own call data and Nest's own join-by-token endpoint
@@ -174,6 +244,8 @@ _RESOLVERS = {
     "partner": _resolve_partner,
     "contact": _resolve_contact,
     "referral": _resolve_referral,
+    "gift": _resolve_gift,
+    "live-guest": _resolve_live_guest,
 }
 
 

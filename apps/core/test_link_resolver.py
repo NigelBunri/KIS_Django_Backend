@@ -8,6 +8,10 @@ from django.urls import reverse
 from rest_framework.test import APIClient
 
 from apps.accounts.models import AuditLog
+from apps.broadcasts.models import (
+    BroadcastChannel, ChannelLiveStream, ChannelLiveStreamGuest,
+    ChannelMembershipGift, ChannelMembershipTier,
+)
 from apps.chat.models import Conversation, ConversationType
 from apps.chat.models import ContactShareLink
 from apps.communities.models import Community
@@ -193,6 +197,157 @@ class PublicLinkResolveViewTests(TestCase):
 
     def test_nonexistent_referral_code_is_404_not_500(self):
         resp = self.client.get(self._url("referral", "NOTAREALCODE"))
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.data["status"], "invalid")
+
+    # --- gift (share-link reachability fix, Sep 2026) -----------------------
+
+    def _make_gift_channel_and_tier(self):
+        channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            handle="resolver-gift-channel", display_name="Resolver Gift Channel",
+        )
+        tier = ChannelMembershipTier.objects.create(
+            channel=channel, title="Supporter", price_cents=0, currency="USD", is_active=True,
+        )
+        return channel, tier
+
+    def test_valid_pending_gift_resolves_without_exposing_recipient_email(self):
+        _, tier = self._make_gift_channel_and_tier()
+        gift = ChannelMembershipGift.objects.create(
+            tier=tier, gifter=self.owner, recipient_email="secret-recipient@example.com",
+            status=ChannelMembershipGift.Status.PENDING,
+        )
+        resp = self.client.get(self._url("gift", gift.redeem_token))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "ok")
+        self.assertEqual(resp.data["name"], "Resolver Gift Channel")
+        body_text = str(resp.data)
+        self.assertNotIn("secret-recipient@example.com", body_text)
+
+    def test_awaiting_payment_gift_is_revoked(self):
+        _, tier = self._make_gift_channel_and_tier()
+        gift = ChannelMembershipGift.objects.create(
+            tier=tier, gifter=self.owner, recipient_email="x@example.com",
+            status=ChannelMembershipGift.Status.AWAITING_PAYMENT,
+        )
+        resp = self.client.get(self._url("gift", gift.redeem_token))
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.data["status"], "revoked")
+
+    def test_already_redeemed_gift_is_revoked(self):
+        _, tier = self._make_gift_channel_and_tier()
+        gift = ChannelMembershipGift.objects.create(
+            tier=tier, gifter=self.owner, recipient_email="x@example.com",
+            status=ChannelMembershipGift.Status.REDEEMED,
+        )
+        resp = self.client.get(self._url("gift", gift.redeem_token))
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.data["status"], "revoked")
+
+    def test_expired_gift_is_expired_status(self):
+        from datetime import timedelta
+        from django.utils import timezone
+
+        _, tier = self._make_gift_channel_and_tier()
+        gift = ChannelMembershipGift.objects.create(
+            tier=tier, gifter=self.owner, recipient_email="x@example.com",
+            status=ChannelMembershipGift.Status.PENDING,
+            expires_at=timezone.now() - timedelta(days=1),
+        )
+        resp = self.client.get(self._url("gift", gift.redeem_token))
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.data["status"], "expired")
+
+    def test_resolving_a_gift_does_not_change_its_status_or_redeem_it(self):
+        # This is a read-only preview - it must never touch redemption.
+        _, tier = self._make_gift_channel_and_tier()
+        gift = ChannelMembershipGift.objects.create(
+            tier=tier, gifter=self.owner, recipient_email="x@example.com",
+            status=ChannelMembershipGift.Status.PENDING,
+        )
+        self.client.get(self._url("gift", gift.redeem_token))
+        self.client.get(self._url("gift", gift.redeem_token))
+        gift.refresh_from_db()
+        self.assertEqual(gift.status, ChannelMembershipGift.Status.PENDING)
+        self.assertIsNone(gift.recipient_id)
+
+    def test_nonexistent_gift_token_is_404(self):
+        resp = self.client.get(self._url("gift", "does-not-exist"))
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.data["status"], "invalid")
+
+    # --- live-guest (share-link reachability fix, Sep 2026) -----------------
+
+    def _make_livestream(self, status="scheduled"):
+        channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            handle=f"resolver-guest-channel-{status}", display_name="Resolver Guest Channel",
+        )
+        return ChannelLiveStream.objects.create(channel=channel, title="Sunday Service", status=status)
+
+    def test_valid_invited_guest_resolves_without_exposing_email(self):
+        stream = self._make_livestream()
+        guest = ChannelLiveStreamGuest.objects.create(
+            live_stream=stream, email="secret-guest@example.com",
+            role=ChannelLiveStreamGuest.Role.GUEST, invited_by=self.owner,
+        )
+        resp = self.client.get(self._url("live-guest", guest.invite_token))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "ok")
+        self.assertEqual(resp.data["name"], "Resolver Guest Channel")
+        body_text = str(resp.data)
+        self.assertNotIn("secret-guest@example.com", body_text)
+
+    def test_declined_guest_is_revoked(self):
+        stream = self._make_livestream()
+        guest = ChannelLiveStreamGuest.objects.create(
+            live_stream=stream, email="x@example.com",
+            role=ChannelLiveStreamGuest.Role.GUEST, invited_by=self.owner,
+            status=ChannelLiveStreamGuest.Status.DECLINED,
+        )
+        resp = self.client.get(self._url("live-guest", guest.invite_token))
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.data["status"], "revoked")
+
+    def test_ended_livestream_guest_link_is_expired_status(self):
+        stream = self._make_livestream(status="ended")
+        guest = ChannelLiveStreamGuest.objects.create(
+            live_stream=stream, email="x@example.com",
+            role=ChannelLiveStreamGuest.Role.GUEST, invited_by=self.owner,
+        )
+        resp = self.client.get(self._url("live-guest", guest.invite_token))
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.data["status"], "expired")
+
+    def test_guest_link_past_30_day_cap_is_expired_status(self):
+        from datetime import timedelta
+        from django.utils import timezone
+
+        stream = self._make_livestream()
+        guest = ChannelLiveStreamGuest.objects.create(
+            live_stream=stream, email="x@example.com",
+            role=ChannelLiveStreamGuest.Role.GUEST, invited_by=self.owner,
+        )
+        ChannelLiveStreamGuest.objects.filter(id=guest.id).update(created_at=timezone.now() - timedelta(days=31))
+        resp = self.client.get(self._url("live-guest", guest.invite_token))
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.data["status"], "expired")
+
+    def test_resolving_a_guest_link_does_not_bind_it_to_anyone(self):
+        # Read-only preview - must never touch redemption/claiming.
+        stream = self._make_livestream()
+        guest = ChannelLiveStreamGuest.objects.create(
+            live_stream=stream, email="x@example.com",
+            role=ChannelLiveStreamGuest.Role.GUEST, invited_by=self.owner,
+        )
+        self.client.get(self._url("live-guest", guest.invite_token))
+        guest.refresh_from_db()
+        self.assertIsNone(guest.user_id)
+        self.assertEqual(guest.status, ChannelLiveStreamGuest.Status.INVITED)
+
+    def test_nonexistent_guest_token_is_404(self):
+        resp = self.client.get(self._url("live-guest", "does-not-exist"))
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(resp.data["status"], "invalid")
 
