@@ -116,47 +116,6 @@ def process_notification_delivery(self, notification_id):
                     delivery.last_error = str(exc)
                     delivery.status = "FAILED"
                     delivery.save()
-            elif delivery.channel == "SMS":
-                from django.contrib.auth import get_user_model
-                _User = get_user_model()
-                try:
-                    user_obj = _User.objects.filter(id=notif.user_id).first()
-                    phone = getattr(user_obj, "phone", None) if user_obj else None
-                    if not phone:
-                        delivery.status = "PENDING"
-                        delivery.last_error = "No phone number on file."
-                        delivery.save(update_fields=["status", "last_error", "updated_at"])
-                        continue
-                    import urllib.request as _req
-                    import json as _json
-                    from django.conf import settings as _s
-                    api_key = getattr(_s, "INFOBIP_API_KEY", "") or ""
-                    base = getattr(_s, "INFOBIP_BASE", "") or ""
-                    # SMS is disabled by default (SMS_CHANNEL_ENABLED) while
-                    # email via Resend is the single active channel — this
-                    # check is deliberate policy, not just missing credentials.
-                    if not getattr(_s, "SMS_CHANNEL_ENABLED", False) or not api_key or not base:
-                        delivery.status = "PENDING"
-                        delivery.last_error = "SMS channel is currently disabled."
-                        delivery.save(update_fields=["status", "last_error", "updated_at"])
-                        continue
-                    url = f"{base.rstrip('/')}/sms/2/text/advanced"
-                    payload = _json.dumps({
-                        "messages": [{"from": "KIS", "destinations": [{"to": phone}], "text": f"{notif.title}: {notif.body[:160]}"}]
-                    }).encode("utf-8")
-                    req = _req.Request(url, data=payload, headers={"Authorization": f"App {api_key}", "Content-Type": "application/json"}, method="POST")
-                    with _req.urlopen(req, timeout=10) as resp:
-                        ok = resp.status in (200, 201)
-                    delivery.status = "SENT" if ok else "FAILED"
-                    if ok:
-                        delivery.delivered_at = timezone.now()
-                        notif.mark_delivered()
-                    delivery.save()
-                except Exception as exc:
-                    delivery.retry_count += 1
-                    delivery.last_error = str(exc)
-                    delivery.status = "FAILED"
-                    delivery.save()
             else:
                 delivery.status = "PENDING"
                 delivery.save()

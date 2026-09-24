@@ -43,9 +43,16 @@ class Notification(BaseEntity):
         ("IN_APP", "In-App"),
         ("PUSH", "Push"),
         ("EMAIL", "Email"),
-        ("SMS", "SMS"),
         ("WEBHOOK", "Webhook"),
     ]
+    # SMS removed (comms architecture migration, Sep 2026) - the generic
+    # notification-broadcast SMS dispatch had zero call sites creating
+    # channel="SMS" deliveries anywhere in the codebase, confirmed by a
+    # full-repo grep before removal. This is unrelated to the OTP-specific
+    # SMS path (apps.otp.views), which is a live, separate integration and
+    # stays in place until the staged cutover's replacement is verified.
+    # CharField choices aren't DB-enforced, so no migration is needed and
+    # no historical row is invalidated by this change.
     PRIORITY = [
         ("URGENT", "Urgent"),
         ("HIGH", "High"),

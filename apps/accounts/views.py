@@ -1017,19 +1017,24 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
             raise DRFValidationError({"detail": "Duplicate or invalid data."})
 
         upsert_device(user, device_id, device_platform or None, device_name or None, request)
-        # Send welcome email (non-blocking) - a failure here must not block
-        # registration, but previously it vanished with zero trace (bare
-        # except: pass). Now logged + audited so a provider outage is
-        # actually visible instead of silently losing the email forever.
+        # Welcome is an in-app/push notification, not email (comms
+        # architecture migration, Sep 2026) - the user is standing in the
+        # app finishing registration when this fires, so there's nothing an
+        # email adds that the app itself can't show immediately. Kept
+        # non-blocking for the same reason the email version was: a
+        # notification-pipeline failure must never fail registration.
         try:
-            if getattr(user, "email", None):
-                from apps.notifications.email_service import send_welcome_email
-                if not send_welcome_email(to_email=user.email):
-                    logger.warning("Welcome email failed to send for user_id=%s", user.id)
-                    AuditLog.log(actor=user, action="email.welcome.failed", meta={"user_id": str(user.id)})
+            from apps.notifications.services import create_notification
+            create_notification(
+                user_id=user.id,
+                type="ACCOUNT_WELCOME",
+                title="Welcome to KIS",
+                body="Your account is ready. Start exploring today.",
+                priority="LOW",
+                dedup_key=f"account_welcome:{user.id}",
+            )
         except Exception as exc:
-            logger.warning("Welcome email raised for user_id=%s: %s", user.id, exc.__class__.__name__)
-            AuditLog.log(actor=user, action="email.welcome.failed", meta={"user_id": str(user.id), "error": exc.__class__.__name__})
+            logger.warning("Welcome notification failed for user_id=%s: %s", user.id, exc.__class__.__name__)
 
         # Verification is suspended (KIS_PHONE_VERIFICATION_ENABLED=false): skip the
         # OTP step entirely and activate + log the account in immediately.

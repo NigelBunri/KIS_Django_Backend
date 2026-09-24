@@ -97,7 +97,20 @@ def _get_jwk_client() -> PyJWKClient:
         # lifespan caches fetched keys for 10 minutes — short enough that a
         # rotation's overlap window (documented as ~7 days) comfortably
         # covers every worker picking up the new key without a restart.
-        _jwk_client = PyJWKClient(_jwks_url(), lifespan=600)
+        #
+        # Explicit User-Agent required: PyJWKClient's default fetch uses
+        # bare urllib with Python's stock "Python-urllib/x.y" UA, which
+        # kisauth's Cloudflare front rejects outright with a 403 before the
+        # request ever reaches the app — confirmed live against production
+        # (plain `requests`/urllib with any browser-style UA succeeds,
+        # urllib with no UA override does not). Without this, every KIS
+        # Auth verification fails at the JWKS-fetch step, before any JWT
+        # content is even inspected.
+        _jwk_client = PyJWKClient(
+            _jwks_url(),
+            lifespan=600,
+            headers={"User-Agent": "KIS-Django-Backend/1.0"},
+        )
     return _jwk_client
 
 

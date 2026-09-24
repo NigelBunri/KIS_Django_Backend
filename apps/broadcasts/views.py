@@ -20169,25 +20169,24 @@ class ChannelMembershipView(APIView):
                     "expires_at": None,
                 },
             )
-            # Send welcome email for free tiers too
+            # In-app/push confirmation for free tiers - the user is
+            # standing in the app joining right now, so email adds nothing
+            # a toast/notification doesn't already cover (comms
+            # architecture migration, Sep 2026).
             try:
-                if getattr(request.user, "email", None):
-                    from apps.notifications.email_service import send_membership_email
-                    if not send_membership_email(
-                        to_email=request.user.email,
-                        tier_title=tier.title,
-                        channel_name=channel.display_name,
-                    ):
-                        from apps.accounts.models import AuditLog as _GeneralAuditLog
-                        logger.warning("Membership email failed for user_id=%s channel_id=%s", request.user.id, channel.id)
-                        _GeneralAuditLog.log(actor=request.user, action="email.membership.failed", meta={"channel_id": str(channel.id)})
-            except Exception as _exc:
-                from apps.accounts.models import AuditLog as _GeneralAuditLog
-                logger.warning("Membership email raised for user_id=%s: %s", request.user.id, _exc.__class__.__name__)
-                _GeneralAuditLog.log(
-                    actor=request.user, action="email.membership.failed",
-                    meta={"channel_id": str(channel.id), "error": _exc.__class__.__name__},
+                from apps.notifications.services import create_notification
+                create_notification(
+                    user_id=request.user.id,
+                    type="MEMBERSHIP_CONFIRMED",
+                    title=f"You joined {tier.title}",
+                    body=f"You are now a {tier.title} member of {channel.display_name}.",
+                    target_type="channel",
+                    target_id=channel.id,
+                    priority="LOW",
+                    context={"channel_id": str(channel.id), "tier_id": str(tier.id)},
                 )
+            except Exception:
+                logger.warning("Membership notification failed for user_id=%s channel_id=%s", request.user.id, channel.id)
             return Response({"joined": True, "tier_id": str(tier.id), "created": created}, status=201 if created else 200)
 
     def delete(self, request, channel_id):

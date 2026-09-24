@@ -466,6 +466,22 @@ class KisAuthRegistrationCompleteView(APIView):
             },
         )
 
+        # Same welcome notification as apps.accounts.views' password-based
+        # registration - the successful Google hand-off is itself the
+        # "you're in" moment, so this is in-app/push, never email.
+        try:
+            from apps.notifications.services import create_notification
+            create_notification(
+                user_id=user.id,
+                type="ACCOUNT_WELCOME",
+                title="Welcome to KIS",
+                body="Your account is ready. Start exploring today.",
+                priority="LOW",
+                dedup_key=f"account_welcome:{user.id}",
+            )
+        except Exception:
+            logger.warning("Welcome notification failed for user_id=%s", user.id)
+
         return Response(
             {
                 "access": tokens["access"],

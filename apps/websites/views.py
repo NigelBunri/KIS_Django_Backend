@@ -1,3 +1,4 @@
+import logging
 from datetime import timedelta
 
 from django.conf import settings
@@ -12,7 +13,6 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from apps.core.public_web import public_web_base_url, public_web_enabled, resolve_stale_media_url, safe_public_description
-from apps.notifications.email_service import send_website_form_notification_email
 from apps.websites import adapters
 from apps.websites.analytics import classify_device, extract_referrer_host, hash_visitor_session
 from apps.websites.branding import validate_branding
@@ -62,6 +62,8 @@ from apps.websites.permissions import (
 )
 from apps.websites.preview_tokens import sign_website_preview_token, verify_website_preview_token
 from apps.websites.serializers import WebsitePageSerializer, WebsiteSerializer
+
+logger = logging.getLogger(__name__)
 
 
 def _website_public_base_url() -> str:
@@ -328,18 +330,30 @@ class WebsitePublicSitemapPlanView(APIView):
 def _notify_owner_of_form_submission(website: Website, page: WebsitePage, section_data: dict, cleaned: dict):
     owner_instance = resolve_owner_object(website.owner_type, website.owner_id)
     owner_user = resolve_owner_user(website.owner_type, owner_instance)
-    to_email = getattr(owner_user, "email", "") if owner_user else ""
-    if not to_email:
+    if not owner_user:
         return
     field_labels = {f.get("key"): f.get("label") or f.get("key") for f in (section_data.get("fields") or [])}
     labeled = {field_labels.get(k, k): v for k, v in cleaned.items()}
-    send_website_form_notification_email(
-        to_email=to_email,
-        website_name=website.name or website.slug,
-        page_title=page.title,
-        form_title=section_data.get("title") or "Website",
-        fields=labeled,
-    )
+    # In-app/push, not email (comms architecture migration, Sep 2026): the
+    # recipient is always a KIS member who owns this website — never an
+    # external, account-less party — so the "genuinely required for a
+    # non-KIS recipient" exception that keeps gift/guest-invite email alive
+    # doesn't apply here.
+    try:
+        from apps.notifications.services import create_notification
+        form_title = section_data.get("title") or "Website"
+        create_notification(
+            user_id=owner_user.id,
+            type="CONTACT_FORM_RECEIVED",
+            title=f"New form response on {website.name or website.slug}",
+            body=f"Someone submitted \"{form_title}\" on {page.title}.",
+            target_type="website",
+            target_id=website.id,
+            priority="MEDIUM",
+            context={"website_id": str(website.id), "page_id": str(page.id), "fields": labeled},
+        )
+    except Exception:
+        logger.warning("Contact-form notification failed for website_id=%s", website.id)
 
 
 class WebsitePublicFormSubmitView(APIView):

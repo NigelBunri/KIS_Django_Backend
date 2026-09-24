@@ -351,6 +351,8 @@ class OtpInitiateView(APIView):
         # Channel availability checks
         if channel == "sms" and not sms_configured():
             return Response({"success": False, "message": "SMS is not available"}, status=400)
+        if channel == "whatsapp" and not whatsapp_configured():
+            return Response({"success": False, "message": "WhatsApp is not available"}, status=400)
         if channel == "email":
             if not email_configured():
                 return Response({"success": False, "message": "Email is not available"}, status=400)
@@ -607,6 +609,18 @@ class PasswordResetInitiateView(APIView):
         channel = (request.data.get("channel") or "email").strip()
         if channel not in ALLOWED_CHANNELS:
             return Response({"success": False, "message": "invalid channel"}, status=400)
+
+        # Channel availability checks — mirrors OtpInitiateView. Previously
+        # missing here: a client could request channel=sms/whatsapp and this
+        # view would still attempt Infobip delivery even when
+        # SMS_CHANNEL_ENABLED/WHATSAPP_CHANNEL_ENABLED policy had it off, as
+        # long as raw credentials existed.
+        if channel == "sms" and not sms_configured():
+            return Response({"success": False, "message": "SMS is not available"}, status=400)
+        if channel == "whatsapp" and not whatsapp_configured():
+            return Response({"success": False, "message": "WhatsApp is not available"}, status=400)
+        if channel == "email" and not email_configured():
+            return Response({"success": False, "message": "Email is not available"}, status=400)
 
         now = timezone.now()
         last = _find_otp(phone, purpose, country)

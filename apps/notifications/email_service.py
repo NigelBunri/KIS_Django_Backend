@@ -137,6 +137,47 @@ def _from_email() -> str:
     return str(getattr(settings, "DEFAULT_FROM_EMAIL", "KIS <no-reply@kis.app>"))
 
 
+# Communication-architecture migration (Sep 2026): KIS Auth / in-app / push
+# is now the preferred hierarchy, with email minimized to purposes that
+# genuinely can't be replaced. Only a template_key listed here may send —
+# every other purpose has been migrated to create_notification() (in-app +
+# push) instead. This is enforcement, not just documentation: a future call
+# site that isn't on this list fails safe (logged, no send) rather than
+# silently reintroducing an email KIS decided not to send anymore.
+#
+#   DEVICE_AUTH_FALLBACK      — email OTP is the fallback once KIS Auth/SMS
+#                                can't complete register/login/reset; still
+#                                needed for accounts with no phone/no Google
+#                                link.
+#   DEVICE_RECOVERY_FALLBACK  — legacy ParentRecoveryInitView path; KIS Auth
+#                                recovery is now primary, this remains the
+#                                fallback for accounts that never linked
+#                                Google.
+#   GIFT_INVITATION /
+#   EXTERNAL_GUEST_INVITATION — recipient is identified by a bare email
+#                                address and may have no KIS account at all;
+#                                nothing else in the stack can reach them.
+#   PAYMENT_RECEIPT_ARCHIVAL  — kept alongside (not instead of) the in-app
+#                                receipt; people forward/archive these for
+#                                their own records independent of the app.
+#   DIGEST_OPTIN              — re-engagement email for lapsed users; opt-in
+#                                only, never required for account function.
+#   default                   — the generic Notification->EMAIL channel used
+#                                by create_notification()/NotificationRule;
+#                                already gated per-user by the existing
+#                                notification-preference system, not a
+#                                blanket send.
+EMAIL_PURPOSE_ALLOWLIST: frozenset[str] = frozenset({
+    "default",
+    "otp", "otp_register", "otp_login", "otp_web_login", "otp_email_verify", "otp_reset",
+    "device_recovery",
+    "gift_membership",
+    "livestream_guest_invite",
+    "payment_receipt",
+    "digest",
+})
+
+
 def send_notification_email(
     to_email: str,
     title: str,
@@ -144,8 +185,18 @@ def send_notification_email(
     template_key: str = "default",
     context: dict | None = None,
 ) -> bool:
-    """Send a single notification email. Returns True on success."""
+    """Send a single notification email. Returns True on success.
+
+    Fails safe (returns False, logs a warning) for any template_key not in
+    EMAIL_PURPOSE_ALLOWLIST — see the allowlist's docstring for why each
+    approved purpose still needs email."""
     if not to_email:
+        return False
+    if template_key not in EMAIL_PURPOSE_ALLOWLIST:
+        logger.warning(
+            "Blocked email send: template_key=%r is not in EMAIL_PURPOSE_ALLOWLIST.",
+            template_key,
+        )
         return False
     ctx = {**(context or {}), "title": title, "body": body}
     subject_tpl, html_tpl = _TEMPLATES.get(template_key, _TEMPLATES["default"])
