@@ -416,7 +416,20 @@ class PrayerRequestViewSet(ModelViewSet):
         return PrayerRequest.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        prayer = serializer.save(user=self.request.user)
+        # PrayerRequest ("my requests", filtered to the submitter in
+        # get_queryset above) and PrayerWallEntry (the shared wall
+        # PrayerWallView reads from) are separate tables - nothing ever
+        # created the wall-side row when someone submitted a request here,
+        # so a public prayer request never actually appeared on the wall.
+        # Mirror it for both public-with-name and anonymous requests;
+        # leaders_only is intentionally excluded from the public wall.
+        if prayer.privacy in ("public", "anonymous"):
+            PrayerWallEntry.objects.create(
+                user=prayer.user,
+                text=prayer.text,
+                is_public=True,
+            )
 
     @extend_schema(summary="Increment prayer count for a request")
     @action(detail=True, methods=["post"], url_path="pray")

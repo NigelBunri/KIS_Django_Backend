@@ -45,7 +45,7 @@ class OfferingCampaignSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at", "raised_amount"]
+        read_only_fields = ["id", "created_by", "created_at", "updated_at", "raised_amount"]
 
 
 class ChurchGivingSerializer(serializers.ModelSerializer):
@@ -65,7 +65,7 @@ class ChurchGivingSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class TithePledgeSerializer(serializers.ModelSerializer):
@@ -84,7 +84,7 @@ class TithePledgeSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at", "fulfilled_amount"]
+        read_only_fields = ["id", "user", "created_at", "updated_at", "fulfilled_amount"]
 
 
 class ChurchMembershipSerializer(serializers.ModelSerializer):
@@ -105,7 +105,7 @@ class ChurchMembershipSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class ChurchMembershipPublicSerializer(serializers.ModelSerializer):
@@ -127,7 +127,7 @@ class ChurchMembershipPublicSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class AttendanceRecordSerializer(serializers.ModelSerializer):
@@ -144,7 +144,7 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class ChurchLifeEventSerializer(serializers.ModelSerializer):
@@ -163,7 +163,7 @@ class ChurchLifeEventSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class MemberBirthdayAnniversarySerializer(serializers.ModelSerializer):
@@ -178,7 +178,7 @@ class MemberBirthdayAnniversarySerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class SmallGroupSerializer(serializers.ModelSerializer):
@@ -215,7 +215,7 @@ class SmallGroupMembershipSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "join_date", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "join_date", "created_at", "updated_at"]
 
 
 class SmallGroupAttendanceSerializer(serializers.ModelSerializer):
@@ -249,7 +249,7 @@ class DiscipleshipJourneySerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class SpiritualGiftsAssessmentSerializer(serializers.ModelSerializer):
@@ -264,7 +264,7 @@ class SpiritualGiftsAssessmentSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "completed_at", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "completed_at", "created_at", "updated_at"]
 
 
 class AccountabilityPartnerSerializer(serializers.ModelSerializer):
@@ -280,7 +280,7 @@ class AccountabilityPartnerSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "started_at", "created_at", "updated_at"]
+        read_only_fields = ["id", "user1", "started_at", "created_at", "updated_at"]
 
 
 class PrayerRequestSerializer(serializers.ModelSerializer):
@@ -299,7 +299,7 @@ class PrayerRequestSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "prayer_count", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "prayer_count", "created_at", "updated_at"]
 
 
 class PrayerWallEntrySerializer(serializers.ModelSerializer):
@@ -315,7 +315,7 @@ class PrayerWallEntrySerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "prayer_count", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "prayer_count", "created_at", "updated_at"]
 
 
 class FastingRecordSerializer(serializers.ModelSerializer):
@@ -333,7 +333,7 @@ class FastingRecordSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class PrayerChainSlotSerializer(serializers.ModelSerializer):
@@ -350,7 +350,7 @@ class PrayerChainSlotSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class SongSerializer(serializers.ModelSerializer):
@@ -371,10 +371,18 @@ class SongSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
 
 class SetListSerializer(serializers.ModelSerializer):
+    # The frontend has no church picker anywhere (SetListScreen.tsx never
+    # sends church_id) - this app is used as a single-congregation
+    # installation, not a multi-church directory. church_id stays a
+    # required, non-null column on the model (other consumers may filter
+    # by it later), so default it here rather than requiring every client
+    # to know and send a value that has nowhere to come from today.
+    church_id = serializers.UUIDField(required=False, default="00000000-0000-0000-0000-000000000000")
+
     class Meta:
         model = SetList
         fields = [
@@ -388,7 +396,7 @@ class SetListSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
 
 class MinistryDepartmentSerializer(serializers.ModelSerializer):
@@ -422,7 +430,7 @@ class VolunteerSignupSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]
 
 
 class OutreachCampaignSerializer(serializers.ModelSerializer):
@@ -442,7 +450,7 @@ class OutreachCampaignSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
 
 class EvangelismRecordSerializer(serializers.ModelSerializer):
@@ -460,4 +468,4 @@ class EvangelismRecordSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "created_at", "updated_at"]

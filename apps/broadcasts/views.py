@@ -5541,7 +5541,7 @@ def _sanitize_owner_contact(raw: object | None) -> dict:
     }
 
 
-def _sanitize_member(entry: object | None, index: int, institution_name: str) -> dict | None:
+def _sanitize_health_member(entry: object | None, index: int, institution_name: str) -> dict | None:
     if not isinstance(entry, dict):
         return None
 
@@ -5572,7 +5572,7 @@ def _sanitize_members(raw_members: object | None, employees: list[dict], institu
 
     if isinstance(raw_members, list):
         for idx, item in enumerate(raw_members):
-            member = _sanitize_member(item, idx, institution_name)
+            member = _sanitize_health_member(item, idx, institution_name)
             if member:
                 rows.append(member)
 
