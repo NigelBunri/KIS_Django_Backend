@@ -1,9 +1,13 @@
 """
-Email-system audit, Priority 2 discovery #4 ("Never fires", structurally
-identical to gift-membership): ChannelLiveStreamGuestsView.post created the
-ChannelLiveStreamGuest record (with its invite_token) but never notified
-the invitee at all — neither an external email invite nor an existing app
-user learned they'd been invited.
+Comms migration (Sep 2026): ChannelLiveStreamGuestsView.post used to email
+the invitee directly. It now delivers via deliver_livestream_guest_invite_notice
+instead — an in-app/push notification when the email resolves to an existing
+verified KIS member, or a share link (from the guest's own unguessable
+invite_token) handed to the inviter to pass along manually when the invitee
+is genuinely external. Email stays available as the underlying
+send_livestream_guest_invite_email function (see
+SendLivestreamGuestInviteEmailTemplateTests below) but is no longer called
+automatically from this flow.
 
 Run:
   python3 manage.py test apps.broadcasts.test_livestream_guest_invite_email --keepdb -v 2
@@ -13,21 +17,23 @@ from unittest.mock import patch
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
-from apps.accounts.models import AuditLog, Device, User
+from apps.accounts.models import Device, User
 from apps.accounts.views import issue_tokens_for_user
 from apps.broadcasts.models import BroadcastChannel, ChannelLiveStream, ChannelLiveStreamGuest
+from apps.notifications.models import Notification
 
 DEVICE_ID = "livestream-guest-invite-email-test-device"
 
 
-def _make_user(phone: str, display_name: str = "") -> User:
+def _make_user(phone: str, display_name: str = "", email_verified: bool = True) -> User:
     user = User.objects.create_user(phone=phone, password="TestPass12!", country="CM")
     user.email = f"{phone.lstrip('+')}@example.com"
+    user.email_verified = email_verified
     user.status = "active"
     user.is_active = True
     if display_name:
         user.display_name = display_name
-    user.save(update_fields=["email", "status", "is_active", "display_name"])
+    user.save(update_fields=["email", "email_verified", "status", "is_active", "display_name"])
     Device.objects.create(user=user, device_id=DEVICE_ID, platform="android", is_parent=True, token_version=1)
     return user
 
@@ -52,51 +58,69 @@ class LivestreamGuestInviteEmailTests(TestCase):
             format="json",
         )
 
-    @patch("apps.notifications.email_service.send_livestream_guest_invite_email", return_value=True)
-    def test_invite_email_is_now_sent_on_guest_creation(self, mock_send):
-        res = self._invite(email="guest@example.com", role="cohost")
+    def test_external_invitee_gets_a_share_link_not_an_email(self):
+        with patch("apps.notifications.email_service.send_livestream_guest_invite_email") as mock_send:
+            res = self._invite(email="guest@example.com", role="cohost")
 
         self.assertEqual(res.status_code, 201, res.data)
-        mock_send.assert_called_once()
-        kwargs = mock_send.call_args.kwargs
-        self.assertEqual(kwargs["to_email"], "guest@example.com")
-        self.assertEqual(kwargs["inviter_name"], "Chidi O.")
-        self.assertEqual(kwargs["channel_name"], "Livestream Guest Email Test Channel")
-        self.assertEqual(kwargs["stream_title"], "Sunday Service")
-        self.assertEqual(kwargs["role"], "cohost")
+        mock_send.assert_not_called()
         guest = ChannelLiveStreamGuest.objects.get(email="guest@example.com")
-        self.assertIn(guest.invite_token, kwargs["invite_url"])
+        self.assertIsNone(guest.user_id)
+        self.assertIn(guest.invite_token, res.data["share_link"])
 
-    @patch("apps.notifications.email_service.send_livestream_guest_invite_email", return_value=True)
-    def test_no_email_never_attempts_to_send(self, mock_send):
-        invited_user = _make_user("+237699800002")
-        res = self.client.post(
-            f"/api/v1/broadcasts/live-streams/{self.live_stream.id}/guests/",
-            {"user_id": str(invited_user.id), "role": "guest"},
-            format="json",
-        )
+        notif = Notification.objects.filter(
+            user_id=self.owner.id, type="GUEST_INVITATION_READY_TO_SHARE",
+            dedup_key=f"guest_invite_share_link:{guest.id}",
+        ).first()
+        self.assertIsNotNone(notif)
+        self.assertIn(guest.invite_token, notif.body)
+
+    def test_existing_verified_member_gets_in_app_notification_not_a_link(self):
+        invited_user = _make_user("+237699800002", display_name="Existing Member")
+        with patch("apps.notifications.email_service.send_livestream_guest_invite_email") as mock_send:
+            res = self._invite(email=invited_user.email, role="guest")
+
+        self.assertEqual(res.status_code, 201, res.data)
+        mock_send.assert_not_called()
+        self.assertIsNone(res.data.get("share_link"))
+        guest = ChannelLiveStreamGuest.objects.get(email=invited_user.email)
+        self.assertEqual(guest.user_id, invited_user.id)
+
+        notif = Notification.objects.filter(
+            user_id=invited_user.id, type="GUEST_INVITATION", dedup_key=f"guest_invite:{guest.id}",
+        ).first()
+        self.assertIsNotNone(notif)
+
+    def test_unverified_email_match_is_not_resolved_to_that_account(self):
+        unverified = _make_user("+237699800003", email_verified=False)
+        res = self._invite(email=unverified.email, role="guest")
+
+        self.assertEqual(res.status_code, 201, res.data)
+        guest = ChannelLiveStreamGuest.objects.get(email=unverified.email)
+        self.assertIsNone(guest.user_id)
+        self.assertIn(guest.invite_token, res.data["share_link"])
+
+    def test_direct_user_id_invite_never_attempts_to_email(self):
+        invited_user = _make_user("+237699800004")
+        with patch("apps.notifications.email_service.send_livestream_guest_invite_email") as mock_send:
+            res = self.client.post(
+                f"/api/v1/broadcasts/live-streams/{self.live_stream.id}/guests/",
+                {"user_id": str(invited_user.id), "role": "guest"},
+                format="json",
+            )
 
         self.assertEqual(res.status_code, 201, res.data)
         mock_send.assert_not_called()
 
-    @patch("apps.notifications.email_service.send_livestream_guest_invite_email", return_value=False)
-    def test_send_failure_is_logged_and_audited_without_failing_the_request(self, _mock_send):
-        res = self._invite()
-
-        self.assertEqual(res.status_code, 201, res.data)
-        guest = ChannelLiveStreamGuest.objects.get(email="guest@example.com")
-        entry = AuditLog.objects.filter(actor_id=self.owner.id, action="email.livestream_guest_invite.failed").first()
-        self.assertIsNotNone(entry)
-        self.assertEqual(entry.meta.get("guest_id"), str(guest.id))
-
-    @patch("apps.notifications.email_service.send_livestream_guest_invite_email", side_effect=RuntimeError("boom"))
-    def test_send_exception_never_blocks_guest_creation(self, _mock_send):
-        res = self._invite()
+    def test_guest_creation_still_succeeds_even_when_notification_delivery_is_broken(self):
+        with patch(
+            "apps.notifications.services.create_notification",
+            side_effect=RuntimeError("boom"),
+        ):
+            res = self._invite()
 
         self.assertEqual(res.status_code, 201, res.data)
         self.assertTrue(ChannelLiveStreamGuest.objects.filter(email="guest@example.com").exists())
-        entry = AuditLog.objects.filter(actor_id=self.owner.id, action="email.livestream_guest_invite.failed").first()
-        self.assertEqual(entry.meta.get("error"), "RuntimeError")
 
 
 class SendLivestreamGuestInviteEmailTemplateTests(TestCase):

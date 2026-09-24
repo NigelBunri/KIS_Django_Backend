@@ -212,6 +212,7 @@ from .views import (
     ChannelPayoutRequestView,
     ChannelLiveStreamGuestsView,
     ChannelLiveStreamGuestActionView,
+    ChannelLiveStreamGuestRedeemView,
     ChannelContentRecommendationsView,
     ChannelRevenueAnalyticsView,
     ChannelContentAutoChaptersView,
@@ -870,6 +871,7 @@ urlpatterns = [
     # Co-streaming guests
     path("broadcasts/live-streams/<uuid:stream_id>/guests/", ChannelLiveStreamGuestsView.as_view(), name="broadcast-live-stream-guests"),
     path("broadcasts/live-streams/<uuid:stream_id>/guests/<uuid:guest_id>/", ChannelLiveStreamGuestActionView.as_view(), name="broadcast-live-stream-guest-action"),
+    path("broadcasts/live-streams/guests/<str:token>/redeem/", ChannelLiveStreamGuestRedeemView.as_view(), name="broadcast-live-stream-guest-redeem"),
     # Recommendations
     path("broadcasts/recommendations/", ChannelContentRecommendationsView.as_view(), name="broadcast-recommendations"),
     # Revenue analytics

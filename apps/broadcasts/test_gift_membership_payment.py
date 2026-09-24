@@ -30,6 +30,7 @@ from apps.accounts.models import Device, User
 from apps.accounts.views import issue_tokens_for_user
 from apps.billing.models import WalletTransaction
 from apps.broadcasts.models import BroadcastChannel, ChannelMembership, ChannelMembershipGift, ChannelMembershipTier
+from apps.notifications.models import Notification
 
 DEVICE_ID = "gift-membership-payment-test-device"
 
@@ -186,21 +187,23 @@ class FlutterwaveGiftPaymentWebhookTests(TestCase):
             secure=True,
         )
 
-    @patch("apps.notifications.email_service.send_gift_membership_email", return_value=True)
-    def test_successful_payment_activates_gift_and_sends_recipient_email(self, mock_send):
+    @patch("apps.notifications.email_service.send_gift_membership_email")
+    def test_successful_payment_activates_gift_and_notifies_gifter_with_share_link(self, mock_send):
         res = self._post_webhook()
 
         self.assertEqual(res.status_code, 200)
         self.gift.refresh_from_db()
         self.assertEqual(self.gift.status, ChannelMembershipGift.Status.PENDING)
         self.assertEqual(self.gift.payment_reference, self.tx.tx_ref)
-        mock_send.assert_called_once()
-        kwargs = mock_send.call_args.kwargs
-        self.assertEqual(kwargs["to_email"], "giftee@example.com")
-        self.assertEqual(kwargs["gifter_name"], "Aisha K.")
-        self.assertEqual(kwargs["redeem_code"], self.gift.redeem_token)
+        mock_send.assert_not_called()
 
-    @patch("apps.notifications.email_service.send_gift_membership_email", return_value=True)
+        notif = Notification.objects.filter(
+            user_id=self.gifter.id, type="GIFT_READY_TO_SHARE", dedup_key=f"gift_share_link:{self.gift.id}",
+        ).first()
+        self.assertIsNotNone(notif)
+        self.assertIn(self.gift.redeem_token, notif.body)
+
+    @patch("apps.notifications.email_service.send_gift_membership_email")
     def test_gift_is_redeemable_after_payment_confirms(self, _mock_send):
         self._post_webhook()
         self.gift.refresh_from_db()
@@ -252,8 +255,8 @@ class StripeGiftPaymentWebhookTests(TestCase):
             },
         }
 
-    @patch("apps.notifications.email_service.send_gift_membership_email", return_value=True)
-    def test_successful_payment_activates_gift_and_sends_recipient_email(self, mock_send):
+    @patch("apps.notifications.email_service.send_gift_membership_email")
+    def test_successful_payment_activates_gift_and_notifies_gifter_with_share_link(self, mock_send):
         with patch("apps.billing.stripe_payments.verify_webhook", return_value=self._fake_event()):
             res = self.client.post(
                 "/api/v1/billing/stripe/webhook/", {}, format="json",
@@ -264,5 +267,10 @@ class StripeGiftPaymentWebhookTests(TestCase):
         self.gift.refresh_from_db()
         self.assertEqual(self.gift.status, ChannelMembershipGift.Status.PENDING)
         self.assertEqual(self.gift.payment_reference, "pi_test_gift_1")
-        mock_send.assert_called_once()
-        self.assertEqual(mock_send.call_args.kwargs["to_email"], "giftee2@example.com")
+        mock_send.assert_not_called()
+
+        notif = Notification.objects.filter(
+            user_id=self.gifter.id, type="GIFT_READY_TO_SHARE", dedup_key=f"gift_share_link:{self.gift.id}",
+        ).first()
+        self.assertIsNotNone(notif)
+        self.assertIn(self.gift.redeem_token, notif.body)

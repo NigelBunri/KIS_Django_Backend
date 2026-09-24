@@ -15148,6 +15148,153 @@ def _channel_audit(request, *, action: str, target_type: str, target_id, metadat
         return None
 
 
+def _resolve_external_recipient(*, recipient=None, recipient_email: str = "") -> "User | None":
+    """Comms migration (Sep 2026): gift/guest-invite recipients are often
+    typed in as a bare email address, but if that address already belongs
+    to a KIS member we should notify them in-app instead of treating them
+    as an external, email-only recipient - that's the whole point of
+    minimizing email to genuinely external people.
+
+    Only matches a VERIFIED email (mirrors ParentRecoveryInitView's same
+    rule for device recovery) - an unverified email on someone else's
+    account must never let a gift/invite silently attach to that account
+    instead of the person who actually owns the inbox.
+
+    `recipient` is returned as-is when already resolved (e.g. by an
+    explicit recipient_id/user_id from the caller) - this function only
+    fills the gap when nothing more specific was given.
+    """
+    if recipient:
+        return recipient
+    email = (recipient_email or "").strip()
+    if not email:
+        return None
+    return User.objects.filter(email__iexact=email, email_verified=True, is_active=True).first()
+
+
+def deliver_gift_membership_notice(gift: "ChannelMembershipGift") -> dict:
+    """Notifies the recipient a gift exists (comms migration, Sep 2026):
+    an in-app+push GIFT_RECEIVED notification when `gift.recipient` is a
+    resolved KIS member, or — for a genuinely external recipient — builds
+    a share link from the gift's own unguessable redeem_token
+    (secrets.token_urlsafe(48), see ChannelMembershipGift.save) instead of
+    auto-emailing it. KIS never sends the link itself; it's handed to the
+    gifter to share however they choose.
+
+    Called from both the free-tier path here (which can return the link
+    synchronously) and the paid-tier webhook handlers in apps.billing.views
+    (which can't — the gifter isn't mid-request when the webhook fires),
+    so the gifter is *also* always notified in-app with the same link when
+    it's external. Returns {"share_link": str | None} for a synchronous
+    caller to surface directly; non-blocking by design — every exception
+    is swallowed here so a notification failure never breaks gift
+    creation/activation itself.
+    """
+    tier = gift.tier
+    gifter_name = (
+        getattr(gift.gifter, "display_name", None)
+        or getattr(gift.gifter, "username", None)
+        or "A KIS member"
+    )
+    try:
+        from apps.notifications.services import create_notification
+
+        if gift.recipient_id:
+            create_notification(
+                user_id=gift.recipient_id,
+                type="GIFT_RECEIVED",
+                title=f"{gifter_name} sent you a gift!",
+                body=f"You received a {tier.title} membership on {tier.channel.display_name}.",
+                target_type="channel_membership_gift",
+                target_id=gift.id,
+                priority="HIGH",
+                dedup_key=f"gift_received:{gift.id}",
+                context={"gift_id": str(gift.id), "tier_id": str(tier.id)},
+            )
+            return {"share_link": None}
+
+        from django.conf import settings as _settings
+        share_link = f"{_settings.KIS_PUBLIC_WEB_BASE_URL}/gift/{gift.redeem_token}"
+        create_notification(
+            user_id=gift.gifter_id,
+            type="GIFT_READY_TO_SHARE",
+            title="Your gift is ready to share",
+            body=(
+                f"Share this link with {gift.recipient_email or 'your recipient'} so they "
+                f"can redeem their {tier.title} membership: {share_link}"
+            ),
+            target_type="channel_membership_gift",
+            target_id=gift.id,
+            priority="MEDIUM",
+            dedup_key=f"gift_share_link:{gift.id}",
+            context={"gift_id": str(gift.id), "share_link": share_link},
+        )
+        return {"share_link": share_link}
+    except Exception:
+        logger.warning("Gift notice delivery failed for gift_id=%s", gift.id)
+        return {"share_link": None}
+
+
+def deliver_livestream_guest_invite_notice(guest: "ChannelLiveStreamGuest") -> str | None:
+    """Notifies a livestream co-host/guest invitee (comms migration, Sep
+    2026): in-app+push when `guest.user` is a resolved KIS member, or a
+    share link built from the guest's own unguessable invite_token
+    (secrets.token_urlsafe(48)) for a genuinely external invitee - the
+    inviter shares it manually, KIS doesn't auto-email it.
+
+    Returns the share link (or None for the in-app case) so the caller can
+    surface it directly in the create-response; the inviter is also always
+    notified in-app with the same link when it's external, for the same
+    "no synchronous response to hand it back in" reason as
+    deliver_gift_membership_notice's paid-gift webhook case — here that's
+    any caller that isn't the original POST (e.g. a re-send action).
+    """
+    inviter_name = (
+        getattr(guest.invited_by, "display_name", None)
+        or getattr(guest.invited_by, "username", None)
+        or "A KIS member"
+    )
+    stream_title = guest.live_stream.title
+    channel_name = guest.live_stream.channel.display_name
+    try:
+        from apps.notifications.services import create_notification
+
+        if guest.user_id:
+            create_notification(
+                user_id=guest.user_id,
+                type="GUEST_INVITATION",
+                title=f"{inviter_name} invited you to a livestream",
+                body=f"You're invited as a {guest.role} on {channel_name}'s livestream: {stream_title}.",
+                target_type="live_stream_guest",
+                target_id=guest.id,
+                priority="HIGH",
+                dedup_key=f"guest_invite:{guest.id}",
+                context={"guest_id": str(guest.id), "live_stream_id": str(guest.live_stream_id)},
+            )
+            return None
+
+        from django.conf import settings as _settings
+        share_link = f"{_settings.KIS_PUBLIC_WEB_BASE_URL}/live-guest/{guest.invite_token}"
+        create_notification(
+            user_id=guest.invited_by_id,
+            type="GUEST_INVITATION_READY_TO_SHARE",
+            title="Your guest invitation is ready to share",
+            body=(
+                f"Share this link with {guest.email or 'your guest'} so they can join "
+                f"{stream_title} as a {guest.role}: {share_link}"
+            ),
+            target_type="live_stream_guest",
+            target_id=guest.id,
+            priority="MEDIUM",
+            dedup_key=f"guest_invite_share_link:{guest.id}",
+            context={"guest_id": str(guest.id), "share_link": share_link},
+        )
+        return share_link
+    except Exception:
+        logger.warning("Guest invite notice delivery failed for guest_id=%s", guest.id)
+        return None
+
+
 def _notify_channel_subscribers(channel: BroadcastChannel, *, notification_type: str, title: str, body: str, target_type: str, target_id):
     try:
         from apps.notifications import services as notification_services
@@ -20611,6 +20758,10 @@ class ChannelLiveStreamGuestsView(APIView):
         user_id = request.data.get("user_id")
         email = str(request.data.get("email") or "")
         invited_user = get_object_or_404(User, id=user_id) if user_id else None
+        # A typed-in email that already belongs to a verified KIS member
+        # resolves to that member (comms migration, Sep 2026) - they get an
+        # in-app/push invitation, not an email one.
+        invited_user = _resolve_external_recipient(recipient=invited_user, recipient_email=email)
         guest_role = str(request.data.get("role") or ChannelLiveStreamGuest.Role.GUEST)
         guest = ChannelLiveStreamGuest.objects.create(
             live_stream=live_stream,
@@ -20619,46 +20770,11 @@ class ChannelLiveStreamGuestsView(APIView):
             role=guest_role,
             invited_by=request.user,
         )
-        # Notify the invitee — previously this created the guest record and
-        # nothing else, so neither an external email invite nor an existing
-        # app user learned they'd been invited (email-system audit,
-        # Priority 2 discovery #4). Non-blocking: the guest slot itself is
-        # already created and returned regardless of email outcome.
-        if guest.email:
-            try:
-                inviter_name = (
-                    getattr(request.user, "display_name", None)
-                    or getattr(request.user, "username", None)
-                    or "A KIS member"
-                )
-                invite_url = request.build_absolute_uri(f"/broadcasts/live/join/{guest.invite_token}/")
-                from apps.notifications.email_service import send_livestream_guest_invite_email
-                if not send_livestream_guest_invite_email(
-                    to_email=guest.email,
-                    inviter_name=inviter_name,
-                    channel_name=live_stream.channel.display_name,
-                    stream_title=live_stream.title,
-                    role=guest_role,
-                    invite_url=invite_url,
-                    scheduled_start_at=(
-                        live_stream.scheduled_start_at.strftime("%B %d, %Y at %H:%M UTC")
-                        if live_stream.scheduled_start_at else None
-                    ),
-                ):
-                    logger.warning("Livestream guest invite email failed for guest_id=%s", guest.id)
-                    from apps.accounts.models import AuditLog as _GeneralAuditLog
-                    _GeneralAuditLog.log(actor=request.user, action="email.livestream_guest_invite.failed", meta={"guest_id": str(guest.id)})
-            except Exception as _exc:
-                logger.warning("Livestream guest invite email raised for guest_id=%s: %s", guest.id, _exc.__class__.__name__)
-                from apps.accounts.models import AuditLog as _GeneralAuditLog
-                _GeneralAuditLog.log(
-                    actor=request.user, action="email.livestream_guest_invite.failed",
-                    meta={"guest_id": str(guest.id), "error": _exc.__class__.__name__},
-                )
-        return Response(
-            ChannelLiveStreamGuestSerializer(guest, context={"request": request}).data,
-            status=status.HTTP_201_CREATED,
-        )
+        share_link = deliver_livestream_guest_invite_notice(guest)
+        payload = ChannelLiveStreamGuestSerializer(guest, context={"request": request}).data
+        if share_link:
+            payload["share_link"] = share_link
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class ChannelLiveStreamGuestActionView(APIView):
@@ -20692,6 +20808,56 @@ class ChannelLiveStreamGuestActionView(APIView):
                 guest.save(update_fields=["status", "removed_at", "updated_at"])
         else:
             raise ValidationError({"action": "Use: accept, decline, activate, remove."})
+        return Response(ChannelLiveStreamGuestSerializer(guest, context={"request": request}).data)
+
+
+class ChannelLiveStreamGuestRedeemView(APIView):
+    """POST broadcasts/live-streams/guests/<token>/redeem/
+
+    Claims a guest slot by its share-link token, for the genuinely
+    external case: a guest invited by email that couldn't be resolved to
+    an existing KIS member at invite time (see _resolve_external_recipient
+    and deliver_livestream_guest_invite_notice). Whoever redeems the token
+    becomes the guest — the token itself is the authorization, the same
+    trust model as ChannelMembershipGiftRedeemView.
+
+    A member-scoped invite (guest.user already set at creation) is
+    intentionally NOT claimable here — that invite already has a proper
+    in-app notification + accept/decline path via
+    ChannelLiveStreamGuestActionView, scoped to that specific account;
+    letting anyone with the token hijack it would defeat that scoping.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, token):
+        guest = get_object_or_404(ChannelLiveStreamGuest, invite_token=token)
+
+        if guest.user_id and guest.user_id != request.user.id:
+            raise PermissionDenied("This invitation is scoped to a different KIS account.")
+
+        if guest.status in (ChannelLiveStreamGuest.Status.DECLINED, ChannelLiveStreamGuest.Status.REMOVED):
+            return Response({"detail": "This invitation is no longer available."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # No dedicated expiry field on this model - a link tied to a
+        # livestream that already ended/was cancelled is moot regardless
+        # of age, and a flat 30-day cap (matching ChannelMembershipGift's
+        # own convention) covers a far-future scheduled stream whose link
+        # leaked or was held onto too long.
+        if guest.live_stream.status in ("ended", "cancelled"):
+            return Response({"detail": "This livestream has already ended."}, status=status.HTTP_400_BAD_REQUEST)
+        if timezone.now() - guest.created_at > timedelta(days=30):
+            return Response({"detail": "This invitation link has expired."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if guest.status in (ChannelLiveStreamGuest.Status.ACCEPTED, ChannelLiveStreamGuest.Status.ACTIVE):
+            # Already claimed by this same account - idempotent success,
+            # not an error (a user re-opening the same link twice).
+            return Response(ChannelLiveStreamGuestSerializer(guest, context={"request": request}).data)
+
+        guest.user = request.user
+        guest.status = ChannelLiveStreamGuest.Status.ACCEPTED
+        guest.accepted_at = timezone.now()
+        guest.save(update_fields=["user", "status", "accepted_at", "updated_at"])
         return Response(ChannelLiveStreamGuestSerializer(guest, context={"request": request}).data)
 
 
@@ -21126,15 +21292,21 @@ class ChannelMembershipGiftView(APIView):
         recipient_id = request.data.get("recipient_id")
         recipient = get_object_or_404(User, id=recipient_id) if recipient_id else None
         recipient_email = str(request.data.get("recipient_email") or "")
+        # A typed-in email that already belongs to a verified KIS member
+        # resolves to that member — they get notified in-app, not emailed
+        # (comms migration, Sep 2026). Only affects notification routing
+        # below; recipient_email itself is still stored as typed.
+        recipient = _resolve_external_recipient(recipient=recipient, recipient_email=recipient_email)
         message = str(request.data.get("message") or "")[:300]
 
         if tier.price_cents > 0:
             # Paid tier — create the gift in AWAITING_PAYMENT (not yet
-            # redeemable, recipient not yet emailed) and initiate payment,
+            # redeemable, recipient not yet notified) and initiate payment,
             # mirroring ChannelMembershipView.post()'s own paid branch.
             # The webhook (apps.billing.views) flips this to PENDING and
-            # sends the recipient email once the gifter's charge clears -
-            # never here, since nobody has actually paid yet at this point.
+            # calls deliver_gift_membership_notice() once the gifter's
+            # charge clears - never here, since nobody has actually paid
+            # yet at this point.
             gift = ChannelMembershipGift.objects.create(
                 tier=tier,
                 gifter=request.user,
@@ -21238,39 +21410,11 @@ class ChannelMembershipGiftView(APIView):
             message=message,
             expires_at=timezone.now() + timedelta(days=30),
         )
-        # Notify the recipient the gift exists — previously nothing ever
-        # emailed them (audit row 10: "Never fires. UI collects the
-        # recipient's email. Nothing ever emails them — no way to learn the
-        # gift exists."). Non-blocking: the gift record itself is already
-        # created and returned to the gifter regardless of email outcome.
-        if gift.recipient_email:
-            try:
-                gifter_name = (
-                    getattr(request.user, "display_name", None)
-                    or getattr(request.user, "username", None)
-                    or "A KIS member"
-                )
-                from apps.notifications.email_service import send_gift_membership_email
-                if not send_gift_membership_email(
-                    to_email=gift.recipient_email,
-                    gifter_name=gifter_name,
-                    tier_title=tier.title,
-                    channel_name=tier.channel.display_name,
-                    redeem_code=gift.redeem_token,
-                    expires_at=gift.expires_at.strftime("%B %d, %Y"),
-                    message=gift.message or None,
-                ):
-                    logger.warning("Gift membership email failed for gift_id=%s", gift.id)
-                    from apps.accounts.models import AuditLog as _GeneralAuditLog
-                    _GeneralAuditLog.log(actor=request.user, action="email.gift_membership.failed", meta={"gift_id": str(gift.id)})
-            except Exception as _exc:
-                logger.warning("Gift membership email raised for gift_id=%s: %s", gift.id, _exc.__class__.__name__)
-                from apps.accounts.models import AuditLog as _GeneralAuditLog
-                _GeneralAuditLog.log(
-                    actor=request.user, action="email.gift_membership.failed",
-                    meta={"gift_id": str(gift.id), "error": _exc.__class__.__name__},
-                )
-        return Response(ChannelMembershipGiftSerializer(gift).data, status=status.HTTP_201_CREATED)
+        delivery = deliver_gift_membership_notice(gift)
+        payload = ChannelMembershipGiftSerializer(gift).data
+        if delivery.get("share_link"):
+            payload["share_link"] = delivery["share_link"]
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class ChannelMembershipGiftRedeemView(APIView):
@@ -21278,6 +21422,15 @@ class ChannelMembershipGiftRedeemView(APIView):
 
     def post(self, request, token):
         gift = get_object_or_404(ChannelMembershipGift.objects.select_related("tier__channel"), redeem_token=token)
+        # Comms migration hardening: a member-scoped gift (recipient
+        # resolved to an existing verified KIS member at creation - see
+        # _resolve_external_recipient) is never handed a share link under
+        # normal operation, but the token itself doesn't stop working for
+        # anyone else who obtains it without this check. Mirrors the same
+        # ownership guard already enforced by
+        # ChannelLiveStreamGuestRedeemView for its member-scoped case.
+        if gift.recipient_id and gift.recipient_id != request.user.id:
+            raise PermissionDenied("This gift is scoped to a different KIS account.")
         if gift.status == ChannelMembershipGift.Status.AWAITING_PAYMENT:
             raise ValidationError({"detail": "The gifter hasn't completed payment for this gift yet."})
         if gift.status == ChannelMembershipGift.Status.REDEEMED:

@@ -2774,10 +2774,13 @@ class ChannelLiveStreamGuestSerializer(serializers.ModelSerializer):
                 or getattr(obj.user, "display_name", str(obj.user_id)))
 
     def get_invite_url(self, obj):
-        request = self.context.get("request")
-        if not request:
-            return None
-        return request.build_absolute_uri(f"/broadcasts/live/join/{obj.invite_token}/")
+        # Previously built /broadcasts/live/join/{token}/ - not a
+        # registered URL anywhere (backend or app deep link), so every
+        # invite_url this ever returned 404'd. live-guest/:token is the
+        # real, registered deep link (see App.tsx's linking config and
+        # ChannelLiveStreamGuestRedeemView).
+        from django.conf import settings
+        return f"{settings.KIS_PUBLIC_WEB_BASE_URL}/live-guest/{obj.invite_token}"
 
 
 class ChannelContentTranscriptSerializer(serializers.ModelSerializer):

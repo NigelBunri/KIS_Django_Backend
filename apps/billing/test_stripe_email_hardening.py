@@ -20,6 +20,13 @@ of send_membership_email's own mocked return value. That's fixed now
 free-tier join path with the identical copy-paste mistake — the test below
 now covers the real success path instead of documenting the bug.
 
+Comms migration (Sep 2026): the generic payment-receipt leg of this webhook
+no longer emails a receipt automatically — replaced by an immediate
+in-app/push PAYMENT_SUCCESS notification (see test_payment_email_hardening.py
+for the Flutterwave equivalent). The membership-confirmation email tests
+below (send_membership_email) are a separate, still-intact email use case
+and are untouched by that migration.
+
 Run:
   python3 manage.py test apps.billing.test_stripe_email_hardening --keepdb -v 2
 """
@@ -30,6 +37,7 @@ from rest_framework.test import APIClient
 
 from apps.accounts.models import AuditLog, User
 from apps.broadcasts.models import BroadcastChannel, ChannelMembership, ChannelMembershipTier
+from apps.notifications.models import Notification
 
 
 def _make_user(phone: str) -> User:
@@ -77,45 +85,53 @@ class StripeMembershipAndReceiptEmailFailureVisibilityTests(TestCase):
                 HTTP_STRIPE_SIGNATURE="test-sig", secure=True,
             )
 
-    @patch("apps.notifications.email_service.send_payment_receipt_email", return_value=False)
-    def test_failed_receipt_email_is_logged_and_audited(self, _mock_receipt):
-        res = self._post_stripe_webhook()
+    def test_receipt_email_is_no_longer_sent_automatically(self):
+        with patch("apps.notifications.email_service.send_payment_receipt_email") as mock_receipt:
+            res = self._post_stripe_webhook()
 
         self.assertEqual(res.status_code, 200)
-        self.assertTrue(
+        mock_receipt.assert_not_called()
+        self.assertFalse(
             AuditLog.objects.filter(actor_id=self.user.id, action="email.payment_receipt.failed").exists()
         )
         self.membership.refresh_from_db()
         self.assertEqual(self.membership.status, ChannelMembership.Status.ACTIVE)
 
-    @patch("apps.notifications.email_service.send_payment_receipt_email", return_value=True)
-    def test_successful_receipt_email_does_not_create_a_failure_audit_entry(self, _mock_receipt):
+    def test_payment_success_notification_is_created_instead(self):
         res = self._post_stripe_webhook()
 
         self.assertEqual(res.status_code, 200)
-        self.assertFalse(
-            AuditLog.objects.filter(actor_id=self.user.id, action="email.payment_receipt.failed").exists()
-        )
+        notif = Notification.objects.filter(
+            user_id=self.user.id, type="PAYMENT_SUCCESS", dedup_key="payment_success:pi_test_123",
+        ).first()
+        self.assertIsNotNone(notif)
+        self.assertIn("5.00", notif.body)
 
-    @patch("apps.notifications.email_service.send_membership_email", return_value=True)
-    def test_membership_email_now_sends_successfully_with_the_real_channel_name(self, mock_send):
-        # Regression test for the channel.name -> channel.display_name fix:
-        # previously this always raised AttributeError before ever calling
-        # send_membership_email at all.
+    def test_membership_confirmation_notification_uses_the_real_channel_name(self):
+        # Regression coverage for the channel.name -> channel.display_name
+        # fix, carried over from when this was an email assertion: the
+        # confirmation is now an in-app MEMBERSHIP_CONFIRMED notification
+        # (comms architecture migration, Sep 2026) rather than an email.
         res = self._post_stripe_webhook()
 
         self.assertEqual(res.status_code, 200)
-        mock_send.assert_called_once()
-        self.assertEqual(mock_send.call_args.kwargs.get("channel_name"), "Stripe Email Test Channel")
+        notif = Notification.objects.filter(
+            user_id=self.user.id, type="MEMBERSHIP_CONFIRMED",
+            context_data__membership_id=str(self.membership.id),
+        ).first()
+        self.assertIsNotNone(notif)
+        self.assertIn("Stripe Email Test Channel", notif.body)
         self.assertFalse(
             AuditLog.objects.filter(actor_id=self.user.id, action="email.membership.failed").exists()
         )
 
-    @patch("apps.notifications.email_service.send_membership_email", return_value=False)
-    def test_membership_email_failure_is_still_logged_and_audited(self, _mock_send):
-        res = self._post_stripe_webhook()
+    def test_notification_failure_never_blocks_activation(self):
+        with patch(
+            "apps.notifications.services.create_notification",
+            side_effect=RuntimeError("boom"),
+        ):
+            res = self._post_stripe_webhook()
 
         self.assertEqual(res.status_code, 200)
-        entry = AuditLog.objects.filter(actor_id=self.user.id, action="email.membership.failed").first()
-        self.assertIsNotNone(entry)
-        self.assertEqual(entry.meta.get("membership_id"), str(self.membership.id))
+        self.membership.refresh_from_db()
+        self.assertEqual(self.membership.status, ChannelMembership.Status.ACTIVE)

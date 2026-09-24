@@ -1,20 +1,17 @@
 """
-Phase 6: confirms a failed payment-receipt email from the Flutterwave
-webhook handler is now logged + audited instead of vanishing via a bare
-`except: pass` (apps/billing/views.py FlutterwaveWebhookView).
+Comms migration (Sep 2026): the Flutterwave webhook's payment-receipt leg
+no longer emails a receipt automatically — the permanent WalletTransaction
+row (queryable via GET wallet/transactions/, with an on-demand POST
+wallet/transactions/{id}/email-receipt/ action) is the primary receipt,
+backed by an immediate in-app/push PAYMENT_SUCCESS notification. This
+file's PaymentReceiptEmailFailureVisibilityTests class covers that
+notification (including the dollars-not-raw-cents amount formatting bug
+guard it inherited from the email version it replaced).
 
-Email-system audit, Priority 2, adds coverage for two real bugs fixed in
-the same handler:
-- The receipt email sent transaction_obj.amount_cents raw as "amount" —
-  a $5.00 (500 cents) charge read as "500" in the email, and larger
-  amounts were off by two orders of magnitude, e.g. a $5,000 charge read
-  as "500000". Now formatted as cents/100 with 2 decimals, matching the
-  Stripe branch's (correct) equivalent.
-- The channel_membership activation branch never sent a confirmation
-  email at all (audit finding, row 09: "Inconsistent" vs. Stripe's and
-  the free-tier join path's — which also turned out to be silently
-  broken by a separate channel.name/display_name bug, fixed alongside
-  this one; see test_stripe_email_hardening.py's docstring).
+FlutterwaveMembershipConfirmationEmailTests below is untouched by that
+migration - it covers a different email (channel_membership tier
+activation, send_membership_email), not the generic payment receipt, and
+stays in scope as a legitimate email use case.
 
 Run:
   python3 manage.py test apps.billing.test_payment_email_hardening --keepdb -v 2
@@ -27,6 +24,7 @@ from rest_framework.test import APIClient
 from apps.accounts.models import AuditLog, AccountTier, User
 from apps.billing.models import WalletTransaction
 from apps.broadcasts.models import BroadcastChannel, ChannelMembership, ChannelMembershipTier
+from apps.notifications.models import Notification
 
 
 def _make_user(phone: str) -> User:
@@ -57,38 +55,32 @@ class PaymentReceiptEmailFailureVisibilityTests(TestCase):
             secure=True,
         )
 
-    @patch("apps.notifications.email_service.send_payment_receipt_email", return_value=False)
-    def test_failed_receipt_email_is_logged_and_audited_without_failing_the_webhook(self, _mock_send):
-        res = self._post_webhook()
+    def test_receipt_email_is_no_longer_sent_automatically(self):
+        with patch("apps.notifications.email_service.send_payment_receipt_email") as mock_send:
+            res = self._post_webhook()
 
         self.assertEqual(res.status_code, 200)
-        self.assertTrue(
+        mock_send.assert_not_called()
+        self.assertFalse(
             AuditLog.objects.filter(actor_id=self.user.id, action="email.payment_receipt.failed").exists()
         )
         self.tx.refresh_from_db()
         self.assertEqual(self.tx.status, "success")
 
-    @patch("apps.notifications.email_service.send_payment_receipt_email", return_value=True)
-    def test_successful_receipt_email_does_not_create_a_failure_audit_entry(self, _mock_send):
-        res = self._post_webhook()
-
-        self.assertEqual(res.status_code, 200)
-        self.assertFalse(
-            AuditLog.objects.filter(actor_id=self.user.id, action="email.payment_receipt.failed").exists()
-        )
-
-    @patch("apps.notifications.email_service.send_payment_receipt_email", return_value=True)
-    def test_receipt_amount_is_dollars_not_raw_cents(self, mock_send):
+    def test_payment_success_notification_amount_is_dollars_not_raw_cents(self):
         # self.tx.amount_cents == 1500 (set in setUp) — a $15.00 charge.
-        # Previously sent as the literal string "1500".
+        # The email version this replaced used to send the literal string
+        # "1500"; the in-app notification inherits the same guard.
         res = self._post_webhook()
 
         self.assertEqual(res.status_code, 200)
-        mock_send.assert_called_once()
-        self.assertEqual(mock_send.call_args.kwargs.get("amount"), "15.00")
+        notif = Notification.objects.filter(
+            user_id=self.user.id, type="PAYMENT_SUCCESS", dedup_key=f"payment_success:{self.tx.tx_ref}",
+        ).first()
+        self.assertIsNotNone(notif)
+        self.assertIn("15.00", notif.body)
 
-    @patch("apps.notifications.email_service.send_payment_receipt_email", return_value=True)
-    def test_receipt_amount_handles_a_large_charge_correctly(self, mock_send):
+    def test_payment_success_notification_amount_handles_a_large_charge_correctly(self):
         # The bug this specifically guards against: a $5,000 charge used to
         # read as "500000" (raw cents) rather than "5000.00".
         big_tx = WalletTransaction.objects.create(
@@ -106,17 +98,26 @@ class PaymentReceiptEmailFailureVisibilityTests(TestCase):
         )
 
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(mock_send.call_args.kwargs.get("amount"), "5000.00")
+        notif = Notification.objects.filter(
+            user_id=self.user.id, type="PAYMENT_SUCCESS", dedup_key=f"payment_success:{big_tx.tx_ref}",
+        ).first()
+        self.assertIsNotNone(notif)
+        self.assertIn("5000.00", notif.body)
 
 
 @override_settings(SECURE_SSL_REDIRECT=False, FLW_WEBHOOK_SECRET="test-webhook-secret")
 class FlutterwaveMembershipConfirmationEmailTests(TestCase):
-    """Row 09 of the audit ("Inconsistent"): the channel_membership
-    activation branch of the Flutterwave webhook never sent a confirmation
-    email at all, unlike the Stripe and free-tier join paths. Fixed
-    alongside the channel.name -> channel.display_name bug that was
-    silently breaking those other two paths' emails too (see
-    test_stripe_email_hardening.py)."""
+    """Originally covered row 09 of the audit ("Inconsistent"): the
+    channel_membership activation branch of the Flutterwave webhook never
+    sent a confirmation email at all, unlike the Stripe and free-tier join
+    paths (fixed alongside the channel.name -> channel.display_name bug
+    that was silently breaking those other two paths' emails too).
+
+    That confirmation has since moved to an in-app/push MEMBERSHIP_CONFIRMED
+    notification (comms architecture migration, Sep 2026) - the payment
+    itself already gets its own receipt notification elsewhere in this
+    handler, so a second email for the same transaction was redundant.
+    These tests were updated to match; class name kept for history."""
 
     def setUp(self):
         self.user = _make_user("+237699300002")
@@ -147,25 +148,27 @@ class FlutterwaveMembershipConfirmationEmailTests(TestCase):
             secure=True,
         )
 
-    @patch("apps.notifications.email_service.send_membership_email", return_value=True)
-    def test_membership_confirmation_email_is_now_sent_on_flutterwave_activation(self, mock_send):
+    def test_membership_confirmation_notification_is_sent_on_flutterwave_activation(self):
         res = self._post_webhook()
 
         self.assertEqual(res.status_code, 200)
         self.membership.refresh_from_db()
         self.assertEqual(self.membership.status, ChannelMembership.Status.ACTIVE)
-        mock_send.assert_called_once()
-        self.assertEqual(mock_send.call_args.kwargs.get("to_email"), self.user.email)
-        self.assertEqual(mock_send.call_args.kwargs.get("tier_title"), "Supporter")
-        self.assertEqual(mock_send.call_args.kwargs.get("channel_name"), "FLW Membership Email Test Channel")
+        notif = Notification.objects.filter(
+            user_id=self.user.id, type="MEMBERSHIP_CONFIRMED",
+            context_data__membership_id=str(self.membership.id),
+        ).first()
+        self.assertIsNotNone(notif)
+        self.assertIn("Supporter", notif.title)
+        self.assertIn("FLW Membership Email Test Channel", notif.body)
 
-    @patch("apps.notifications.email_service.send_membership_email", return_value=False)
-    def test_membership_email_failure_is_logged_and_audited_without_failing_activation(self, _mock_send):
-        res = self._post_webhook()
+    def test_notification_failure_never_blocks_activation(self):
+        with patch(
+            "apps.notifications.services.create_notification",
+            side_effect=RuntimeError("boom"),
+        ):
+            res = self._post_webhook()
 
         self.assertEqual(res.status_code, 200)
         self.membership.refresh_from_db()
         self.assertEqual(self.membership.status, ChannelMembership.Status.ACTIVE)
-        entry = AuditLog.objects.filter(actor_id=self.user.id, action="email.membership.failed").first()
-        self.assertIsNotNone(entry)
-        self.assertEqual(entry.meta.get("membership_id"), str(self.membership.id))
