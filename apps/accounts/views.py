@@ -16,7 +16,7 @@ from django.conf import settings
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from django.db import transaction, IntegrityError
-from django.db.models import Sum, Q
+from django.db.models import Sum, Q, Max
 from django.contrib.auth import authenticate
 from django.core.cache import cache
 from django.utils.decorators import method_decorator
@@ -609,6 +609,80 @@ def _partner_profile_summary(user: User, request) -> dict:
         "partner_profiles_is_unlimited": limit_info["is_unlimited"],
         "partner_profiles_can_create": can_create,
     }
+
+class BroadcastersDirectoryView(APIView):
+    """
+    GET /api/v1/profiles/broadcasters/ - distinct users who have
+    broadcasted (posted) content, most-recently-active first. Powers the
+    Feeds tab's avatar row (replaces the old "Manage blocked users" entry
+    point there - blocked-user management still lives in Settings).
+
+    Each entry's avatar is resolved through the exact same
+    ProfileFieldVisibility rules as any other profile field (see
+    _build_profile_payload/_can_view_field above), not just returned raw -
+    a user whose avatar is private or contacts-only renders as
+    avatar_url: null here so the client falls back to a placeholder
+    instead of leaking a photo that field's own visibility rule says this
+    viewer shouldn't see. display_name is also null whenever the user
+    genuinely never set one (it's optional at registration, only set
+    later via completing their profile - see UserCreateSerializer) - the
+    client shows no name label in that case rather than inventing one.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.broadcasts.models import BroadcastItem
+
+        limit = min(max(int(request.query_params.get("limit", 30) or 30), 1), 100)
+        offset = max(int(request.query_params.get("offset", 0) or 0), 0)
+
+        last_broadcast_by_user = {
+            row["broadcasted_by"]: row["last_broadcasted_at"]
+            for row in (
+                BroadcastItem.objects.filter(is_deleted=False, broadcasted_by__isnull=False)
+                .values("broadcasted_by")
+                .annotate(last_broadcasted_at=Max("broadcasted_at"))
+            )
+        }
+        ordered_user_ids = sorted(
+            last_broadcast_by_user.keys(),
+            key=lambda uid: last_broadcast_by_user[uid],
+            reverse=True,
+        )
+        total = len(ordered_user_ids)
+        page_ids = ordered_user_ids[offset: offset + limit]
+
+        users_by_id = {
+            str(u.id): u
+            for u in User.objects.filter(id__in=page_ids).select_related("profile")
+        }
+        avatar_rules_by_user = {
+            str(rule.user_id): rule
+            for rule in ProfileFieldVisibility.objects.filter(
+                user_id__in=page_ids, field_key="avatar",
+            ).prefetch_related("allow_targets")
+        }
+        viewer = request.user if request.user.is_authenticated else None
+
+        results = []
+        for uid in page_ids:
+            user = users_by_id.get(str(uid))
+            if not user:
+                continue
+            profile = getattr(user, "profile", None)
+            avatar_url = None
+            if profile and _can_view_field(user, viewer, avatar_rules_by_user.get(str(user.id))):
+                avatar_url = _resolve_media_url(request, profile.avatar_file, profile.avatar_url)
+            display_name = str(getattr(user, "display_name", "") or "").strip() or None
+            results.append({
+                "id": str(user.id),
+                "display_name": display_name,
+                "avatar_url": avatar_url,
+            })
+
+        next_offset = offset + limit if offset + limit < total else None
+        return Response({"results": results, "next_offset": next_offset, "count": total})
+
 
 # -----------------------------
 # Permissions
