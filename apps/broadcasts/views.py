@@ -7853,6 +7853,7 @@ class BroadcastFeedView(APIView):
                     "expires_at": item.expires_at.isoformat(),
                     "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                     "reaction_count": reaction_counts.get(item.id, 0),
+                    "save_count": item.save_count,
                     "viewer_reaction": viewer_reactions.get(item.id),
                     "source": {
                         "type": "channel",
@@ -7898,6 +7899,7 @@ class BroadcastFeedView(APIView):
                         "expires_at": item.expires_at.isoformat(),
                         "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                         "reaction_count": reaction_counts.get(item.id, 0),
+                        "save_count": item.save_count,
                         "viewer_reaction": viewer_reactions.get(item.id),
                         "source": {
                             "type": "broadcast_channel",
@@ -7960,6 +7962,7 @@ class BroadcastFeedView(APIView):
                         "expires_at": item.expires_at.isoformat(),
                         "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                         "reaction_count": reaction_counts.get(item.id, 0),
+                        "save_count": item.save_count,
                         "viewer_reaction": viewer_reactions.get(item.id),
                         "source": {
                             "type": "channel_content",
@@ -8027,6 +8030,7 @@ class BroadcastFeedView(APIView):
                     "expires_at": item.expires_at.isoformat(),
                     "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                     "reaction_count": reaction_counts.get(item.id, 0),
+                    "save_count": item.save_count,
                     "viewer_reaction": viewer_reactions.get(item.id),
                     "source": {
                         "type": "community",
@@ -8105,6 +8109,7 @@ class BroadcastFeedView(APIView):
                     "expires_at": item.expires_at.isoformat(),
                     "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                     "reaction_count": reaction_counts.get(item.id, 0),
+                    "save_count": item.save_count,
                     "viewer_reaction": viewer_reactions.get(item.id),
                     "source": {
                         "type": "partner",
@@ -8188,6 +8193,7 @@ class BroadcastFeedView(APIView):
                     "expires_at": item.expires_at.isoformat(),
                     "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                     "reaction_count": reaction_counts.get(item.id, 0),
+                    "save_count": item.save_count,
                     "viewer_reaction": viewer_reactions.get(item.id),
                     "source": {
                         "type": "market",
@@ -8279,6 +8285,7 @@ class BroadcastFeedView(APIView):
                         "expires_at": item.expires_at.isoformat(),
                         "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                         "reaction_count": reaction_counts.get(item.id, 0),
+                        "save_count": item.save_count,
                         "viewer_reaction": viewer_reactions.get(item.id),
                         "source": {
                             "type": "market",
@@ -8481,6 +8488,7 @@ class BroadcastFeedView(APIView):
                         "expires_at": item.expires_at.isoformat(),
                         "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                         "reaction_count": reaction_counts.get(item.id, 0),
+                        "save_count": item.save_count,
                         "viewer_reaction": viewer_reactions.get(item.id),
                         "health_card": enriched_health_card,
                         "source": {
@@ -8515,6 +8523,7 @@ class BroadcastFeedView(APIView):
                     "expires_at": item.expires_at.isoformat(),
                     "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                     "reaction_count": reaction_counts.get(item.id, 0),
+                    "save_count": item.save_count,
                     "viewer_reaction": viewer_reactions.get(item.id),
                     "author": author_payload,
                     "source": {
@@ -8569,6 +8578,7 @@ class BroadcastFeedView(APIView):
                     "expires_at": item.expires_at.isoformat(),
                     "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                     "reaction_count": reaction_counts.get(item.id, 0),
+                    "save_count": item.save_count,
                     "viewer_reaction": viewer_reactions.get(item.id),
                     "courses": metadata.get("courses") or [],
                     "modules": metadata.get("modules") or [],
@@ -8601,6 +8611,7 @@ class BroadcastFeedView(APIView):
                     "expires_at": item.expires_at.isoformat(),
                     "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                     "reaction_count": reaction_counts.get(item.id, 0),
+                    "save_count": item.save_count,
                     "viewer_reaction": viewer_reactions.get(item.id),
                     "source": {
                         "type": metadata.get("source") or "education_profile",
@@ -8637,6 +8648,7 @@ class BroadcastFeedView(APIView):
                     "expires_at": item.expires_at.isoformat(),
                     "comment_conversation_id": str(item.comment_conversation_id) if item.comment_conversation_id else None,
                     "reaction_count": reaction_counts.get(item.id, 0),
+                    "save_count": item.save_count,
                     "viewer_reaction": viewer_reactions.get(item.id),
                     "source": {
                         "type": "education_institution",
@@ -8992,6 +9004,7 @@ class BroadcastViewEventView(APIView):
 class BroadcastSaveView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, pk=None):
         try:
             item = BroadcastItem.objects.get(id=pk, is_deleted=False)
@@ -8999,13 +9012,24 @@ class BroadcastSaveView(APIView):
             return Response({"detail": "Broadcast item not found."}, status=404)
 
         action = str(request.query_params.get("action") or request.data.get("action") or "save").strip().lower()
-        prefs = dict(getattr(request.user, "preferences", {}) or {})
+        item_id = str(item.id)
+
+        # select_for_update locks this user's row for the rest of the
+        # transaction - without it, two near-simultaneous save/unsave
+        # requests for the same user (a slow connection plus a
+        # double-tap, since this list previously had no loading state to
+        # prevent that) both read the same starting preferences, and
+        # whichever finishes last silently overwrites the other's change.
+        # This is a plain user-scoped JSON list, not a hot/contended row,
+        # so locking it for one quick read-modify-write is cheap.
+        user = type(request.user).objects.select_for_update().get(id=request.user.id)
+        prefs = dict(getattr(user, "preferences", {}) or {})
         saved_ids = [
             str(value).strip()
             for value in (prefs.get("saved_broadcast_ids") or [])
             if str(value).strip()
         ]
-        item_id = str(item.id)
+        was_saved = item_id in saved_ids
 
         if action == "unsave":
             saved_ids = [value for value in saved_ids if value != item_id]
@@ -9016,10 +9040,26 @@ class BroadcastSaveView(APIView):
             saved = True
 
         prefs["saved_broadcast_ids"] = saved_ids
-        request.user.preferences = prefs
-        request.user.save(update_fields=["preferences"])
+        user.preferences = prefs
+        user.save(update_fields=["preferences"])
 
-        return Response({"saved": saved, "broadcast_id": item_id}, status=status.HTTP_200_OK)
+        # save_count is a separate atomic counter (not derived from the
+        # list above - see BroadcastItem.save_count's docstring), only
+        # bumped when this action actually changes this user's saved
+        # state, so a redundant save-while-already-saved (or the reverse)
+        # can't double-count.
+        save_count = item.save_count
+        if saved and not was_saved:
+            BroadcastItem.objects.filter(id=item.id).update(save_count=models.F("save_count") + 1)
+            save_count += 1
+        elif not saved and was_saved:
+            BroadcastItem.objects.filter(id=item.id, save_count__gt=0).update(save_count=models.F("save_count") - 1)
+            save_count = max(0, save_count - 1)
+
+        return Response(
+            {"saved": saved, "broadcast_id": item_id, "save_count": save_count},
+            status=status.HTTP_200_OK,
+        )
 
 
 class BroadcastHideView(APIView):

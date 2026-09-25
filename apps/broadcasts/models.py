@@ -76,6 +76,14 @@ class BroadcastItem(models.Model):
     is_deleted = models.BooleanField(default=False, db_index=True)
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
+    # "Saved" state itself lives per-user on User.preferences.
+    # saved_broadcast_ids (see BroadcastSaveView) - a JSON blob with no
+    # reverse index, so counting "how many users saved this" from it would
+    # mean scanning every user row. This is a plain atomic counter
+    # (F('save_count') +/- 1 in BroadcastSaveView) kept in sync with that
+    # instead, the same way reaction/comment counts are already handled by
+    # a real model rather than an unindexed blob.
+    save_count = models.PositiveIntegerField(default=0)
 
     class Meta:
         db_table = "broadcast_item"
