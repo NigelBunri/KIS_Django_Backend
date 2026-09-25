@@ -200,8 +200,20 @@ class S3MediaStorage(Storage):
         self.addressing_style = _env("AWS_S3_ADDRESSING_STYLE")
         if not self.bucket:
             raise ImproperlyConfigured("S3 storage requires AWS_STORAGE_BUCKET_NAME.")
+        self._boto_client = None
 
     def _client(self):
+        # Cached on the instance instead of rebuilt on every call - a
+        # feed page alone can call this dozens of times (once per
+        # attachment per item, via url()), and constructing a fresh
+        # boto3 client each time (loads botocore's service model from
+        # disk) is real, measurable overhead that has nothing to do with
+        # the presign operation itself. default_storage is a lazy
+        # singleton, so this instance - and the client - lives for the
+        # worker process, exactly where a boto3 client is meant to live.
+        if self._boto_client is not None:
+            return self._boto_client
+
         try:
             import boto3
             from botocore.config import Config
@@ -220,12 +232,13 @@ class S3MediaStorage(Storage):
         # own request signing, not a standalone presigned URL string — which
         # is why this bug shows up as "save succeeded, image never loads."
         endpoint_url = self.endpoint_url or f"https://s3.{self.region_name}.amazonaws.com"
-        return boto3.client(
+        self._boto_client = boto3.client(
             "s3",
             region_name=self.region_name,
             endpoint_url=endpoint_url,
             config=Config(**config_kwargs),
         )
+        return self._boto_client
 
     def _object_key(self, name: str) -> str:
         clean = str(name or "").replace("\\", "/").lstrip("/")
