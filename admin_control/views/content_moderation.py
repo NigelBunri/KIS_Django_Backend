@@ -130,6 +130,17 @@ class AdminContentActionView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        if action == "takedown":
+            # Attempted BEFORE the flag is saved as ACTIONED below - a
+            # takedown that didn't actually touch anything (unrecognized
+            # target_type, or a real failure) must not leave the flag
+            # looking resolved while the flagged content is still live.
+            if not _apply_content_takedown(flag, actor=request.user):
+                return Response(
+                    {"detail": f"No takedown handler is wired up for target_type={flag.target_type!r} yet."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         if action == "dismiss":
             flag.status = "DISMISSED"
         else:
@@ -154,9 +165,6 @@ class AdminContentActionView(APIView):
             # Update target user status if ban/suspend
             if action in {"suspend", "ban"} and flag.target_type == "user":
                 _apply_user_status(flag.target_id, "banned" if action == "ban" else "suspended")
-
-        if action == "takedown":
-            _apply_content_takedown(flag)
 
         AuditLogger.log(
             actor=request.user,
@@ -221,6 +229,8 @@ class AdminContentTrendView(APIView):
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _serialize_flag(flag):
+    from apps.broadcasts.moderation_gate import MODERATABLE_TARGET_TYPES
+
     tags = getattr(flag, "tags", None) or {}
     scan_id = tags.get("media_safety_scan_id") if isinstance(tags, dict) else None
     media_safety_scan = None
@@ -247,6 +257,11 @@ def _serialize_flag(flag):
         "reviewed_at": flag.reviewed_at.isoformat() if getattr(flag, "reviewed_at", None) else None,
         "created_at": flag.created_at.isoformat() if flag.created_at else None,
         "media_safety_scan": media_safety_scan,
+        # Computed on the flag's OWN target_type/target_id, not gated behind
+        # a linked media_safety_scan - a user-reported channel_content flag
+        # (no AI scan involved at all, so media_safety_scan is None) still
+        # needs a real Delete action available in the moderation queue.
+        "moderatable": flag.target_type in MODERATABLE_TARGET_TYPES and bool(flag.target_id),
     }
 
 
@@ -258,21 +273,41 @@ def _apply_user_status(target_id, new_status: str):
         pass
 
 
-def _apply_content_takedown(flag):
-    """Mark the flagged content as deleted/hidden based on target_type."""
+def _apply_content_takedown(flag, *, actor) -> bool:
+    """Mark the flagged content as deleted/hidden based on target_type.
+    Returns True only if a takedown handler for this target_type actually
+    ran and updated a row - the caller must not report success (or mark
+    the flag ACTIONED) on a False return. Previously this silently no-op'd
+    and swallowed all exceptions, so clicking "takedown" on any target_type
+    not in the three handled below (or on a genuine DB error) reported
+    success while leaving the flagged content completely untouched."""
+    import logging
+
+    logger = logging.getLogger("security.admin_control")
     target_type = flag.target_type
     target_id = flag.target_id
     if not target_id:
-        return
+        return False
     try:
         if target_type == "post":
             from apps.partners.models import PartnerPost
-            PartnerPost.objects.filter(id=target_id).update(is_deleted=True)
+            updated = PartnerPost.objects.filter(id=target_id).update(is_deleted=True)
         elif target_type == "status":
             from apps.statuses.models import Status
-            Status.objects.filter(id=target_id).update(is_deleted=True)
+            updated = Status.objects.filter(id=target_id).update(is_deleted=True)
         elif target_type == "channel":
             from apps.channels.models import Channel
-            Channel.objects.filter(id=target_id).update(is_archived=True)
+            updated = Channel.objects.filter(id=target_id).update(is_archived=True)
+        elif target_type in {"broadcast_video", "channel_content"}:
+            from apps.broadcasts.moderation_gate import resolve_and_apply_moderation_decision
+            return resolve_and_apply_moderation_decision(
+                target_type, target_id, action="delete", actor=actor,
+            )
+        else:
+            return False
     except Exception:
-        pass
+        logger.exception(
+            "content_takedown_failed", extra={"target_type": target_type, "target_id": str(target_id)},
+        )
+        return False
+    return bool(updated)

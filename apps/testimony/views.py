@@ -80,6 +80,28 @@ class TestimonyDetailView(generics.RetrieveUpdateDestroyAPIView):
     def get_queryset(self):
         return models.UserTestimony.objects.filter(user=self.request.user)
 
+    def perform_destroy(self, instance):
+        # resource_url stores a raw private S3 object key directly on the
+        # row (see the model's own comment - there's no MediaAsset behind
+        # it to route through apps.media's lifecycle service), so the
+        # default DRF instance.delete() below never touched storage at
+        # all - the object was orphaned in S3 forever. Best-effort, same
+        # as every other proven delete-time purge in this codebase: a
+        # storage failure must never block the row actually being deleted.
+        if instance.resource_url:
+            import logging
+
+            from django.core.files.storage import default_storage
+
+            logger = logging.getLogger("security.testimony")
+            try:
+                default_storage.delete(instance.resource_url)
+            except Exception:
+                logger.warning(
+                    "testimony_media_delete_cleanup_failed", extra={"testimony_id": str(instance.id)},
+                )
+        instance.delete()
+
     def perform_update(self, serializer):
         instance = self.get_object()
         was_unavailable = not instance.is_available

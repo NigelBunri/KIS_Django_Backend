@@ -397,6 +397,15 @@ def archive_channel_content_for_feed_entry(user, entry_id: str, *, hard_deleted:
     if hard_deleted:
         content.is_deleted = True
     content.save(update_fields=["status", "visibility", "is_deleted", "updated_at"])
+    if hard_deleted:
+        # hard_deleted historically only flipped is_deleted - the row
+        # stayed, and so did every asset's S3 object, forever. This is the
+        # one place a broadcast feed entry delete actually reaches
+        # ChannelContent, so it's the right place to also purge storage,
+        # same as the self-service ChannelContentDetailView.delete() path.
+        from apps.broadcasts.moderation_gate import purge_channel_content_assets
+
+        purge_channel_content_assets(content)
     return content
 
 

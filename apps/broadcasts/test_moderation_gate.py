@@ -17,8 +17,13 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from apps.broadcasts.models import BroadcastVideo
-from apps.broadcasts.moderation_gate import apply_moderation_decision, filter_broadcast_eligible, is_broadcast_eligible
+from apps.broadcasts.models import BroadcastVideo, ChannelContent, ChannelContentAsset
+from apps.broadcasts.moderation_gate import (
+    apply_moderation_decision,
+    filter_broadcast_eligible,
+    is_broadcast_eligible,
+    resolve_and_apply_moderation_decision,
+)
 
 User = get_user_model()
 
@@ -264,3 +269,184 @@ class PublicEndpointEnforcementTests(TestCase):
         stranger.force_authenticate(user=self.viewer)
         stranger_resp = stranger.get(f"/api/v1/broadcasts/videos/{video.id}/stream/")
         self.assertEqual(stranger_resp.status_code, 404)
+
+
+class ValidateAssetReadyForPublishLiveCheckTests(TestCase):
+    """Regression coverage for a real production bug: an admin passing a
+    BroadcastVideo through the moderation website correctly flipped
+    moderation_status to PASSED, but validate_asset_ready_for_publish (the
+    gate BroadcastFeedEntryBroadcastView calls) only ever looked at a
+    processing_status string frozen into the feed entry's JSON attachment
+    payload at upload time - before any human review happened - so an
+    already-passed video stayed permanently stuck reporting "still under
+    review" to its own uploader trying to broadcast it."""
+
+    def setUp(self):
+        self.owner = _make_user("0007")
+
+    def _attachment(self, video, **overrides):
+        payload = {
+            "id": str(video.id),
+            "asset_type": "video",
+            # The stale snapshot every real upload freezes in before any
+            # human review - BLOCKED_STATUSES includes "pending_review".
+            "processing_status": "pending_review",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_rejects_a_video_still_pending_review(self):
+        from apps.broadcasts.media_pipeline import validate_asset_ready_for_publish
+        from rest_framework.exceptions import ValidationError
+
+        video = _make_video(self.owner)  # PENDING_REVIEW by default
+        with self.assertRaises(ValidationError):
+            validate_asset_ready_for_publish(self._attachment(video))
+
+    def test_accepts_an_already_passed_video_despite_a_stale_pending_snapshot(self):
+        from apps.broadcasts.media_pipeline import validate_asset_ready_for_publish
+
+        video = _make_video(
+            self.owner,
+            moderation_status=BroadcastVideo.ModerationStatus.PASSED,
+            moderation_expires_at=timezone.now() + timedelta(days=90),
+        )
+        # No exception raised is the assertion - the stale
+        # processing_status="pending_review" snapshot must be ignored in
+        # favor of the video's current, live moderation_status.
+        validate_asset_ready_for_publish(self._attachment(video))
+
+    def test_rejects_a_video_whose_pass_has_since_expired_despite_a_stale_ready_snapshot(self):
+        from apps.broadcasts.media_pipeline import validate_asset_ready_for_publish
+        from rest_framework.exceptions import ValidationError
+
+        video = _make_video(
+            self.owner,
+            moderation_status=BroadcastVideo.ModerationStatus.PASSED,
+            moderation_expires_at=timezone.now() - timedelta(days=1),
+        )
+        with self.assertRaises(ValidationError):
+            validate_asset_ready_for_publish(self._attachment(video, processing_status="ready"))
+
+    def test_full_broadcast_flow_no_longer_reports_still_under_review_once_passed(self):
+        """End-to-end through validate_feed_entry_ready_for_broadcast, the
+        exact function BroadcastFeedEntryBroadcastView calls - proves the
+        fix at the level the original bug report was actually filed at."""
+        from apps.broadcasts.media_pipeline import validate_feed_entry_ready_for_broadcast
+
+        video = _make_video(self.owner)
+        entry = {"attachment": self._attachment(video)}
+        with self.assertRaises(Exception):
+            validate_feed_entry_ready_for_broadcast(entry)
+
+        apply_moderation_decision(video, action="pass", actor=self.owner)
+        video.refresh_from_db()
+        # Still-stale entry dict (as a real one would be, unless the
+        # composer happened to re-fetch it) - must succeed anyway now.
+        validate_feed_entry_ready_for_broadcast(entry)
+
+    def test_falls_back_to_snapshot_check_when_no_matching_broadcastvideo_exists(self):
+        """Channel-content images/videos scanned via the separate,
+        synchronous scan_channel_asset_payload_for_explicit_content path
+        have no BroadcastVideo row and no follow-up human-review step -
+        the snapshot-based check must still apply to those."""
+        from apps.broadcasts.media_pipeline import validate_asset_ready_for_publish
+        from rest_framework.exceptions import ValidationError
+
+        payload = {"asset_type": "image", "processing_status": "pending_review"}
+        with self.assertRaises(ValidationError):
+            validate_asset_ready_for_publish(payload)
+
+        payload_ready = {"asset_type": "image", "processing_status": "ready"}
+        validate_asset_ready_for_publish(payload_ready)  # no exception
+
+
+def _make_channel(owner):
+    from apps.broadcasts.models import BroadcastChannel
+
+    return BroadcastChannel.objects.create(
+        owner_type=BroadcastChannel.OwnerType.USER, owner_id=owner.id, owner_user=owner,
+        handle=f"moderation-gate-test-channel-{uuid.uuid4().hex[:8]}", display_name="Moderation Gate Test Channel",
+    )
+
+
+@override_settings(
+    MEDIA_ROOT=tempfile.mkdtemp(),
+    STORAGES={
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    },
+)
+class ChannelContentModerationDeleteTests(TestCase):
+    """Regression coverage: the content-inspection website could only ever
+    delete broadcast_video content - channel_content (the other real media
+    type in the same moderation queue) had no gate wired up at all, and
+    nothing anywhere purged a deleted piece of content's assets from
+    storage. resolve_and_apply_moderation_decision is the same dispatcher
+    admin_control's moderate endpoint calls."""
+
+    def setUp(self):
+        self.owner = _make_user("0008")
+        self.channel = _make_channel(self.owner)
+        self.content = ChannelContent.objects.create(
+            channel=self.channel, content_type="video", title="A testimony video",
+        )
+        from django.conf import settings as django_settings
+
+        self.storage_path = f"channel_content/{uuid.uuid4()}.mp4"
+        full_path = os.path.join(django_settings.MEDIA_ROOT, self.storage_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "wb") as fh:
+            fh.write(b"fake channel content video bytes")
+        self.asset = ChannelContentAsset.objects.create(
+            content=self.content, asset_type="video", storage_path=self.storage_path,
+        )
+
+    def test_channel_content_is_in_moderatable_target_types(self):
+        from apps.broadcasts.moderation_gate import MODERATABLE_TARGET_TYPES
+
+        self.assertIn("channel_content", MODERATABLE_TARGET_TYPES)
+
+    def test_delete_soft_deletes_and_purges_storage(self):
+        from django.core.files.storage import default_storage
+
+        full_path_exists_before = default_storage.exists(self.storage_path)
+        self.assertTrue(full_path_exists_before)
+
+        result = resolve_and_apply_moderation_decision(
+            "channel_content", str(self.content.id), action="delete", actor=self.owner,
+        )
+        self.assertTrue(result)
+
+        self.content.refresh_from_db()
+        self.assertTrue(self.content.is_deleted)
+        self.assertEqual(self.content.status, ChannelContent.Status.ARCHIVED)
+        self.assertEqual(self.content.visibility, ChannelContent.Visibility.PRIVATE)
+        self.assertFalse(default_storage.exists(self.storage_path))
+
+    def test_non_delete_action_is_a_no_op_and_returns_false(self):
+        """ChannelContent has no pass/pending/block review lifecycle -
+        only delete means anything for it."""
+        result = resolve_and_apply_moderation_decision(
+            "channel_content", str(self.content.id), action="pass", actor=self.owner,
+        )
+        self.assertFalse(result)
+        self.content.refresh_from_db()
+        self.assertFalse(self.content.is_deleted)
+
+    def test_unknown_target_id_returns_false_without_raising(self):
+        result = resolve_and_apply_moderation_decision(
+            "channel_content", str(uuid.uuid4()), action="delete", actor=self.owner,
+        )
+        self.assertFalse(result)
+
+    def test_self_service_delete_also_purges_storage(self):
+        """ChannelContentDetailView.delete() - the user-facing endpoint,
+        not the admin one - must purge storage the same way."""
+        from django.core.files.storage import default_storage
+
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        resp = client.delete(f"/api/v1/broadcasts/channel-contents/{self.content.id}/")
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(default_storage.exists(self.storage_path))

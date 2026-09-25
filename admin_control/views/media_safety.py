@@ -10,6 +10,7 @@ from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 
 from admin_control.permissions import IsAdminControlUser
+from apps.broadcasts.moderation_gate import MODERATABLE_TARGET_TYPES
 
 # Private messaging contexts (apps.media.safety.SAFE_UPLOAD_CONTEXTS) are
 # excluded from every admin media-safety view for privacy — confirmed via
@@ -18,13 +19,6 @@ from admin_control.permissions import IsAdminControlUser
 # surfaced here, made subject to the human PASS/PENDING/BLOCK workflow
 # below, or counted toward public broadcast eligibility.
 CHAT_EXCLUDED_CONTEXTS = {"chat", "dm", "group"}
-
-# target_type values (apps.media.tasks.ContentSafetyResolutionTarget) this
-# admin surface currently knows how to apply a human moderation decision
-# to. Deliberately narrow rather than silently no-op'ing for a target type
-# with no real gate wired up yet — see apps.broadcasts.moderation_gate for
-# the one that's actually implemented (BroadcastVideo).
-MODERATABLE_TARGET_TYPES = {"broadcast_video"}
 
 
 def _safe_int(val, default, lo=1, hi=250):
@@ -245,13 +239,28 @@ class AdminMediaSafetyModerateView(APIView):
                 {"detail": f"No moderation gate is wired up for target_type={target_type!r} yet."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        # ChannelContent has no pass/pending/block review lifecycle (only
+        # status/visibility/is_deleted) - unlike BroadcastVideo, there is no
+        # human-revalidation state for it to be moved into, only removed
+        # from. Reject up front with a clear reason rather than silently
+        # marking a linked scan passed/blocked while nothing actually
+        # happens to the content itself.
+        if target_type == "channel_content" and action != "delete":
+            return Response(
+                {"detail": "channel_content has no review lifecycle to update - only 'delete' is supported."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        from apps.broadcasts.models import BroadcastVideo
-        from apps.broadcasts.moderation_gate import apply_moderation_decision
+        from apps.broadcasts.models import BroadcastVideo, ChannelContent
+        from apps.broadcasts.moderation_gate import resolve_and_apply_moderation_decision
         from apps.media.models import MediaSafetyScan
         from apps.moderation.services import apply_media_safety_action
 
-        if not BroadcastVideo.objects.filter(id=target_id).exists():
+        target_exists = {
+            "broadcast_video": lambda: BroadcastVideo.objects.filter(id=target_id).exists(),
+            "channel_content": lambda: ChannelContent.objects.filter(id=target_id).exists(),
+        }[target_type]()
+        if not target_exists:
             return Response({"detail": "Content not found."}, status=status.HTTP_404_NOT_FOUND)
 
         # scan.result is a JSONField - resolution_target/resolution_id are
@@ -281,21 +290,17 @@ class AdminMediaSafetyModerateView(APIView):
             from django.utils import timezone
             scan.scheduled_deletion_at = timezone.now()
             scan.save(update_fields=["scheduled_deletion_at", "updated_at"])
-            video = BroadcastVideo.objects.filter(id=target_id).first()
-            if video is not None:
-                apply_moderation_decision(video, action="delete", actor=request.user, notes=notes)
+            resolve_and_apply_moderation_decision(target_type, target_id, action="delete", actor=request.user, notes=notes)
         else:
             # No linked scan at all - apply directly to the content. Skips
             # the strike/notification/deletion-scheduling consequences
             # above since there's no scan for them to attach to.
-            video = BroadcastVideo.objects.filter(id=target_id).first()
-            if video is not None:
-                apply_moderation_decision(video, action=action, actor=request.user, notes=notes)
+            resolve_and_apply_moderation_decision(target_type, target_id, action=action, actor=request.user, notes=notes)
 
         result_payload = {
             "target_type": target_type,
             "target_id": target_id,
-            "moderation": _serialize_broadcast_video_moderation(target_id),
+            "moderation": _serialize_broadcast_video_moderation(target_id) if target_type == "broadcast_video" else None,
         }
 
         AuditLogger.log(

@@ -219,8 +219,53 @@ def scan_channel_asset_payload_for_explicit_content(payload: dict[str, Any]) -> 
     return payload
 
 
+def _live_broadcast_video_eligibility(payload: dict[str, Any]) -> bool | None:
+    """When this asset is backed by a real BroadcastVideo row (video/short
+    attachments from uploadBroadcastVideoAttachment carry its id - see
+    mapServerVideoAttachment on the RN side), the authoritative answer is
+    that row's CURRENT moderation state, not whatever processing_status
+    was frozen into this payload at upload time - before any human review
+    happened. A moderator passing the video later (apps.broadcasts.
+    moderation_gate.apply_moderation_decision, via the admin site) has no
+    other way to reach a caller still relying on that snapshot, which is
+    exactly what left an already-passed video permanently stuck reporting
+    "still under review" to anyone trying to broadcast it.
+
+    Returns None (defer to the snapshot-based check) when this asset isn't
+    video, has no id, or no matching BroadcastVideo row exists - e.g.
+    channel-content images/videos scanned via the separate, synchronous
+    scan_channel_asset_payload_for_explicit_content path have no follow-up
+    human-review step, so there's nothing live to check for those."""
+    asset_type = _asset_type(payload)
+    video_id = str(payload.get("id") or payload.get("video_id") or "").strip()
+    if asset_type not in VIDEO_ASSET_TYPES or not video_id:
+        return None
+
+    from .models import BroadcastVideo
+    from .moderation_gate import is_broadcast_eligible
+
+    video = BroadcastVideo.objects.filter(id=video_id).first()
+    if video is None:
+        return None
+    return is_broadcast_eligible(video)
+
+
 def validate_asset_ready_for_publish(asset_or_payload: Any) -> None:
+    # _safe_asset_dict deepcopies every key for a raw dict (the shape
+    # validate_feed_entry_ready_for_broadcast passes, carrying whatever id
+    # mapServerVideoAttachment set client-side) but only lifts a fixed
+    # field set off a real model instance - channel_content's
+    # ChannelContentAsset rows have no BroadcastVideo id to find anyway,
+    # so _live_broadcast_video_eligibility correctly defers to the
+    # snapshot check for those regardless.
     payload = _safe_asset_dict(asset_or_payload)
+
+    live_eligible = _live_broadcast_video_eligibility(payload)
+    if live_eligible is not None:
+        if not live_eligible:
+            raise ValidationError({"attachments": USER_SAFE_REVIEW_MESSAGE})
+        return
+
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     pipeline = metadata.get("pipeline") if isinstance(metadata.get("pipeline"), dict) else {}
     status = (

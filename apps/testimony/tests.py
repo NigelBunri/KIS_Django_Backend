@@ -199,3 +199,58 @@ class TestimonyMediaAttachmentTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         scan = MediaSafetyScan.objects.get(upload_id=str(intent.id))
         self.assertEqual(scan.reason, "nudenet_scan_queued")
+
+
+@override_settings(
+    STORAGES={
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    },
+)
+class TestimonyDeletePurgesStorageTests(APITestCase):
+    """Regression coverage: resource_url stores a raw private S3 object key
+    directly on the row (no MediaAsset behind it) - the default DRF
+    destroy() this view relied on before never touched storage at all,
+    orphaning the object in S3 forever on every testimony delete."""
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        from django.conf import settings as django_settings
+        from django.core.files.storage import default_storage
+
+        self.media_root_override = override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+        self.media_root_override.enable()
+        self.addCleanup(self.media_root_override.disable)
+
+        self.user = _create_user("+237699800011", "testimony_delete_user")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+        self.storage_key = f"private/testimony/media/{self.user.id}/story.mp4"
+        full_path = os.path.join(django_settings.MEDIA_ROOT, self.storage_key)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "wb") as fh:
+            fh.write(b"fake testimony video bytes")
+        self.assertTrue(default_storage.exists(self.storage_key))
+
+        self.testimony = UserTestimony.objects.create(
+            user=self.user, category="faith", title="A story worth telling",
+            media_kind="video", resource_url=self.storage_key,
+        )
+
+    def test_delete_purges_the_storage_object(self):
+        from django.core.files.storage import default_storage
+
+        url = reverse("testimonies-detail", kwargs={"pk": self.testimony.pk})
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(UserTestimony.objects.filter(pk=self.testimony.pk).exists())
+        self.assertFalse(default_storage.exists(self.storage_key))
+
+    def test_delete_with_no_resource_url_does_not_error(self):
+        bare = UserTestimony.objects.create(user=self.user, category="faith", title="No attachment")
+        url = reverse("testimonies-detail", kwargs={"pk": bare.pk})
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)

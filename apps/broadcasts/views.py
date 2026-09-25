@@ -15854,13 +15854,12 @@ class ChannelContentDetailView(APIView):
         return Response(ChannelContentDetailSerializer(content, context={"request": request}).data)
 
     def delete(self, request, content_id):
+        from .moderation_gate import delete_channel_content
+
         content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
         if not _user_can_edit_content(request.user, content):
             raise PermissionDenied("You cannot delete this content.")
-        content.status = ChannelContent.Status.ARCHIVED
-        content.visibility = ChannelContent.Visibility.PRIVATE
-        content.is_deleted = True
-        content.save(update_fields=["status", "visibility", "is_deleted", "updated_at"])
+        delete_channel_content(content, actor=request.user)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

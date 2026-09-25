@@ -94,17 +94,61 @@ def apply_moderation_decision(video, *, action: str, actor, notes: str = "") -> 
 # to look up a BroadcastVideo directly, so adding a second content type
 # later (education_material, status_item, ...) only means adding one entry
 # here, not touching every caller.
-MODERATABLE_TARGET_TYPES = {"broadcast_video"}
+#
+# The single source of truth - admin_control/views/media_safety.py imports
+# this rather than keeping its own copy, after the two independently
+# maintained sets were found to have already drifted apart in scope.
+MODERATABLE_TARGET_TYPES = {"broadcast_video", "channel_content"}
+
+
+def purge_channel_content_assets(content) -> None:
+    """Best-effort real storage delete for every ChannelContentAsset row
+    under this content, mirroring apps.media.services.lifecycle.delete_asset's
+    proven pattern (soft-delete the row first, storage cleanup after - never
+    let a storage-layer failure block or roll back the actual deletion).
+    Shared by ChannelContentDetailView.delete() (self-service) and the
+    channel_content branch below (admin moderation delete) so there is one
+    place that knows how, not two copies that could drift."""
+    import logging
+
+    from django.core.files.storage import default_storage
+
+    logger = logging.getLogger("security.broadcasts")
+    for asset in content.assets.all():
+        if not asset.storage_path:
+            continue
+        try:
+            default_storage.delete(asset.storage_path)
+        except Exception:
+            logger.warning(
+                "channel_content_asset_delete_cleanup_failed",
+                extra={"content_id": str(content.id), "asset_id": str(asset.id)},
+            )
+
+
+def delete_channel_content(content, *, actor, notes: str = "") -> None:
+    """Same soft-delete ChannelContentDetailView.delete() already applies
+    for a self-service delete, reused here for an admin-initiated one via
+    resolve_and_apply_moderation_decision, plus the real storage purge
+    neither path had before."""
+    from .models import ChannelContent
+
+    content.status = ChannelContent.Status.ARCHIVED
+    content.visibility = ChannelContent.Visibility.PRIVATE
+    content.is_deleted = True
+    content.save(update_fields=["status", "visibility", "is_deleted", "updated_at"])
+    purge_channel_content_assets(content)
 
 
 def resolve_and_apply_moderation_decision(target_type: str, target_id, *, action: str, actor, notes: str = "") -> bool:
     """Resolves target_type/target_id (the same resolution_target/
     resolution_id convention already stored on MediaSafetyScan.result by
     apps.media.tasks) to a real content row and applies a moderation
-    decision to it. Returns False (no-op) for an unknown target_type or a
-    target_id that no longer resolves, rather than raising - a scan whose
-    underlying content was already hard-deleted by the 24h sweep is a
-    normal, expected state to encounter here, not an error."""
+    decision to it. Returns False (no-op) for an unknown target_type, an
+    action that doesn't apply to this target_type, or a target_id that no
+    longer resolves, rather than raising - a scan whose underlying content
+    was already hard-deleted by the 24h sweep is a normal, expected state
+    to encounter here, not an error."""
     if target_type == "broadcast_video":
         from .models import BroadcastVideo
 
@@ -112,6 +156,19 @@ def resolve_and_apply_moderation_decision(target_type: str, target_id, *, action
         if video is None:
             return False
         apply_moderation_decision(video, action=action, actor=actor, notes=notes)
+        return True
+    if target_type == "channel_content":
+        from .models import ChannelContent
+
+        # Unlike BroadcastVideo, ChannelContent has no moderation_status/
+        # pass-fail review lifecycle (just status/visibility/is_deleted) -
+        # "delete" is the only action that means anything for it here.
+        if action != "delete":
+            return False
+        content = ChannelContent.objects.filter(id=target_id).first()
+        if content is None:
+            return False
+        delete_channel_content(content, actor=actor, notes=notes)
         return True
     return False
 
