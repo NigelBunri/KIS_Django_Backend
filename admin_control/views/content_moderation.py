@@ -230,6 +230,7 @@ class AdminContentTrendView(APIView):
 
 def _serialize_flag(flag):
     from apps.broadcasts.moderation_gate import MODERATABLE_TARGET_TYPES
+    from .media_safety import target_content_exists
 
     tags = getattr(flag, "tags", None) or {}
     scan_id = tags.get("media_safety_scan_id") if isinstance(tags, dict) else None
@@ -260,8 +261,14 @@ def _serialize_flag(flag):
         # Computed on the flag's OWN target_type/target_id, not gated behind
         # a linked media_safety_scan - a user-reported channel_content flag
         # (no AI scan involved at all, so media_safety_scan is None) still
-        # needs a real Delete action available in the moderation queue.
-        "moderatable": flag.target_type in MODERATABLE_TARGET_TYPES and bool(flag.target_id),
+        # needs a real Delete action available in the moderation queue. Also
+        # requires the content to still actually exist - see
+        # target_content_exists's docstring for why bool(target_id) alone
+        # isn't enough.
+        "moderatable": (
+            flag.target_type in MODERATABLE_TARGET_TYPES
+            and target_content_exists(flag.target_type, str(flag.target_id or ""))
+        ),
     }
 
 

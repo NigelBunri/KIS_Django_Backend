@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import datetime
+import os
+import tempfile
 from io import StringIO
 
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -365,8 +367,17 @@ class AdminDeviceWipeTests(TestCase):
 
 # ─── Media safety (content-safety scan ground truth) ─────────────────────────
 
+@override_settings(
+    MEDIA_ROOT=tempfile.mkdtemp(),
+    STORAGES={
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    },
+)
 class AdminMediaSafetyScanTests(TestCase):
     def setUp(self):
+        from django.conf import settings as django_settings
+
         from apps.media.models import MediaSafetyScan
 
         self.MediaSafetyScan = MediaSafetyScan
@@ -374,6 +385,17 @@ class AdminMediaSafetyScanTests(TestCase):
         self.admin = _make_user("admin@test.com", is_superuser=True, is_staff=True, tier="Partner Pro")
         _make_admin_role(self.admin)
         self.target = _make_user("target@test.com", tier="Free")
+
+        # Real on-disk files: the scans list now filters out any row whose
+        # storage_path no longer resolves to a real object (see
+        # admin_control.views.media_safety._scan_file_is_confirmed_gone) -
+        # these two rows need to actually exist to stay visible here.
+        for rel_path in ("broadcast_videos/blocked.mp4", "broadcast_videos/clean.mp4"):
+            full_path = os.path.join(django_settings.MEDIA_ROOT, rel_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "wb") as fh:
+                fh.write(b"fake video bytes")
+
         self.blocked_scan = MediaSafetyScan.objects.create(
             owner=self.target, upload_id="broadcast_videos/blocked.mp4", context="broadcast",
             mime_type="video/mp4", provider="nudenet", status="blocked", quarantine=True,
@@ -406,11 +428,45 @@ class AdminMediaSafetyScanTests(TestCase):
         self.assertGreaterEqual(resp.data["total"], 2)
 
     def test_media_url_404s_when_file_missing_from_storage(self):
-        # No real S3 object exists for this test scan's storage_path, so the
-        # view's default_storage.exists() check should correctly report 404
-        # rather than returning a URL to nothing.
-        resp = self.client.get(f"/control/admin/media-safety/scans/{self.blocked_scan.id}/media-url/")
+        # A separate scan (NOT self.blocked_scan, which now has a real
+        # file) whose storage_path has no backing object - the view's
+        # default_storage.exists() check should correctly report 404
+        # rather than returning a URL to nothing. This scenario (a scan
+        # row pointing at a path that was never actually written, as
+        # opposed to one that existed and was later purged) is exactly why
+        # the list endpoint's filter and this endpoint's own check both
+        # need to exist independently.
+        gone_scan = self.MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="broadcast_videos/never-existed.mp4", context="broadcast",
+            mime_type="video/mp4", provider="nudenet", status="blocked", quarantine=True,
+            requires_review=False, reason="nudenet_explicit:FEMALE_BREAST_EXPOSED",
+            result={"score": 0.9, "storage_path": "broadcast_videos/never-existed.mp4"},
+        )
+        resp = self.client.get(f"/control/admin/media-safety/scans/{gone_scan.id}/media-url/")
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_list_scans_excludes_a_scan_whose_file_was_since_purged(self):
+        """The literal reported bug: a scan row whose file has been
+        deleted from storage no longer belongs on the table at all - not
+        shown with a dead 'Show flagged content' button."""
+        purged_scan = self.MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="broadcast_videos/purged.mp4", context="broadcast",
+            mime_type="video/mp4", provider="nudenet", status="blocked", quarantine=True,
+            requires_review=False, reason="nudenet_explicit:FEMALE_BREAST_EXPOSED",
+            result={"score": 0.9, "storage_path": "broadcast_videos/purged.mp4"},
+        )
+        resp = self.client.get("/control/admin/media-safety/scans/")
+        ids = {s["id"] for s in resp.data["scans"]}
+        self.assertNotIn(str(purged_scan.id), ids)
+        # A scan with no storage_path/upload_id at all (never had a file
+        # to begin with) is a completely different case and must stay.
+        no_file_scan = self.MediaSafetyScan.objects.create(
+            owner=self.target, upload_id="", context="broadcast",
+            mime_type="", provider="nudenet", status="not_configured", result={},
+        )
+        resp = self.client.get("/control/admin/media-safety/scans/")
+        ids = {s["id"] for s in resp.data["scans"]}
+        self.assertIn(str(no_file_scan.id), ids)
 
     def test_media_url_404s_for_unknown_scan(self):
         import uuid
@@ -478,8 +534,17 @@ class AdminContentQueueMediaSafetyLinkTests(TestCase):
 
 # ─── Human moderation gate for public broadcast content ──────────────────────
 
+@override_settings(
+    MEDIA_ROOT=tempfile.mkdtemp(),
+    STORAGES={
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    },
+)
 class AdminMediaSafetyModerateTests(TestCase):
     def setUp(self):
+        from django.conf import settings as django_settings
+
         from apps.broadcasts.models import BroadcastVideo
         from apps.media.models import MediaSafetyScan
 
@@ -492,6 +557,13 @@ class AdminMediaSafetyModerateTests(TestCase):
             title="t", creator=self.creator, video_url="", mime_type="video/mp4",
             storage_path="broadcast_videos/x.mp4", type="video",
         )
+        # Real on-disk file: the scans list filters out rows whose
+        # storage_path (here via upload_id, the same fallback
+        # _resolve_storage_path uses) no longer resolves to a real object.
+        full_path = os.path.join(django_settings.MEDIA_ROOT, "broadcast_videos/x.mp4")
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "wb") as fh:
+            fh.write(b"fake video bytes")
         self.scan = MediaSafetyScan.objects.create(
             owner=self.creator, upload_id="broadcast_videos/x.mp4", context="broadcast",
             mime_type="video/mp4", provider="nudenet", status="passed", quarantine=False,
@@ -611,13 +683,41 @@ class AdminMediaSafetyModerateTests(TestCase):
         })
         self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    def test_scan_stops_reporting_moderatable_once_its_video_is_hard_deleted(self):
+        """Regression: a MediaSafetyScan row outlives the BroadcastVideo it
+        points at once delete_blocked_media's sweep hard-deletes the video
+        row. moderatable staying True purely because target_type/target_id
+        were still set left the scans table offering Pass/Pending/Block/
+        Delete buttons for content that no longer existed - any click 404'd
+        with "Content not found" instead of the UI reflecting reality."""
+        video_id = str(self.video.id)  # Model.delete() clears self.pk/id
+        self.video.delete()
 
+        resp = self.client.get("/control/admin/media-safety/scans/")
+        row = next(s for s in resp.data["scans"] if s["id"] == str(self.scan.id))
+        self.assertFalse(row["moderatable"])
+
+        action_resp = self.client.post("/control/admin/media-safety/moderate/", {
+            "target_type": "broadcast_video", "target_id": video_id, "action": "pass",
+        })
+        self.assertEqual(action_resp.status_code, status.HTTP_404_NOT_FOUND)
+
+
+@override_settings(
+    MEDIA_ROOT=tempfile.mkdtemp(),
+    STORAGES={
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    },
+)
 class AdminMediaSafetyChatExclusionTests(TestCase):
     """Private-messaging content must never appear in any admin
     media-safety/moderation surface - confirmed via apps.media.safety's own
     context list, not assumed."""
 
     def setUp(self):
+        from django.conf import settings as django_settings
+
         from apps.media.models import MediaSafetyScan
         from apps.moderation.services import create_media_safety_alert_for_scan
 
@@ -631,6 +731,14 @@ class AdminMediaSafetyChatExclusionTests(TestCase):
             reason="nudenet_explicit:FEMALE_BREAST_EXPOSED", result={"score": 0.9, "storage_path": "chat/x.jpg"},
         )
         create_media_safety_alert_for_scan(self.chat_scan)
+
+        # Real on-disk file: broadcast_scan is expected to survive the
+        # scans list's storage-existence filter (chat_scan doesn't need
+        # one - it's excluded by context before that filter ever runs).
+        full_path = os.path.join(django_settings.MEDIA_ROOT, "broadcast_videos/y.mp4")
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "wb") as fh:
+            fh.write(b"fake video bytes")
         self.broadcast_scan = MediaSafetyScan.objects.create(
             owner=self.target, upload_id="broadcast_videos/y.mp4", context="broadcast",
             mime_type="video/mp4", provider="nudenet", status="blocked", quarantine=True,

@@ -28,9 +28,46 @@ def _safe_int(val, default, lo=1, hi=250):
         return default
 
 
+def target_content_exists(target_type: str, target_id: str) -> bool:
+    """A MediaSafetyScan (or Flag) row can outlive the content it points
+    at - most commonly the 15-minute delete_blocked_media sweep hard-
+    deleting a BroadcastVideo row after an earlier admin "Delete" click.
+    Without this check, moderatable stayed True purely because
+    target_type/target_id were still present, so the scans/moderation
+    tables kept offering Pass/Pending/Block/Delete buttons for content
+    that no longer existed - any click 404'd with "Content not found",
+    a confusing dead end rather than the UI reflecting reality."""
+    if not target_id:
+        return False
+    if target_type == "broadcast_video":
+        from apps.broadcasts.models import BroadcastVideo
+
+        return BroadcastVideo.objects.filter(id=target_id).exists()
+    if target_type == "channel_content":
+        from apps.broadcasts.models import ChannelContent
+
+        return ChannelContent.objects.filter(id=target_id).exists()
+    return False
+
+
 def _resolve_storage_path(scan) -> str:
     result = scan.result if isinstance(scan.result, dict) else {}
     return str(result.get("storage_path") or scan.upload_id or "").strip()
+
+
+def _storage_object_still_exists(storage_path: str) -> bool:
+    if not storage_path:
+        return False
+    from django.core.files.storage import default_storage
+
+    try:
+        return bool(default_storage.exists(storage_path))
+    except Exception:
+        # A storage-backend hiccup must not make an existing file look
+        # deleted (and disappear from the table) - fail open here, the
+        # opposite of every other check in this module, specifically
+        # because this one's failure mode is "hide it," not "expose it."
+        return True
 
 
 class AdminMediaSafetyScanListView(APIView):
@@ -65,7 +102,13 @@ class AdminMediaSafetyScanListView(APIView):
         paginator = Paginator(qs, per_page)
         page_obj = paginator.get_page(page_num)
 
-        items = [_serialize_scan(s) for s in page_obj.object_list]
+        # Dropped rather than shown with a dead "Show flagged content"
+        # button - a scan whose file has since been purged from storage
+        # (the delete-time cleanup this same session added, or the older
+        # blocked-media sweep) previously 404'd with "The flagged file no
+        # longer exists in storage." on click. Filtered post-pagination, so
+        # a page can legitimately return fewer than per_page rows.
+        items = [_serialize_scan(s) for s in page_obj.object_list if not _scan_file_is_confirmed_gone(s)]
         return Response({
             "scans": items,
             "pagination": {
@@ -143,6 +186,16 @@ class AdminMediaSafetyScanMediaUrlView(APIView):
         })
 
 
+def _scan_file_is_confirmed_gone(scan) -> bool:
+    """True only when this scan DID record a file and that file is
+    confirmed no longer in storage - never true for a scan that simply
+    never had a file (nothing to be "gone"). Used to drop rows from the
+    scans table that would otherwise offer a "Show flagged content"
+    button dead-ending in AdminMediaSafetyScanMediaUrlView's 404."""
+    storage_path = _resolve_storage_path(scan)
+    return bool(storage_path) and not _storage_object_still_exists(storage_path)
+
+
 def _serialize_scan(scan):
     result = scan.result if isinstance(scan.result, dict) else {}
     target_type = str(result.get("resolution_target") or "")
@@ -168,7 +221,7 @@ def _serialize_scan(scan):
         "has_media": bool(_resolve_storage_path(scan)),
         "target_type": target_type or None,
         "target_id": target_id or None,
-        "moderatable": target_type in MODERATABLE_TARGET_TYPES and bool(target_id),
+        "moderatable": target_type in MODERATABLE_TARGET_TYPES and target_content_exists(target_type, target_id),
         "moderation": moderation,
     }
 
