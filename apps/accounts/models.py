@@ -1042,17 +1042,10 @@ class GDPRRequest(BaseEntity):
 
 class DailyFeedUsage(BaseEntity):
     """
-    Server-authoritative daily passive-feed consumption tracker (the
-    2-hour/day responsible-engagement limit - see apps.accounts.
-    responsible_feed and apps.broadcasts.views.BroadcastFeedView.get,
-    the only endpoint that actually checks this). `date` is always the
-    server's own clock, never anything client-supplied - a device with a
-    manipulated clock, a fresh reinstall, or a logout/login has nothing to
-    reset or spoof, since this row lives on the account, not the device,
-    and the elapsed-time math in record_feed_heartbeat is entirely
-    server-timestamp-based too (see FeedEngagementState). Deliberately
-    does NOT gate messaging, calls, the user's own profile, settings, or
-    any other intentional navigation - only passive feed scrolling.
+    Historical: backed the daily passive-feed time limit, which has been
+    removed (no code enforces or reads this anymore). Left in place to
+    avoid a schema migration on existing rows; safe to drop in a future
+    cleanup.
     """
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="daily_feed_usage")
     date = models.DateField(db_index=True)
@@ -1064,12 +1057,8 @@ class DailyFeedUsage(BaseEntity):
 
 class FeedEngagementState(BaseEntity):
     """
-    One row per user, tracking only the server-received timestamp of
-    their last feed heartbeat - used to compute the real elapsed gap for
-    the NEXT heartbeat (see record_feed_heartbeat). Separate from
-    DailyFeedUsage (which is per-day) because a heartbeat landing right
-    after midnight still needs to know when the previous heartbeat
-    happened, even though that was technically "yesterday"'s row.
+    Historical: paired with DailyFeedUsage for the now-removed daily feed
+    time limit. No longer read or written anywhere.
     """
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="feed_engagement_state")
     last_heartbeat_at = models.DateTimeField(null=True, blank=True)
