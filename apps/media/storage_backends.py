@@ -181,6 +181,18 @@ class S3MediaStorage(Storage):
       AWS_S3_CUSTOM_DOMAIN=<cdn-or-bucket-domain>
       AWS_S3_PUBLIC_BUCKET=True
       AWS_S3_PRESIGNED_EXPIRY_SECONDS=3600
+      AWS_S3_PUBLIC_PREFIXES=broadcast_videos,broadcast_thumbnails
+        Comma-separated key prefixes to serve as plain (non-presigned)
+        URLs even when AWS_S3_PUBLIC_BUCKET is False - for content that's
+        already public within the app (e.g. broadcast/feed media) but
+        shares a private bucket with genuinely restricted purposes
+        (status documents, etc). A presigned URL is a different string
+        on every request, which defeats browser/CDN HTTP caching for
+        content that never needed per-request access control in the
+        first place. DOES NOT by itself make anything publicly
+        readable - the bucket (or a policy scoped to these exact
+        prefixes) still has to actually grant public s3:GetObject, or
+        these URLs just 403. Leave unset until that policy is live.
     """
 
     # See SupabaseStorage.supports_presigned_uploads — this backend
@@ -197,6 +209,9 @@ class S3MediaStorage(Storage):
         self.custom_domain = _env("AWS_S3_CUSTOM_DOMAIN").strip().strip("/")
         self.public_bucket = _env_bool("AWS_S3_PUBLIC_BUCKET", False)
         self.presigned_expiry = int(_env("AWS_S3_PRESIGNED_EXPIRY_SECONDS", "3600") or "3600")
+        self.public_prefixes = tuple(
+            p.strip().strip("/") for p in _env("AWS_S3_PUBLIC_PREFIXES").split(",") if p.strip()
+        )
         self.addressing_style = _env("AWS_S3_ADDRESSING_STYLE")
         if not self.bucket:
             raise ImproperlyConfigured("S3 storage requires AWS_STORAGE_BUCKET_NAME.")
@@ -285,15 +300,18 @@ class S3MediaStorage(Storage):
         key = self._object_key(name)
         self._client().delete_object(Bucket=self.bucket, Key=key)
 
+    def _public_url(self, key: str) -> str:
+        if self.custom_domain:
+            return f"https://{self.custom_domain}/{quote(key, safe='/')}"
+        if self.endpoint_url:
+            endpoint = self.endpoint_url.rstrip("/")
+            return f"{endpoint}/{quote(self.bucket, safe='')}/{quote(key, safe='/')}"
+        return f"https://{self.bucket}.s3.{self.region_name}.amazonaws.com/{quote(key, safe='/')}"
+
     def url(self, name: str) -> str:
         key = self._object_key(name)
-        if self.public_bucket:
-            if self.custom_domain:
-                return f"https://{self.custom_domain}/{quote(key, safe='/')}"
-            if self.endpoint_url:
-                endpoint = self.endpoint_url.rstrip("/")
-                return f"{endpoint}/{quote(self.bucket, safe='')}/{quote(key, safe='/')}"
-            return f"https://{self.bucket}.s3.{self.region_name}.amazonaws.com/{quote(key, safe='/')}"
+        if self.public_bucket or key.startswith(self.public_prefixes):
+            return self._public_url(key)
         return self._client().generate_presigned_url(
             "get_object",
             Params={"Bucket": self.bucket, "Key": key},
