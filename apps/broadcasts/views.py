@@ -66,6 +66,7 @@ from apps.commerce.serializers import ProductSerializer, ServiceBookingSerialize
 from apps.moderation.models import AuditLog as ModerationAuditLog, Flag as ModerationFlag, UserBlock
 from apps.notifications.realtime import notify_main_tab_badges_updated
 from apps.partners.models import Partner, PartnerPost, PartnerMembership, PartnerMembershipStatus
+from apps.partners.permissions import is_platform_go
 from apps.media.models import MediaSafetyScan
 from apps.media.safety import (
     NUDENET_SCAN_QUEUED_REASON,
@@ -7604,6 +7605,16 @@ class BroadcastFeedView(APIView):
                 media_url = f"{media_url}/"
             return build_absolute_url(request, f"{media_url}{text.lstrip('/')}")
 
+        def _shop_avatar_url(shop) -> str | None:
+            # shop.image_file.url raises ValueError on a blank ImageField
+            # rather than returning None/"" like a plain CharField would.
+            if not shop or not getattr(shop, "image_file", None):
+                return None
+            try:
+                return _absolutize_avatar(shop.image_file.url)
+            except ValueError:
+                return None
+
         def _absolutize_media_url(value: Any) -> str | None:
             if value is None:
                 return None
@@ -7695,6 +7706,13 @@ class BroadcastFeedView(APIView):
             payload: dict[str, Any] = {
                 "id": str(user.id),
                 "display_name": display_name,
+                # Lets the client show the official KIS mark only for
+                # posts actually made by the platform's own GO account,
+                # instead of falling back to it for every author with no
+                # avatar (see is_platform_go - GO is a fixed identity, not
+                # a role, so this can't be spoofed via any user-editable
+                # field).
+                "is_go": is_platform_go(user),
             }
             if profile_id:
                 payload["profile_id"] = profile_id
@@ -7840,6 +7858,7 @@ class BroadcastFeedView(APIView):
                         "type": "channel",
                         "id": str(channel.id),
                         "name": channel.name,
+                        "avatar_url": channel.avatar_url or None,
                         "conversation_id": str(channel.conversation_id),
                         "allow_subscribe": True,
                         "is_subscribed": is_subscribed,
@@ -7947,6 +7966,7 @@ class BroadcastFeedView(APIView):
                             "id": str(content.channel_id),
                             "name": content.channel.display_name,
                             "handle": content.channel.handle,
+                            "avatar_url": content.channel.avatar_url or None,
                             "can_open": True,
                         },
                     }
@@ -8012,6 +8032,7 @@ class BroadcastFeedView(APIView):
                         "type": "community",
                         "id": str(post.community_id),
                         "name": post.community.name,
+                        "avatar_url": post.community.avatar_url or None,
                         "join_policy": post.community.join_policy,
                         "allow_subscribe": True,
                         "is_subscribed": is_member,
@@ -8089,6 +8110,7 @@ class BroadcastFeedView(APIView):
                         "type": "partner",
                         "id": str(partner.id),
                         "name": partner.name,
+                        "avatar_url": partner.avatar_url or None,
                         "is_member": is_member,
                         "is_subscribed": is_subscribed,
                         "can_open": is_member,
@@ -8171,6 +8193,7 @@ class BroadcastFeedView(APIView):
                         "type": "market",
                         "id": str(shop.id) if shop else None,
                         "name": shop.name if shop else "Market",
+                        "avatar_url": _shop_avatar_url(shop),
                         "can_open": True,
                         "viewer_is_member": viewer_is_member,
                         "membership_open": bool(getattr(shop, 'membership_public', False)),
@@ -8261,6 +8284,7 @@ class BroadcastFeedView(APIView):
                             "type": "market",
                             "id": str(shop.id) if shop else None,
                             "name": shop.name if shop else "Market",
+                            "avatar_url": _shop_avatar_url(shop),
                             "can_open": True,
                             "viewer_is_member": viewer_is_member,
                             "membership_open": bool(getattr(shop, 'membership_public', False)),
