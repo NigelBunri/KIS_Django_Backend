@@ -9828,14 +9828,28 @@ class EducationInstitutionPayoutAccountConnectView(APIView):
             institution.save(update_fields=["payout_account_status", "updated_at"])
             raise ValidationError({"detail": f"Could not reach the payment provider: {exc}"})
 
+        subaccount_id = ""
         if response.status_code >= 400 or payload.get("status") != "success":
-            institution.payout_account_status = EducationInstitutionPayoutAccountStatus.NOT_CONNECTED
-            institution.save(update_fields=["payout_account_status", "updated_at"])
             message = payload.get("message") or "Unable to connect payout account."
-            raise ValidationError({"detail": message})
+            # Flutterwave enforces global (account_bank, account_number)
+            # uniqueness across every subaccount on our platform account -
+            # two institutions/providers who legitimately share a bank
+            # account (or two of our own test fixtures reusing the same
+            # sandbox test account number) get a hard rejection here with
+            # no id to fall back to. Reuse the existing subaccount instead
+            # of blocking the second institution's setup outright - see
+            # apps.billing.payout_accounts.find_existing_flutterwave_subaccount.
+            if "already exist" in message.lower():
+                from apps.billing.payout_accounts import find_existing_flutterwave_subaccount
 
-        data = payload.get("data") or {}
-        subaccount_id = str(data.get("subaccount_id") or data.get("id") or "")
+                subaccount_id = find_existing_flutterwave_subaccount(account_bank, account_number) or ""
+            if not subaccount_id:
+                institution.payout_account_status = EducationInstitutionPayoutAccountStatus.NOT_CONNECTED
+                institution.save(update_fields=["payout_account_status", "updated_at"])
+                raise ValidationError({"detail": message})
+        else:
+            data = payload.get("data") or {}
+            subaccount_id = str(data.get("subaccount_id") or data.get("id") or "")
         if not subaccount_id:
             institution.payout_account_status = EducationInstitutionPayoutAccountStatus.NOT_CONNECTED
             institution.save(update_fields=["payout_account_status", "updated_at"])
