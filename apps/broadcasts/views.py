@@ -12879,6 +12879,39 @@ class EducationContentItemActionView(APIView):
                 status=status.HTTP_200_OK,
             )
 
+        if action == "mark_complete":
+            # Lessons and materials have no assessment to submit and no
+            # attendance to take - "read/viewed it" is the only signal
+            # there is for them, so this trusts the same client-reported
+            # completion the frontend already relies on for progress
+            # (identical trust boundary to mark_attended above). Reuses
+            # _update_learning_enrollment_metadata exactly as-is - no new
+            # progress/completion semantics, just a dispatch path the
+            # other two item types already had.
+            if learning_item.get("type") not in {
+                EducationCourseModuleItemType.LESSON,
+                EducationCourseModuleItemType.MATERIAL,
+            }:
+                raise ValidationError({"action": "This item type is completed a different way."})
+            enrollment = _update_learning_enrollment_metadata(
+                enrollment,
+                course_outline,
+                current_item_id=str(learning_item.get("id")),
+                completed_item_id=str(learning_item.get("id")),
+            )
+            progress_payload = _build_learning_progress_payload(broadcast, course_outline, enrollment)
+            return Response(
+                {
+                    "completed": True,
+                    "progress": progress_payload,
+                    "insights": _build_public_learning_insights(broadcast, course_outline, enrollment, progress_payload),
+                    "current_item": progress_payload.get("currentItem"),
+                    "current_module": progress_payload.get("currentModule"),
+                    "next_item": progress_payload.get("nextItem"),
+                },
+                status=status.HTTP_200_OK,
+            )
+
         if learning_item.get("type") != EducationCourseModuleItemType.ASSESSMENT:
             raise ValidationError({"action": "Unsupported learner item action."})
 
