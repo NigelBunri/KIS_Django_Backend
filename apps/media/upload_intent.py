@@ -178,15 +178,16 @@ def _education_image_max_bytes() -> int:
 
 
 def _education_material_allowed_content_types() -> set[str]:
+    # PDF / video / audio only — deliberately excludes Word docs and images
+    # (previously allowed here), since those can't be rendered inline by
+    # our own viewer (MaterialViewer.tsx) and would force a student to
+    # leave the platform (download + an external app) to open them. Cover
+    # art for a material still goes through the separate
+    # education_image_* context, not this one.
     configured = getattr(settings, "EDUCATION_MATERIAL_ALLOWED_CONTENT_TYPES", "")
     values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
     return values or {
         "application/pdf",
-        "application/msword",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "image/jpeg",
-        "image/png",
-        "image/webp",
         "video/mp4",
         "video/quicktime",
         "video/webm",

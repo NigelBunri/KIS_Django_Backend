@@ -1419,6 +1419,11 @@ def _education_source_cover_image(
     return ""
 
 
+# NOTE: apps.broadcasts.serializers has its own independent copy of this
+# same function (pre-existing duplication, not introduced here) — the
+# EducationInstitutionBroadcastSerializer.to_representation call site uses
+# that copy, not this one. Any future change to the cover-image fallback
+# logic (e.g. the institution-kind branch) needs to be applied to both.
 def _education_effective_broadcast_cover_image(broadcast: EducationInstitutionBroadcast) -> str:
     explicit_cover = normalize_media_reference(broadcast.cover_image_url)
     metadata = broadcast.metadata if isinstance(broadcast.metadata, dict) else {}
@@ -1437,6 +1442,11 @@ def _education_effective_broadcast_cover_image(broadcast: EducationInstitutionBr
         prioritized_entities = [broadcast.class_session, broadcast.lesson, broadcast.course, broadcast.event, broadcast.program]
     elif broadcast.broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION}:
         prioritized_entities = [broadcast.event, broadcast.class_session, broadcast.lesson, broadcast.course, broadcast.program]
+    elif broadcast.broadcast_kind == EducationBroadcastKind.INSTITUTION:
+        branding = broadcast.institution.branding or {}
+        logo = branding.get("logo_url") or branding.get("image_url")
+        value = normalize_media_reference(str(logo or "").strip())
+        return value or explicit_cover or ""
     else:
         prioritized_entities = [broadcast.program, broadcast.course, broadcast.lesson, broadcast.class_session, broadcast.event]
 
@@ -1468,6 +1478,55 @@ def _sync_course_pricing_to_broadcasts(course: "EducationInstitutionCourse") -> 
         broadcast.price_currency = course.price_currency
         broadcast.booking_enabled = bool(course.price_amount and course.price_amount > 0)
         broadcast.save(update_fields=["price_amount", "price_currency", "booking_enabled", "updated_at"])
+
+
+def _ensure_course_broadcast_matches_status(course: "EducationInstitutionCourse", user: User) -> None:
+    """A course's own `status` is the single source of truth for whether it
+    should be live: status=published must mean a course-kind broadcast
+    exists and is itself published (the broadcast is the record that
+    actually makes a course discoverable/enrollable — see
+    EducationContentEnrollmentView); anything else must mean any existing
+    course broadcast is pulled back to draft rather than left live and
+    orphaned from an unpublished course.
+
+    Previously this was only enforced by the Education UX v2 course builder
+    screen remembering to make a second API call after saving the course
+    (see CourseBuilderScreen.saveDetails on the frontend) — any other
+    caller that PATCHes/creates a course with status=published (another
+    screen, a script, a direct API request) could leave it published with
+    no broadcast at all, or a stale draft one. Enforcing it here, in the
+    same request that changes course.status, makes "published" always mean
+    what a non-technical provider expects it to mean, regardless of caller."""
+    broadcast = course.broadcasts.filter(broadcast_kind=EducationBroadcastKind.COURSE).order_by("-created_at").first()
+    is_published = course.status == EducationAcademicRecordStatus.PUBLISHED
+    if is_published:
+        if broadcast is None:
+            broadcast = EducationInstitutionBroadcast.objects.create(
+                institution=course.institution,
+                created_by=user,
+                broadcast_kind=EducationBroadcastKind.COURSE,
+                course=course,
+                title=course.title,
+                summary=course.summary,
+                description=course.description,
+                cover_image_url=course.cover_image_url,
+                seat_limit=course.seat_limit,
+                booking_enabled=bool(course.price_amount and course.price_amount > 0),
+                price_amount=course.price_amount,
+                price_currency=course.price_currency,
+                status=EducationBroadcastStatus.PUBLISHED,
+                published_at=timezone.now(),
+            )
+            _sync_education_broadcast_item(broadcast)
+        elif broadcast.status != EducationBroadcastStatus.PUBLISHED:
+            broadcast.status = EducationBroadcastStatus.PUBLISHED
+            broadcast.published_at = timezone.now()
+            broadcast.save(update_fields=["status", "published_at", "updated_at"])
+            _sync_education_broadcast_item(broadcast)
+    elif broadcast is not None and broadcast.status == EducationBroadcastStatus.PUBLISHED:
+        broadcast.status = EducationBroadcastStatus.DRAFT
+        broadcast.save(update_fields=["status", "updated_at"])
+        _sync_education_broadcast_item(broadcast)
 
 
 def _education_booking_provider_user(booking: EducationInstitutionBooking) -> User:
@@ -2372,6 +2431,8 @@ def _build_broadcast_viewer_state(
 
 
 def _education_discovery_type_for_broadcast(broadcast: EducationInstitutionBroadcast) -> str:
+    if broadcast.broadcast_kind == EducationBroadcastKind.INSTITUTION:
+        return "institution"
     if broadcast.broadcast_kind == EducationBroadcastKind.PROGRAM:
         return "program"
     if broadcast.broadcast_kind == EducationBroadcastKind.LESSON:
@@ -2454,6 +2515,11 @@ def _education_discovery_item_from_broadcast(
                 "seatLimit": broadcast.event.seat_limit,
             }
         )
+    if broadcast.broadcast_kind == EducationBroadcastKind.INSTITUTION:
+        # The special showcase card needs the full institution summary
+        # (logo, counts, verification) up front — this is a promotional
+        # card for the institution itself, not for one of its courses.
+        item.update(_build_public_institution_summary(broadcast.institution))
     return item
 
 
@@ -2626,7 +2692,7 @@ def _build_education_discovery_payload(user: User, request) -> dict[str, Any]:
         # when the global feed itself would otherwise be truncated.
         qs = qs.filter(institution_id=institution_id_filter)
     if kind_filter:
-        if kind_filter in {"program", "course", "lesson", "workshop"}:
+        if kind_filter in {"program", "course", "lesson", "workshop", "institution"}:
             filtered = []
             for row in qs:
                 if _education_discovery_type_for_broadcast(row) == kind_filter:
@@ -10810,6 +10876,7 @@ class EducationInstitutionCourseListView(APIView):
         )
         if cover_intent is not None:
             education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionCourse", target_id=str(course.id))
+        _ensure_course_broadcast_matches_status(course, request.user)
         serializer = EducationInstitutionCourseSerializer(course)
         return Response({"course": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -10868,6 +10935,7 @@ class EducationInstitutionCourseDetailView(APIView):
             course.settings = request.data.get("settings")
         _require_payment_setup_for_paid_course(institution, status=course.status, price_amount=course.price_amount)
         course.save()
+        _ensure_course_broadcast_matches_status(course, request.user)
         _sync_education_source_broadcasts(course)
         _sync_course_pricing_to_broadcasts(course)
         serializer = EducationInstitutionCourseSerializer(course)
@@ -11837,8 +11905,10 @@ class EducationInstitutionBroadcastListView(APIView):
             raise ValidationError({"class_session_id": "Class session is required for class broadcasts."})
         if broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION} and not event:
             raise ValidationError({"event_id": "Event is required for event/training broadcasts."})
-        if broadcast_kind == EducationBroadcastKind.INSTITUTION_NOTICE and any([program, course, lesson, class_session, event]):
-            raise ValidationError({"broadcast_kind": "Institution notices should not target a specific academic entity."})
+        if broadcast_kind in {EducationBroadcastKind.INSTITUTION_NOTICE, EducationBroadcastKind.INSTITUTION} and any(
+            [program, course, lesson, class_session, event]
+        ):
+            raise ValidationError({"broadcast_kind": "Institution notices/spotlights should not target a specific academic entity."})
         if event and broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION}:
             broadcast_kind = (
                 EducationBroadcastKind.TRAINING_SESSION
@@ -11846,13 +11916,14 @@ class EducationInstitutionBroadcastListView(APIView):
                 else EducationBroadcastKind.EVENT
             )
 
+        is_institution_level = broadcast_kind in {EducationBroadcastKind.INSTITUTION_NOTICE, EducationBroadcastKind.INSTITUTION}
         default_title = (
             (program.title if program else None)
             or (course.title if course else None)
             or (lesson.title if lesson else None)
             or (class_session.title if class_session else None)
             or (event.title if event else None)
-            or (institution.name if broadcast_kind == EducationBroadcastKind.INSTITUTION_NOTICE else None)
+            or (institution.name if is_institution_level else None)
             or "Education Broadcast"
         )
         default_summary = (
@@ -11861,6 +11932,7 @@ class EducationInstitutionBroadcastListView(APIView):
             or (lesson.summary if lesson else None)
             or (class_session.summary if class_session else None)
             or (event.summary if event else None)
+            or (institution.description if is_institution_level else None)
             or ""
         )
         default_description = (
@@ -11868,6 +11940,7 @@ class EducationInstitutionBroadcastListView(APIView):
             or (course.description if course else None)
             or (lesson.content if lesson else None)
             or (event.description if event else None)
+            or (institution.description if is_institution_level else None)
             or ""
         )
         starts_at = class_session.starts_at if class_session else (event.starts_at if event else None)

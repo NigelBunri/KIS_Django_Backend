@@ -1490,6 +1490,12 @@ class EducationBroadcastKind(models.TextChoices):
     TRAINING_SESSION = "training_session", "Training Session"
     EVENT = "event", "Event"
     INSTITUTION_NOTICE = "institution_notice", "Institution Notice"
+    # Promotes the institution itself (not a specific course/program/etc.) —
+    # distinct from INSTITUTION_NOTICE, which is a text announcement. This
+    # is a one-tap "advertise us" action with no target entity, rendered as
+    # a special showcase card in the feed (see
+    # _education_discovery_item_from_broadcast / _build_public_institution_summary).
+    INSTITUTION = "institution", "Institution Spotlight"
 
 
 class EducationBroadcastStatus(models.TextChoices):

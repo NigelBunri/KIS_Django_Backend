@@ -898,6 +898,16 @@ def _education_effective_broadcast_cover_image(instance: EducationInstitutionBro
         prioritized_entities = [instance.class_session, instance.lesson, instance.course, instance.event, instance.program]
     elif instance.broadcast_kind in {"event", "training_session"}:
         prioritized_entities = [instance.event, instance.class_session, instance.lesson, instance.course, instance.program]
+    elif instance.broadcast_kind == "institution":
+        # Institution-spotlight broadcasts have no program/course/etc.
+        # target — fall back to the institution's own branding logo. Keep
+        # this in sync with the identical branch in
+        # apps.broadcasts.views._education_effective_broadcast_cover_image
+        # (two independent copies of this function exist; see that
+        # module's docstring note).
+        branding = instance.institution.branding or {}
+        logo = str(branding.get("logo_url") or branding.get("image_url") or "").strip()
+        return logo or explicit_cover or ""
     else:
         prioritized_entities = [instance.program, instance.course, instance.lesson, instance.class_session, instance.event]
 
