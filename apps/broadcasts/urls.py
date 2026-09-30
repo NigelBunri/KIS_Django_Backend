@@ -152,6 +152,7 @@ from .views import (
     EducationInstitutionBroadcastBookingPaymentView,
     EducationBroadcastCatalogView,
     EducationDiscoveryView,
+    EducationInstitutionDirectoryView,
     EducationContentDetailView,
     EducationContentQuestionsView,
     EducationContentReviewsView,
@@ -657,6 +658,11 @@ urlpatterns = [
         "education/discovery/",
         EducationDiscoveryView.as_view(),
         name="education-discovery",
+    ),
+    path(
+        "education/institutions/directory/",
+        EducationInstitutionDirectoryView.as_view(),
+        name="education-institution-directory",
     ),
     path(
         "education/contents/<uuid:content_id>/",

@@ -2530,6 +2530,10 @@ def _education_discovery_item_from_broadcast(
         "coverUrl": absolutize_backend_media(_education_effective_broadcast_cover_image(broadcast)) if _education_effective_broadcast_cover_image(broadcast) else "",
         "partnerId": str(broadcast.institution_id),
         "partnerName": broadcast.institution.name,
+        "partnerLogoUrl": _resolve_education_media_display_url(
+            (broadcast.institution.branding or {}).get("logo_url") or (broadcast.institution.branding or {}).get("image_url") or "",
+            None,
+        ),
         "language": str((broadcast.metadata or {}).get("language") or "English"),
         "level": str((broadcast.metadata or {}).get("level") or "all"),
         "durationMinutes": _duration_minutes_between(broadcast.starts_at, broadcast.ends_at),
@@ -3594,6 +3598,28 @@ def _build_education_hub_payload(user: User, request) -> dict[str, Any]:
         many=True,
         context={"request": request},
     )
+    # The institution's own "advertise us" broadcast (EducationBroadcastKind
+    # .INSTITUTION) is a distinct record from the institution itself, so the
+    # picker screen's Broadcast button needs to know whether one already
+    # exists and is live, rather than blindly creating a new one on every
+    # tap (which used to leave a growing pile of duplicate spotlight
+    # broadcasts with no way to take the institution back off the feed).
+    # Only the single most recent one per institution is surfaced — that's
+    # the one the button acts on.
+    institution_broadcasts_qs = EducationInstitutionBroadcast.objects.filter(
+        institution_id__in=institution_ids,
+        broadcast_kind=EducationBroadcastKind.INSTITUTION,
+    ).order_by("institution_id", "-created_at")
+    latest_institution_broadcast_by_institution_id: dict[str, EducationInstitutionBroadcast] = {}
+    for candidate in institution_broadcasts_qs:
+        key = str(candidate.institution_id)
+        if key not in latest_institution_broadcast_by_institution_id:
+            latest_institution_broadcast_by_institution_id[key] = candidate
+    institutions_payload = institution_serializer.data
+    for row in institutions_payload:
+        latest = latest_institution_broadcast_by_institution_id.get(str(row.get("id")))
+        row["institution_broadcast_id"] = str(latest.id) if latest else None
+        row["institution_broadcast_status"] = latest.status if latest else None
     published_broadcasts = (
         EducationInstitutionBroadcast.objects.select_related("institution", "course", "lesson", "class_session", "event")
         .filter(institution_id__in=institution_ids, status=EducationBroadcastStatus.PUBLISHED)
@@ -3613,7 +3639,7 @@ def _build_education_hub_payload(user: User, request) -> dict[str, Any]:
         ).count(),
     }
     return {
-        "institutions": institution_serializer.data,
+        "institutions": institutions_payload,
         "quick_stats": quick_stats,
         "recent_broadcasts": recent_broadcasts,
     }
@@ -12930,6 +12956,29 @@ class EducationDiscoveryView(APIView):
 
     def get(self, request):
         return Response(_build_education_discovery_payload(request.user, request), status=status.HTTP_200_OK)
+
+
+class EducationInstitutionDirectoryView(APIView):
+    """
+    GET /api/v1/education/institutions/directory/ — every active
+    institution on the platform, not just the ones with a live broadcast
+    (that's what institution_spotlights inside the discovery payload
+    already covers — capped at 12, derived only from institutions that
+    currently have a published broadcast). This is the real "View all
+    institutions" list: public/anonymous-browsable, same shape as a
+    spotlight (_build_public_institution_summary) so the frontend needs no
+    second card type.
+    """
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        search = str(request.query_params.get("q") or "").strip().lower()
+        qs = EducationInstitution.objects.filter(is_active=True).order_by("name")
+        if search:
+            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
+        institutions = [_build_public_institution_summary(institution, request) for institution in qs[:200]]
+        return Response({"institutions": institutions}, status=status.HTTP_200_OK)
 
 
 class EducationContentDetailView(APIView):

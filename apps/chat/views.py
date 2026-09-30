@@ -271,6 +271,14 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 | Q(community_main__partner__isnull=False)
                 | Q(community_posts__partner__isnull=False)
                 | Q(partner_main__isnull=False)
+                # A course's own "classroom" group chat (see KIS's
+                # courseGroupChat.ts — one persistent group per course,
+                # found by the deterministic slug "edu-course-{courseId}")
+                # is reachable only from the course itself or its live-class
+                # tab, the same way a partner-channel conversation above is
+                # reachable only from Partners — never from the main
+                # Messages tab.
+                | Q(group__slug__startswith="edu-course-")
             )
         q = (self.request.query_params.get('q') or self.request.query_params.get('search') or '').strip()
         if q:
