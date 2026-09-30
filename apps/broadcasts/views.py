@@ -3457,6 +3457,28 @@ def _build_education_hub_payload(user: User, request) -> dict[str, Any]:
         many=True,
         context={"request": request},
     )
+    # The institution's own "advertise us" broadcast (EducationBroadcastKind
+    # .INSTITUTION) is a distinct record from the institution itself, so the
+    # picker screen's Broadcast button needs to know whether one already
+    # exists and is live, rather than blindly creating a new one on every
+    # tap (which used to leave a growing pile of duplicate spotlight
+    # broadcasts with no way to take the institution back off the feed).
+    # Only the single most recent one per institution is surfaced — that's
+    # the one the button acts on.
+    institution_broadcasts_qs = EducationInstitutionBroadcast.objects.filter(
+        institution_id__in=institution_ids,
+        broadcast_kind=EducationBroadcastKind.INSTITUTION,
+    ).order_by("institution_id", "-created_at")
+    latest_institution_broadcast_by_institution_id: dict[str, EducationInstitutionBroadcast] = {}
+    for candidate in institution_broadcasts_qs:
+        key = str(candidate.institution_id)
+        if key not in latest_institution_broadcast_by_institution_id:
+            latest_institution_broadcast_by_institution_id[key] = candidate
+    institutions_payload = institution_serializer.data
+    for row in institutions_payload:
+        latest = latest_institution_broadcast_by_institution_id.get(str(row.get("id")))
+        row["institution_broadcast_id"] = str(latest.id) if latest else None
+        row["institution_broadcast_status"] = latest.status if latest else None
     published_broadcasts = (
         EducationInstitutionBroadcast.objects.select_related("institution", "course", "lesson", "class_session", "event")
         .filter(institution_id__in=institution_ids, status=EducationBroadcastStatus.PUBLISHED)
@@ -3476,7 +3498,7 @@ def _build_education_hub_payload(user: User, request) -> dict[str, Any]:
         ).count(),
     }
     return {
-        "institutions": institution_serializer.data,
+        "institutions": institutions_payload,
         "quick_stats": quick_stats,
         "recent_broadcasts": recent_broadcasts,
     }
