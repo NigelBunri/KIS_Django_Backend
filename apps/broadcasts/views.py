@@ -179,6 +179,7 @@ from apps.broadcasts.models import (
     EducationInstitutionStaffAssignmentRole,
     EducationInstitutionStaffAssignmentStatus,
     EducationInstitutionClassSession,
+    EducationInstitutionClass,
     EducationInstitutionCourse,
     EducationInstitutionCourseModule,
     EducationInstitutionCourseModuleItem,
@@ -286,6 +287,7 @@ from apps.broadcasts.serializers import (
     EducationInstitutionLessonSerializer,
     EducationInstitutionMaterialSerializer,
     EducationInstitutionProgramSerializer,
+    EducationInstitutionClassSerializer,
     LessonEnrollmentSerializer,
     EducationProfileSerializer,
     MediumSerializer,
@@ -334,6 +336,12 @@ from apps.broadcasts.media_utils import (
     perceptual_fingerprint_similarity,
 )
 from apps.broadcasts import education_media
+from apps.broadcasts.education_communication_sync import (
+    sync_enrollment_communication,
+    sync_staff_assignment_communication,
+    revoke_staff_assignment_communication,
+    on_institution_partner_disconnected,
+)
 from apps.billing.services import (
     cents_to_credits,
     cents_to_usd,
@@ -374,6 +382,19 @@ def _parse_dt(value: object) -> datetime:
         except ValueError:
             return datetime.min
     return datetime.min
+
+
+def _parse_optional_date(value: object):
+    from datetime import date as _date
+
+    if isinstance(value, _date):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return _date.fromisoformat(value.strip()[:10])
+        except ValueError:
+            raise ValidationError({"date": f"'{value}' is not a valid date (expected YYYY-MM-DD)."})
+    return None
 
 
 def _to_bool(value: object | None, default: bool = False) -> bool:
@@ -1229,6 +1250,7 @@ def _education_broadcast_kind_from_targets(
     lesson=None,
     class_session=None,
     event=None,
+    institution_class=None,
 ) -> str:
     if value not in (None, ""):
         return _normalize_education_broadcast_kind(value)
@@ -1242,6 +1264,8 @@ def _education_broadcast_kind_from_targets(
         return EducationBroadcastKind.LESSON
     if course:
         return EducationBroadcastKind.COURSE
+    if institution_class:
+        return EducationBroadcastKind.INSTITUTION_CLASS
     if program:
         return EducationBroadcastKind.PROGRAM
     return EducationBroadcastKind.INSTITUTION_NOTICE
@@ -1719,6 +1743,7 @@ def _get_institution_staff_assignment_or_404(
         EducationInstitutionStaffAssignment.objects.select_related(
             "membership__user",
             "program",
+            "institution_class",
             "course",
             "class_session",
             "event",
@@ -1741,6 +1766,7 @@ def _get_institution_broadcast_or_404(
         EducationInstitutionBroadcast.objects.select_related(
             "institution",
             "program",
+            "institution_class",
             "course",
             "lesson",
             "class_session",
@@ -1777,6 +1803,39 @@ def _validate_program_course_pair(
         # do not block otherwise valid updates.
         program = course.program
     return program, course
+
+
+def _get_institution_class_or_404(
+    institution: EducationInstitution,
+    class_id: str,
+) -> EducationInstitutionClass:
+    return get_object_or_404(EducationInstitutionClass, institution=institution, id=class_id)
+
+
+def _validate_class_program_course(
+    institution_class: EducationInstitutionClass | None,
+    program: EducationInstitutionProgram | None,
+    course: EducationInstitutionCourse | None,
+) -> tuple[
+    EducationInstitutionClass | None,
+    EducationInstitutionProgram | None,
+    EducationInstitutionCourse | None,
+]:
+    """Resolves a (class, program, course) triple the same way
+    _validate_program_course_pair resolves (program, course): the more
+    specific relationship wins when the client sends an inconsistent or
+    partial combination, and a missing parent is filled in from whichever
+    child already has it set. None of the three is required."""
+    if course and not institution_class:
+        institution_class = course.institution_class
+    if course and institution_class and course.institution_class_id and course.institution_class_id != institution_class.id:
+        institution_class = course.institution_class
+    if institution_class and not program:
+        program = institution_class.program
+    if institution_class and program and institution_class.program_id and institution_class.program_id != program.id:
+        program = institution_class.program
+    program, course = _validate_program_course_pair(program, course)
+    return institution_class, program, course
 
 
 def _normalize_assessment_type(value: object, default: str = EducationAssessmentType.MCQ) -> str:
@@ -2435,6 +2494,8 @@ def _education_discovery_type_for_broadcast(broadcast: EducationInstitutionBroad
         return "institution"
     if broadcast.broadcast_kind == EducationBroadcastKind.PROGRAM:
         return "program"
+    if broadcast.broadcast_kind == EducationBroadcastKind.INSTITUTION_CLASS:
+        return "class"
     if broadcast.broadcast_kind == EducationBroadcastKind.LESSON:
         return "lesson"
     if broadcast.broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION}:
@@ -2488,6 +2549,16 @@ def _education_discovery_item_from_broadcast(
         "timezoneName": broadcast.timezone_name,
         "status": broadcast.status,
         "targetLabel": target_label,
+        # Explicit relationship fields — targetLabel above is a generic
+        # "parent entity" fallback chain kept unchanged for every existing
+        # broadcast kind; a Class card needs to distinguish "belongs to a
+        # Program" from "standalone" precisely (not just fall through to
+        # the institution's own name), so it gets its own unambiguous
+        # fields instead of overloading targetLabel further.
+        "programId": str(broadcast.program_id) if broadcast.program_id else None,
+        "programTitle": broadcast.program.title if broadcast.program else None,
+        "institutionClassId": str(broadcast.institution_class_id) if broadcast.institution_class_id else None,
+        "institutionClassName": broadcast.institution_class.name if broadcast.institution_class else None,
         "viewerState": viewer_state,
         "reviewSummary": _build_education_review_summary(broadcast),
         "questionSummary": _build_education_question_summary(broadcast),
@@ -2503,6 +2574,12 @@ def _education_discovery_item_from_broadcast(
                 "locationText": broadcast.class_session.location_text,
                 "meetingUrl": broadcast.class_session.meeting_url,
                 "seatLimit": broadcast.class_session.seat_limit,
+            }
+        )
+    if broadcast.institution_class:
+        item.update(
+            {
+                "seatLimit": broadcast.institution_class.seat_limit,
             }
         )
     if broadcast.event:
@@ -2550,6 +2627,7 @@ def _build_public_institution_summary(institution: EducationInstitution, request
             "moderationSafe": True,
         },
         "programCount": institution.programs.count(),
+        "classCount": institution.classes.count(),
         "courseCount": institution.courses_v2.count(),
         "eventCount": institution.events.count(),
         "publishedBroadcastCount": published.count(),
@@ -3039,6 +3117,7 @@ def _update_learning_enrollment_metadata(
     metadata["progress_percent"] = int(progress_payload.get("progressPercent") or 0)
     enrollment.metadata = metadata
 
+    previous_status = enrollment.status
     valid_ids = valid_item_ids
     completed_ids = set(metadata.get("completed_item_ids") or [])
     if valid_ids and completed_ids == valid_ids:
@@ -3050,6 +3129,8 @@ def _update_learning_enrollment_metadata(
         enrollment.completed_at = None
 
     enrollment.save()
+    if enrollment.status != previous_status:
+        sync_enrollment_communication(enrollment)
     return enrollment
 
 
@@ -3182,6 +3263,33 @@ def _build_learning_progress_payload(
     }
 
 
+def _serialize_courses_with_broadcast_ids(courses: list) -> list[dict[str, Any]]:
+    """A course is only actually reachable by a learner through its own
+    published course-kind broadcast (EducationContentDetailView is keyed
+    by broadcast id, not course id) — resolve that here, one query for
+    the whole list, so the frontend has somewhere to link to instead of
+    just a course title with nowhere to go. Shared by both the Program
+    and the Class detail page's course lists."""
+    if not courses:
+        return []
+    broadcast_ids: dict[Any, Any] = {}
+    for course_id, broadcast_id in (
+        EducationInstitutionBroadcast.objects.filter(
+            course_id__in=[c.id for c in courses],
+            broadcast_kind=EducationBroadcastKind.COURSE,
+            status=EducationBroadcastStatus.PUBLISHED,
+        ).order_by("course_id", "-published_at").values_list("course_id", "id")
+    ):
+        # First row per course_id (order_by course_id, -published_at) is
+        # the most recently published one — keep only that.
+        broadcast_ids.setdefault(course_id, broadcast_id)
+    payload = EducationInstitutionCourseSerializer(courses, many=True).data
+    for row, course_row in zip(payload, courses):
+        resolved = broadcast_ids.get(course_row.id)
+        row["broadcastId"] = str(resolved) if resolved else None
+    return payload
+
+
 def _build_public_education_content_detail(
     broadcast: EducationInstitutionBroadcast,
     request,
@@ -3278,13 +3386,44 @@ def _build_public_education_content_detail(
             }
         ],
     }
+    detail_item["programId"] = str(broadcast.program_id) if broadcast.program_id else None
+    detail_item["programTitle"] = broadcast.program.title if broadcast.program else None
+    detail_item["institutionClassId"] = str(broadcast.institution_class_id) if broadcast.institution_class_id else None
+    detail_item["institutionClassName"] = broadcast.institution_class.name if broadcast.institution_class else None
     if broadcast.program:
-        detail_item["courses"] = EducationInstitutionCourseSerializer(
-            institution.courses_v2.filter(program=broadcast.program).order_by("title", "-created_at")[:20],
+        # A course counts as "in this program" either directly
+        # (course.program) or through its Class (course.institution_class
+        # .program) — a course attached only via Class inherits `program`
+        # at creation time (see _validate_class_program_course), but that
+        # snapshot goes stale if the Class is later moved to a different
+        # Program, so this can't rely on course.program alone.
+        sibling_courses = list(
+            institution.courses_v2.filter(
+                Q(program=broadcast.program) | Q(institution_class__program=broadcast.program)
+            ).distinct().order_by("title", "-created_at")[:20]
+        )
+        detail_item["courses"] = _serialize_courses_with_broadcast_ids(sibling_courses)
+        detail_item["classes"] = EducationInstitutionClassSerializer(
+            broadcast.program.classes.filter(status=EducationAcademicRecordStatus.PUBLISHED).order_by("name", "-created_at")[:20],
             many=True,
         ).data
+    if broadcast.institution_class:
+        detail_item["courses"] = _serialize_courses_with_broadcast_ids(
+            list(broadcast.institution_class.courses.order_by("title", "-created_at")[:20])
+        )
     if broadcast.course:
         course_payload = _build_course_detail_payload(institution, broadcast.course, request)
+        if broadcast.course.institution_class:
+            # Surfaces the Program -> Class -> Course relationship to the
+            # learner even though a Class has no discovery/broadcast card
+            # of its own - just enough context (name, parent program) to
+            # place this course, not a full class detail payload.
+            detail_item["institutionClass"] = {
+                "id": str(broadcast.course.institution_class_id),
+                "name": broadcast.course.institution_class.name,
+                "programId": str(broadcast.course.institution_class.program_id) if broadcast.course.institution_class.program_id else None,
+                "programTitle": broadcast.course.institution_class.program.title if broadcast.course.institution_class.program_id else None,
+            }
         detail_item["syllabus"] = _course_outline_to_syllabus(course_outline)
         detail_item["outcomes"] = [
             {"id": f"outcome-{index + 1}", "label": value}
@@ -3428,7 +3567,7 @@ def _grant_education_enrollment_for_confirmed_booking(booking: "EducationInstitu
     seat_limit_reached = bool(broadcast.seat_limit and already_enrolled_count >= broadcast.seat_limit)
     target_status = EducationEnrollmentStatus.WAITLISTED if seat_limit_reached else EducationEnrollmentStatus.ENROLLED
     if enrollment is None:
-        broadcast.enrollments.create(
+        enrollment = broadcast.enrollments.create(
             institution=booking.institution,
             broadcast=broadcast,
             program=broadcast.program,
@@ -3440,9 +3579,11 @@ def _grant_education_enrollment_for_confirmed_booking(booking: "EducationInstitu
             status=target_status,
             metadata={"created_from": "education_booking_payment_confirmed"},
         )
+        sync_enrollment_communication(enrollment)
     elif enrollment.status in {EducationEnrollmentStatus.PENDING, EducationEnrollmentStatus.WAITLISTED}:
         enrollment.status = target_status
         enrollment.save(update_fields=["status", "updated_at"])
+        sync_enrollment_communication(enrollment)
 
 
 def _build_education_hub_payload(user: User, request) -> dict[str, Any]:
@@ -3488,6 +3629,7 @@ def _build_education_institution_dashboard_payload(institution: EducationInstitu
     )
     metrics = {
         "program_count": institution.programs.count(),
+        "class_count": institution.classes.count(),
         "course_count": institution.courses_v2.count(),
         "lesson_count": institution.lessons_v2.count(),
         "class_session_count": institution.class_sessions.count(),
@@ -3571,11 +3713,24 @@ def _build_program_detail_payload(
     program: EducationInstitutionProgram,
     request,
 ) -> dict[str, Any]:
-    courses_qs = institution.courses_v2.filter(program=program).order_by("title", "-created_at")
+    # A course/enrollment counts as "in this program" either directly or
+    # through its Class (see the identical reasoning in
+    # _build_public_education_content_detail) — course.program/
+    # enrollment.program alone would miss anything only linked via
+    # institution_class.program, and go stale if that Class later moves
+    # to a different Program.
+    courses_qs = institution.courses_v2.filter(
+        Q(program=program) | Q(institution_class__program=program)
+    ).distinct().order_by("title", "-created_at")
+    classes_qs = program.classes.order_by("name", "-created_at")
     materials_qs = institution.materials.filter(_material_scope_q(program=program)).distinct().order_by("title", "-created_at")
     events_qs = institution.events.filter(program=program).order_by("starts_at", "-created_at")
-    broadcasts_qs = institution.education_broadcasts.filter(program=program).order_by("-published_at", "-created_at")
-    enrollments_qs = institution.enrollments.filter(program=program).order_by("-created_at")
+    broadcasts_qs = institution.education_broadcasts.filter(
+        Q(program=program) | Q(institution_class__program=program)
+    ).distinct().order_by("-published_at", "-created_at")
+    enrollments_qs = institution.enrollments.filter(
+        Q(program=program) | Q(institution_class__program=program)
+    ).distinct().order_by("-created_at")
     bookings_qs = institution.bookings.filter(program=program).order_by("-created_at")
     staff_assignments_qs = institution.staff_assignments.filter(program=program).select_related("membership__user").order_by("-created_at")
     program_payload = EducationInstitutionProgramSerializer(program).data
@@ -3583,6 +3738,7 @@ def _build_program_detail_payload(
         "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
         "program": program_payload,
         "metrics": {
+            "class_count": classes_qs.count(),
             "course_count": courses_qs.count(),
             "material_count": materials_qs.count(),
             "event_count": events_qs.count(),
@@ -3591,14 +3747,48 @@ def _build_program_detail_payload(
             "booking_count": bookings_qs.count(),
             "staff_assignment_count": staff_assignments_qs.count(),
         },
-        "courses": EducationInstitutionCourseSerializer(courses_qs[:20], many=True).data,
+        "classes": EducationInstitutionClassSerializer(classes_qs[:50], many=True).data,
+        "courses": EducationInstitutionCourseSerializer(courses_qs[:50], many=True).data,
         "materials": EducationInstitutionMaterialSerializer(materials_qs[:20], many=True).data,
         "events": EducationInstitutionEventSerializer(events_qs[:20], many=True).data,
         "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:20], many=True, context={"request": request}).data,
-        "enrollments": EducationInstitutionEnrollmentSerializer(enrollments_qs[:20], many=True).data,
+        "enrollments": EducationInstitutionEnrollmentSerializer(enrollments_qs[:50], many=True).data,
         "bookings": EducationInstitutionBookingSerializer(bookings_qs[:20], many=True).data,
-        "staff_assignments": EducationInstitutionStaffAssignmentSerializer(staff_assignments_qs[:20], many=True).data,
+        "staff_assignments": EducationInstitutionStaffAssignmentSerializer(staff_assignments_qs[:50], many=True).data,
     }, "program")
+
+
+def _build_class_detail_payload(
+    institution: EducationInstitution,
+    institution_class: "EducationInstitutionClass",
+    request,
+) -> dict[str, Any]:
+    courses_qs = institution_class.courses.order_by("title", "-created_at")
+    # EducationInstitutionEvent has no institution_class FK of its own
+    # (see the model) — reusing its existing `course` relationship to
+    # reach "events belonging to one of this Class's courses" instead of
+    # adding a new column/migration just for this tab.
+    events_qs = institution.events.filter(course__institution_class=institution_class).order_by("starts_at", "-created_at")
+    broadcasts_qs = institution.education_broadcasts.filter(institution_class=institution_class).order_by("-published_at", "-created_at")
+    enrollments_qs = institution.enrollments.filter(institution_class=institution_class).order_by("-created_at")
+    staff_assignments_qs = institution.staff_assignments.filter(institution_class=institution_class).select_related("membership__user").order_by("-created_at")
+    class_payload = EducationInstitutionClassSerializer(institution_class).data
+    return _with_primary_detail_summary({
+        "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
+        "class": class_payload,
+        "metrics": {
+            "course_count": courses_qs.count(),
+            "event_count": events_qs.count(),
+            "broadcast_count": broadcasts_qs.count(),
+            "enrollment_count": enrollments_qs.count(),
+            "staff_assignment_count": staff_assignments_qs.count(),
+        },
+        "courses": EducationInstitutionCourseSerializer(courses_qs[:50], many=True).data,
+        "events": EducationInstitutionEventSerializer(events_qs[:20], many=True).data,
+        "broadcasts": EducationInstitutionBroadcastSerializer(broadcasts_qs[:20], many=True, context={"request": request}).data,
+        "enrollments": EducationInstitutionEnrollmentSerializer(enrollments_qs[:50], many=True).data,
+        "staff_assignments": EducationInstitutionStaffAssignmentSerializer(staff_assignments_qs[:50], many=True).data,
+    }, "class")
 
 
 def _module_item_target(item: EducationInstitutionCourseModuleItem) -> Any:
@@ -4182,6 +4372,7 @@ def _build_course_detail_payload(
         "institution": EducationInstitutionSerializer(institution, context={"request": request}).data,
         "course": course_payload,
         "program": EducationInstitutionProgramSerializer(course.program).data if course.program else None,
+        "institution_class": EducationInstitutionClassSerializer(course.institution_class).data if course.institution_class else None,
         "metrics": {
             "module_count": len(course_outline),
             "lesson_count": lessons_qs.count(),
@@ -10032,6 +10223,7 @@ class EducationInstitutionPartnerConnectView(APIView):
 
         institution.partner = None
         institution.save(update_fields=["partner"])
+        on_institution_partner_disconnected(institution)
         return Response(EducationInstitutionSerializer(institution, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
@@ -10313,6 +10505,7 @@ class EducationInstitutionEnrollmentActionView(APIView):
         metadata["last_action_at"] = timezone.now().isoformat()
         enrollment.metadata = metadata
         enrollment.save(update_fields=["status", "metadata", "updated_at"])
+        sync_enrollment_communication(enrollment)
         return Response(
             {"enrollment": EducationInstitutionEnrollmentSerializer(enrollment).data},
             status=status.HTTP_200_OK,
@@ -10549,6 +10742,7 @@ class EducationInstitutionStaffAssignmentListView(APIView):
         qs = institution.staff_assignments.select_related(
             "membership__user",
             "program",
+            "institution_class",
             "course",
             "class_session",
             "event",
@@ -10558,6 +10752,8 @@ class EducationInstitutionStaffAssignmentListView(APIView):
             qs = qs.filter(membership_id=request.query_params.get("membership_id"))
         if request.query_params.get("program_id"):
             qs = qs.filter(program_id=request.query_params.get("program_id"))
+        if request.query_params.get("institution_class_id"):
+            qs = qs.filter(institution_class_id=request.query_params.get("institution_class_id"))
         if request.query_params.get("course_id"):
             qs = qs.filter(course_id=request.query_params.get("course_id"))
         if request.query_params.get("class_session_id"):
@@ -10584,10 +10780,11 @@ class EducationInstitutionStaffAssignmentListView(APIView):
             raise ValidationError({"membership_id": "Student memberships cannot receive staff assignments."})
         program = _get_institution_program_or_404(institution, str(request.data.get("program_id"))) if request.data.get("program_id") else None
         course = _get_institution_course_or_404(institution, str(request.data.get("course_id"))) if request.data.get("course_id") else None
+        institution_class = _get_institution_class_or_404(institution, str(request.data.get("institution_class_id"))) if request.data.get("institution_class_id") else None
         class_session = _get_institution_class_session_or_404(institution, str(request.data.get("class_session_id"))) if request.data.get("class_session_id") else None
         event = _get_institution_event_or_404(institution, str(request.data.get("event_id"))) if request.data.get("event_id") else None
         assessment = _get_institution_assessment_or_404(institution, str(request.data.get("assessment_id"))) if request.data.get("assessment_id") else None
-        program, course = _validate_program_course_pair(program, course)
+        institution_class, program, course = _validate_class_program_course(institution_class, program, course)
         program, course, class_session = _validate_event_links(institution, program, course, class_session)
         if assessment and assessment.course and course and assessment.course_id != course.id:
             raise ValidationError({"assessment_id": "Assessment must belong to the selected course."})
@@ -10595,6 +10792,7 @@ class EducationInstitutionStaffAssignmentListView(APIView):
             institution=institution,
             membership=membership,
             program=program,
+            institution_class=institution_class,
             course=course,
             class_session=class_session,
             event=event,
@@ -10605,6 +10803,8 @@ class EducationInstitutionStaffAssignmentListView(APIView):
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
             created_by=request.user,
         )
+        if assignment.status == EducationInstitutionStaffAssignmentStatus.ACTIVE:
+            sync_staff_assignment_communication(assignment)
         serializer = EducationInstitutionStaffAssignmentSerializer(assignment)
         return Response({"staff_assignment": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -10626,6 +10826,23 @@ class EducationInstitutionStaffAssignmentDetailView(APIView):
         institution = _get_education_institution_or_404(request.user, institution_id)
         _require_manage_institution_membership(request.user, institution)
         assignment = _get_institution_staff_assignment_or_404(institution, assignment_id)
+        # Snapshot the pre-mutation scope/status/membership — needed after
+        # save() to detect whether the assignment moved to a *different*
+        # communication space (course/class/program) or lost active status,
+        # so the OLD space's admin grant can be revoked explicitly rather
+        # than just re-deriving from (and only ever granting on) the new
+        # scope, which would leave a stale admin grant behind on the space
+        # the assignment no longer covers.
+        old_status = assignment.status
+        old_snapshot = SimpleNamespace(
+            membership=assignment.membership,
+            course_id=assignment.course_id,
+            course=assignment.course,
+            institution_class_id=assignment.institution_class_id,
+            institution_class=assignment.institution_class,
+            program_id=assignment.program_id,
+            program=assignment.program,
+        )
         if "membership_id" in request.data and request.data.get("membership_id"):
             membership = get_object_or_404(
                 institution.memberships.select_related("user"),
@@ -10637,6 +10854,9 @@ class EducationInstitutionStaffAssignmentDetailView(APIView):
         if "program_id" in request.data:
             program_id = request.data.get("program_id")
             assignment.program = _get_institution_program_or_404(institution, str(program_id)) if program_id else None
+        if "institution_class_id" in request.data:
+            institution_class_id = request.data.get("institution_class_id")
+            assignment.institution_class = _get_institution_class_or_404(institution, str(institution_class_id)) if institution_class_id else None
         if "course_id" in request.data:
             course_id = request.data.get("course_id")
             assignment.course = _get_institution_course_or_404(institution, str(course_id)) if course_id else None
@@ -10649,7 +10869,9 @@ class EducationInstitutionStaffAssignmentDetailView(APIView):
         if "assessment_id" in request.data:
             assessment_id = request.data.get("assessment_id")
             assignment.assessment = _get_institution_assessment_or_404(institution, str(assessment_id)) if assessment_id else None
-        assignment.program, assignment.course = _validate_program_course_pair(assignment.program, assignment.course)
+        assignment.institution_class, assignment.program, assignment.course = _validate_class_program_course(
+            assignment.institution_class, assignment.program, assignment.course,
+        )
         assignment.program, assignment.course, assignment.class_session = _validate_event_links(
             institution,
             assignment.program,
@@ -10665,6 +10887,19 @@ class EducationInstitutionStaffAssignmentDetailView(APIView):
         if isinstance(request.data.get("metadata"), dict):
             assignment.metadata = request.data.get("metadata")
         assignment.save()
+
+        was_active = old_status == EducationInstitutionStaffAssignmentStatus.ACTIVE
+        scope_changed = (
+            assignment.course_id != old_snapshot.course_id
+            or assignment.institution_class_id != old_snapshot.institution_class_id
+            or assignment.program_id != old_snapshot.program_id
+            or assignment.membership_id != old_snapshot.membership.id
+        )
+        if was_active and (scope_changed or assignment.status != EducationInstitutionStaffAssignmentStatus.ACTIVE):
+            revoke_staff_assignment_communication(old_snapshot)
+        if assignment.status == EducationInstitutionStaffAssignmentStatus.ACTIVE:
+            sync_staff_assignment_communication(assignment)
+
         serializer = EducationInstitutionStaffAssignmentSerializer(assignment)
         return Response({"staff_assignment": serializer.data}, status=status.HTTP_200_OK)
 
@@ -10672,6 +10907,8 @@ class EducationInstitutionStaffAssignmentDetailView(APIView):
         institution = _get_education_institution_or_404(request.user, institution_id)
         _require_manage_institution_membership(request.user, institution)
         assignment = _get_institution_staff_assignment_or_404(institution, assignment_id)
+        if assignment.status == EducationInstitutionStaffAssignmentStatus.ACTIVE:
+            revoke_staff_assignment_communication(assignment)
         assignment.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -10719,6 +10956,43 @@ class EducationInstitutionStaffMembershipDetailView(APIView):
         )
 
 
+def _apply_program_field_updates(program: "EducationInstitutionProgram", data: dict) -> None:
+    """Shared by create and update — every field here is optional (a
+    kindergarten's 'program' and a university's PhD track need wildly
+    different subsets of this), so this only ever touches a field when
+    the caller actually sent it, never forces a value."""
+    if "program_type" in data:
+        program.program_type = str(data.get("program_type") or "").strip()
+    if "level" in data:
+        program.level = str(data.get("level") or "").strip()
+    if "duration_value" in data:
+        program.duration_value = _to_optional_positive_int(data.get("duration_value"))
+    if "duration_unit" in data:
+        program.duration_unit = str(data.get("duration_unit") or "").strip()
+    if "department" in data:
+        program.department = str(data.get("department") or "").strip()
+    if "faculty" in data:
+        program.faculty = str(data.get("faculty") or "").strip()
+    if "start_date" in data:
+        program.start_date = _parse_optional_date(data.get("start_date"))
+    if "end_date" in data:
+        program.end_date = _parse_optional_date(data.get("end_date"))
+    if "entry_requirements" in data:
+        program.entry_requirements = str(data.get("entry_requirements") or "").strip()
+    if "target_audience" in data:
+        program.target_audience = str(data.get("target_audience") or "").strip()
+    if "learning_outcomes" in data and isinstance(data.get("learning_outcomes"), list):
+        program.learning_outcomes = [str(item).strip() for item in data.get("learning_outcomes") if str(item).strip()]
+    if "seat_limit" in data:
+        program.seat_limit = _to_optional_positive_int(data.get("seat_limit"))
+    if "price_amount" in data:
+        program.price_amount = _normalize_education_decimal(data.get("price_amount"), "price_amount")
+    if "price_currency" in data:
+        program.price_currency = _normalize_education_currency(data.get("price_currency"))
+    if "visibility" in data:
+        program.visibility = _normalize_course_visibility(data.get("visibility"), program.visibility)
+
+
 class EducationInstitutionProgramListView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -10751,6 +11025,8 @@ class EducationInstitutionProgramListView(APIView):
             status=_normalize_academic_status(request.data.get("status")),
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
+        _apply_program_field_updates(program, request.data)
+        program.save()
         if cover_intent is not None:
             education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionProgram", target_id=str(program.id))
         serializer = EducationInstitutionProgramSerializer(program)
@@ -10795,6 +11071,7 @@ class EducationInstitutionProgramDetailView(APIView):
             program.status = _normalize_academic_status(request.data.get("status"), program.status)
         if isinstance(request.data.get("metadata"), dict):
             program.metadata = request.data.get("metadata")
+        _apply_program_field_updates(program, request.data)
         program.save()
         _sync_education_source_broadcasts(program)
         serializer = EducationInstitutionProgramSerializer(program)
@@ -10805,6 +11082,145 @@ class EducationInstitutionProgramDetailView(APIView):
         _require_manage_institution_membership(request.user, institution)
         program = _get_institution_program_or_404(institution, program_id)
         program.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _apply_class_field_updates(institution_class: "EducationInstitutionClass", data: dict) -> None:
+    """Shared by create and update — same optional-everything philosophy
+    as _apply_program_field_updates: "Level 100", "Cohort 2027" and
+    "Class of 2029" all need different subsets of these fields, none
+    required."""
+    if "code" in data:
+        institution_class.code = str(data.get("code") or "").strip()
+    if "class_type" in data:
+        institution_class.class_type = str(data.get("class_type") or "").strip()
+    if "level" in data:
+        institution_class.level = str(data.get("level") or "").strip()
+    if "academic_year" in data:
+        institution_class.academic_year = str(data.get("academic_year") or "").strip()
+    if "term" in data:
+        institution_class.term = str(data.get("term") or "").strip()
+    if "start_date" in data:
+        institution_class.start_date = _parse_optional_date(data.get("start_date"))
+    if "end_date" in data:
+        institution_class.end_date = _parse_optional_date(data.get("end_date"))
+    if "seat_limit" in data:
+        institution_class.seat_limit = _to_optional_positive_int(data.get("seat_limit"))
+    if "visibility" in data:
+        institution_class.visibility = _normalize_course_visibility(data.get("visibility"), institution_class.visibility)
+
+
+class EducationInstitutionClassListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, institution_id: str):
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        current_membership = _get_institution_membership(request.user, institution)
+        if not current_membership:
+            raise PermissionDenied("You do not belong to this institution.")
+        qs = institution.classes.select_related("program").order_by("name", "-created_at")
+        if current_membership.role not in _education_manage_roles():
+            qs = qs.filter(status=EducationAcademicRecordStatus.PUBLISHED)
+        if request.query_params.get("program_id"):
+            qs = qs.filter(program_id=request.query_params.get("program_id"))
+        if str(request.query_params.get("standalone") or "").lower() in ("1", "true", "yes"):
+            qs = qs.filter(program__isnull=True)
+        serializer = EducationInstitutionClassSerializer(qs, many=True)
+        return Response({"classes": serializer.data}, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def post(self, request, institution_id: str):
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+        name = str(request.data.get("name") or "").strip()
+        if not name:
+            raise ValidationError({"name": "Class name is required."})
+        program = None
+        program_id = request.data.get("program_id")
+        if program_id:
+            # A class is never required to belong to a program — this is
+            # purely opt-in, same as EducationInstitutionCourse.program.
+            program = _get_institution_program_or_404(institution, str(program_id))
+        cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+        institution_class = EducationInstitutionClass.objects.create(
+            institution=institution,
+            program=program,
+            name=name,
+            description=str(request.data.get("description") or "").strip(),
+            cover_image_url=cover_url,
+            status=_normalize_academic_status(request.data.get("status")),
+            schedule=request.data.get("schedule") if isinstance(request.data.get("schedule"), dict) else {},
+            metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
+            created_by=request.user,
+        )
+        _apply_class_field_updates(institution_class, request.data)
+        institution_class.save()
+        if cover_intent is not None:
+            education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionClass", target_id=str(institution_class.id))
+        serializer = EducationInstitutionClassSerializer(institution_class)
+        return Response({"class": serializer.data}, status=status.HTTP_201_CREATED)
+
+
+class EducationInstitutionClassDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, institution_id: str, class_id: str):
+        # The Class Dashboard (courses/learners/staff/broadcasts all
+        # bundled together) is a management surface, same as Course's own
+        # detail view — matches _require_manage_institution_membership
+        # gating EducationInstitutionCourseDetailView.get exactly. A
+        # published Class's basic info is still reachable by non-managers
+        # through the public discovery endpoints built in the previous
+        # phase (EducationContentDetailView), which never expose
+        # enrollments/staff assignments.
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+        institution_class = _get_institution_class_or_404(institution, class_id)
+        return Response(
+            _build_class_detail_payload(institution, institution_class, request),
+            status=status.HTTP_200_OK,
+        )
+
+    @transaction.atomic
+    def patch(self, request, institution_id: str, class_id: str):
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+        institution_class = _get_institution_class_or_404(institution, class_id)
+        name = request.data.get("name")
+        if isinstance(name, str) and name.strip():
+            institution_class.name = name.strip()
+        description = request.data.get("description")
+        if isinstance(description, str):
+            institution_class.description = description.strip()
+        if "program_id" in request.data:
+            program_id = request.data.get("program_id")
+            institution_class.program = _get_institution_program_or_404(institution, str(program_id)) if program_id else None
+        if "status" in request.data:
+            institution_class.status = _normalize_academic_status(request.data.get("status"), institution_class.status)
+        if isinstance(request.data.get("schedule"), dict):
+            institution_class.schedule = request.data.get("schedule")
+        if isinstance(request.data.get("metadata"), dict):
+            institution_class.metadata = request.data.get("metadata")
+        if _education_cover_image_in_payload(request.data):
+            cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
+            institution_class.cover_image_url = cover_url
+            if cover_intent is not None:
+                education_media.bind_education_media(intent=cover_intent, target_type="broadcasts.EducationInstitutionClass", target_id=str(institution_class.id))
+        _apply_class_field_updates(institution_class, request.data)
+        institution_class.save()
+        serializer = EducationInstitutionClassSerializer(institution_class)
+        return Response({"class": serializer.data}, status=status.HTTP_200_OK)
+
+    def delete(self, request, institution_id: str, class_id: str):
+        institution = _get_education_institution_or_404(request.user, institution_id)
+        _require_manage_institution_membership(request.user, institution)
+        institution_class = _get_institution_class_or_404(institution, class_id)
+        # Courses/enrollments/staff assignments referencing this class use
+        # on_delete=SET_NULL (see models.py) — deleting a Class detaches
+        # its Courses back to standalone rather than deleting them, and
+        # existing communication (its Group, and any Channel underneath)
+        # is left exactly as-is; nothing here touches those rows.
+        institution_class.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -10835,9 +11251,13 @@ class EducationInstitutionCourseListView(APIView):
         current_membership = _get_institution_membership(request.user, institution)
         if not current_membership:
             raise PermissionDenied("You do not belong to this institution.")
-        qs = institution.courses_v2.select_related("program").order_by("title", "-created_at")
+        qs = institution.courses_v2.select_related("program", "institution_class").order_by("title", "-created_at")
         if current_membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationAcademicRecordStatus.PUBLISHED)
+        if request.query_params.get("program_id"):
+            qs = qs.filter(program_id=request.query_params.get("program_id"))
+        if request.query_params.get("institution_class_id"):
+            qs = qs.filter(institution_class_id=request.query_params.get("institution_class_id"))
         serializer = EducationInstitutionCourseSerializer(qs, many=True)
         return Response({"courses": serializer.data}, status=status.HTTP_200_OK)
 
@@ -10852,6 +11272,11 @@ class EducationInstitutionCourseListView(APIView):
         program_id = request.data.get("program_id")
         if program_id:
             program = _get_institution_program_or_404(institution, str(program_id))
+        institution_class = None
+        institution_class_id = request.data.get("institution_class_id")
+        if institution_class_id:
+            institution_class = _get_institution_class_or_404(institution, str(institution_class_id))
+        institution_class, program, _ = _validate_class_program_course(institution_class, program, None)
         cover_url, cover_intent = _education_cover_image_from_payload(request.data, user=request.user, institution=institution)
         raw_price_amount = request.data.get("price_amount")
         new_status = _normalize_academic_status(request.data.get("status"))
@@ -10860,6 +11285,7 @@ class EducationInstitutionCourseListView(APIView):
         course = EducationInstitutionCourse.objects.create(
             institution=institution,
             program=program,
+            institution_class=institution_class,
             title=title,
             code=str(request.data.get("code") or "").strip(),
             summary=str(request.data.get("summary") or "").strip(),
@@ -10918,6 +11344,13 @@ class EducationInstitutionCourseDetailView(APIView):
         if "program_id" in request.data:
             program_id = request.data.get("program_id")
             course.program = _get_institution_program_or_404(institution, str(program_id)) if program_id else None
+        if "institution_class_id" in request.data:
+            institution_class_id = request.data.get("institution_class_id")
+            course.institution_class = _get_institution_class_or_404(institution, str(institution_class_id)) if institution_class_id else None
+        if "program_id" in request.data or "institution_class_id" in request.data:
+            course.institution_class, course.program, _ = _validate_class_program_course(
+                course.institution_class, course.program, None,
+            )
         if "status" in request.data:
             course.status = _normalize_academic_status(request.data.get("status"), course.status)
         if "duration_minutes" in request.data:
@@ -11827,7 +12260,7 @@ class EducationInstitutionBroadcastListView(APIView):
         if not membership:
             raise PermissionDenied("You do not belong to this institution.")
         qs = institution.education_broadcasts.select_related(
-            "institution", "program", "course", "lesson", "class_session", "event", "created_by"
+            "institution", "program", "institution_class", "course", "lesson", "class_session", "event", "created_by"
         ).order_by("-published_at", "-created_at")
         if request.query_params.get("broadcast_kind"):
             qs = qs.filter(broadcast_kind=_normalize_education_broadcast_kind(request.query_params.get("broadcast_kind")))
@@ -11842,6 +12275,7 @@ class EducationInstitutionBroadcastListView(APIView):
         manager_membership = _require_manage_institution_membership(request.user, institution)
 
         program = None
+        institution_class = None
         course = None
         lesson = None
         class_session = None
@@ -11850,6 +12284,11 @@ class EducationInstitutionBroadcastListView(APIView):
             _nested_payload_value(request.data, "program_id", "programId", "program"),
             "program_id",
             "programId",
+        )
+        institution_class_id = _coerce_payload_id(
+            _nested_payload_value(request.data, "institution_class_id", "institutionClassId", "institution_class"),
+            "institution_class_id",
+            "institutionClassId",
         )
         course_id = _coerce_payload_id(
             _nested_payload_value(request.data, "course_id", "courseId", "course"),
@@ -11873,6 +12312,8 @@ class EducationInstitutionBroadcastListView(APIView):
         )
         if program_id:
             program = _get_institution_program_or_404(institution, str(program_id))
+        if institution_class_id:
+            institution_class = _get_institution_class_or_404(institution, str(institution_class_id))
         if course_id:
             course = _get_institution_course_or_404(institution, str(course_id))
         if lesson_id:
@@ -11889,16 +12330,19 @@ class EducationInstitutionBroadcastListView(APIView):
             lesson=lesson,
             class_session=class_session,
             event=event,
+            institution_class=institution_class,
         )
 
-        program, course = _validate_program_course_pair(program, course)
+        institution_class, program, course = _validate_class_program_course(institution_class, program, course)
         course, lesson = _validate_course_lesson_pair(course, lesson)
-        program, course = _validate_program_course_pair(program, course)
+        institution_class, program, course = _validate_class_program_course(institution_class, program, course)
         program, course, class_session = _validate_event_links(institution, program, course, class_session)
         if broadcast_kind == EducationBroadcastKind.COURSE and not course:
             raise ValidationError({"course_id": "Course is required for course broadcasts."})
         if broadcast_kind == EducationBroadcastKind.PROGRAM and not program:
             raise ValidationError({"program_id": "Program is required for program broadcasts."})
+        if broadcast_kind == EducationBroadcastKind.INSTITUTION_CLASS and not institution_class:
+            raise ValidationError({"institution_class_id": "Class is required for class broadcasts."})
         if broadcast_kind == EducationBroadcastKind.LESSON and not lesson:
             raise ValidationError({"lesson_id": "Lesson is required for lesson broadcasts."})
         if broadcast_kind == EducationBroadcastKind.CLASS_SESSION and not class_session:
@@ -11906,7 +12350,7 @@ class EducationInstitutionBroadcastListView(APIView):
         if broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION} and not event:
             raise ValidationError({"event_id": "Event is required for event/training broadcasts."})
         if broadcast_kind in {EducationBroadcastKind.INSTITUTION_NOTICE, EducationBroadcastKind.INSTITUTION} and any(
-            [program, course, lesson, class_session, event]
+            [program, course, lesson, class_session, event, institution_class]
         ):
             raise ValidationError({"broadcast_kind": "Institution notices/spotlights should not target a specific academic entity."})
         if event and broadcast_kind in {EducationBroadcastKind.EVENT, EducationBroadcastKind.TRAINING_SESSION}:
@@ -11919,6 +12363,7 @@ class EducationInstitutionBroadcastListView(APIView):
         is_institution_level = broadcast_kind in {EducationBroadcastKind.INSTITUTION_NOTICE, EducationBroadcastKind.INSTITUTION}
         default_title = (
             (program.title if program else None)
+            or (institution_class.name if institution_class else None)
             or (course.title if course else None)
             or (lesson.title if lesson else None)
             or (class_session.title if class_session else None)
@@ -11928,6 +12373,7 @@ class EducationInstitutionBroadcastListView(APIView):
         )
         default_summary = (
             (program.summary if program else None)
+            or (institution_class.description if institution_class else None)
             or (course.summary if course else None)
             or (lesson.summary if lesson else None)
             or (class_session.summary if class_session else None)
@@ -11937,6 +12383,7 @@ class EducationInstitutionBroadcastListView(APIView):
         )
         default_description = (
             (program.description if program else None)
+            or (institution_class.description if institution_class else None)
             or (course.description if course else None)
             or (lesson.content if lesson else None)
             or (event.description if event else None)
@@ -11953,7 +12400,10 @@ class EducationInstitutionBroadcastListView(APIView):
         seat_limit = (
             (class_session.seat_limit if class_session else None)
             if class_session
-            else (event.seat_limit if event else (course.seat_limit if course else None))
+            else (
+                event.seat_limit if event
+                else (course.seat_limit if course else (institution_class.seat_limit if institution_class else (program.seat_limit if program else None)))
+            )
         )
         published_at = timezone.now()
         raw_price_amount = _education_price_amount_from_payload(request.data)
@@ -11968,6 +12418,7 @@ class EducationInstitutionBroadcastListView(APIView):
             created_by=request.user,
             broadcast_kind=broadcast_kind,
             program=program,
+            institution_class=institution_class,
             course=course,
             lesson=lesson,
             class_session=class_session,
@@ -12032,6 +12483,13 @@ class EducationInstitutionBroadcastDetailView(APIView):
                 "programId",
             )
             broadcast.program = _get_institution_program_or_404(institution, str(program_id)) if program_id else None
+        if any(key in request.data for key in ("institution_class_id", "institutionClassId", "institution_class")):
+            institution_class_id = _coerce_payload_id(
+                _nested_payload_value(request.data, "institution_class_id", "institutionClassId", "institution_class"),
+                "institution_class_id",
+                "institutionClassId",
+            )
+            broadcast.institution_class = _get_institution_class_or_404(institution, str(institution_class_id)) if institution_class_id else None
         if any(key in request.data for key in ("course_id", "courseId", "course")):
             course_id = _coerce_payload_id(
                 _nested_payload_value(request.data, "course_id", "courseId", "course"),
@@ -12060,9 +12518,13 @@ class EducationInstitutionBroadcastDetailView(APIView):
                 "eventId",
             )
             broadcast.event = _get_institution_event_or_404(institution, str(event_id)) if event_id else None
-        broadcast.program, broadcast.course = _validate_program_course_pair(broadcast.program, broadcast.course)
+        broadcast.institution_class, broadcast.program, broadcast.course = _validate_class_program_course(
+            broadcast.institution_class, broadcast.program, broadcast.course,
+        )
         broadcast.course, broadcast.lesson = _validate_course_lesson_pair(broadcast.course, broadcast.lesson)
-        broadcast.program, broadcast.course = _validate_program_course_pair(broadcast.program, broadcast.course)
+        broadcast.institution_class, broadcast.program, broadcast.course = _validate_class_program_course(
+            broadcast.institution_class, broadcast.program, broadcast.course,
+        )
         broadcast.program, broadcast.course, broadcast.class_session = _validate_event_links(
             institution,
             broadcast.program,
@@ -12077,9 +12539,12 @@ class EducationInstitutionBroadcastDetailView(APIView):
                 lesson=broadcast.lesson,
                 class_session=broadcast.class_session,
                 event=broadcast.event,
+                institution_class=broadcast.institution_class,
             )
         if broadcast.broadcast_kind == EducationBroadcastKind.PROGRAM and not broadcast.program:
             raise ValidationError({"program_id": "Program is required for program broadcasts."})
+        if broadcast.broadcast_kind == EducationBroadcastKind.INSTITUTION_CLASS and not broadcast.institution_class:
+            raise ValidationError({"institution_class_id": "Class is required for class broadcasts."})
         if broadcast.broadcast_kind == EducationBroadcastKind.COURSE and not broadcast.course:
             raise ValidationError({"course_id": "Course is required for course broadcasts."})
         if broadcast.broadcast_kind == EducationBroadcastKind.LESSON and not broadcast.lesson:
@@ -12248,6 +12713,7 @@ class EducationInstitutionBroadcastEnrollmentListView(APIView):
             status=status_value,
             metadata=request.data.get("metadata") if isinstance(request.data.get("metadata"), dict) else {},
         )
+        sync_enrollment_communication(enrollment)
         serializer = EducationInstitutionEnrollmentSerializer(enrollment)
         return Response({"enrollment": serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -12873,6 +13339,7 @@ class EducationProgressView(APIView):
         progress_percent = int(progress_preview.get("progressPercent") or 0)
         metadata["progress_percent"] = progress_percent
 
+        previous_status = enrollment.status
         if valid_item_ids and completed_item_ids == valid_item_ids:
             enrollment.status = EducationEnrollmentStatus.COMPLETED
             if not enrollment.completed_at:
@@ -12883,6 +13350,8 @@ class EducationProgressView(APIView):
 
         enrollment.metadata = metadata
         enrollment.save()
+        if enrollment.status != previous_status:
+            sync_enrollment_communication(enrollment)
 
         progress_payload = _build_learning_progress_payload(broadcast, course_outline, enrollment)
         return Response(
@@ -13230,6 +13699,7 @@ class EducationContentEnrollmentView(APIView):
                     status=EducationEnrollmentStatus.PENDING,
                     metadata={"created_from": "education_discovery_paid"},
                 )
+                sync_enrollment_communication(enrollment)
             has_learning_access = bool(
                 enrollment
                 and enrollment.status in {EducationEnrollmentStatus.ENROLLED, EducationEnrollmentStatus.COMPLETED}
@@ -13283,6 +13753,7 @@ class EducationContentEnrollmentView(APIView):
                 status=status_value,
                 metadata={"created_from": "education_discovery"},
             )
+            sync_enrollment_communication(enrollment)
         outline = _build_public_learning_outline(broadcast, request)
         return Response(
             {

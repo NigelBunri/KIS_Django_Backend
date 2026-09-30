@@ -1486,6 +1486,12 @@ class EducationBroadcastKind(models.TextChoices):
     PROGRAM = "program", "Program"
     COURSE = "course", "Course"
     LESSON = "lesson", "Lesson"
+    # Named distinctly from CLASS_SESSION just below — that's a single
+    # scheduled meeting instance (EducationInstitutionClassSession); this
+    # is a broadcast for an EducationInstitutionClass cohort/group itself
+    # (e.g. "DVM Class of 2029"), matching that model's own field name
+    # (EducationInstitutionBroadcast.institution_class).
+    INSTITUTION_CLASS = "institution_class", "Class"
     CLASS_SESSION = "class_session", "Class Session"
     TRAINING_SESSION = "training_session", "Training Session"
     EVENT = "event", "Event"
@@ -1559,12 +1565,56 @@ class EducationInstitutionProgram(models.Model):
     summary = models.TextField(blank=True, default="")
     description = models.TextField(blank=True, default="")
     cover_image_url = models.URLField(max_length=2048, blank=True, default="")
+    # Free text rather than a constrained enum, deliberately — a Program
+    # spans everything from a kindergarten's "Early Years" program to a
+    # university's PhD, a seminary's ordination track, or a vocational
+    # institute's trade certificate. The frontend offers common presets
+    # (Degree/Diploma/Certificate/Professional/Vocational/Short Program/
+    # Continuing Education) plus free entry; the backend never rejects a
+    # value outside that list.
+    program_type = models.CharField(max_length=64, blank=True, default="")
+    level = models.CharField(max_length=64, blank=True, default="")
+    duration_value = models.PositiveIntegerField(null=True, blank=True)
+    # Also free text for the same reason as program_type/level — "Do not
+    # hard-code duration into years" (a 12-week certificate and a 5-year
+    # degree are both valid Programs).
+    duration_unit = models.CharField(max_length=32, blank=True, default="")
+    department = models.CharField(max_length=255, blank=True, default="")
+    faculty = models.CharField(max_length=255, blank=True, default="")
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    entry_requirements = models.TextField(blank=True, default="")
+    target_audience = models.TextField(blank=True, default="")
+    learning_outcomes = models.JSONField(default=list, blank=True)
+    seat_limit = models.PositiveIntegerField(null=True, blank=True)
+    # Pricing/visibility: same convention as EducationInstitutionCourse
+    # (null/0 price = free, KIS_COIN_CODE default currency, shared
+    # EducationCourseVisibility enum — a Program's visibility means the
+    # same thing a Course's does, no need for a separate enum).
+    price_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    price_currency = models.CharField(max_length=8, blank=True, default=KIS_COIN_CODE)
+    visibility = models.CharField(
+        max_length=16,
+        choices=EducationCourseVisibility.choices,
+        default=EducationCourseVisibility.PUBLIC,
+    )
     status = models.CharField(
         max_length=16,
         choices=EducationAcademicRecordStatus.choices,
         default=EducationAcademicRecordStatus.DRAFT,
     )
     metadata = models.JSONField(default=dict, blank=True)
+    # Stable reference to this program's communication Community — see
+    # EducationInstitutionClass.group's docstring below for why this is a
+    # persisted FK rather than a slug lookup. String ref, same
+    # circular-import-avoidance convention as Group/Channel.
+    community = models.ForeignKey(
+        "communities.Community",
+        on_delete=models.SET_NULL,
+        related_name="education_programs",
+        null=True,
+        blank=True,
+    )
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1578,6 +1628,105 @@ class EducationInstitutionProgram(models.Model):
 
     def __str__(self):
         return self.title
+
+    @property
+    def is_free(self) -> bool:
+        return not self.price_amount or self.price_amount <= 0
+
+
+class EducationInstitutionClass(models.Model):
+    """
+    A learning cohort/group — "Computer Science Year 1", "January 2027
+    Coding Cohort", "Sunday Bible School Class". Sits between Program and
+    Course in the hierarchy but is independently useful on both sides:
+    a Class can exist without a Program (institution.classes), and a
+    Course can exist without a Class (EducationInstitutionCourse
+    .institution_class below) — neither relationship is required, the
+    same optional-FK convention EducationInstitutionCourse.program
+    already uses one field up.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        EducationInstitution,
+        on_delete=models.CASCADE,
+        related_name="classes",
+    )
+    program = models.ForeignKey(
+        EducationInstitutionProgram,
+        on_delete=models.SET_NULL,
+        related_name="classes",
+        null=True,
+        blank=True,
+    )
+    name = models.CharField(max_length=255)
+    code = models.CharField(max_length=64, blank=True, default="")
+    description = models.TextField(blank=True, default="")
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
+    # Free text, same reasoning as EducationInstitutionProgram.program_type
+    # — "Class of 2029", "Level 100", "Executive Cohort 2027" and "January
+    # 2027 Cohort" are all legitimate Classes with no common rigid shape.
+    # The frontend suggests common values (Cohort/Level/Stage/Section/
+    # Term) without the backend enforcing them.
+    class_type = models.CharField(max_length=64, blank=True, default="")
+    level = models.CharField(max_length=64, blank=True, default="")
+    academic_year = models.CharField(max_length=32, blank=True, default="")
+    term = models.CharField(max_length=64, blank=True, default="")
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    seat_limit = models.PositiveIntegerField(null=True, blank=True)
+    visibility = models.CharField(
+        max_length=16,
+        choices=EducationCourseVisibility.choices,
+        default=EducationCourseVisibility.PUBLIC,
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=EducationAcademicRecordStatus.choices,
+        default=EducationAcademicRecordStatus.DRAFT,
+    )
+    # Freeform schedule (meeting days/times, term dates, ...) — a class's
+    # schedule shape varies too much by institution type (a Sunday School
+    # class vs. a coding bootcamp cohort) to model as fixed columns; same
+    # pattern as EducationInstitution.settings/metadata elsewhere in this
+    # file.
+    schedule = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    # Stable reference to this class's communication Group (see
+    # apps/broadcasts/education_communication_sync.py) — persisted
+    # explicitly rather than resolved by slug lookup at read time, so the
+    # link survives the slug ever changing and a single FK hop resolves
+    # it. Null until the institution is connected to a Partner Account
+    # and the sync has actually run at least once. String ref to avoid a
+    # circular import with apps.groups.models, same as Group/Channel's
+    # own "partners.Partner" references.
+    group = models.ForeignKey(
+        "groups.Group",
+        on_delete=models.SET_NULL,
+        related_name="education_classes",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="created_education_classes",
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "education_institution_class"
+        ordering = ["name", "-created_at"]
+        indexes = [
+            models.Index(fields=["institution", "status"]),
+            models.Index(fields=["program", "status"]),
+        ]
+
+    def __str__(self):
+        return self.name
 
 
 class EducationInstitutionStaffAssignment(models.Model):
@@ -1594,6 +1743,13 @@ class EducationInstitutionStaffAssignment(models.Model):
     )
     program = models.ForeignKey(
         "EducationInstitutionProgram",
+        on_delete=models.SET_NULL,
+        related_name="staff_assignments",
+        null=True,
+        blank=True,
+    )
+    institution_class = models.ForeignKey(
+        "EducationInstitutionClass",
         on_delete=models.SET_NULL,
         related_name="staff_assignments",
         null=True,
@@ -1655,6 +1811,7 @@ class EducationInstitutionStaffAssignment(models.Model):
         indexes = [
             models.Index(fields=["institution", "status"]),
             models.Index(fields=["membership", "status"]),
+            models.Index(fields=["institution_class", "status"]),
             models.Index(fields=["course", "status"]),
             models.Index(fields=["class_session", "status"]),
             models.Index(fields=["event", "status"]),
@@ -1675,6 +1832,34 @@ class EducationInstitutionCourse(models.Model):
         EducationInstitutionProgram,
         on_delete=models.SET_NULL,
         related_name="courses",
+        null=True,
+        blank=True,
+    )
+    # Optional — a course can sit inside a class, inside a program with no
+    # class, or fully standalone. Not required to also set `program`: a
+    # class's own `program` FK (if any) is the source of truth for that
+    # relationship, so a course doesn't need to duplicate it.
+    institution_class = models.ForeignKey(
+        "EducationInstitutionClass",
+        on_delete=models.SET_NULL,
+        related_name="courses",
+        null=True,
+        blank=True,
+    )
+    # Stable reference to this course's communication Channel — see
+    # EducationInstitutionClass.group's docstring for why this is a
+    # persisted FK rather than a slug lookup. Distinct from the existing
+    # ad hoc "edu-course-{id}" Group used for the live-class chat/call
+    # room (see courseGroupChat.ts on the frontend and the chat-list
+    # exclusion in apps/chat/views.py) — that one is a lightweight,
+    # always-available classroom room independent of Partner Account
+    # status; this Channel is the richer, Partner-Account-gated
+    # announcement/discussion space, created only once a Partner Account
+    # is connected. The two are allowed to coexist.
+    channel = models.ForeignKey(
+        "channels.Channel",
+        on_delete=models.SET_NULL,
+        related_name="education_courses",
         null=True,
         blank=True,
     )
@@ -1715,6 +1900,7 @@ class EducationInstitutionCourse(models.Model):
             models.Index(fields=["institution", "status"]),
             models.Index(fields=["institution", "code"]),
             models.Index(fields=["program", "status"]),
+            models.Index(fields=["institution_class", "status"]),
             models.Index(fields=["institution", "visibility"]),
         ]
 
@@ -2422,6 +2608,18 @@ class EducationInstitutionBroadcast(models.Model):
         null=True,
         blank=True,
     )
+    # Same convention as `program` just above — publishing a Class must
+    # not tie its lifecycle to the broadcast row's; removing a Class from
+    # broadcast (or deleting the broadcast for any other reason) never
+    # touches the Class, and deleting the Class itself just detaches the
+    # broadcast (SET_NULL) rather than deleting broadcast history.
+    institution_class = models.ForeignKey(
+        "EducationInstitutionClass",
+        on_delete=models.SET_NULL,
+        related_name="broadcasts",
+        null=True,
+        blank=True,
+    )
     course = models.ForeignKey(
         EducationInstitutionCourse,
         on_delete=models.CASCADE,
@@ -2479,6 +2677,7 @@ class EducationInstitutionBroadcast(models.Model):
             models.Index(fields=["institution", "status"]),
             models.Index(fields=["institution", "broadcast_kind"]),
             models.Index(fields=["program", "status"]),
+            models.Index(fields=["institution_class", "status"]),
             models.Index(fields=["published_at"]),
             models.Index(fields=["expires_at"]),
         ]
@@ -2505,6 +2704,13 @@ class EducationInstitutionEnrollment(models.Model):
     )
     program = models.ForeignKey(
         EducationInstitutionProgram,
+        on_delete=models.SET_NULL,
+        related_name="enrollments",
+        null=True,
+        blank=True,
+    )
+    institution_class = models.ForeignKey(
+        EducationInstitutionClass,
         on_delete=models.SET_NULL,
         related_name="enrollments",
         null=True,
@@ -2561,6 +2767,7 @@ class EducationInstitutionEnrollment(models.Model):
             models.Index(fields=["institution", "status"]),
             models.Index(fields=["broadcast", "status"]),
             models.Index(fields=["program", "status"]),
+            models.Index(fields=["institution_class", "status"]),
             models.Index(fields=["user", "status"]),
         ]
 

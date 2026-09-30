@@ -128,6 +128,8 @@ from .views import (
     EducationInstitutionBookingSatisfactionView,
     EducationInstitutionProgramListView,
     EducationInstitutionProgramDetailView,
+    EducationInstitutionClassListView,
+    EducationInstitutionClassDetailView,
     EducationInstitutionCourseListView,
     EducationInstitutionCourseDetailView,
     EducationInstitutionCourseModuleListView,
@@ -535,6 +537,16 @@ urlpatterns = [
         "broadcasts/education/institutions/<uuid:institution_id>/programs/<uuid:program_id>/",
         EducationInstitutionProgramDetailView.as_view(),
         name="education-institution-program-detail",
+    ),
+    path(
+        "broadcasts/education/institutions/<uuid:institution_id>/classes/",
+        EducationInstitutionClassListView.as_view(),
+        name="education-institution-class-list",
+    ),
+    path(
+        "broadcasts/education/institutions/<uuid:institution_id>/classes/<uuid:class_id>/",
+        EducationInstitutionClassDetailView.as_view(),
+        name="education-institution-class-detail",
     ),
     path(
         "broadcasts/education/institutions/<uuid:institution_id>/courses/",

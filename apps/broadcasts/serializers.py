@@ -50,6 +50,7 @@ from .models import (
     EducationInstitutionAssessmentResponse,
     EducationInstitutionAssessmentResponseOption,
     EducationInstitutionBroadcast,
+    EducationBroadcastStatus,
     EducationInstitutionBooking,
     EducationInstitutionEnrollment,
     EducationCourseQuestion,
@@ -57,6 +58,7 @@ from .models import (
     EducationInstitutionEvent,
     EducationInstitutionStaffAssignment,
     EducationInstitutionProgram,
+    EducationInstitutionClass,
     EducationInstitutionCourse,
     EducationInstitutionCourseAccessRequest,
     EducationInstitutionCourseModule,
@@ -1373,6 +1375,26 @@ class EducationInstitutionSerializer(serializers.ModelSerializer):
 
 
 class EducationInstitutionProgramSerializer(serializers.ModelSerializer):
+    community_id = serializers.UUIDField(source="community.id", read_only=True)
+    is_free = serializers.BooleanField(read_only=True)
+    class_count = serializers.SerializerMethodField()
+    course_count = serializers.SerializerMethodField()
+    broadcast_id = serializers.SerializerMethodField()
+
+    def get_class_count(self, instance) -> int:
+        return instance.classes.count()
+
+    def get_broadcast_id(self, instance):
+        # Lets a list row show a live [Remove from Broadcast] control
+        # without a second round-trip per row — same "is this currently
+        # published as a broadcast" question CourseBuilderScreen already
+        # answers per-course, just exposed here for the list view too.
+        active = instance.broadcasts.filter(status=EducationBroadcastStatus.PUBLISHED).order_by("-published_at").first()
+        return str(active.id) if active else None
+
+    def get_course_count(self, instance) -> int:
+        return instance.courses.count()
+
     class Meta:
         model = EducationInstitutionProgram
         fields = [
@@ -1382,8 +1404,28 @@ class EducationInstitutionProgramSerializer(serializers.ModelSerializer):
             "summary",
             "description",
             "cover_image_url",
+            "program_type",
+            "level",
+            "duration_value",
+            "duration_unit",
+            "department",
+            "faculty",
+            "start_date",
+            "end_date",
+            "entry_requirements",
+            "target_audience",
+            "learning_outcomes",
+            "seat_limit",
+            "price_amount",
+            "price_currency",
+            "is_free",
+            "visibility",
             "status",
             "metadata",
+            "community_id",
+            "class_count",
+            "course_count",
+            "broadcast_id",
             "created_at",
             "updated_at",
         ]
@@ -1391,6 +1433,11 @@ class EducationInstitutionProgramSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         payload = super().to_representation(instance)
         payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        duration_label = (
+            f"{payload.get('duration_value')} {payload.get('duration_unit')}".strip()
+            if payload.get("duration_value") and payload.get("duration_unit")
+            else ""
+        )
         return _attach_education_detail_summary(
             payload,
             _education_detail_summary(
@@ -1401,6 +1448,9 @@ class EducationInstitutionProgramSerializer(serializers.ModelSerializer):
                 status=payload.get("status") or "",
                 highlights=[
                     _education_detail_item("Code", payload.get("code")),
+                    _education_detail_item("Type", payload.get("program_type")),
+                    _education_detail_item("Level", payload.get("level")),
+                    _education_detail_item("Duration", duration_label),
                     _education_detail_item("Status", _education_humanize(payload.get("status"))),
                 ],
                 sections=[
@@ -1416,11 +1466,83 @@ class EducationInstitutionProgramSerializer(serializers.ModelSerializer):
         )
 
 
+class EducationInstitutionClassSerializer(serializers.ModelSerializer):
+    program_id = serializers.UUIDField(source="program.id", read_only=True)
+    program_title = serializers.CharField(source="program.title", read_only=True)
+    group_id = serializers.UUIDField(source="group.id", read_only=True)
+    course_count = serializers.SerializerMethodField()
+    broadcast_id = serializers.SerializerMethodField()
+
+    def get_course_count(self, instance) -> int:
+        return instance.courses.count()
+
+    def get_broadcast_id(self, instance):
+        active = instance.broadcasts.filter(status=EducationBroadcastStatus.PUBLISHED).order_by("-published_at").first()
+        return str(active.id) if active else None
+
+    class Meta:
+        model = EducationInstitutionClass
+        fields = [
+            "id",
+            "program_id",
+            "program_title",
+            "group_id",
+            "name",
+            "code",
+            "description",
+            "cover_image_url",
+            "class_type",
+            "level",
+            "academic_year",
+            "term",
+            "start_date",
+            "end_date",
+            "seat_limit",
+            "visibility",
+            "status",
+            "schedule",
+            "metadata",
+            "course_count",
+            "broadcast_id",
+            "created_at",
+            "updated_at",
+        ]
+
+    def to_representation(self, instance):
+        payload = super().to_representation(instance)
+        payload = _attach_education_cover_image(payload, payload.get("cover_image_url") or "", self.context)
+        return _attach_education_detail_summary(
+            payload,
+            _education_detail_summary(
+                module="Class",
+                title=payload.get("name") or "",
+                subtitle=payload.get("program_title") or "Standalone Class",
+                description=payload.get("description") or "",
+                status=payload.get("status") or "",
+                highlights=[
+                    _education_detail_item("Type", payload.get("class_type")),
+                    _education_detail_item("Level", payload.get("level")),
+                    _education_detail_item("Status", _education_humanize(payload.get("status"))),
+                    _education_detail_item("Courses", payload.get("course_count")),
+                ],
+                sections=[
+                    _education_detail_section(
+                        "Overview",
+                        [
+                            _education_detail_item("Description", payload.get("description")),
+                        ],
+                    ),
+                ],
+            ),
+        )
+
+
 class EducationInstitutionStaffAssignmentSerializer(serializers.ModelSerializer):
     membership_id = serializers.UUIDField(source="membership.id", read_only=True)
     user_id = serializers.UUIDField(source="membership.user.id", read_only=True)
     display_name = serializers.SerializerMethodField()
     program_id = serializers.UUIDField(source="program.id", read_only=True, allow_null=True)
+    institution_class_id = serializers.UUIDField(source="institution_class.id", read_only=True, allow_null=True)
     course_id = serializers.UUIDField(source="course.id", read_only=True, allow_null=True)
     class_session_id = serializers.UUIDField(source="class_session.id", read_only=True, allow_null=True)
     event_id = serializers.UUIDField(source="event.id", read_only=True, allow_null=True)
@@ -1434,6 +1556,7 @@ class EducationInstitutionStaffAssignmentSerializer(serializers.ModelSerializer)
             "user_id",
             "display_name",
             "program_id",
+            "institution_class_id",
             "course_id",
             "class_session_id",
             "event_id",
@@ -1453,6 +1576,8 @@ class EducationInstitutionStaffAssignmentSerializer(serializers.ModelSerializer)
 
 class EducationInstitutionCourseSerializer(serializers.ModelSerializer):
     program_id = serializers.UUIDField(source="program.id", read_only=True)
+    institution_class_id = serializers.UUIDField(source="institution_class.id", read_only=True)
+    channel_id = serializers.UUIDField(source="channel.id", read_only=True)
     is_free = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -1460,6 +1585,8 @@ class EducationInstitutionCourseSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "program_id",
+            "institution_class_id",
+            "channel_id",
             "title",
             "code",
             "summary",
@@ -2134,6 +2261,7 @@ class EducationInstitutionEventSerializer(serializers.ModelSerializer):
 
 class EducationInstitutionBroadcastSerializer(serializers.ModelSerializer):
     program_id = serializers.UUIDField(source="program.id", read_only=True, allow_null=True)
+    institution_class_id = serializers.UUIDField(source="institution_class.id", read_only=True, allow_null=True)
     course_id = serializers.UUIDField(source="course.id", read_only=True)
     lesson_id = serializers.UUIDField(source="lesson.id", read_only=True)
     class_session_id = serializers.UUIDField(source="class_session.id", read_only=True)
@@ -2151,6 +2279,7 @@ class EducationInstitutionBroadcastSerializer(serializers.ModelSerializer):
             "created_by_id",
             "broadcast_kind",
             "program_id",
+            "institution_class_id",
             "course_id",
             "lesson_id",
             "class_session_id",
@@ -2221,6 +2350,7 @@ class EducationInstitutionBroadcastSerializer(serializers.ModelSerializer):
 class EducationInstitutionEnrollmentSerializer(serializers.ModelSerializer):
     broadcast_id = serializers.UUIDField(source="broadcast.id", read_only=True)
     program_id = serializers.UUIDField(source="program.id", read_only=True, allow_null=True)
+    institution_class_id = serializers.UUIDField(source="institution_class.id", read_only=True, allow_null=True)
     user_id = serializers.UUIDField(source="user.id", read_only=True)
     course_id = serializers.UUIDField(source="course.id", read_only=True, allow_null=True)
     lesson_id = serializers.UUIDField(source="lesson.id", read_only=True, allow_null=True)
@@ -2233,6 +2363,7 @@ class EducationInstitutionEnrollmentSerializer(serializers.ModelSerializer):
             "id",
             "broadcast_id",
             "program_id",
+            "institution_class_id",
             "user_id",
             "course_id",
             "lesson_id",
