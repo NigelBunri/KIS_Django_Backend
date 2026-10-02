@@ -19,6 +19,7 @@ from .models import (
     ProductQuestion,
     ProductRating,
     ProductReview,
+    ProductReviewReport,
     ProductShare,
     ProductSubscription,
     ProductVariant,
@@ -188,9 +189,16 @@ class ProductRatingAdmin(admin.ModelAdmin):
 
 @admin.register(ProductReview)
 class ProductReviewAdmin(admin.ModelAdmin):
-    list_display = ('id', 'product', 'user', 'rating', 'status', 'helpful_count', 'created_at')
-    list_filter = ('status', 'rating')
+    list_display = ('id', 'product', 'user', 'rating', 'status', 'is_verified_purchase', 'report_count', 'helpful_count', 'created_at')
+    list_filter = ('status', 'rating', 'is_verified_purchase')
     search_fields = ('product__name', 'user__username', 'title', 'body')
+
+
+@admin.register(ProductReviewReport)
+class ProductReviewReportAdmin(admin.ModelAdmin):
+    list_display = ('id', 'review', 'reporter', 'reason', 'created_at')
+    list_filter = ('reason',)
+    search_fields = ('review__product__name', 'reporter__username', 'notes')
 
 
 @admin.register(ProductQuestion)

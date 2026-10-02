@@ -707,6 +707,27 @@ def _provider_can_manage_shop(user, shop):
     return False
 
 
+def _is_verified_purchase(user, product) -> bool:
+    """Whether this user has a real, paid-or-further order containing this
+    product - computed once at review-creation time from
+    MarketplaceOrderItem history, never from client input. TEMPORAL orders
+    (payment not yet completed) and CANCELLED orders don't count; a later
+    refund/return doesn't retroactively strip an already-granted badge."""
+    if not user or getattr(user, "is_anonymous", False):
+        return False
+    qualifying_statuses = {
+        MarketplaceOrderStatus.AWAITING_SATISFACTION,
+        MarketplaceOrderStatus.SATISFIED,
+        MarketplaceOrderStatus.COMPLETED,
+        MarketplaceOrderStatus.COMPLAINT,
+    }
+    return MarketplaceOrderItem.objects.filter(
+        product=product,
+        order__buyer=user,
+        order__status__in=qualifying_statuses,
+    ).exists()
+
+
 def provider_complete_marketplace_order_by_id(*, order_id, provider):
     order = MarketplaceOrder.objects.select_related('shop').filter(id=order_id).first()
     if not order:

@@ -40,6 +40,7 @@ Security & authenticity recommended next steps:
 
 from datetime import timedelta
 import uuid
+from django.contrib.postgres.indexes import GinIndex
 from django.db import models
 from django.db.models import JSONField as DjangoJSONField
 from django.conf import settings
@@ -755,6 +756,7 @@ class Product(BaseEntity):
             models.Index(fields=['slug']),
             models.Index(fields=['shop', 'is_active']),
             models.Index(fields=['inventory_type']),
+            GinIndex(fields=['name'], name='commerce_product_name_trgm', opclasses=['gin_trgm_ops']),
         ]
         ordering = ['-created_at']
 
@@ -990,6 +992,18 @@ class ProductReview(BaseEntity):
     status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_PUBLISHED, db_index=True)
     helpful_count = models.PositiveIntegerField(default=0)
     metadata = JSONField(default=dict, blank=True)
+    # Computed once at creation from real MarketplaceOrderItem history - never
+    # client-supplied, never re-derived later (a later refund/return doesn't
+    # retroactively strip the badge, matching Amazon's own behavior).
+    is_verified_purchase = models.BooleanField(default=False, db_index=True)
+    image_urls = JSONField(default=list, blank=True)
+    seller_response = models.TextField(blank=True, default='')
+    seller_response_at = models.DateTimeField(null=True, blank=True)
+    seller_response_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='commerce_product_review_responses',
+    )
+    report_count = models.PositiveIntegerField(default=0)
 
     class Meta:
         unique_together = ('product', 'user')
@@ -1000,6 +1014,31 @@ class ProductReview(BaseEntity):
 
     def __str__(self):
         return f"Review {self.rating} for {self.product_id} by {self.user_id}"
+
+
+class ProductReviewReportReason(models.TextChoices):
+    SPAM = 'spam', 'Spam or advertising'
+    OFFENSIVE = 'offensive', 'Offensive content'
+    FAKE = 'fake', 'Suspected fake review'
+    IRRELEVANT = 'irrelevant', 'Not about this product'
+    OTHER = 'other', 'Other'
+
+
+class ProductReviewReport(BaseEntity):
+    """One user's abuse report against a review. Distinct from
+    ProductReview.report_count (a denormalized tally kept in sync here) so
+    moderators can see who reported what and why, not just a number."""
+    review = models.ForeignKey(ProductReview, on_delete=models.CASCADE, related_name='reports')
+    reporter = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='commerce_review_reports')
+    reason = models.CharField(max_length=20, choices=ProductReviewReportReason.choices, default=ProductReviewReportReason.OTHER)
+    notes = models.TextField(blank=True, default='')
+
+    class Meta:
+        unique_together = ('review', 'reporter')
+        indexes = [models.Index(fields=['review'])]
+
+    def __str__(self):
+        return f"Report on review {self.review_id} by {self.reporter_id}"
 
 
 class ProductQuestion(BaseEntity):

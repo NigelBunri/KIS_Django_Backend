@@ -516,6 +516,8 @@ class ProductRatingSerializer(serializers.ModelSerializer):
 class ProductReviewSerializer(serializers.ModelSerializer):
     user = serializers.SerializerMethodField()
     product_name = serializers.CharField(source='product.name', read_only=True)
+    image_urls = serializers.ListField(child=serializers.URLField(), required=False, default=list)
+    seller_response_by = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductReview
@@ -527,12 +529,27 @@ class ProductReviewSerializer(serializers.ModelSerializer):
             'rating',
             'title',
             'body',
+            'image_urls',
             'status',
             'helpful_count',
+            'is_verified_purchase',
+            'seller_response',
+            'seller_response_at',
+            'seller_response_by',
+            'report_count',
             'created_at',
             'updated_at',
         )
-        read_only_fields = ('id', 'user', 'status', 'helpful_count', 'created_at', 'updated_at')
+        read_only_fields = (
+            'id', 'user', 'status', 'helpful_count', 'is_verified_purchase',
+            'seller_response', 'seller_response_at', 'seller_response_by',
+            'report_count', 'created_at', 'updated_at',
+        )
+
+    def get_seller_response_by(self, obj):
+        if not obj.seller_response_by_id:
+            return None
+        return _public_user_summary(obj.seller_response_by)
 
     def get_user(self, obj):
         return _public_user_summary(getattr(obj, 'user', None))
@@ -540,6 +557,11 @@ class ProductReviewSerializer(serializers.ModelSerializer):
     def validate_rating(self, value):
         if value < 1 or value > 5:
             raise serializers.ValidationError('Rating must be between 1 and 5.')
+        return value
+
+    def validate_image_urls(self, value):
+        if len(value) > 5:
+            raise serializers.ValidationError('A review can include at most 5 images.')
         return value
 
     def validate(self, attrs):

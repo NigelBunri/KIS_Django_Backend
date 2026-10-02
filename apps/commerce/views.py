@@ -13,6 +13,7 @@ from django.conf import settings
 from django.shortcuts import get_object_or_404
 from django.db import transaction
 from django.db.models import Q
+from django.contrib.postgres.search import TrigramSimilarity
 from django.http import FileResponse
 from django.utils import timezone
 
@@ -50,6 +51,8 @@ from .models import (
     FraudSignal,
     ProductRating,
     ProductReview,
+    ProductReviewReport,
+    ProductReviewReportReason,
     ProductQuestion,
     SavedItem,
     ShopService,
@@ -74,6 +77,7 @@ from .services import (
     provider_complete_marketplace_order_by_id,
     create_marketplace_complaint_from_data,
     _provider_can_manage_shop,
+    _is_verified_purchase,
 )
 from apps.verification.serializers import validate_private_evidence_metadata
 from apps.verification.services import sync_shop_verification_request
@@ -1143,13 +1147,21 @@ class ProductViewSet(viewsets.ModelViewSet):
                 qs = qs.none()
         query = str(self.request.query_params.get("q") or self.request.query_params.get("search") or "").strip()
         if query:
-            qs = qs.filter(
+            # Exact/substring matches (name/description/sku/shop/category)
+            # are kept exactly as before - precise and fast. Trigram
+            # similarity on name is added on top to catch typos ("wdiget"
+            # still finds "widget") and to rank exact-field matches above
+            # weaker fuzzy ones rather than falling back to recency, which
+            # told the buyer nothing about how well a result actually
+            # matched what they typed.
+            qs = qs.annotate(_name_similarity=TrigramSimilarity("name", query)).filter(
                 Q(name__icontains=query)
                 | Q(description__icontains=query)
                 | Q(sku__icontains=query)
                 | Q(shop__name__icontains=query)
                 | Q(catalog_categories__name__icontains=query)
-            ).distinct()
+                | Q(_name_similarity__gt=0.3)
+            ).distinct().order_by("-_name_similarity", "-created_at")
         category = self.request.query_params.get("category")
         if category:
             # Frontends pass the human-readable slug (the only thing
@@ -1890,9 +1902,13 @@ class ProductReviewViewSet(viewsets.ModelViewSet):
         product = serializer.validated_data.get('product')
         if not product or not getattr(product, 'is_active', False):
             raise ValidationError({'product': 'Product is unavailable.'})
+        # Computed server-side from real order history - never trust a
+        # client-supplied is_verified_purchase flag.
+        verified = _is_verified_purchase(self.request.user, product)
         serializer.save(
             user=self.request.user,
             status=ProductReview.STATUS_PUBLISHED,
+            is_verified_purchase=verified,
             metadata={'source': 'commerce_product_detail'},
         )
 
@@ -1902,6 +1918,46 @@ class ProductReviewViewSet(viewsets.ModelViewSet):
         review.helpful_count = (review.helpful_count or 0) + 1
         review.save(update_fields=['helpful_count', 'updated_at'])
         return Response({'helpful_count': review.helpful_count})
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def respond(self, request, pk=None):
+        # get_object() already applies get_queryset()'s scoping, so this
+        # 404s for a review a non-staff user can't see at all before the
+        # seller-ownership check below ever runs.
+        review = self.get_object()
+        if not _provider_can_manage_shop(request.user, review.product.shop) and not request.user.is_staff:
+            raise PermissionDenied('Only the seller, a shop manager, or staff can respond to this review.')
+        text = str(request.data.get('response') or '').strip()
+        if len(text) < 2:
+            raise ValidationError({'response': 'Provide a response.'})
+        review.seller_response = text
+        review.seller_response_at = timezone.now()
+        review.seller_response_by = request.user
+        review.save(update_fields=['seller_response', 'seller_response_at', 'seller_response_by', 'updated_at'])
+        return Response(self.get_serializer(review).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def report(self, request, pk=None):
+        review = self.get_object()
+        reason = str(request.data.get('reason') or 'other').strip()
+        valid_reasons = {c for c, _ in ProductReviewReportReason.choices}
+        if reason not in valid_reasons:
+            reason = ProductReviewReportReason.OTHER
+        _, created = ProductReviewReport.objects.get_or_create(
+            review=review, reporter=request.user,
+            defaults={'reason': reason, 'notes': str(request.data.get('notes') or '')[:2000]},
+        )
+        if created:
+            review.report_count = review.reports.count()
+            update_fields = ['report_count', 'updated_at']
+            # Auto-flag for moderator review past a small threshold - this
+            # is the "fraud signal" half of reporting; it hides the review
+            # pending a human look rather than deleting it outright.
+            if review.report_count >= 5 and review.status == ProductReview.STATUS_PUBLISHED:
+                review.status = ProductReview.STATUS_PENDING
+                update_fields.append('status')
+            review.save(update_fields=update_fields)
+        return Response({'report_count': review.report_count, 'created': created})
 
 
 @class_doc_decorator('Product Questions')
