@@ -662,3 +662,102 @@ class HealthOpsWorkflowRuntimeTests(APITestCase):
 
         self.assertEqual(start_response.status_code, status.HTTP_403_FORBIDDEN, start_response.data)
         self.assertEqual(start_response.data["code"], "legacy_health_wallet_checkout_disabled")
+
+
+class HealthOpsPartnerMembershipSyncTests(APITestCase):
+    """A patient starting a service workflow (the closest Health analog to
+    an Education 'enrollment') should be added to the institution's
+    Partner Account when one is connected, and notified - see
+    apps.health_ops.partner_sync.sync_patient_partner_membership, called
+    from _start_workflow_session."""
+
+    def setUp(self):
+        from apps.partners.models import Partner
+
+        self.client = APIClient()
+        self.owner = _create_user("+237690700201", "partner_sync_owner")
+        self.user = _create_user("+237690700202", "partner_sync_user")
+        self.partner = Partner.objects.create(owner=self.owner, name="Sunrise Health Group", slug="sunrise-health-group")
+        self.institution = HealthInstitution.objects.create(
+            owner=self.owner, name="Partner Sync Clinic", slug="partner-sync-clinic",
+            institution_type="hospital", timezone="UTC", settings={}, is_active=True,
+            partner=self.partner,
+        )
+        self.service = HealthService.objects.create(
+            institution=self.institution, name="General Checkup", description="", is_active=True,
+            requires_assessment=False, assessment_schema={}, base_cost_micro=0,
+        )
+        engine = _seed_engine("partner_sync_checkup", "Partner Sync Checkup", ["review"])
+        ServiceEngineMap.objects.create(
+            service=self.service, engine=engine, execution_order=1, config={}, cost_micro=0,
+            is_required=True, access_window_days=2, completion_mode=EngineCompletionMode.STEP_PROGRESS,
+        )
+        HealthInstitutionMembership.objects.create(
+            institution=self.institution, user=self.user, role=MembershipRole.MEMBER, is_active=True,
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_starting_a_workflow_session_adds_user_to_the_partner_account(self):
+        from apps.partners.models import PartnerMembership, PartnerMembershipStatus
+
+        response = self.client.post(
+            reverse("health-ops-session-start"),
+            {"institution_id": str(self.institution.id), "service_id": str(self.service.id)},
+            format="json", secure=True,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(
+            PartnerMembership.objects.filter(partner=self.partner, user=self.user, status=PartnerMembershipStatus.MEMBER).exists()
+        )
+
+    def test_starting_a_workflow_session_notifies_with_the_partner_as_target(self):
+        from apps.notifications.models import Notification
+
+        response = self.client.post(
+            reverse("health-ops-session-start"),
+            {"institution_id": str(self.institution.id), "service_id": str(self.service.id)},
+            format="json", secure=True,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        notif = Notification.objects.get(user_id=self.user.id, type="HEALTH_PARTNER_MEMBERSHIP_ADDED")
+        self.assertEqual(notif.target_type, "partner")
+        self.assertEqual(str(notif.target_id), str(self.partner.id))
+
+    def test_no_partner_membership_without_a_connected_partner(self):
+        from apps.partners.models import PartnerMembership
+
+        self.institution.partner = None
+        self.institution.save(update_fields=["partner"])
+        response = self.client.post(
+            reverse("health-ops-session-start"),
+            {"institution_id": str(self.institution.id), "service_id": str(self.service.id)},
+            format="json", secure=True,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertFalse(PartnerMembership.objects.filter(user=self.user).exists())
+
+    def test_resuming_an_already_synced_user_does_not_send_a_second_notification(self):
+        from apps.notifications.models import Notification
+
+        self.client.post(
+            reverse("health-ops-session-start"),
+            {"institution_id": str(self.institution.id), "service_id": str(self.service.id)},
+            format="json", secure=True,
+        )
+        other_service = HealthService.objects.create(
+            institution=self.institution, name="Follow-up Visit", description="", is_active=True,
+            requires_assessment=False, assessment_schema={}, base_cost_micro=0,
+        )
+        other_engine = _seed_engine("partner_sync_followup", "Partner Sync Follow-up", ["review"])
+        ServiceEngineMap.objects.create(
+            service=other_service, engine=other_engine, execution_order=1, config={}, cost_micro=0,
+            is_required=True, access_window_days=2, completion_mode=EngineCompletionMode.STEP_PROGRESS,
+        )
+        self.client.post(
+            reverse("health-ops-session-start"),
+            {"institution_id": str(self.institution.id), "service_id": str(other_service.id)},
+            format="json", secure=True,
+        )
+        self.assertEqual(
+            Notification.objects.filter(user_id=self.user.id, type="HEALTH_PARTNER_MEMBERSHIP_ADDED").count(), 1,
+        )

@@ -55,6 +55,7 @@ from apps.communities.models import (
 )
 from apps.groups.models import Group, GroupMembership, GroupRole
 from apps.channels.models import Channel
+from apps.partners.models import PartnerMembership, PartnerMembershipStatus
 
 from .models import EducationEnrollmentStatus, EducationInstitutionStaffAssignmentStatus
 
@@ -195,12 +196,95 @@ _ACTIVE_ENROLLMENT_STATUSES = {
 }
 
 
+def _ensure_partner_membership(institution, user) -> bool:
+    """Adds the user to the institution's Partner Account itself, not just
+    one of its Community/Group/Channel spaces — this is what lets them
+    show up under the Partner's own member list and be reachable from the
+    Partner sections in general, same idea as the existing lesson-
+    enrollment -> PartnerMembership(lesson_access_only=True) pattern in
+    LessonEnrollmentActionView.ensure_lesson_memberships, just for the
+    Institution/Program/Class/Course enrollment system instead of the
+    legacy standalone-lesson one. Idempotent (get_or_create on the
+    partner+user unique_together) and never removes membership on its
+    own - losing access to one course/class shouldn't silently evict
+    someone who may still be active elsewhere at the same institution;
+    removal is left to explicit partner-membership management. Returns
+    whether a new row was actually created, so the caller can notify only
+    once per real addition rather than on every idempotent re-sync."""
+    if not institution.partner_id:
+        return False
+    _membership, created = PartnerMembership.objects.get_or_create(
+        partner=institution.partner,
+        user=user,
+        defaults={"status": PartnerMembershipStatus.MEMBER},
+    )
+    return created
+
+
+def _most_specific_conversation_id(*, course=None, institution_class=None):
+    """Same course > class specificity order used throughout this module -
+    the conversation a 'you've been added' notification should open
+    straight into. Program-only (Community) has no Conversation-backed
+    room of its own, so callers fall back to the Partner itself for that
+    case (see _notify_added_to_partner)."""
+    if course is not None and course.channel_id:
+        return course.channel.conversation_id
+    if institution_class is not None and institution_class.group_id:
+        return institution_class.group.conversation_id
+    return None
+
+
+def _notify_added_to_partner(*, institution, user, label: str, course=None, institution_class=None) -> None:
+    """Tells the learner/staffer they've been added to the institution's
+    Partner Account, and gets them straight to where the actual
+    conversation lives when there is one (the Channel/Group this specific
+    enrollment/assignment unlocked) - falling back to the Partner itself
+    (the one target every notification type below Education already knows
+    how to route to - see ProfileNotificationDetailScreen.tsx's
+    buildRouteNotificationData) when the entity is Program-only and so has
+    only a Community, not a Conversation-backed room."""
+    if not institution.partner_id:
+        return
+    from apps.notifications.services import create_notification
+
+    conversation_id = _most_specific_conversation_id(course=course, institution_class=institution_class)
+    title = f"You've been added to {label}"
+    body = f"{institution.name} added you to its Partner Account — tap to start the conversation."
+    if conversation_id:
+        create_notification(
+            user_id=user.id,
+            type="EDUCATION_PARTNER_MEMBERSHIP_ADDED",
+            title=title,
+            body=body,
+            target_type="conversation",
+            target_id=str(conversation_id),
+            priority="MEDIUM",
+            dedup_key=f"education_partner_added:{institution.partner_id}:{user.id}:{conversation_id}",
+            context={"institution_id": str(institution.id), "partner_id": str(institution.partner_id)},
+        )
+    else:
+        create_notification(
+            user_id=user.id,
+            type="EDUCATION_PARTNER_MEMBERSHIP_ADDED",
+            title=title,
+            body=body,
+            target_type="partner",
+            target_id=str(institution.partner_id),
+            priority="MEDIUM",
+            dedup_key=f"education_partner_added:{institution.partner_id}:{user.id}",
+            context={"institution_id": str(institution.id)},
+        )
+
+
 def sync_enrollment_communication(enrollment) -> None:
     active = enrollment.status in _ACTIVE_ENROLLMENT_STATUSES
     user = enrollment.user
+    newly_added_to_partner = _ensure_partner_membership(enrollment.institution, user) if active else False
+
+    course = enrollment.course if enrollment.course_id else None
+    institution_class = enrollment.institution_class if enrollment.institution_class_id else None
 
     if enrollment.course_id:
-        course = enrollment.course
         if active:
             channel = ensure_course_channel(course)
             if channel:
@@ -209,7 +293,6 @@ def sync_enrollment_communication(enrollment) -> None:
             _leave_conversation(course.channel.conversation, user)
 
     if enrollment.institution_class_id:
-        institution_class = enrollment.institution_class
         if active:
             group = ensure_class_group(institution_class)
             if group:
@@ -226,6 +309,15 @@ def sync_enrollment_communication(enrollment) -> None:
         elif program.community_id:
             _leave_community(program.community, user)
 
+    if newly_added_to_partner:
+        label = course.title if course else institution_class.name if institution_class else (
+            enrollment.program.title if enrollment.program_id else enrollment.institution.name
+        )
+        _notify_added_to_partner(
+            institution=enrollment.institution, user=user, label=label,
+            course=course, institution_class=institution_class,
+        )
+
 
 def sync_staff_assignment_communication(assignment) -> None:
     """Adds the assigned user as an *admin* of whichever communication
@@ -238,21 +330,33 @@ def sync_staff_assignment_communication(assignment) -> None:
     if assignment.status != EducationInstitutionStaffAssignmentStatus.ACTIVE:
         return
     user = assignment.membership.user
+    newly_added_to_partner = _ensure_partner_membership(assignment.institution, user)
+
+    course = assignment.course if assignment.course_id else None
+    institution_class = assignment.institution_class if assignment.institution_class_id else None
+    label = assignment.institution.name
 
     if assignment.course_id:
-        channel = ensure_course_channel(assignment.course)
+        channel = ensure_course_channel(course)
         if channel:
             _grant_conversation_admin(channel.conversation, user)
-        return
-    if assignment.institution_class_id:
-        group = ensure_class_group(assignment.institution_class)
+        label = course.title
+    elif assignment.institution_class_id:
+        group = ensure_class_group(institution_class)
         if group:
             _grant_group_admin(group, user)
-        return
-    if assignment.program_id:
+        label = institution_class.name
+    elif assignment.program_id:
         community = ensure_program_community(assignment.program)
         if community:
             _grant_community_admin(community, user)
+        label = assignment.program.title
+
+    if newly_added_to_partner:
+        _notify_added_to_partner(
+            institution=assignment.institution, user=user, label=label,
+            course=course, institution_class=institution_class,
+        )
 
 
 def revoke_staff_assignment_communication(assignment) -> None:
@@ -268,6 +372,29 @@ def revoke_staff_assignment_communication(assignment) -> None:
         _revoke_group_admin(assignment.institution_class.group, user)
     if assignment.program_id and assignment.program.community_id:
         _revoke_community_admin(assignment.program.community, user)
+
+
+def on_institution_partner_connected(institution) -> None:
+    """The symmetric counterpart to on_institution_partner_disconnected —
+    runs once, right after institution.partner is set. Found missing
+    during the university-scale acceptance test: an institution that
+    builds its full catalog and enrolls learners/staff *before* ever
+    connecting a Partner Account (a completely normal real-world
+    sequence) would otherwise have every one of those already-active
+    enrollments/assignments silently stranded with no communication
+    access — every ensure_*/sync_* function above only ever fires on a
+    *new* enrollment/assignment event, never retroactively. This backfills
+    exactly once at connect time; every call inside is already idempotent
+    (ensure_* reuses an existing room, sync_* reuses existing membership),
+    so re-running this (e.g. disconnect then reconnect) is always safe."""
+    for enrollment in institution.enrollments.filter(
+        status__in={EducationEnrollmentStatus.ENROLLED, EducationEnrollmentStatus.COMPLETED},
+    ).select_related("program", "institution_class", "course"):
+        sync_enrollment_communication(enrollment)
+    for assignment in institution.staff_assignments.filter(
+        status=EducationInstitutionStaffAssignmentStatus.ACTIVE,
+    ).select_related("membership__user", "program", "institution_class", "course"):
+        sync_staff_assignment_communication(assignment)
 
 
 def on_institution_partner_disconnected(institution) -> None:

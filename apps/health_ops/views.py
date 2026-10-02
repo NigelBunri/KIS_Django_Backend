@@ -758,6 +758,8 @@ def _start_workflow_session(
         assessment_completed=not service.requires_assessment,
         metadata=metadata,
     )
+    from apps.health_ops.partner_sync import sync_patient_partner_membership
+    sync_patient_partner_membership(institution=institution, user=user, label=service.name)
 
     now_value = timezone.now()
     sessions: list[EngineSession] = []

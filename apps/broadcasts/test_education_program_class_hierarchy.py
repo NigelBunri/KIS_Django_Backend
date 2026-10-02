@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from django.contrib.auth import get_user_model
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from apps.broadcasts.models import (
     EducationAcademicRecordStatus,
@@ -15,6 +15,7 @@ from apps.broadcasts.models import (
     EducationInstitutionCourse,
     EducationInstitutionEnrollment,
     EducationInstitutionMembership,
+    EducationInstitutionMembershipPolicy,
     EducationInstitutionMembershipRole,
     EducationInstitutionMembershipStatus,
     EducationInstitutionProgram,
@@ -35,7 +36,7 @@ from apps.channels.models import Channel
 from apps.chat.models import ConversationMember
 from apps.communities.models import Community, CommunityMembership, CommunityMembershipStatus, CommunityRole
 from apps.groups.models import Group, GroupMembership, GroupRole
-from apps.partners.models import Partner
+from apps.partners.models import Partner, PartnerMembership, PartnerMembershipStatus
 
 
 def _make_user(User, phone_suffix: str, username: str):
@@ -437,6 +438,122 @@ class EducationCommunicationSyncPropagationTests(APITestCase):
         )
 
 
+    def test_active_enrollment_adds_user_to_the_partner_account(self):
+        enrollment = EducationInstitutionEnrollment.objects.create(
+            institution=self.institution, broadcast=self.broadcast, program=self.program, course=self.course,
+            institution_class=self.institution_class, user=self.learner,
+            status=EducationEnrollmentStatus.ENROLLED,
+        )
+        sync_enrollment_communication(enrollment)
+        self.assertTrue(
+            PartnerMembership.objects.filter(partner=self.partner, user=self.learner, status=PartnerMembershipStatus.MEMBER).exists()
+        )
+
+    def test_pending_enrollment_does_not_add_to_partner_account(self):
+        enrollment = EducationInstitutionEnrollment.objects.create(
+            institution=self.institution, broadcast=self.broadcast, program=self.program, course=self.course,
+            user=self.learner, status=EducationEnrollmentStatus.PENDING,
+        )
+        sync_enrollment_communication(enrollment)
+        self.assertFalse(PartnerMembership.objects.filter(partner=self.partner, user=self.learner).exists())
+
+    def test_cancelling_enrollment_does_not_remove_existing_partner_membership(self):
+        # Losing access to one course shouldn't silently evict someone who
+        # may still be legitimately active elsewhere at the same
+        # institution - see _ensure_partner_membership's docstring.
+        enrollment = EducationInstitutionEnrollment.objects.create(
+            institution=self.institution, broadcast=self.broadcast, program=self.program, course=self.course,
+            user=self.learner, status=EducationEnrollmentStatus.ENROLLED,
+        )
+        sync_enrollment_communication(enrollment)
+        self.assertTrue(PartnerMembership.objects.filter(partner=self.partner, user=self.learner).exists())
+
+        enrollment.status = EducationEnrollmentStatus.CANCELLED
+        enrollment.save(update_fields=['status'])
+        sync_enrollment_communication(enrollment)
+        self.assertTrue(PartnerMembership.objects.filter(partner=self.partner, user=self.learner).exists())
+
+    def test_active_staff_assignment_adds_user_to_the_partner_account(self):
+        membership = self.institution.memberships.get(user=self.staffer)
+        assignment = EducationInstitutionStaffAssignment.objects.create(
+            institution=self.institution, membership=membership, institution_class=self.institution_class,
+            role=EducationInstitutionStaffAssignmentRole.INSTRUCTOR, status=EducationInstitutionStaffAssignmentStatus.ACTIVE,
+        )
+        sync_staff_assignment_communication(assignment)
+        self.assertTrue(
+            PartnerMembership.objects.filter(partner=self.partner, user=self.staffer, status=PartnerMembershipStatus.MEMBER).exists()
+        )
+
+    def test_course_enrollment_notifies_with_the_channel_conversation_as_target(self):
+        from apps.notifications.models import Notification
+        enrollment = EducationInstitutionEnrollment.objects.create(
+            institution=self.institution, broadcast=self.broadcast, program=self.program, course=self.course,
+            institution_class=self.institution_class, user=self.learner,
+            status=EducationEnrollmentStatus.ENROLLED,
+        )
+        sync_enrollment_communication(enrollment)
+        self.course.refresh_from_db()
+        notif = Notification.objects.get(user_id=self.learner.id, type='EDUCATION_PARTNER_MEMBERSHIP_ADDED')
+        self.assertEqual(notif.target_type, 'conversation')
+        self.assertEqual(str(notif.target_id), str(self.course.channel.conversation_id))
+
+    def test_program_only_enrollment_notifies_with_the_partner_as_target(self):
+        from apps.notifications.models import Notification
+        program_broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=self.institution, created_by=self.owner, broadcast_kind=EducationBroadcastKind.PROGRAM,
+            program=self.program,
+        )
+        enrollment = EducationInstitutionEnrollment.objects.create(
+            institution=self.institution, broadcast=program_broadcast, program=self.program, user=self.learner,
+            status=EducationEnrollmentStatus.ENROLLED,
+        )
+        sync_enrollment_communication(enrollment)
+        notif = Notification.objects.get(user_id=self.learner.id, type='EDUCATION_PARTNER_MEMBERSHIP_ADDED')
+        self.assertEqual(notif.target_type, 'partner')
+        self.assertEqual(str(notif.target_id), str(self.partner.id))
+
+    def test_resyncing_an_already_added_enrollment_does_not_send_a_second_notification(self):
+        from apps.notifications.models import Notification
+        enrollment = EducationInstitutionEnrollment.objects.create(
+            institution=self.institution, broadcast=self.broadcast, program=self.program, course=self.course,
+            user=self.learner, status=EducationEnrollmentStatus.ENROLLED,
+        )
+        sync_enrollment_communication(enrollment)
+        sync_enrollment_communication(enrollment)
+        sync_enrollment_communication(enrollment)
+        self.assertEqual(
+            Notification.objects.filter(user_id=self.learner.id, type='EDUCATION_PARTNER_MEMBERSHIP_ADDED').count(), 1,
+        )
+
+    def test_staff_assignment_notifies_on_first_add(self):
+        from apps.notifications.models import Notification
+        membership = self.institution.memberships.get(user=self.staffer)
+        assignment = EducationInstitutionStaffAssignment.objects.create(
+            institution=self.institution, membership=membership, institution_class=self.institution_class,
+            role=EducationInstitutionStaffAssignmentRole.INSTRUCTOR, status=EducationInstitutionStaffAssignmentStatus.ACTIVE,
+        )
+        sync_staff_assignment_communication(assignment)
+        self.institution_class.refresh_from_db()
+        notif = Notification.objects.get(user_id=self.staffer.id, type='EDUCATION_PARTNER_MEMBERSHIP_ADDED')
+        self.assertEqual(notif.target_type, 'conversation')
+        self.assertEqual(str(notif.target_id), str(self.institution_class.group.conversation_id))
+
+    def test_no_partner_membership_created_without_a_partner(self):
+        unpartnered = EducationInstitution.objects.create(owner=self.owner, name='No Partner Membership Academy')
+        program = EducationInstitutionProgram.objects.create(institution=unpartnered, title='No Partner Program 2')
+        broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=unpartnered, created_by=self.owner, broadcast_kind=EducationBroadcastKind.PROGRAM, program=program,
+        )
+        enrollment = EducationInstitutionEnrollment.objects.create(
+            institution=unpartnered, broadcast=broadcast, program=program, user=self.learner,
+            status=EducationEnrollmentStatus.ENROLLED,
+        )
+        sync_enrollment_communication(enrollment)
+        self.assertFalse(PartnerMembership.objects.filter(user=self.learner).exists())
+        from apps.notifications.models import Notification
+        self.assertFalse(Notification.objects.filter(user_id=self.learner.id, type='EDUCATION_PARTNER_MEMBERSHIP_ADDED').exists())
+
+
 class EducationPartnerDisconnectTests(APITestCase):
     """Task: 'Disconnecting a Partner Account must NOT delete Education
     data, students, enrollments, Courses, Classes, or Programs.'"""
@@ -621,6 +738,176 @@ class EducationHierarchyDiscoveryAndDashboardTests(APITestCase):
         self.assertEqual(summary['classCount'], 1)
 
 
+class EducationRealEnrollmentInstitutionClassPropagationTests(APITestCase):
+    """Regression found via the university-scale acceptance test: a
+    learner enrolling through the REAL public enroll endpoint
+    (EducationContentEnrollmentView / the "self-enroll" broadcast
+    endpoints) against a Class-kind broadcast never got
+    enrollment.institution_class set - only the admin-facing enrollment
+    paths did. That silently broke Group communication access and the
+    Class Dashboard's own learner count for every self-service
+    enrollment against a Class broadcast, which is the normal way a
+    learner actually joins a Class in the product."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = _make_user(User, '901001', 'realenroll_owner')
+        self.learner = _make_user(User, '901002', 'realenroll_learner')
+        self.partner = Partner.objects.create(owner=self.owner, name='Real Enroll Partner', slug='real-enroll-epc')
+        self.institution = EducationInstitution.objects.create(
+            owner=self.owner, name='Real Enroll Academy', partner=self.partner,
+            membership_policy=EducationInstitutionMembershipPolicy.OPEN,
+        )
+        self.program = EducationInstitutionProgram.objects.create(institution=self.institution, title='Real Enroll Program')
+        self.institution_class = EducationInstitutionClass.objects.create(
+            institution=self.institution, program=self.program, name='Real Enroll Class',
+            status=EducationAcademicRecordStatus.PUBLISHED,
+        )
+        self.broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=self.institution, created_by=self.owner, broadcast_kind=EducationBroadcastKind.INSTITUTION_CLASS,
+            institution_class=self.institution_class, program=self.program, title='Real Enroll Class',
+            status=EducationBroadcastStatus.PUBLISHED,
+        )
+
+    def test_public_enroll_endpoint_sets_institution_class_and_syncs_group(self):
+        self.client.force_authenticate(self.learner)
+        response = self.client.post(f'/api/v1/education/contents/{self.broadcast.id}/enroll/', {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        enrollment = EducationInstitutionEnrollment.objects.get(institution=self.institution, user=self.learner)
+        self.assertEqual(enrollment.institution_class_id, self.institution_class.id)
+
+        self.institution_class.refresh_from_db()
+        self.assertIsNotNone(self.institution_class.group_id)
+        group = Group.objects.get(id=self.institution_class.group_id)
+        self.assertTrue(
+            GroupMembership.objects.filter(group=group, user=self.learner, left_at__isnull=True).exists()
+        )
+
+    def test_broadcast_enrollment_list_endpoint_also_sets_institution_class(self):
+        self.client.force_authenticate(self.learner)
+        url = f'/api/v1/broadcasts/education/institutions/{self.institution.id}/broadcasts/{self.broadcast.id}/enrollments/'
+        response = self.client.post(url, {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        enrollment = EducationInstitutionEnrollment.objects.get(institution=self.institution, user=self.learner)
+        self.assertEqual(enrollment.institution_class_id, self.institution_class.id)
+
+
+class EducationPublicInstitutionSummaryMissionVisionTests(APITestCase):
+    """Regression found via the university-scale acceptance test: an
+    institution owner could PATCH mission/vision/admissions_info into
+    institution.metadata (a free-form JSONField, already returned to
+    authenticated members via EducationInstitutionSerializer), but the
+    PUBLIC directory/discovery summary (_build_public_institution_summary,
+    AllowAny) never surfaced any of it - a prospective student browsing
+    anonymously had no way to see mission/vision/admissions content at
+    all. Fixed by allowlisting exactly these three known keys onto the
+    public summary (not the whole metadata dict, which can hold
+    internal/operational keys an owner never intended to be public)."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = _make_user(User, '901201', 'missionvision_owner')
+        self.institution = EducationInstitution.objects.create(
+            owner=self.owner, name='Mission Vision Academy',
+            metadata={
+                'mission': 'Educate without barriers.',
+                'vision': 'A campus for every learner.',
+                'admissions_info': 'Rolling admissions, no application fee.',
+                'internal_note': 'not for public display',
+            },
+        )
+
+    def test_public_directory_surfaces_mission_vision_admissions_but_not_other_metadata_keys(self):
+        anon_client = APIClient()
+        response = anon_client.get('/api/v1/education/institutions/directory/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        entry = next(i for i in response.data['institutions'] if i['id'] == str(self.institution.id))
+        self.assertEqual(entry['mission'], 'Educate without barriers.')
+        self.assertEqual(entry['vision'], 'A campus for every learner.')
+        self.assertEqual(entry['admissionsInfo'], 'Rolling admissions, no application fee.')
+        self.assertNotIn('internal_note', entry)
+        self.assertNotIn('internalNote', entry)
+
+
+class EducationPartnerConnectBackfillTests(APITestCase):
+    """Regression found via the university-scale acceptance test:
+    connecting a Partner Account to an institution that already has
+    active enrollments/staff assignments (the completely normal
+    real-world sequence of "build the catalog and enroll people first,
+    connect Partner Account later") never synced any of that pre-existing
+    activity - only new enrollment/assignment events after the connect
+    did. on_institution_partner_connected backfills it once at connect
+    time."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.owner = _make_user(User, '901101', 'backfill_owner')
+        self.learner = _make_user(User, '901102', 'backfill_learner')
+        self.staffer = _make_user(User, '901103', 'backfill_staffer')
+        self.partner = Partner.objects.create(owner=self.owner, name='Backfill Partner', slug='backfill-epc')
+        # Institution starts WITHOUT a partner - enrollment/staff activity
+        # happens first, matching the real-world sequence this bug was
+        # found in.
+        self.institution = EducationInstitution.objects.create(owner=self.owner, name='Backfill Academy')
+        self.program = EducationInstitutionProgram.objects.create(institution=self.institution, title='Backfill Program')
+        self.course = EducationInstitutionCourse.objects.create(
+            institution=self.institution, program=self.program, title='Backfill Course',
+        )
+        self.broadcast = EducationInstitutionBroadcast.objects.create(
+            institution=self.institution, created_by=self.owner, broadcast_kind=EducationBroadcastKind.COURSE,
+            course=self.course, program=self.program, status=EducationBroadcastStatus.PUBLISHED,
+        )
+        self.enrollment = EducationInstitutionEnrollment.objects.create(
+            institution=self.institution, broadcast=self.broadcast, program=self.program, course=self.course,
+            user=self.learner, status=EducationEnrollmentStatus.ENROLLED,
+        )
+        self.membership = EducationInstitutionMembership.objects.create(
+            institution=self.institution, user=self.staffer,
+            role=EducationInstitutionMembershipRole.LECTURER, status=EducationInstitutionMembershipStatus.ACTIVE,
+        )
+        self.assignment = EducationInstitutionStaffAssignment.objects.create(
+            institution=self.institution, membership=self.membership, program=self.program,
+            role=EducationInstitutionStaffAssignmentRole.INSTRUCTOR, status=EducationInstitutionStaffAssignmentStatus.ACTIVE,
+        )
+        # Sanity: sync attempted now (no partner yet) is correctly a no-op.
+        sync_enrollment_communication(self.enrollment)
+        self.course.refresh_from_db()
+        assert self.course.channel_id is None
+
+    def test_connecting_partner_backfills_preexisting_enrollment_and_staff(self):
+        self.client.force_authenticate(self.owner)
+        url = f'/api/v1/broadcasts/education/institutions/{self.institution.id}/partner/'
+        response = self.client.post(url, {'partner_id': str(self.partner.id)}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.course.refresh_from_db()
+        self.program.refresh_from_db()
+        self.assertIsNotNone(self.course.channel_id, "pre-existing enrollment must be backfilled on connect")
+        self.assertIsNotNone(self.program.community_id, "pre-existing staff assignment must be backfilled on connect")
+
+        channel = Channel.objects.get(id=self.course.channel_id)
+        self.assertTrue(
+            ConversationMember.objects.filter(conversation=channel.conversation, user=self.learner, left_at__isnull=True).exists()
+        )
+        community = Community.objects.get(id=self.program.community_id)
+        self.assertEqual(
+            CommunityMembership.objects.get(community=community, user=self.staffer).role, CommunityRole.ADMIN,
+        )
+
+    def test_backfill_is_idempotent_across_disconnect_reconnect(self):
+        self.client.force_authenticate(self.owner)
+        connect_url = f'/api/v1/broadcasts/education/institutions/{self.institution.id}/partner/'
+        self.client.post(connect_url, {'partner_id': str(self.partner.id)}, format='json')
+        self.course.refresh_from_db()
+        first_channel_id = self.course.channel_id
+
+        self.client.delete(connect_url)
+        self.client.post(connect_url, {'partner_id': str(self.partner.id)}, format='json')
+        self.course.refresh_from_db()
+        self.assertEqual(self.course.channel_id, first_channel_id, "reconnect must reuse the existing Channel, not create a second one")
+
+
 class EducationHierarchyDeletedObjectBehaviorTests(APITestCase):
     """Task 7's 'Deleted/archived object behavior' - a Program or Class
     referenced by live Enrollment/StaffAssignment/Course rows can be
@@ -709,6 +996,12 @@ class EducationProgramFullDetailTests(APITestCase):
         User = get_user_model()
         self.owner = _make_user(User, '900601', 'progdetail_owner')
         self.institution = EducationInstitution.objects.create(owner=self.owner, name='Full Detail Academy')
+        # test_create_program_with_full_details_persists_every_field
+        # publishes a $25,000 program - must be payment-eligible or the
+        # new publish-time gate (_require_payment_setup_for_paid_item)
+        # correctly 402s it.
+        self.institution.stripe_charges_enabled = True
+        self.institution.save(update_fields=['stripe_charges_enabled'])
 
     def _programs_url(self):
         return f'/api/v1/broadcasts/education/institutions/{self.institution.id}/programs/'
@@ -786,6 +1079,57 @@ class EducationProgramFullDetailTests(APITestCase):
         self.assertEqual(program.level, 'Graduate')
         self.assertEqual(program.duration_value, 2)
         self.assertEqual(program.seat_limit, 40)
+
+    def test_publishing_a_priced_program_without_payment_setup_is_blocked(self):
+        # Regression: EducationInstitutionProgramListView/DetailView never
+        # called the payment-setup gate at all (unlike Course, which
+        # already did) - a program could be published at any price
+        # regardless of whether the institution could actually get paid.
+        unpaid_institution = EducationInstitution.objects.create(owner=self.owner, name='No Payout Academy')
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{unpaid_institution.id}/programs/',
+            {'title': 'Priced Program', 'price_amount': 500, 'status': 'published'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_402_PAYMENT_REQUIRED, response.data)
+        self.assertEqual(response.data.get('code'), 'PAYMENT_SETUP_REQUIRED')
+        self.assertFalse(EducationInstitutionProgram.objects.filter(institution=unpaid_institution).exists())
+
+    def test_publishing_a_free_program_without_payment_setup_is_allowed(self):
+        unpaid_institution = EducationInstitution.objects.create(owner=self.owner, name='No Payout Academy Free')
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{unpaid_institution.id}/programs/',
+            {'title': 'Free Program', 'status': 'published'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_publishing_a_priced_program_draft_without_payment_setup_is_allowed(self):
+        unpaid_institution = EducationInstitution.objects.create(owner=self.owner, name='No Payout Academy Draft')
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f'/api/v1/broadcasts/education/institutions/{unpaid_institution.id}/programs/',
+            {'title': 'Priced Draft Program', 'price_amount': 500, 'status': 'draft'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_updating_a_draft_program_to_published_with_a_price_is_blocked_without_payment_setup(self):
+        unpaid_institution = EducationInstitution.objects.create(owner=self.owner, name='No Payout Academy Update')
+        program = EducationInstitutionProgram.objects.create(
+            institution=unpaid_institution, title='Draft Program', price_amount=500,
+        )
+        self.client.force_authenticate(self.owner)
+        response = self.client.patch(
+            f'/api/v1/broadcasts/education/institutions/{unpaid_institution.id}/programs/{program.id}/',
+            {'status': 'published'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_402_PAYMENT_REQUIRED, response.data)
+        program.refresh_from_db()
+        self.assertEqual(program.status, 'draft')
 
     def test_program_dashboard_payload_has_classes_courses_and_metrics(self):
         program = EducationInstitutionProgram.objects.create(institution=self.institution, title='BSc Computer Science')
@@ -1002,6 +1346,39 @@ class EducationClassBroadcastTests(APITestCase):
     def _classes_url(self):
         return f'/api/v1/broadcasts/education/institutions/{self.institution.id}/classes/'
 
+    def test_publishing_a_priced_class_broadcast_without_payment_setup_is_blocked(self):
+        # Regression: Class has no price field of its own (pricing for a
+        # Class only ever exists on its Broadcast), and
+        # EducationInstitutionBroadcastListView never called the
+        # payment-setup gate at all - any institution, regardless of
+        # payment eligibility, could publish a priced Class/Program/Course
+        # broadcast and appear to be "selling" access with no way to
+        # actually collect money.
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            self._broadcasts_url(),
+            {'institution_class_id': str(self.institution_class.id), 'broadcast_kind': 'institution_class', 'price_amount': 1, 'status': 'published'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_402_PAYMENT_REQUIRED, response.data)
+        self.assertEqual(response.data.get('code'), 'PAYMENT_SETUP_REQUIRED')
+
+    def test_updating_a_broadcast_to_priced_and_published_is_blocked_without_payment_setup(self):
+        self.client.force_authenticate(self.owner)
+        create_response = self.client.post(
+            self._broadcasts_url(),
+            {'institution_class_id': str(self.institution_class.id), 'broadcast_kind': 'institution_class', 'status': 'draft'},
+            format='json',
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        broadcast_id = create_response.data['broadcast']['id']
+        update_response = self.client.patch(
+            self._broadcast_detail_url(broadcast_id),
+            {'price_amount': 1, 'status': 'published'},
+            format='json',
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_402_PAYMENT_REQUIRED, update_response.data)
+
     def test_broadcasting_class_makes_it_discoverable_as_class_type(self):
         self.client.force_authenticate(self.owner)
         response = self.client.post(
@@ -1023,9 +1400,31 @@ class EducationClassBroadcastTests(APITestCase):
         self.assertEqual(detail.data['content']['title'], 'Web Development Bootcamp')
         self.assertIsNone(detail.data['content']['programId'])
 
-        list_response = self.client.get(self._classes_url())
-        row = next(c for c in list_response.data['classes'] if c['id'] == str(self.institution_class.id))
-        self.assertEqual(row['broadcast_id'], broadcast_id)
+    def test_published_class_broadcast_appears_in_discovery_feed_sections(self):
+        # Regression found via the university-scale acceptance test:
+        # _build_education_discovery_payload's section_titles/section_order
+        # only listed program/course/lesson/workshop - "class" (this
+        # broadcast kind) was computed by
+        # _education_discovery_type_for_broadcast but never iterated as a
+        # section, so every published Class broadcast was silently dropped
+        # from the public discovery feed's sections/categories entirely,
+        # even though it was a real, published, publicly-fetchable
+        # EducationContentDetailView item on its own.
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            self._broadcasts_url(),
+            {'institution_class_id': str(self.institution_class.id), 'broadcast_kind': 'institution_class', 'status': 'published'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        anon_client = APIClient()
+        discovery = anon_client.get(f'/api/v1/education/discovery/?institution_id={self.institution.id}')
+        self.assertEqual(discovery.status_code, status.HTTP_200_OK, discovery.data)
+        class_sections = [s for s in discovery.data['sections'] if s['id'] == 'class']
+        self.assertEqual(len(class_sections), 1, discovery.data['sections'])
+        self.assertEqual(class_sections[0]['items'][0]['title'], 'Web Development Bootcamp')
+        self.assertIn({'id': 'class', 'label': 'Classes'}, discovery.data['categories'])
 
     def test_class_broadcast_requires_a_class(self):
         self.client.force_authenticate(self.owner)
@@ -1066,3 +1465,27 @@ class EducationClassBroadcastTests(APITestCase):
         self.assertEqual(detail.status_code, status.HTTP_200_OK, detail.data)
         class_ids = {row['id'] for row in detail.data['content']['classes']}
         self.assertIn(str(self.institution_class.id), class_ids)
+
+    def test_program_nested_class_broadcast_title_defaults_to_the_class_not_the_program(self):
+        # Regression: found via the university-scale acceptance test - a
+        # program-nested Class's default broadcast title/summary was
+        # picking up the PROGRAM's title/summary instead of the Class's
+        # own, because `program` is always backfilled onto a Class
+        # broadcast (see _validate_class_program_course) and the old
+        # fallback chain checked `program` before `institution_class`.
+        program = EducationInstitutionProgram.objects.create(
+            institution=self.institution, title='MBA', summary='Program-level summary.',
+        )
+        self.institution_class.program = program
+        self.institution_class.description = 'Class-level description.'
+        self.institution_class.save(update_fields=['program', 'description'])
+
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            self._broadcasts_url(),
+            {'institution_class_id': str(self.institution_class.id), 'broadcast_kind': 'institution_class', 'status': 'published'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data['broadcast']['title'], self.institution_class.name)
+        self.assertNotEqual(response.data['broadcast']['title'], 'MBA')

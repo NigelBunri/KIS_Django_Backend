@@ -1099,6 +1099,7 @@ class EducationInstitutionMembershipSerializer(serializers.ModelSerializer):
     display_name = serializers.SerializerMethodField()
     phone = serializers.CharField(source="user.phone", read_only=True)
     email = serializers.EmailField(source="user.email", read_only=True, allow_null=True)
+    avatar_url = serializers.SerializerMethodField()
 
     class Meta:
         model = EducationInstitutionMembership
@@ -1108,6 +1109,7 @@ class EducationInstitutionMembershipSerializer(serializers.ModelSerializer):
             "display_name",
             "phone",
             "email",
+            "avatar_url",
             "role",
             "status",
             "title",
@@ -1122,12 +1124,18 @@ class EducationInstitutionMembershipSerializer(serializers.ModelSerializer):
         user = getattr(obj, "user", None)
         return getattr(user, "display_name", "") or getattr(user, "username", "") or ""
 
+    def get_avatar_url(self, obj: EducationInstitutionMembership):
+        user = getattr(obj, "user", None)
+        profile = getattr(user, "profile", None)
+        return str(getattr(profile, "avatar_url", "") or "").strip() or None
+
 
 class EducationInstitutionCourseAccessRequestSerializer(serializers.ModelSerializer):
     user_id = serializers.UUIDField(source="user.id", read_only=True)
     display_name = serializers.SerializerMethodField()
     phone = serializers.CharField(source="user.phone", read_only=True)
     email = serializers.EmailField(source="user.email", read_only=True, allow_null=True)
+    avatar_url = serializers.SerializerMethodField()
     course_id = serializers.UUIDField(source="course.id", read_only=True)
     course_title = serializers.CharField(source="course.title", read_only=True)
 
@@ -1141,6 +1149,7 @@ class EducationInstitutionCourseAccessRequestSerializer(serializers.ModelSeriali
             "display_name",
             "phone",
             "email",
+            "avatar_url",
             "status",
             "created_at",
             "updated_at",
@@ -1150,6 +1159,11 @@ class EducationInstitutionCourseAccessRequestSerializer(serializers.ModelSeriali
     def get_display_name(self, obj: EducationInstitutionCourseAccessRequest):
         user = getattr(obj, "user", None)
         return getattr(user, "display_name", "") or getattr(user, "username", "") or ""
+
+    def get_avatar_url(self, obj: EducationInstitutionCourseAccessRequest):
+        user = getattr(obj, "user", None)
+        profile = getattr(user, "profile", None)
+        return str(getattr(profile, "avatar_url", "") or "").strip() or None
 
 
 class EducationInstitutionSerializer(serializers.ModelSerializer):
@@ -1541,6 +1555,7 @@ class EducationInstitutionStaffAssignmentSerializer(serializers.ModelSerializer)
     membership_id = serializers.UUIDField(source="membership.id", read_only=True)
     user_id = serializers.UUIDField(source="membership.user.id", read_only=True)
     display_name = serializers.SerializerMethodField()
+    avatar_url = serializers.SerializerMethodField()
     program_id = serializers.UUIDField(source="program.id", read_only=True, allow_null=True)
     institution_class_id = serializers.UUIDField(source="institution_class.id", read_only=True, allow_null=True)
     course_id = serializers.UUIDField(source="course.id", read_only=True, allow_null=True)
@@ -1555,6 +1570,7 @@ class EducationInstitutionStaffAssignmentSerializer(serializers.ModelSerializer)
             "membership_id",
             "user_id",
             "display_name",
+            "avatar_url",
             "program_id",
             "institution_class_id",
             "course_id",
@@ -1572,6 +1588,11 @@ class EducationInstitutionStaffAssignmentSerializer(serializers.ModelSerializer)
     def get_display_name(self, obj: EducationInstitutionStaffAssignment):
         user = getattr(getattr(obj, "membership", None), "user", None)
         return getattr(user, "display_name", "") or getattr(user, "username", "") or ""
+
+    def get_avatar_url(self, obj: EducationInstitutionStaffAssignment):
+        user = getattr(getattr(obj, "membership", None), "user", None)
+        profile = getattr(user, "profile", None)
+        return str(getattr(profile, "avatar_url", "") or "").strip() or None
 
 
 class EducationInstitutionCourseSerializer(serializers.ModelSerializer):
@@ -2352,6 +2373,13 @@ class EducationInstitutionEnrollmentSerializer(serializers.ModelSerializer):
     program_id = serializers.UUIDField(source="program.id", read_only=True, allow_null=True)
     institution_class_id = serializers.UUIDField(source="institution_class.id", read_only=True, allow_null=True)
     user_id = serializers.UUIDField(source="user.id", read_only=True)
+    # Enrollment lists (Program/Class Dashboard "Learners" tabs) were
+    # rendering this raw user_id as the row's title - no name/avatar was
+    # ever serialized to fall back to. Same display_name/phone/avatar_url
+    # trio as EducationInstitutionMembershipSerializer below.
+    display_name = serializers.SerializerMethodField()
+    phone = serializers.CharField(source="user.phone", read_only=True)
+    avatar_url = serializers.SerializerMethodField()
     course_id = serializers.UUIDField(source="course.id", read_only=True, allow_null=True)
     lesson_id = serializers.UUIDField(source="lesson.id", read_only=True, allow_null=True)
     class_session_id = serializers.UUIDField(source="class_session.id", read_only=True, allow_null=True)
@@ -2365,6 +2393,9 @@ class EducationInstitutionEnrollmentSerializer(serializers.ModelSerializer):
             "program_id",
             "institution_class_id",
             "user_id",
+            "display_name",
+            "phone",
+            "avatar_url",
             "course_id",
             "lesson_id",
             "class_session_id",
@@ -2376,6 +2407,15 @@ class EducationInstitutionEnrollmentSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_display_name(self, obj: EducationInstitutionEnrollment):
+        user = getattr(obj, "user", None)
+        return getattr(user, "display_name", "") or getattr(user, "username", "") or ""
+
+    def get_avatar_url(self, obj: EducationInstitutionEnrollment):
+        user = getattr(obj, "user", None)
+        profile = getattr(user, "profile", None)
+        return str(getattr(profile, "avatar_url", "") or "").strip() or None
 
 
 class EducationCourseReviewSerializer(serializers.ModelSerializer):

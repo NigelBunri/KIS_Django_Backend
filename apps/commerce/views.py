@@ -51,6 +51,7 @@ from .models import (
     ProductRating,
     ProductReview,
     ProductQuestion,
+    SavedItem,
     ShopService,
     ShopRole,
     ShopTeamMember,
@@ -96,6 +97,7 @@ from .serializers import (
     ProductRatingSerializer,
     ProductReviewSerializer,
     ProductQuestionSerializer,
+    SavedItemSerializer,
     CatalogCategorySerializer,
     ShopServiceSerializer,
     ServiceImageSerializer,
@@ -823,8 +825,16 @@ class ShopViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
     def join(self, request, pk=None):
-        shop = self.get_object()
+        # Not self.get_object() - that's overridden above to reject
+        # anyone but the shop's own owner/manager/staff (ShopSerializer
+        # leaks payout/financial fields, so GET/PATCH/DELETE correctly
+        # stay owner-only), which silently defeated this action's own
+        # permission_classes=[IsAuthenticated] override: any regular user
+        # following a shop got a 403 instead of actually joining it.
+        shop = get_object_or_404(Shop, pk=pk)
         ShopFollow.objects.get_or_create(user=request.user, shop=shop)
+        from apps.commerce.partner_sync import sync_follower_partner_membership
+        sync_follower_partner_membership(shop=shop, user=request.user)
         return Response({'joined': True}, status=status.HTTP_200_OK)
 
 
@@ -1115,10 +1125,22 @@ class ProductViewSet(viewsets.ModelViewSet):
         )
         shop_id = self.request.query_params.get("shop")
         if shop_id:
-            qs = qs.filter(shop_id=shop_id)
+            # Accepts either the shop's UUID or its slug - a bare
+            # filter(shop_id=shop_id) crashed with a 500 for any non-UUID
+            # value (e.g. a shop slug from a shop-profile page URL), same
+            # root cause as the category filter fixed just above.
+            try:
+                uuid.UUID(str(shop_id))
+                qs = qs.filter(shop_id=shop_id)
+            except (ValueError, AttributeError, TypeError):
+                qs = qs.filter(shop__slug=shop_id)
         owner_id = self.request.query_params.get("owner")
         if owner_id:
-            qs = qs.filter(shop__owner_id=owner_id)
+            try:
+                uuid.UUID(str(owner_id))
+                qs = qs.filter(shop__owner_id=owner_id)
+            except (ValueError, AttributeError, TypeError):
+                qs = qs.none()
         query = str(self.request.query_params.get("q") or self.request.query_params.get("search") or "").strip()
         if query:
             qs = qs.filter(
@@ -1130,7 +1152,17 @@ class ProductViewSet(viewsets.ModelViewSet):
             ).distinct()
         category = self.request.query_params.get("category")
         if category:
-            qs = qs.filter(Q(catalog_categories__id=category) | Q(catalog_categories__slug=category)).distinct()
+            # Frontends pass the human-readable slug (the only thing
+            # category_catalog.py exposes to clients) almost always - a raw
+            # Q(id=category) | Q(slug=category) crashes with a 500 for any
+            # non-UUID slug because Django validates the id= side as a UUID
+            # while building the query, before the OR is ever evaluated.
+            try:
+                uuid.UUID(str(category))
+                qs = qs.filter(catalog_categories__id=category)
+            except (ValueError, AttributeError, TypeError):
+                qs = qs.filter(catalog_categories__slug=category)
+            qs = qs.distinct()
         min_price = _decimal_from_value(self.request.query_params.get("min_price"))
         max_price_raw = self.request.query_params.get("max_price")
         if min_price > 0:
@@ -1844,7 +1876,11 @@ class ProductReviewViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         product_id = self.request.query_params.get('product')
         if product_id:
-            qs = qs.filter(product_id=product_id)
+            try:
+                uuid.UUID(str(product_id))
+                qs = qs.filter(product_id=product_id)
+            except (ValueError, AttributeError, TypeError):
+                qs = qs.none()
         user = self.request.user
         if not getattr(user, 'is_staff', False):
             qs = qs.filter(status=ProductReview.STATUS_PUBLISHED)
@@ -1878,7 +1914,11 @@ class ProductQuestionViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         product_id = self.request.query_params.get('product')
         if product_id:
-            qs = qs.filter(product_id=product_id)
+            try:
+                uuid.UUID(str(product_id))
+                qs = qs.filter(product_id=product_id)
+            except (ValueError, AttributeError, TypeError):
+                qs = qs.none()
         user = self.request.user
         if not getattr(user, 'is_staff', False):
             qs = qs.exclude(status=ProductQuestion.STATUS_HIDDEN)
@@ -1904,6 +1944,41 @@ class ProductQuestionViewSet(viewsets.ModelViewSet):
         question.status = ProductQuestion.STATUS_ANSWERED
         question.save(update_fields=['answer', 'answered_by', 'answered_at', 'status', 'updated_at'])
         return Response(self.get_serializer(question).data)
+
+
+@class_doc_decorator('Wishlist')
+class SavedItemViewSet(
+    viewsets.GenericViewSet,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+):
+    serializer_class = SavedItemSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return (
+            SavedItem.objects.filter(user=self.request.user, is_deleted=False)
+            .select_related('product', 'product__shop')
+            .order_by('-created_at')
+        )
+
+    def create(self, request, *args, **kwargs):
+        # Saving a product you've already saved is a no-op, not a 400 - the
+        # frontend's "save" button shouldn't have to pre-check membership.
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        product = serializer.validated_data['product']
+        saved, _created = SavedItem.objects.get_or_create(user=request.user, product=product)
+        output = self.get_serializer(saved)
+        return Response(output.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['delete'], url_path=r'by-product/(?P<product_id>[0-9a-f-]+)')
+    def by_product(self, request, product_id=None):
+        deleted, _ = SavedItem.objects.filter(user=request.user, product_id=product_id).delete()
+        if not deleted:
+            raise NotFound('This product is not in your wishlist.')
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @class_doc_decorator('Product Categories')
@@ -3094,6 +3169,19 @@ class MarketplaceOrderViewSet(
             )
         buffer = render_marketplace_receipt_pdf(order)
         return FileResponse(buffer, as_attachment=True, filename=f'marketplace_receipt_{order.id}.pdf')
+
+    @action(detail=True, methods=['get'])
+    def fulfillment(self, request, pk=None):
+        # get_object() already scopes to Q(buyer=user) | provider_filter, so
+        # reusing it here means a buyer or seller with no legitimate
+        # relationship to this order 404s before ever reaching the
+        # fulfillment lookup - no separate authorization check needed.
+        order = self.get_object()
+        fulfillment = getattr(order, 'fulfillment', None)
+        if not fulfillment:
+            return Response({'detail': 'This order has no shipping/fulfillment record.'}, status=status.HTTP_404_NOT_FOUND)
+        from .shipping_serializers import FulfillmentSerializer
+        return Response(FulfillmentSerializer(fulfillment).data)
 
     def destroy(self, request, *args, **kwargs):
         order = self.get_object()

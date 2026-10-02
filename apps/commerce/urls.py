@@ -1,6 +1,7 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 from . import views
+from . import shipping_views
 
 router = DefaultRouter()
 router.register(r'shops', views.ShopViewSet)
@@ -9,6 +10,7 @@ router.register(r'products', views.ProductViewSet)
 router.register(r'product-ratings', views.ProductRatingViewSet)
 router.register(r'product-reviews', views.ProductReviewViewSet)
 router.register(r'product-questions', views.ProductQuestionViewSet)
+router.register(r'saved-items', views.SavedItemViewSet, basename='saved-items')
 router.register(r'product-categories', views.ProductCategoryViewSet)
 router.register(r'product-auth-checks', views.ProductAuthenticityCheckViewSet, basename='product-auth-checks')
 router.register(r'orders', views.OrderViewSet, basename='orders')
@@ -30,6 +32,12 @@ router.register(r'cart-items', views.CartItemViewSet)
 router.register(r'marketplace-orders', views.MarketplaceOrderViewSet, basename='marketplace-orders')
 router.register(r'marketplace-complaints', views.MarketplaceComplaintViewSet)
 router.register(r'marketplace-provider-orders', views.MarketplaceProviderOrderViewSet, basename='marketplace-provider-orders')
+router.register(r'addresses', shipping_views.CustomerAddressViewSet, basename='addresses')
+router.register(r'shipping-zones', shipping_views.ShippingZoneViewSet, basename='shipping-zones')
+router.register(r'shipping-methods', shipping_views.ShippingMethodViewSet, basename='shipping-methods')
+router.register(r'shipping-rates', shipping_views.ShippingRateViewSet, basename='shipping-rates')
+router.register(r'fulfillments', shipping_views.FulfillmentViewSet, basename='fulfillments')
+router.register(r'shipments', shipping_views.ShipmentViewSet, basename='shipments')
 
 urlpatterns = [
     path(
@@ -46,6 +54,11 @@ urlpatterns = [
         'uploads/initiate/',
         views.CommerceUploadInitiateView.as_view(),
         name='commerce-upload-initiate',
+    ),
+    path(
+        'shipping/options/',
+        shipping_views.ShippingOptionsView.as_view(),
+        name='commerce-shipping-options',
     ),
     *router.urls,
     path(

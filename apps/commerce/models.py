@@ -733,6 +733,11 @@ class Product(BaseEntity):
     inventory_type = models.CharField(max_length=20, choices=INVENTORY_TYPES, default='PHYSICAL')
     stock_qty = models.IntegerField(default=0)
     low_stock_threshold = models.PositiveIntegerField(null=True, blank=True)
+    # Nullable - added for weight-based shipping rate calculation
+    # (shipping_services.py). A null weight contributes 0kg to a WEIGHT-type
+    # rate rather than erroring, so existing products (and any shop that
+    # never configures a weight-based rate) are unaffected.
+    weight_kg = models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True)
     catalog_categories = models.ManyToManyField('CatalogCategory', blank=True, related_name='products')
 
     # Flexible Data
@@ -1032,6 +1037,22 @@ class ProductQuestion(BaseEntity):
         return f"Question for {self.product_id} by {self.user_id}"
 
 
+class SavedItem(BaseEntity):
+    """A buyer's wishlist/saved-for-later entry. Deliberately a bare
+    user+product pairing (no notes/priority/list-grouping) - the spec calls
+    for a basic wishlist that can grow more advanced later, not a day-one
+    multi-list registry."""
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='saved_items')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='saved_by')
+
+    class Meta:
+        unique_together = ('user', 'product')
+        indexes = [models.Index(fields=['user', 'created_at'])]
+
+    def __str__(self):
+        return f"SavedItem {self.product_id} by {self.user_id}"
+
+
 class ProductAuthenticityCheck(BaseEntity):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='auth_checks')
     requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
@@ -1279,3 +1300,32 @@ class Complaint(BaseEntity):
 
     def __str__(self):
         return f"Complaint {self.id} · Order {self.order_id}"
+
+
+# Shipping/fulfillment models live in shipping_models.py (their own module -
+# see that file's docstring for the rationale), but MUST be imported here,
+# at the bottom of models.py, rather than left to be imported transitively
+# by a views/serializers module. models.py is the one module every startup
+# path (runserver, every management command, migrations) unconditionally
+# imports; a prior module in this app (business_models.py) was wired in only
+# via its own views/serializers files, which nothing else imports, so its
+# models never actually register with Django's app registry during normal
+# operation - confirmed by grep, not inherited here.
+from .shipping_models import (  # noqa: E402,F401
+    AddressValidationStatus,
+    CustomerAddress,
+    Fulfillment,
+    FulfillmentStatus,
+    FULFILLMENT_TRANSITIONS,
+    Shipment,
+    ShipmentEvent,
+    ShipmentEventSource,
+    ShipmentItem,
+    ShipmentStatus,
+    SHIPMENT_TRANSITIONS,
+    ShippingMethod,
+    ShippingMethodType,
+    ShippingRate,
+    ShippingRateType,
+    ShippingZone,
+)

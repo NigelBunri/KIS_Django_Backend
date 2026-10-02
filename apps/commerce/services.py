@@ -34,7 +34,12 @@ from .models import (
     MarketplaceOrderItem,
     MarketplaceOrderStatus,
     MarketplaceComplaint,
+    Promotion,
+    CustomerAddress,
+    ShippingMethod,
+    ShippingZone,
 )
+from .shipping_services import RateableItem, create_fulfillment_for_order, resolve_shipping_selection
 
 
 def run_shop_verification_checks(req: ShopVerificationRequest) -> Dict[str, Any]:
@@ -196,12 +201,16 @@ def place_marketplace_order(*, buyer, shop_id, items, metadata=None):
     if not shop:
         raise ValidationError('Shop not found for this marketplace order.')
 
-    normalized_items = _normalize_marketplace_items(items, shop)
-    total_cents = _calculate_items_total_cents(normalized_items)
-    if total_cents <= 0:
-        raise ValidationError('Order total must be greater than zero.')
-
     metadata_payload = {**(metadata or {})}
+    promo_code = str(metadata_payload.get('promo_code') or metadata_payload.get('promoCode') or '').strip()
+    # Shipping is opt-in at this layer: a shop/order with no shipping_method_id
+    # supplied gets no Fulfillment row and no shipping cost added, so digital-
+    # only orders and shops that haven't configured shipping yet (and every
+    # pre-existing test in this file) are completely unaffected. See
+    # shipping_services.py for the address/zone/rate resolution this calls.
+    address_id = str(metadata_payload.get('address_id') or metadata_payload.get('addressId') or '').strip()
+    shipping_method_id = str(metadata_payload.get('shipping_method_id') or metadata_payload.get('shippingMethodId') or '').strip()
+
     requested_method = str(
         metadata_payload.get('payment_method')
         or metadata_payload.get('paymentMethod')
@@ -215,13 +224,68 @@ def place_marketplace_order(*, buyer, shop_id, items, metadata=None):
         )
 
     cart_id = metadata_payload.get('cart_id')
-    metadata_payload.setdefault('items', len(normalized_items))
-    metadata_payload.setdefault('total_amount_cents', total_cents)
-    metadata_payload.setdefault('currency', 'USD')
     metadata_payload.setdefault('payment_method', requested_method if requested_method else settings.KIS_COMMERCE_DEFAULT_PAYMENT_PROVIDER)
     reference = f'marketplace-{buyer.id}-{uuid.uuid4().hex}'
 
     with transaction.atomic():
+        # Locks each Product row (select_for_update inside
+        # _normalize_marketplace_items) for the rest of this transaction, so
+        # two simultaneous checkouts for the last unit of the same product
+        # serialize here instead of both reading stale stock_qty and both
+        # succeeding - see _reserve_stock_for_items.
+        normalized_items = _normalize_marketplace_items(items, shop)
+        subtotal_cents = _calculate_items_total_cents(normalized_items)
+        if subtotal_cents <= 0:
+            raise ValidationError('Order total must be greater than zero.')
+
+        _reserve_stock_for_items(normalized_items)
+
+        discount_cents = 0
+        promotion = None
+        if promo_code:
+            discount_cents, promotion = _apply_promotion(shop, promo_code, normalized_items, subtotal_cents)
+
+        shipping_cents = 0
+        shipping_address = None
+        shipping_selection = None
+        if shipping_method_id:
+            if not address_id:
+                raise ValidationError({'address_id': 'A delivery address is required when selecting a shipping method.'})
+            shipping_address = CustomerAddress.objects.filter(id=address_id, user=buyer, is_deleted=False).first()
+            if not shipping_address:
+                raise ValidationError({'address_id': 'Delivery address not found.'})
+            rateable_items = [
+                RateableItem(quantity=item['quantity'], weight_kg=item['product'].weight_kg)
+                for item in normalized_items
+            ]
+            # Re-derives cost/zone/estimate from the shop's own ShippingRate
+            # rows - a client can select a shipping_method_id, never a price
+            # (same anti-manipulation pattern as price/discount above).
+            shipping_selection = resolve_shipping_selection(
+                shop=shop, address=shipping_address, shipping_method_id=shipping_method_id,
+                subtotal_cents=subtotal_cents, items=rateable_items,
+            )
+            shipping_cents = shipping_selection['cost_cents']
+
+        total_cents = subtotal_cents - discount_cents + shipping_cents
+        if total_cents <= 0:
+            raise ValidationError('Order total must be greater than zero.')
+
+        metadata_payload.setdefault('items', len(normalized_items))
+        metadata_payload['subtotal_amount_cents'] = subtotal_cents
+        metadata_payload['discount_amount_cents'] = discount_cents
+        metadata_payload['shipping_amount_cents'] = shipping_cents
+        metadata_payload['total_amount_cents'] = total_cents
+        metadata_payload.setdefault('currency', 'USD')
+        if promotion:
+            metadata_payload['promo_code'] = promotion.code
+            metadata_payload['promotion_id'] = str(promotion.id)
+        if shipping_selection:
+            metadata_payload['shipping_method_id'] = shipping_selection['shipping_method_id']
+            metadata_payload['shipping_method_name'] = shipping_selection['shipping_method_name']
+            metadata_payload['shipping_estimated_delivery_min'] = shipping_selection['estimated_delivery_min']
+            metadata_payload['shipping_estimated_delivery_max'] = shipping_selection['estimated_delivery_max']
+
         buyer_tx = None
         status = MarketplaceOrderStatus.TEMPORAL
         if legacy_wallet_requested and legacy_wallet_enabled:
@@ -267,6 +331,16 @@ def place_marketplace_order(*, buyer, shop_id, items, metadata=None):
             for item in normalized_items
         ]
         MarketplaceOrderItem.objects.bulk_create(items_to_create)
+
+        if shipping_selection:
+            shipping_method = ShippingMethod.objects.get(id=shipping_selection['shipping_method_id'])
+            shipping_zone = ShippingZone.objects.get(id=shipping_selection['shipping_zone_id'])
+            create_fulfillment_for_order(
+                order=order, shop=shop, address=shipping_address,
+                shipping_method=shipping_method, shipping_zone=shipping_zone,
+                shipping_cost_cents=shipping_cents,
+            )
+
         if cart_id and (buyer_tx or not metadata_payload.get('payment_required')):
             Cart.objects.filter(id=cart_id, status='active').update(status='checked_out')
         if not buyer_tx and metadata_payload.get('payment_required'):
@@ -300,8 +374,16 @@ def _normalize_marketplace_items(items, shop):
     product_ids = {str(item.get('product_id')) for item in items if item.get('product_id')}
     if not product_ids:
         raise ValidationError('Each marketplace order item must reference a product_id.')
-    products = Product.objects.filter(id__in=product_ids, shop=shop).select_related('shop')
-    if products.count() != len(product_ids):
+    # select_for_update locks these Product rows for the remainder of the
+    # caller's transaction (place_marketplace_order), so a concurrent
+    # checkout for the same product blocks here instead of racing past a
+    # stale stock_qty read - see _reserve_stock_for_items below. list() is
+    # used rather than .count() because Postgres rejects FOR UPDATE
+    # combined with an aggregate query.
+    products = list(
+        Product.objects.filter(id__in=product_ids, shop=shop).select_related('shop').select_for_update()
+    )
+    if len(products) != len(product_ids):
         raise ValidationError('One or more products are invalid or not part of this shop.')
     product_map = {str(product.id): product for product in products}
 
@@ -340,6 +422,74 @@ def _normalize_marketplace_items(items, shop):
             'custom_description': entry.get('custom_description') or '',
         })
     return normalized_items
+
+
+def _reserve_stock_for_items(normalized_items):
+    """Validate and decrement stock_qty for PHYSICAL products before the
+    order is created. Must run after _normalize_marketplace_items has
+    select_for_update-locked the Product rows in the same transaction, so
+    two buyers racing for the last unit are serialized here rather than
+    both reading stock_qty=1 and both succeeding."""
+    required_by_product = {}
+    for item in normalized_items:
+        product = item['product']
+        if product.inventory_type != 'PHYSICAL':
+            continue
+        required_by_product[product.id] = required_by_product.get(product.id, 0) + item['quantity']
+
+    for product_id, required_qty in required_by_product.items():
+        product = next(item['product'] for item in normalized_items if item['product'].id == product_id)
+        if int(product.stock_qty or 0) < required_qty:
+            raise ValidationError(f'{product.name} only has {product.stock_qty} left in stock.')
+
+    for product_id, required_qty in required_by_product.items():
+        product = next(item['product'] for item in normalized_items if item['product'].id == product_id)
+        product.stock_qty = int(product.stock_qty or 0) - required_qty
+        product.save(update_fields=['stock_qty'])
+
+
+def _apply_promotion(shop, promo_code, normalized_items, subtotal_cents):
+    """Validate a buyer-supplied promo code and return the server-computed
+    discount in cents. The client only ever supplies the code string -
+    discount_type/discount_value/eligibility/usage_limit are all read from
+    the Promotion row itself, never trusted from the request, so a client
+    cannot grant itself an arbitrary discount by posting a fabricated
+    discount amount."""
+    promotion = (
+        Promotion.objects.select_for_update()
+        .filter(shop=shop, code__iexact=promo_code, is_deleted=False)
+        .first()
+    )
+    if not promotion:
+        raise ValidationError({'promo_code': 'This promo code is not valid for this shop.'})
+
+    now = timezone.now()
+    if not (promotion.start_date <= now <= promotion.end_date):
+        raise ValidationError({'promo_code': 'This promo code is not currently active.'})
+    if promotion.usage_limit is not None and promotion.used_count >= promotion.usage_limit:
+        raise ValidationError({'promo_code': 'This promo code has reached its usage limit.'})
+
+    eligible_cents = subtotal_cents
+    if promotion.applicable_products:
+        allowed_ids = {str(pid) for pid in promotion.applicable_products}
+        eligible_cents = sum(
+            item['quantity'] * item['unit_price_cents']
+            for item in normalized_items
+            if str(item['product'].id) in allowed_ids
+        )
+        if eligible_cents <= 0:
+            raise ValidationError({'promo_code': 'None of the items in this order are eligible for this promo code.'})
+
+    if promotion.discount_type == 'PERCENT':
+        discount_cents = int((Decimal(eligible_cents) * promotion.discount_value / Decimal('100')).to_integral_value(rounding=ROUND_HALF_UP))
+    else:
+        discount_cents = _decimal_price_to_cents(promotion.discount_value)
+    discount_cents = max(0, min(discount_cents, eligible_cents))
+
+    promotion.used_count = promotion.used_count + 1
+    promotion.save(update_fields=['used_count'])
+
+    return discount_cents, promotion
 
 
 def _calculate_items_total_cents(normalized_items):

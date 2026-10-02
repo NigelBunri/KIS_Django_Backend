@@ -10,7 +10,8 @@ from django.db.models.signals import post_save
 from django.core.management import call_command
 from django.http import QueryDict
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
+import threading
 from unittest.mock import patch
 from django.utils import timezone
 from rest_framework import status
@@ -31,7 +32,9 @@ from .models import (
     MarketplaceOrderStatus,
     Product,
     ProductImage,
+    Promotion,
     ProductQuestion,
+    SavedItem,
     ProductReview,
     ServiceBooking,
     ServiceBookingComplaint,
@@ -504,6 +507,208 @@ class MarketplaceUsdCheckoutTests(TestCase):
 
         self.assertEqual(result['status'], 'satisfied_deleted')
         self.assertFalse(order.__class__.objects.filter(id=order.id).exists())
+
+
+class MarketplaceStockReservationTests(TestCase):
+    """place_marketplace_order must validate and decrement Product.stock_qty
+    for PHYSICAL items - previously the checkout path never checked stock
+    at all, letting a buyer order more units than a shop actually had."""
+
+    def setUp(self):
+        disable_product_recommendation_signal(self)
+        User = get_user_model()
+        self.provider = User.objects.create_user(phone='5555553100', username='provider_stock', password='secret', country='NG')
+        self.buyer = User.objects.create_user(phone='5555554200', username='buyer_stock', password='secret', country='NG')
+        self.shop = Shop.objects.create(
+            owner=self.provider, name='Stock Shop', slug='stock-shop',
+            payout_account_status=ShopPayoutAccountStatus.ACTIVE, flutterwave_subaccount_id='RS_TEST_STOCK',
+        )
+        self.product = Product.objects.create(
+            shop=self.shop, sku='STOCK-001', name='Limited Widget', slug='limited-widget',
+            price=Decimal('10.00'), stock_qty=2, currency='USD',
+        )
+
+    def test_order_exceeding_stock_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            place_marketplace_order(
+                buyer=self.buyer, shop_id=self.shop.id,
+                items=[{'product_id': str(self.product.id), 'quantity': 3}],
+            )
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_qty, 2)
+
+    def test_successful_order_decrements_stock(self):
+        place_marketplace_order(
+            buyer=self.buyer, shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 2}],
+        )
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_qty, 0)
+
+    def test_digital_products_are_not_stock_checked(self):
+        digital = Product.objects.create(
+            shop=self.shop, sku='DIGITAL-001', name='E-book', slug='e-book',
+            price=Decimal('5.00'), stock_qty=0, currency='USD',
+            inventory_type='DIGITAL', requires_shipping=False,
+        )
+        order = place_marketplace_order(
+            buyer=self.buyer, shop_id=self.shop.id,
+            items=[{'product_id': str(digital.id), 'quantity': 5}],
+        )
+        self.assertIsNotNone(order.id)
+
+
+class MarketplaceLastUnitRaceConditionTests(TransactionTestCase):
+    """Two buyers racing to purchase the last unit of the same product must
+    not both succeed. _normalize_marketplace_items locks the Product row
+    with select_for_update inside place_marketplace_order's transaction, so
+    the second concurrent call should see the decremented stock_qty and be
+    rejected. Uses TransactionTestCase (real commits, real threads) because
+    the default TestCase wraps each test in one shared transaction, which
+    would hide this exact bug by never letting two threads see independent
+    uncommitted state."""
+
+    def setUp(self):
+        post_save.disconnect(on_product_save, sender=Product)
+        self.addCleanup(post_save.connect, on_product_save, sender=Product)
+        User = get_user_model()
+        self.provider = User.objects.create_user(phone='5555555100', username='provider_race', password='secret', country='NG')
+        self.buyer_a = User.objects.create_user(phone='5555556200', username='buyer_race_a', password='secret', country='NG')
+        self.buyer_b = User.objects.create_user(phone='5555557200', username='buyer_race_b', password='secret', country='NG')
+        self.shop = Shop.objects.create(
+            owner=self.provider, name='Race Shop', slug='race-shop',
+            payout_account_status=ShopPayoutAccountStatus.ACTIVE, flutterwave_subaccount_id='RS_TEST_RACE',
+        )
+        self.product = Product.objects.create(
+            shop=self.shop, sku='RACE-001', name='Last Unit Widget', slug='last-unit-widget',
+            price=Decimal('10.00'), stock_qty=1, currency='USD',
+        )
+
+    def test_only_one_buyer_wins_the_last_unit(self):
+        from django.db import connections
+
+        results = {}
+
+        def attempt(buyer, key):
+            try:
+                place_marketplace_order(
+                    buyer=buyer, shop_id=self.shop.id,
+                    items=[{'product_id': str(self.product.id), 'quantity': 1}],
+                )
+                results[key] = 'success'
+            except ValidationError:
+                results[key] = 'rejected'
+            finally:
+                connections.close_all()
+
+        t1 = threading.Thread(target=attempt, args=(self.buyer_a, 'a'))
+        t2 = threading.Thread(target=attempt, args=(self.buyer_b, 'b'))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        outcomes = list(results.values())
+        self.assertEqual(outcomes.count('success'), 1, f'expected exactly one winner, got {results}')
+        self.assertEqual(outcomes.count('rejected'), 1, f'expected exactly one rejection, got {results}')
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_qty, 0)
+
+
+class MarketplacePromotionTests(TestCase):
+    """A buyer-supplied promo_code must be validated and priced entirely
+    server-side from the Promotion row - the client only ever supplies the
+    code string, never the discount amount."""
+
+    def setUp(self):
+        disable_product_recommendation_signal(self)
+        User = get_user_model()
+        self.provider = User.objects.create_user(phone='5555558100', username='provider_promo', password='secret', country='NG')
+        self.buyer = User.objects.create_user(phone='5555559200', username='buyer_promo', password='secret', country='NG')
+        self.shop = Shop.objects.create(
+            owner=self.provider, name='Promo Shop', slug='promo-shop',
+            payout_account_status=ShopPayoutAccountStatus.ACTIVE, flutterwave_subaccount_id='RS_TEST_PROMO',
+        )
+        self.product = Product.objects.create(
+            shop=self.shop, sku='PROMO-001', name='Discountable Widget', slug='discountable-widget',
+            price=Decimal('100.00'), stock_qty=10, currency='USD',
+        )
+        self.now = timezone.now()
+
+    def _make_promo(self, **overrides):
+        defaults = dict(
+            shop=self.shop, code='SAVE10', discount_type='PERCENT', discount_value=Decimal('10'),
+            start_date=self.now - timedelta(days=1), end_date=self.now + timedelta(days=1),
+        )
+        defaults.update(overrides)
+        return Promotion.objects.create(**defaults)
+
+    def test_percent_promo_discounts_total_and_increments_usage(self):
+        promo = self._make_promo()
+        order = place_marketplace_order(
+            buyer=self.buyer, shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1}],
+            metadata={'promo_code': 'save10'},
+        )
+        self.assertEqual(order.total_amount, Decimal('90'))
+        self.assertEqual(order.metadata.get('discount_amount_cents'), 1000)
+        promo.refresh_from_db()
+        self.assertEqual(promo.used_count, 1)
+
+    def test_fixed_promo_larger_than_subtotal_is_capped_not_negative(self):
+        # discount_value (999.00) exceeds the 100.00 subtotal - the discount
+        # clamps to the subtotal rather than going negative, which zeroes
+        # the order out entirely. place_marketplace_order rejects a
+        # zero-total order the same way it rejects an empty cart.
+        self._make_promo(code='HUGE50', discount_type='FIXED', discount_value=Decimal('999.00'))
+        with self.assertRaises(ValidationError):
+            place_marketplace_order(
+                buyer=self.buyer, shop_id=self.shop.id,
+                items=[{'product_id': str(self.product.id), 'quantity': 1}],
+                metadata={'promo_code': 'HUGE50'},
+            )
+
+    def test_client_supplied_discount_amount_is_ignored(self):
+        """A modified client cannot grant itself a discount by posting a
+        fabricated discount_amount_cents - only a real Promotion row,
+        looked up and validated server-side, can reduce the total."""
+        order = place_marketplace_order(
+            buyer=self.buyer, shop_id=self.shop.id,
+            items=[{'product_id': str(self.product.id), 'quantity': 1}],
+            metadata={'discount_amount_cents': 999999},
+        )
+        self.assertEqual(order.total_amount, Decimal('100'))
+
+    def test_expired_promo_code_rejected(self):
+        self._make_promo(code='OLD5', start_date=self.now - timedelta(days=10), end_date=self.now - timedelta(days=1))
+        with self.assertRaises(ValidationError):
+            place_marketplace_order(
+                buyer=self.buyer, shop_id=self.shop.id,
+                items=[{'product_id': str(self.product.id), 'quantity': 1}],
+                metadata={'promo_code': 'OLD5'},
+            )
+
+    def test_usage_limit_exhausted_promo_code_rejected(self):
+        self._make_promo(code='ONCE', usage_limit=1, used_count=1)
+        with self.assertRaises(ValidationError):
+            place_marketplace_order(
+                buyer=self.buyer, shop_id=self.shop.id,
+                items=[{'product_id': str(self.product.id), 'quantity': 1}],
+                metadata={'promo_code': 'ONCE'},
+            )
+
+    def test_promo_code_from_another_shop_is_rejected(self):
+        other_shop = Shop.objects.create(owner=self.provider, name='Other Shop', slug='other-shop-promo')
+        Promotion.objects.create(
+            shop=other_shop, code='OTHERSHOP', discount_type='PERCENT', discount_value=Decimal('50'),
+            start_date=self.now - timedelta(days=1), end_date=self.now + timedelta(days=1),
+        )
+        with self.assertRaises(ValidationError):
+            place_marketplace_order(
+                buyer=self.buyer, shop_id=self.shop.id,
+                items=[{'product_id': str(self.product.id), 'quantity': 1}],
+                metadata={'promo_code': 'OTHERSHOP'},
+            )
 
 
 class CommerceLaunchProofCommandTests(TestCase):
@@ -2117,3 +2322,62 @@ class ShopTeamMemberAPITests(APITestCase):
         self.client.force_authenticate(user=self.staffer)
         response = self.client.patch(f'/api/v1/commerce/shop-members/{self.member.id}/', {'role': ShopRole.MANAGER}, format='json')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class SavedItemWishlistAPITests(APITestCase):
+    def setUp(self):
+        disable_product_recommendation_signal(self)
+        User = get_user_model()
+        self.buyer = User.objects.create_user(phone='5559910001', username='wishlist_buyer', password='secret', country='NG')
+        self.other_buyer = User.objects.create_user(phone='5559910002', username='wishlist_other', password='secret', country='NG')
+        self.owner = User.objects.create_user(phone='5559910003', username='wishlist_shop_owner', password='secret', country='NG')
+        self.shop = Shop.objects.create(owner=self.owner, name='Wishlist Shop', slug='wishlist-shop')
+        self.product = Product.objects.create(
+            shop=self.shop, sku='WISH-001', name='Wishlist Widget', slug='wishlist-widget',
+            price=Decimal('20.00'), stock_qty=5, currency='USD',
+        )
+
+    def _list_url(self):
+        return '/api/v1/commerce/saved-items/'
+
+    def _by_product_url(self, product_id):
+        return f'/api/v1/commerce/saved-items/by-product/{product_id}/'
+
+    def test_save_product_to_wishlist(self):
+        self.client.force_authenticate(self.buyer)
+        response = self.client.post(self._list_url(), {'product_id': str(self.product.id)}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data['product_detail']['id'], str(self.product.id))
+        self.assertTrue(SavedItem.objects.filter(user=self.buyer, product=self.product).exists())
+
+    def test_saving_same_product_twice_is_idempotent(self):
+        self.client.force_authenticate(self.buyer)
+        first = self.client.post(self._list_url(), {'product_id': str(self.product.id)}, format='json')
+        second = self.client.post(self._list_url(), {'product_id': str(self.product.id)}, format='json')
+        self.assertEqual(first.data['id'], second.data['id'])
+        self.assertEqual(SavedItem.objects.filter(user=self.buyer, product=self.product).count(), 1)
+
+    def test_wishlist_is_scoped_to_the_requesting_user(self):
+        SavedItem.objects.create(user=self.other_buyer, product=self.product)
+        self.client.force_authenticate(self.buyer)
+        response = self.client.get(self._list_url())
+        results = response.data if isinstance(response.data, list) else response.data.get('results', [])
+        self.assertEqual(len(results), 0)
+
+    def test_remove_from_wishlist_by_product(self):
+        SavedItem.objects.create(user=self.buyer, product=self.product)
+        self.client.force_authenticate(self.buyer)
+        response = self.client.delete(self._by_product_url(self.product.id))
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(SavedItem.objects.filter(user=self.buyer, product=self.product).exists())
+
+    def test_cannot_remove_another_users_wishlist_item(self):
+        SavedItem.objects.create(user=self.other_buyer, product=self.product)
+        self.client.force_authenticate(self.buyer)
+        response = self.client.delete(self._by_product_url(self.product.id))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertTrue(SavedItem.objects.filter(user=self.other_buyer, product=self.product).exists())
+
+    def test_anonymous_user_cannot_access_wishlist(self):
+        response = self.client.get(self._list_url())
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)

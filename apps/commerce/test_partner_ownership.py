@@ -108,3 +108,57 @@ class ShopPartnerOwnershipTests(APITestCase):
         self.client.force_authenticate(self.shop_owner)
         still_ok = self.client.patch(self._detail_url(), {'description': 'owner still fine'}, format='json')
         self.assertEqual(still_ok.status_code, status.HTTP_200_OK, still_ok.data)
+
+
+class ShopFollowPartnerMembershipSyncTests(APITestCase):
+    """Following a shop should add the user to the shop's Partner Account
+    when one is connected, and notify them - see
+    apps.commerce.partner_sync.sync_follower_partner_membership, called
+    from ShopViewSet.join."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.shop_owner = User.objects.create_user(
+            phone='5559830001', username='sfp_shop_owner', password='secret', country='NG',
+        )
+        self.follower = User.objects.create_user(
+            phone='5559830002', username='sfp_follower', password='secret', country='NG',
+        )
+        self.partner = Partner.objects.create(owner=self.shop_owner, name='Follow Group', slug='follow-group-sfp')
+        self.shop = Shop.objects.create(owner=self.shop_owner, name='Follow Stall', slug='follow-stall-sfp', partner=self.partner)
+
+    def _join_url(self):
+        return f'/api/v1/commerce/shops/{self.shop.id}/join/'
+
+    def test_joining_a_shop_adds_the_user_to_its_partner_account(self):
+        self.client.force_authenticate(self.follower)
+        response = self.client.post(self._join_url(), {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(
+            PartnerMembership.objects.filter(partner=self.partner, user=self.follower, status=PartnerMembershipStatus.MEMBER).exists()
+        )
+
+    def test_joining_a_shop_notifies_with_the_partner_as_target(self):
+        from apps.notifications.models import Notification
+        self.client.force_authenticate(self.follower)
+        response = self.client.post(self._join_url(), {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        notif = Notification.objects.get(user_id=self.follower.id, type='SHOP_PARTNER_MEMBERSHIP_ADDED')
+        self.assertEqual(notif.target_type, 'partner')
+        self.assertEqual(str(notif.target_id), str(self.partner.id))
+
+    def test_no_partner_membership_without_a_connected_partner(self):
+        unpartnered_shop = Shop.objects.create(owner=self.shop_owner, name='Unpartnered Stall', slug='unpartnered-stall-sfp')
+        self.client.force_authenticate(self.follower)
+        response = self.client.post(f'/api/v1/commerce/shops/{unpartnered_shop.id}/join/', {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(PartnerMembership.objects.filter(user=self.follower).exists())
+
+    def test_rejoining_does_not_send_a_second_notification(self):
+        from apps.notifications.models import Notification
+        self.client.force_authenticate(self.follower)
+        self.client.post(self._join_url(), {}, format='json')
+        self.client.post(self._join_url(), {}, format='json')
+        self.assertEqual(
+            Notification.objects.filter(user_id=self.follower.id, type='SHOP_PARTNER_MEMBERSHIP_ADDED').count(), 1,
+        )

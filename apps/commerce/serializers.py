@@ -33,6 +33,7 @@ from .models import (
     ProductShare,
     ProductReview,
     ProductQuestion,
+    SavedItem,
     AIRecommendation,
     AuditLog,
     FraudSignal,
@@ -1541,6 +1542,18 @@ class ProductAuthenticityCheckSerializer(serializers.ModelSerializer):
         model = ProductAuthenticityCheck
         fields = '__all__'
         read_only_fields = ('status', 'result', 'confidence', 'checked_at')
+
+
+class SavedItemSerializer(serializers.ModelSerializer):
+    product_detail = ProductSerializer(source='product', read_only=True)
+    product_id = serializers.PrimaryKeyRelatedField(
+        source='product', queryset=Product.objects.filter(is_deleted=False), write_only=True,
+    )
+
+    class Meta:
+        model = SavedItem
+        fields = ('id', 'product_id', 'product_detail', 'created_at')
+        read_only_fields = ('id', 'created_at')
 
 
 class OrderItemSerializer(serializers.ModelSerializer):

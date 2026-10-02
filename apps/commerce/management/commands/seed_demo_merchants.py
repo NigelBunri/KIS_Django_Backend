@@ -4,12 +4,14 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.core.management.base import BaseCommand
+from django.db.models.signals import post_save
 from django.utils import timezone
 from django.utils.text import slugify
 
 from apps.accounts.models import User
 from apps.commerce.constants import KIS_COIN_CODE
 from apps.commerce.category_catalog import ensure_catalog_categories
+from apps.commerce.signals import on_product_save
 from apps.commerce.models import (
     CatalogCategory,
     Product,
@@ -222,6 +224,19 @@ class Command(BaseCommand):
     help = "Create demo merchants with fully populated shops, products, and services for QA."
 
     def handle(self, *args, **options):
+        # on_product_save fires compute_recommendations.delay(...) on every
+        # Product create/update. Outside a request/task context there is no
+        # guarantee of a reachable broker, and this command observed it
+        # blocking indefinitely rather than failing fast - disconnect for
+        # the duration of this bulk seed, same as apps/commerce/tests.py's
+        # disable_product_recommendation_signal pattern.
+        post_save.disconnect(on_product_save, sender=Product)
+        try:
+            self._run(*args, **options)
+        finally:
+            post_save.connect(on_product_save, sender=Product)
+
+    def _run(self, *args, **options):
         summary_lines = []
         ensure_catalog_categories()
         for index, entry in enumerate(MERCHANTS):
@@ -415,11 +430,18 @@ class Command(BaseCommand):
             )
 
     def build_product_defaults(self, entry, shop, price, slug):
+        # NOTE: this previously included image_url/rating_avg/rating_count/
+        # ai_score/ar_preview_url/authenticity_status/authenticity_proof/
+        # availability/coverage/location/service_type/other_shops_discount/
+        # availability_rules - none of those are fields on Product (several
+        # are ShopService-only fields, apparently copy-pasted from
+        # build_service_defaults below). update_or_create crashed with
+        # "invalid keyword argument" on every run; this command had never
+        # successfully completed. Trimmed to real Product fields only.
         return {
             "shop": shop,
             "name": f"{entry['visible_name']} Signature Box",
             "slug": slugify(f"{slug}-product"),
-            "image_url": f"https://images.kis.test/products/{shop.slug}-box.jpg",
             "description": (
                 f"A {entry['visible_name']}-curated kit with artisan tools, bespoke documentation, "
                 f"and premium packaging created for {entry['city']} and remote collaborators."
@@ -439,22 +461,6 @@ class Command(BaseCommand):
             },
             "is_active": True,
             "is_featured": True,
-            "rating_avg": round(4.7 + entry_index(entry) * 0.01, 2),
-            "rating_count": 32 + entry_index(entry),
-            "ai_score": round(0.92 + entry_index(entry) * 0.003, 3),
-            "ar_preview_url": f"https://ar.kis.test/{shop.slug}/product",
-            "authenticity_status": "VERIFIED",
-            "authenticity_proof": {
-                "certificate_id": f"{shop.slug.upper()}-AUTH",
-                "verified_at": timezone.now().isoformat(),
-                "issuer": "KIS Auth Vault",
-            },
-            "availability": "Ships within 2 business days.",
-            "coverage": f"{entry['city']}, {entry['state']}, United States",
-            "location": f"{entry['city']}, {entry['state']}",
-            "service_type": "Lifestyle Product",
-            "other_shops_discount": Decimal("6.50"),
-            "availability_rules": [{"name": "max_per_order", "value": 3}],
         }
 
     def build_service_defaults(self, entry, shop, price, slug):
@@ -528,8 +534,8 @@ class Command(BaseCommand):
                 {"rule": "max_advance_days", "value": 120},
             ],
             "blackout_dates": [
-                timezone.now().date(),
-                (timezone.now() + timedelta(days=14)).date(),
+                timezone.now().date().isoformat(),
+                (timezone.now() + timedelta(days=14)).date().isoformat(),
             ],
             "coverage": ["Metro area", "Regional travel"],
             "remote_regions": ["North America", "UK & EU"],
