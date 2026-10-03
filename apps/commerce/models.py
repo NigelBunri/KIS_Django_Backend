@@ -930,7 +930,11 @@ class MarketplaceOrder(BaseEntity):
 
 class MarketplaceOrderItem(BaseEntity):
     order = models.ForeignKey(MarketplaceOrder, on_delete=models.CASCADE, related_name='items')
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='marketplace_order_items')
+    # PROTECT, not CASCADE: a Product is normally only soft-deleted (see
+    # ProductViewSet.perform_destroy), but this is defense-in-depth against
+    # a hard delete (Django admin, shell, management command) silently
+    # wiping historical order records for a product that was ever sold.
+    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name='marketplace_order_items')
     variant_id = models.CharField(max_length=128, blank=True, default='')
     quantity = models.PositiveIntegerField(default=1)
     unit_price_cents = models.PositiveIntegerField()
@@ -957,6 +961,11 @@ class MarketplaceComplaint(BaseEntity):
     text = models.TextField()
     attachment = models.FileField(upload_to='commerce/marketplace/complaints/', max_length=1024, null=True, blank=True)
     status = models.CharField(max_length=32, choices=MarketplaceComplaintStatus.choices, default=MarketplaceComplaintStatus.PENDING)
+    resolution_notes = models.TextField(blank=True, default='')
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+'
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         indexes = [models.Index(fields=['order'])]
@@ -1113,8 +1122,27 @@ class Promotion(BaseEntity):
     end_date = models.DateTimeField()
     usage_limit = models.IntegerField(null=True, blank=True)
     used_count = models.IntegerField(default=0)
+    # Per-buyer cap, independent of usage_limit (the shop-wide total). Null
+    # means no per-user cap - only the shop-wide usage_limit applies.
+    per_user_limit = models.PositiveIntegerField(null=True, blank=True)
     applicable_products = JSONField(default=list, blank=True)
     social_boost = models.BooleanField(default=False)
+
+
+class PromotionRedemption(BaseEntity):
+    """One row per successful promo-code use, so per_user_limit can be
+    enforced by counting rows for (promotion, user) rather than trusting a
+    mutable counter on the user. Created inside the same checkout
+    transaction that locks the Promotion row (see services._apply_promotion),
+    so concurrent checkouts by the same buyer can't both slip past the cap."""
+    promotion = models.ForeignKey(Promotion, on_delete=models.CASCADE, related_name='redemptions')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='promotion_redemptions')
+    order = models.ForeignKey(
+        'MarketplaceOrder', on_delete=models.SET_NULL, null=True, blank=True, related_name='promotion_redemptions'
+    )
+
+    class Meta:
+        indexes = [models.Index(fields=['promotion', 'user'])]
 
 
 class Subscription(BaseEntity):
@@ -1367,4 +1395,15 @@ from .shipping_models import (  # noqa: E402,F401
     ShippingRate,
     ShippingRateType,
     ShippingZone,
+)
+from .returns_models import (  # noqa: E402,F401
+    Refund,
+    RefundReason,
+    RefundStatus,
+    RETURN_TRANSITIONS,
+    RETURN_WINDOW_DAYS,
+    ReturnItem,
+    ReturnReason,
+    ReturnRequest,
+    ReturnStatus,
 )

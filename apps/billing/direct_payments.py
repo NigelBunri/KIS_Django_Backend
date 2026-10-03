@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
@@ -110,6 +111,36 @@ def verify_flutterwave_transaction(transaction_id: str) -> dict:
     data = response.json() if response.content else {}
     if response.status_code >= 300:
         raise ValueError(str(data.get("message") or "Unable to verify transaction with the payment provider."))
+    return data.get("data") or {}
+
+
+def refund_flutterwave_transaction(provider_transaction_id: str, *, amount_cents: int | None = None) -> dict:
+    """Server-to-server call against Flutterwave's own
+    POST /transactions/:id/refund endpoint. amount_cents=None requests a
+    full refund of the original charge; a value requests a partial refund
+    of that many cents (converted to major units, as Flutterwave's refund
+    API expects an `amount` in the charge's major currency unit, not minor
+    units like the rest of this module's cents-based accounting).
+    Raises ValueError on any non-2xx response rather than returning a
+    fabricated success - callers (returns_services.create_refund) must
+    treat an exception here as a FAILED refund attempt, not a succeeded
+    one."""
+    if not str(provider_transaction_id or "").strip():
+        raise ValueError("provider_transaction_id is required.")
+    payload: dict[str, Any] = {}
+    if amount_cents is not None:
+        if amount_cents <= 0:
+            raise ValueError("amount_cents must be greater than zero for a partial refund.")
+        payload["amount"] = amount_cents / 100
+    response = requests.post(
+        f"{FLW_BASE_URL}/transactions/{provider_transaction_id}/refund",
+        json=payload,
+        headers=_flutterwave_headers(),
+        timeout=30,
+    )
+    data = response.json() if response.content else {}
+    if response.status_code >= 300:
+        raise ValueError(str(data.get("message") or "Unable to refund this transaction with the payment provider."))
     return data.get("data") or {}
 
 
@@ -662,7 +693,7 @@ def _attach_intent_to_target(intent: DirectPaymentIntent, target: Any | None = N
 
 def reconcile_direct_payment_callback(*, payload: dict, signature: str = "") -> tuple[bool, str, DirectPaymentIntent | None]:
     secret = getattr(settings, "FLW_WEBHOOK_SECRET", "")
-    if not secret or signature != secret:
+    if not secret or not hmac.compare_digest(signature or "", secret):
         write_direct_payment_audit(event="callback.signature_invalid", metadata={"provider": "flutterwave"})
         return False, "invalid_signature", None
     body = payload if isinstance(payload, dict) else {}

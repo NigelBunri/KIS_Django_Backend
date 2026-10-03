@@ -86,11 +86,18 @@ class RateableItem:
     weight_kg: Decimal | None = None
 
 
-def calculate_rate_cents(rate: ShippingRate, *, subtotal_cents: int, items: Iterable[RateableItem]) -> int:
+def calculate_rate_cents(rate: ShippingRate, *, subtotal_cents: int, items: Iterable[RateableItem]) -> int | None:
     """Pure calculation - no I/O, no side effects, safe to call for a
     checkout preview as well as from inside the order transaction. The
     server is always the one calling this; checkout never accepts a client-
-    supplied shipping price (spec §8)."""
+    supplied shipping price (spec §8).
+
+    Returns None, rather than a dollar amount, when this rate cannot be
+    priced at all - currently only a WEIGHT rate with missing product
+    weight data. list_shipping_options treats None as "not offered"; it is
+    never coerced into a cost, since a WEIGHT-type rate silently charging
+    $0 for an unweighed item would look like free shipping rather than the
+    missing-data case it actually is."""
     items = list(items)
     if rate.rate_type == ShippingRateType.FREE:
         return 0
@@ -103,8 +110,11 @@ def calculate_rate_cents(rate: ShippingRate, *, subtotal_cents: int, items: Iter
         total_qty = sum(i.quantity for i in items)
         return rate.base_cents * total_qty
     if rate.rate_type == ShippingRateType.WEIGHT:
-        # A product with no weight_kg set contributes 0 - documented in
-        # Product.weight_kg's field comment, not a silent miscalculation.
+        # A WEIGHT rate cannot be honestly priced if any item in the basket
+        # has no weight_kg recorded - explicitly unavailable, not a $0 or
+        # partial-weight estimate. See docs/commerce_shipping.md.
+        if any(i.weight_kg is None and i.quantity > 0 for i in items):
+            return None
         total_weight = sum((i.weight_kg or Decimal("0")) * i.quantity for i in items)
         # round up to the nearest whole kg-unit of pricing, minimum 1 unit
         # for any non-zero shipment so a 0.2kg item isn't free to ship.
@@ -135,6 +145,8 @@ def list_shipping_options(*, shop: Shop, address: CustomerAddress, subtotal_cent
     options = []
     for rate in rates:
         cost_cents = calculate_rate_cents(rate, subtotal_cents=subtotal_cents, items=items)
+        if cost_cents is None:
+            continue
         min_date, max_date = estimate_delivery_dates(rate.method)
         options.append({
             "shipping_method_id": str(rate.method_id),

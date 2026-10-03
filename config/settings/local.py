@@ -80,7 +80,12 @@ DATABASES["default"].setdefault("TEST", {})
 if DATABASES["default"].get("ENGINE") == "django.db.backends.sqlite3":
     DATABASES["default"]["TEST"].setdefault("NAME", str(BASE_DIR / "test_db.sqlite3"))
 else:
-    DATABASES["default"]["TEST"].setdefault("NAME", "kis_test")
+    # Overridable so multiple local checkouts/worktrees (or parallel agent
+    # sessions) running tests against the same Postgres server don't fight
+    # over one "kis_test" database - each can set its own TEST_DB_NAME.
+    # Defaults to the original fixed name, so nothing changes for anyone
+    # who doesn't set it.
+    DATABASES["default"]["TEST"].setdefault("NAME", os.environ.get("TEST_DB_NAME", "kis_test"))
 
 test_mirror = os.environ.get("TEST_DATABASE_MIRROR", "").strip()
 if test_mirror:
