@@ -102,3 +102,54 @@ class AnalyticsAccessBoundaryTests(TestCase):
         self.client.force_authenticate(self.staff)
         allowed = self.client.get("/api/v1/metrics/")
         self.assertEqual(allowed.status_code, 200)
+
+
+class PlatformInsightsViewTests(TestCase):
+    """Covers the real KPI endpoint that replaced the dead /api/v1/dashboards/
+    wiring - the one thing that actually matters here is permission scoping:
+    a regular user must never reach platform-wide data, and every target
+    must return the {kpis, series, breakdown, distribution, top_items}
+    shape the RN client expects."""
+
+    def setUp(self):
+        auth_user = get_user_model()
+        self.user = auth_user.objects.create_user(phone="+237670004201", password="TestPass123!", country="CM")
+        self.staff = auth_user.objects.create_user(
+            phone="+237670004202", password="TestPass123!", country="CM", is_staff=True,
+        )
+        self.client = APIClient()
+
+    def _assert_shape(self, response):
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        for key in ("kpis", "series", "breakdown", "distribution", "top_items"):
+            self.assertIn(key, data)
+
+    def test_analytics_target_is_staff_only(self):
+        self.client.force_authenticate(self.user)
+        denied = self.client.get("/api/v1/analytics/insights/", {"target": "analytics"})
+        self.assertEqual(denied.status_code, 403)
+
+        self.client.force_authenticate(self.staff)
+        allowed = self.client.get("/api/v1/analytics/insights/", {"target": "analytics"})
+        self._assert_shape(allowed)
+
+    def test_profile_target_is_open_to_any_authenticated_user(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/api/v1/analytics/insights/", {"target": "profile"})
+        self._assert_shape(response)
+
+    def test_partner_target_returns_empty_kpis_for_a_user_with_no_partner_org(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/api/v1/analytics/insights/", {"target": "partner"})
+        self._assert_shape(response)
+        self.assertEqual(response.json()["data"]["kpis"], [])
+
+    def test_unauthenticated_request_is_rejected(self):
+        response = self.client.get("/api/v1/analytics/insights/", {"target": "profile"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_unknown_target_falls_back_to_profile_scope_not_platform_data(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/api/v1/analytics/insights/", {"target": "not-a-real-target"})
+        self._assert_shape(response)

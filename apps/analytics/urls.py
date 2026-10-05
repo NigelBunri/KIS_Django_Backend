@@ -1,4 +1,6 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
+from .insight_views import PlatformInsightsView
 from .views import (
     MetricViewSet,
     EventStreamViewSet,
@@ -32,4 +34,6 @@ router.register('outreach-campaigns', OutreachCampaignViewSet, basename='outreac
 router.register('wellness-challenges', WellnessChallengeViewSet, basename='wellnesschallenge')
 router.register('habit-entries', HabitTrackingEntryViewSet, basename='habitentry')
 
-urlpatterns = router.urls
+urlpatterns = router.urls + [
+    path('analytics/insights/', PlatformInsightsView.as_view(), name='platform-insights'),
+]

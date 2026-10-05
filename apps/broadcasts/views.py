@@ -9920,8 +9920,9 @@ class EducationInstitutionListView(APIView):
 
     def get(self, request):
         institutions = _education_institution_qs_for_user(request.user)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
         serializer = EducationInstitutionSerializer(
-            institutions,
+            institutions[:limit],
             many=True,
             context={"request": request},
         )
@@ -10356,7 +10357,8 @@ class EducationInstitutionMembershipListView(APIView):
         qs = institution.memberships.select_related("user", "user__profile").order_by("-created_at")
         if current_membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationInstitutionMembershipStatus.ACTIVE)
-        serializer = EducationInstitutionMembershipSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionMembershipSerializer(qs[:limit], many=True)
         return Response({"memberships": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -10437,7 +10439,8 @@ class EducationInstitutionEnrollmentListView(APIView):
         qs = institution.enrollments.select_related(
             "user", "user__profile", "broadcast", "program", "course", "lesson", "class_session", "event"
         ).order_by("-created_at")
-        serializer = EducationInstitutionEnrollmentSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionEnrollmentSerializer(qs[:limit], many=True)
         return Response({"enrollments": serializer.data}, status=status.HTTP_200_OK)
 
 
@@ -10458,7 +10461,8 @@ class EducationInstitutionCourseAccessRequestListView(APIView):
         status_filter = str(request.query_params.get("status") or "").strip().lower()
         if status_filter in EducationCourseAccessRequestStatus.values:
             qs = qs.filter(status=status_filter)
-        serializer = EducationInstitutionCourseAccessRequestSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionCourseAccessRequestSerializer(qs[:limit], many=True)
         return Response({"access_requests": serializer.data}, status=status.HTTP_200_OK)
 
 
@@ -10497,7 +10501,8 @@ class EducationInstitutionBookingListView(APIView):
             "wallet_transaction",
             "provider_credit_transaction",
         ).order_by("-created_at")
-        serializer = EducationInstitutionBookingSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionBookingSerializer(qs[:limit], many=True)
         return Response({"bookings": serializer.data}, status=status.HTTP_200_OK)
 
 
@@ -10727,7 +10732,8 @@ class EducationCourseAccessRequestListView(APIView):
         qs = course.access_requests.select_related("user").order_by("-created_at")
         if not is_manager:
             qs = qs.filter(user=request.user)
-        serializer = EducationInstitutionCourseAccessRequestSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionCourseAccessRequestSerializer(qs[:limit], many=True)
         return Response({"access_requests": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -10800,7 +10806,8 @@ class EducationInstitutionStaffAssignmentListView(APIView):
             qs = qs.filter(event_id=request.query_params.get("event_id"))
         if request.query_params.get("assessment_id"):
             qs = qs.filter(assessment_id=request.query_params.get("assessment_id"))
-        serializer = EducationInstitutionStaffAssignmentSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionStaffAssignmentSerializer(qs[:limit], many=True)
         return Response({"staff_assignments": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -11042,7 +11049,8 @@ class EducationInstitutionProgramListView(APIView):
         qs = institution.programs.all().order_by("title", "-created_at")
         if current_membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationAcademicRecordStatus.PUBLISHED)
-        serializer = EducationInstitutionProgramSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionProgramSerializer(qs[:limit], many=True)
         return Response({"programs": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -11171,7 +11179,8 @@ class EducationInstitutionClassListView(APIView):
             qs = qs.filter(program_id=request.query_params.get("program_id"))
         if str(request.query_params.get("standalone") or "").lower() in ("1", "true", "yes"):
             qs = qs.filter(program__isnull=True)
-        serializer = EducationInstitutionClassSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionClassSerializer(qs[:limit], many=True)
         return Response({"classes": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -11306,7 +11315,8 @@ class EducationInstitutionCourseListView(APIView):
             qs = qs.filter(program_id=request.query_params.get("program_id"))
         if request.query_params.get("institution_class_id"):
             qs = qs.filter(institution_class_id=request.query_params.get("institution_class_id"))
-        serializer = EducationInstitutionCourseSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionCourseSerializer(qs[:limit], many=True)
         return Response({"courses": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -11442,7 +11452,8 @@ class EducationInstitutionCourseModuleListView(APIView):
         qs = course.modules_v2.prefetch_related("items").order_by("module_order", "title", "-created_at")
         if current_membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationAcademicRecordStatus.PUBLISHED)
-        serializer = EducationInstitutionCourseModuleSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionCourseModuleSerializer(qs[:limit], many=True)
         return Response({"modules": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -11533,7 +11544,8 @@ class EducationInstitutionCourseModuleItemListView(APIView):
             "event",
             "broadcast",
         ).order_by("item_order", "created_at")
-        serializer = EducationInstitutionCourseModuleItemSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionCourseModuleItemSerializer(qs[:limit], many=True)
         return Response({"items": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -11638,7 +11650,8 @@ class EducationInstitutionLessonListView(APIView):
             qs = qs.filter(course_id=course_id)
         if current_membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationAcademicRecordStatus.PUBLISHED)
-        serializer = EducationInstitutionLessonSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionLessonSerializer(qs[:limit], many=True)
         return Response({"lessons": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -11765,7 +11778,8 @@ class EducationInstitutionClassSessionListView(APIView):
         course_id = request.query_params.get("course_id")
         if course_id:
             qs = qs.filter(course_id=course_id)
-        serializer = EducationInstitutionClassSessionSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionClassSessionSerializer(qs[:limit], many=True)
         return Response({"class_sessions": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -11915,7 +11929,8 @@ class EducationInstitutionMaterialListView(APIView):
         if current_membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationAcademicRecordStatus.PUBLISHED)
         qs = qs.distinct()
-        serializer = EducationInstitutionMaterialSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionMaterialSerializer(qs[:limit], many=True)
         return Response({"materials": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -12165,7 +12180,8 @@ class EducationInstitutionEventListView(APIView):
             qs = qs.filter(class_session_id=request.query_params.get("class_session_id"))
         if membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationAcademicRecordStatus.PUBLISHED)
-        serializer = EducationInstitutionEventSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionEventSerializer(qs[:limit], many=True)
         return Response({"events": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -12314,7 +12330,8 @@ class EducationInstitutionBroadcastListView(APIView):
             qs = qs.filter(broadcast_kind=_normalize_education_broadcast_kind(request.query_params.get("broadcast_kind")))
         if membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationBroadcastStatus.PUBLISHED)
-        serializer = EducationInstitutionBroadcastSerializer(qs, many=True, context={"request": request})
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionBroadcastSerializer(qs[:limit], many=True, context={"request": request})
         return Response({"broadcasts": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -12726,7 +12743,8 @@ class EducationInstitutionBroadcastEnrollmentListView(APIView):
         qs = broadcast.enrollments.order_by("-created_at")
         if not membership or membership.role not in _education_manage_roles():
             qs = qs.filter(user=request.user)
-        serializer = EducationInstitutionEnrollmentSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionEnrollmentSerializer(qs[:limit], many=True)
         return Response({"enrollments": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -12784,7 +12802,8 @@ class EducationInstitutionBroadcastBookingListView(APIView):
         qs = broadcast.bookings.order_by("-created_at")
         if not membership or membership.role not in _education_manage_roles():
             qs = qs.filter(user=request.user)
-        serializer = EducationInstitutionBookingSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionBookingSerializer(qs[:limit], many=True)
         return Response({"bookings": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -13864,7 +13883,8 @@ class EducationInstitutionAssessmentListView(APIView):
             qs = qs.filter(lesson_id=request.query_params.get("lesson_id"))
         if membership.role not in _education_manage_roles():
             qs = qs.filter(status=EducationAcademicRecordStatus.PUBLISHED)
-        serializer = EducationInstitutionAssessmentSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionAssessmentSerializer(qs[:limit], many=True)
         return Response({"assessments": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic
@@ -14159,7 +14179,8 @@ class EducationInstitutionAssessmentSubmissionListView(APIView):
         qs = assessment.submissions.prefetch_related("responses__selected_options__option").order_by("-created_at")
         if membership.role not in _education_manage_roles():
             qs = qs.filter(user=request.user)
-        serializer = EducationInstitutionAssessmentSubmissionSerializer(qs, many=True)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = EducationInstitutionAssessmentSubmissionSerializer(qs[:limit], many=True)
         return Response({"submissions": serializer.data}, status=status.HTTP_200_OK)
 
     @transaction.atomic

@@ -2784,6 +2784,23 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
         return _commerce_currency_label(obj.currency, obj.metadata if isinstance(obj.metadata, dict) else {})
 
     def get_payment_status(self, obj):
+        # obj.status is the authoritative payment-completion signal: the
+        # modern (non-legacy-wallet) checkout path sets
+        # metadata['payment_status'] = 'pending' at order creation and
+        # never updates it afterward even once a provider confirms payment
+        # and obj.status transitions to AWAITING_SATISFACTION/SATISFIED/
+        # COMPLETED - without this check a genuinely paid order would
+        # report payment_status 'pending' forever. Same bug class/fix as
+        # InvoiceSerializer.get_status. metadata/buyer_debit_transaction_id
+        # remain the fallback for the legacy wallet-escrow path, which does
+        # keep metadata['payment_status'] current itself.
+        paid_order_statuses = {
+            MarketplaceOrderStatus.AWAITING_SATISFACTION,
+            MarketplaceOrderStatus.SATISFIED,
+            MarketplaceOrderStatus.COMPLETED,
+        }
+        if obj.status in paid_order_statuses:
+            return 'paid'
         meta = obj.metadata if isinstance(obj.metadata, dict) else {}
         return str(meta.get('payment_status') or ('paid' if obj.buyer_debit_transaction_id else 'pending'))
 
@@ -2849,6 +2866,118 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
         if str(meta.get('payment_status') or '').lower() in {'pending', 'failed'}:
             return 'Complete secure Flutterwave checkout before fulfillment begins.'
         return 'Seller fulfillment is being tracked on KIS.'
+
+
+class InvoiceSerializer(serializers.ModelSerializer):
+    """Read-only invoice view over a MarketplaceOrder. Deliberately not a
+    separate stored model - an invoice here is just a formatted
+    presentation of an order that has actually been paid for, so there is
+    one source of truth for the money (MarketplaceOrder/payment metadata)
+    instead of two records that could drift apart."""
+
+    invoice_number = serializers.SerializerMethodField()
+    amount = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+    date = serializers.SerializerMethodField()
+    description = serializers.SerializerMethodField()
+    items = serializers.SerializerMethodField()
+    recipient = serializers.SerializerMethodField()
+    issuer = serializers.SerializerMethodField()
+    download_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MarketplaceOrder
+        fields = (
+            'id',
+            'invoice_number',
+            'amount',
+            'currency',
+            'status',
+            'date',
+            'description',
+            'items',
+            'recipient',
+            'issuer',
+            'download_url',
+            'created_at',
+        )
+
+    def get_invoice_number(self, obj):
+        return f"INV-{str(obj.id).split('-')[0].upper()}"
+
+    def get_amount(self, obj):
+        return str(obj.total_amount)
+
+    def get_status(self, obj):
+        # obj.status is the authoritative payment-completion signal here,
+        # not metadata.payment_status: the modern (non-legacy-wallet)
+        # checkout path sets metadata['payment_status'] = 'pending' at
+        # order creation (see place_marketplace_order in services.py) and
+        # never updates it afterward even once a provider confirms payment
+        # and obj.status transitions to AWAITING_SATISFACTION/SATISFIED/
+        # COMPLETED - that stale-metadata gap is what InvoiceListView's own
+        # get_queryset already works around, and this must stay consistent
+        # with it or a genuinely paid invoice would list as "paid" but
+        # display its own status as "pending". metadata/
+        # buyer_debit_transaction_id are kept only as a fallback for the
+        # legacy wallet-escrow path, which does set metadata['payment_status']
+        # itself and does not use these status values.
+        paid_order_statuses = {
+            MarketplaceOrderStatus.AWAITING_SATISFACTION,
+            MarketplaceOrderStatus.SATISFIED,
+            MarketplaceOrderStatus.COMPLETED,
+        }
+        if obj.status in paid_order_statuses:
+            return 'paid'
+        if obj.status == MarketplaceOrderStatus.CANCELLED:
+            return 'overdue'
+        meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+        payment_status = str(meta.get('payment_status') or ('paid' if obj.buyer_debit_transaction_id else 'pending')).lower()
+        if payment_status in ('paid', 'success', 'succeeded', 'completed'):
+            return 'paid'
+        if payment_status in ('failed', 'cancelled', 'canceled'):
+            return 'overdue'
+        return 'pending'
+
+    def get_date(self, obj):
+        return obj.created_at
+
+    def get_description(self, obj):
+        shop = getattr(obj, 'shop', None)
+        return f"Order from {shop.name}" if shop else None
+
+    def get_items(self, obj):
+        return [
+            {
+                'id': str(item.id),
+                'name': item.product.name if item.product else (item.custom_description or 'Item'),
+                'amount': str((item.unit_price_cents * item.quantity) / 100),
+            }
+            for item in obj.items.all()
+        ]
+
+    def get_recipient(self, obj):
+        user = getattr(obj, 'buyer', None)
+        if not user:
+            return None
+        return {
+            'id': str(user.id),
+            'name': getattr(user, 'display_name', None) or getattr(user, 'username', ''),
+        }
+
+    def get_issuer(self, obj):
+        shop = getattr(obj, 'shop', None)
+        if not shop:
+            return None
+        return {'id': str(shop.id), 'name': shop.name}
+
+    def get_download_url(self, obj):
+        is_paid = self.get_status(obj) == 'paid'
+        if not is_paid:
+            return None
+        path = f"/api/v1/commerce/marketplace-orders/{obj.id}/receipt/"
+        request = self.context.get('request')
+        return request.build_absolute_uri(path) if request else path
 
 
 class MarketplaceOrderItemCreateSerializer(serializers.Serializer):

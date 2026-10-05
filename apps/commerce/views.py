@@ -4,7 +4,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 
-from rest_framework import mixins, viewsets, status, permissions
+from rest_framework import mixins, viewsets, status, permissions, generics
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -116,6 +116,7 @@ from .serializers import (
     CartItemSerializer,
     MarketplaceOrderSerializer,
     MarketplaceOrderCreateSerializer,
+    InvoiceSerializer,
     MarketplaceComplaintSerializer,
     MarketplaceComplaintCreateSerializer,
 )
@@ -3353,6 +3354,45 @@ class MarketplaceOrderViewSet(
             )
         order.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class InvoiceListView(generics.ListAPIView):
+    """Read-only list of the requesting user's paid marketplace orders,
+    presented as invoices (see InvoiceSerializer - no separate Invoice
+    model exists; this is a formatted view over MarketplaceOrder so the
+    money has one source of truth)."""
+
+    serializer_class = InvoiceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        paid_statuses = {
+            MarketplaceOrderStatus.AWAITING_SATISFACTION,
+            MarketplaceOrderStatus.SATISFIED,
+            MarketplaceOrderStatus.COMPLETED,
+        }
+        return (
+            MarketplaceOrder.objects.filter(
+                Q(buyer=self.request.user, status__in=paid_statuses)
+                | Q(buyer=self.request.user, metadata__payment_status='paid')
+            )
+            .order_by('-created_at')
+            .select_related('buyer', 'shop')
+            .prefetch_related('items__product')
+            .distinct()
+        )
+
+
+class InvoiceDetailView(generics.RetrieveAPIView):
+    """Single-invoice detail, same scoping/serializer as InvoiceListView."""
+
+    serializer_class = InvoiceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return MarketplaceOrder.objects.filter(buyer=self.request.user).select_related(
+            'buyer', 'shop'
+        ).prefetch_related('items__product')
 
 
 class MarketplaceProviderOrderViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.RetrieveModelMixin):

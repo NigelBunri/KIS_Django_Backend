@@ -63,6 +63,16 @@ urlpatterns = [
         shipping_views.ShippingOptionsView.as_view(),
         name='commerce-shipping-options',
     ),
+    path(
+        'invoices/',
+        views.InvoiceListView.as_view(),
+        name='commerce-invoices',
+    ),
+    path(
+        'invoices/<uuid:pk>/',
+        views.InvoiceDetailView.as_view(),
+        name='commerce-invoice-detail',
+    ),
     *router.urls,
     path(
         'payments/<uuid:payment_id>/satisfy/',
