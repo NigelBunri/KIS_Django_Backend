@@ -41,6 +41,7 @@ router.register(r'fulfillments', shipping_views.FulfillmentViewSet, basename='fu
 router.register(r'shipments', shipping_views.ShipmentViewSet, basename='shipments')
 router.register(r'returns', returns_views.ReturnRequestViewSet, basename='returns')
 router.register(r'refunds', returns_views.RefundViewSet, basename='refunds')
+router.register(r'drops', views.MarketDropViewSet, basename='drops')
 
 urlpatterns = [
     path(

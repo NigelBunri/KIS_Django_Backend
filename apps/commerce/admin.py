@@ -6,6 +6,7 @@ from .models import (
     Cart,
     CartItem,
     Complaint,
+    MarketDrop,
     FraudSignal,
     LoyaltyPoint,
     MarketplaceComplaint,
@@ -51,6 +52,14 @@ class ShopAdmin(admin.ModelAdmin):
 class ShopCategoryAdmin(admin.ModelAdmin):
     list_display = ('id', 'shop', 'name', 'slug')
     search_fields = ('name', 'slug')
+
+
+@admin.register(MarketDrop)
+class MarketDropAdmin(admin.ModelAdmin):
+    list_display = ('id', 'title', 'shop', 'starts_at', 'ends_at', 'is_live')
+    list_filter = ('shop',)
+    search_fields = ('title', 'shop__name')
+    autocomplete_fields = ('shop', 'products')
 
 
 @admin.register(ShopLandingPage)

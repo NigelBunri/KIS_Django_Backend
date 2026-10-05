@@ -1407,3 +1407,4 @@ from .returns_models import (  # noqa: E402,F401
     ReturnRequest,
     ReturnStatus,
 )
+from .drops_models import MarketDrop  # noqa: E402,F401

@@ -23,6 +23,7 @@ from .models import (
     ShopVerificationRequest,
     Product,
     ProductAuthenticityCheck,
+    MarketDrop,
     Order,
     OrderItem,
     Payment,
@@ -2866,6 +2867,56 @@ class MarketplaceOrderSerializer(serializers.ModelSerializer):
         if str(meta.get('payment_status') or '').lower() in {'pending', 'failed'}:
             return 'Complete secure Flutterwave checkout before fulfillment begins.'
         return 'Seller fulfillment is being tracked on KIS.'
+
+
+class MarketDropSerializer(serializers.ModelSerializer):
+    shop_id = serializers.CharField(source="shop.id", read_only=True)
+    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    product_ids = serializers.SerializerMethodField()
+    is_live = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = MarketDrop
+        fields = (
+            "id",
+            "title",
+            "cover_url",
+            "starts_at",
+            "ends_at",
+            "is_live",
+            "shop_id",
+            "shop_name",
+            "product_ids",
+        )
+        read_only_fields = ("id",)
+
+    def get_product_ids(self, obj):
+        return [str(pid) for pid in obj.products.values_list("id", flat=True)]
+
+
+class MarketDropCreateSerializer(serializers.ModelSerializer):
+    product_ids = serializers.ListField(child=serializers.UUIDField(), required=False, default=list)
+
+    class Meta:
+        model = MarketDrop
+        fields = ("id", "shop", "title", "cover_url", "starts_at", "ends_at", "product_ids")
+        read_only_fields = ("id",)
+
+    def validate(self, attrs):
+        if attrs.get("starts_at") and attrs.get("ends_at") and attrs["starts_at"] >= attrs["ends_at"]:
+            raise serializers.ValidationError("ends_at must be after starts_at.")
+        shop = attrs.get("shop")
+        request = self.context.get("request")
+        if shop and request and shop.owner_id != request.user.id:
+            raise serializers.ValidationError("You can only create drops for a shop you own.")
+        return attrs
+
+    def create(self, validated_data):
+        product_ids = validated_data.pop("product_ids", [])
+        drop = MarketDrop.objects.create(created_by=self.context["request"].user, **validated_data)
+        if product_ids:
+            drop.products.set(Product.objects.filter(id__in=product_ids, shop=drop.shop))
+        return drop
 
 
 class InvoiceSerializer(serializers.ModelSerializer):

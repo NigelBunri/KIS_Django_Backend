@@ -38,6 +38,7 @@ from .models import (
     ShopVerificationRequest,
     Product,
     ProductAuthenticityCheck,
+    MarketDrop,
     Order,
     Payment,
     Promotion,
@@ -117,6 +118,8 @@ from .serializers import (
     MarketplaceOrderSerializer,
     MarketplaceOrderCreateSerializer,
     InvoiceSerializer,
+    MarketDropSerializer,
+    MarketDropCreateSerializer,
     MarketplaceComplaintSerializer,
     MarketplaceComplaintCreateSerializer,
 )
@@ -1042,14 +1045,23 @@ class CommerceDiscoveryView(APIView):
         # live in production before this fix. PublicShopSerializer is the
         # same minimal-fields pattern as HealthInstitutionPublicSerializer.
         shops_data = PublicShopSerializer(popular_shops_qs, many=True, context={'request': request}).data
+        now = timezone.now()
+        drops_qs = (
+            MarketDrop.objects.select_related('shop')
+            .prefetch_related('products')
+            .filter(ends_at__gte=now - timedelta(days=1))
+            .order_by('starts_at')[:12]
+        )
+        drops_data = MarketDropSerializer(drops_qs, many=True, context={'request': request}).data
+        featured_drop = next((d for d in drops_data if d['is_live']), (drops_data[0] if drops_data else None))
         return Response({
             'currency': 'USD',
             'payment_provider': _commerce_default_payment_provider(),
             'legacy_wallet_checkout_enabled': _commerce_wallet_checkout_enabled(),
             'trending_products': trending_data,
             'popular_shops': shops_data,
-            'drops': [],
-            'featured_drop': None,
+            'drops': drops_data,
+            'featured_drop': featured_drop,
             'sections': {
                 'featured_products': trending_data,
                 'trusted_shops': shops_data,
@@ -3393,6 +3405,34 @@ class InvoiceDetailView(generics.RetrieveAPIView):
         return MarketplaceOrder.objects.filter(buyer=self.request.user).select_related(
             'buyer', 'shop'
         ).prefetch_related('items__product')
+
+
+class MarketDropViewSet(viewsets.ModelViewSet):
+    """Shop-scheduled, time-boxed promotional drops (see drops_models.py's
+    docstring - this is the countdown/scheduling half of "Market Drops",
+    not a live-video broadcast). List is public (any authenticated user
+    browsing Market should see upcoming/live drops); create/update/delete
+    is restricted to the drop's own shop owner."""
+
+    serializer_class = MarketDropSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return MarketDropCreateSerializer
+        return MarketDropSerializer
+
+    def get_queryset(self):
+        qs = MarketDrop.objects.select_related("shop").prefetch_related("products")
+        if self.action in ("update", "partial_update", "destroy"):
+            return qs.filter(shop__owner=self.request.user)
+        # Browsing: hide drops that ended more than a day ago rather than
+        # showing every drop ever created.
+        cutoff = timezone.now() - timedelta(days=1)
+        return qs.filter(ends_at__gte=cutoff).order_by("starts_at")
+
+    def perform_create(self, serializer):
+        serializer.save()
 
 
 class MarketplaceProviderOrderViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.RetrieveModelMixin):
