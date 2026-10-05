@@ -167,10 +167,36 @@ class ShippingRateCalculationTests(TestCase):
         # 2 * 1.5kg = 3.0kg -> 3 whole-kg units * 500
         self.assertEqual(cost, 1500)
 
-    def test_weight_rate_with_missing_weight_contributes_zero(self):
+    def test_weight_rate_with_missing_weight_is_unavailable(self):
+        # Missing weight data must make a WEIGHT rate unavailable (None),
+        # never silently price it as free shipping.
         rate = self._rate(rate_type=ShippingRateType.WEIGHT, base_cents=500)
         cost = calculate_rate_cents(rate, subtotal_cents=0, items=[RateableItem(quantity=5, weight_kg=None)])
-        self.assertEqual(cost, 0)
+        self.assertIsNone(cost)
+
+    def test_weight_rate_partial_missing_weight_is_unavailable(self):
+        rate = self._rate(rate_type=ShippingRateType.WEIGHT, base_cents=500)
+        cost = calculate_rate_cents(rate, subtotal_cents=0, items=[
+            RateableItem(quantity=1, weight_kg=Decimal("1.0")),
+            RateableItem(quantity=1, weight_kg=None),
+        ])
+        self.assertIsNone(cost)
+
+    def test_weight_rate_excluded_from_options_but_flat_rate_still_offered(self):
+        # End-to-end through list_shipping_options: an unweighed basket must
+        # not see a free WEIGHT-type option, but an unrelated FLAT-type
+        # method in the same zone is unaffected.
+        self._rate(rate_type=ShippingRateType.WEIGHT, base_cents=500)
+        flat_method = ShippingMethod.objects.create(shop=self.shop, name="Flat")
+        ShippingRate.objects.create(method=flat_method, zone=self.zone, rate_type=ShippingRateType.FLAT, base_cents=800)
+        address = _make_address(self.owner, country="NG")
+        options = list_shipping_options(
+            shop=self.shop, address=address, subtotal_cents=5000,
+            items=[RateableItem(quantity=1, weight_kg=None)],
+        )
+        method_ids = {o["shipping_method_id"] for o in options}
+        self.assertNotIn(str(self.method.id), method_ids)
+        self.assertIn(str(flat_method.id), method_ids)
 
 
 class CheckoutShippingIntegrationTests(TestCase):
@@ -788,3 +814,37 @@ class ShippingOptionsNoImplicitTransactionAPITests(APITransactionTestCase):
         }, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(response.data["options"][0]["cost_cents"], 400)
+
+
+class ProductWeightValidationTests(TestCase):
+    """Product.weight_kg is the real column shipping rate calculation reads
+    (distinct from the cosmetic `weight` display attribute) - must reject
+    negative/unreasonable values at the API boundary, not just in Python."""
+
+    def setUp(self):
+        _disable_recommendation_signal(self)
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone="5557840001", username="wkg_owner", password="secret", country="NG")
+        self.shop = _make_shop(self.owner, "weighttest")
+
+    def _serializer_errors(self, weight_kg):
+        from .serializers import ProductSerializer
+
+        serializer = ProductSerializer(data={
+            "shop": str(self.shop.id), "sku": "WKG-001", "name": "Weight Test Widget",
+            "price": "10.00", "stock_qty": 5, "currency": "USD", "weight_kg": weight_kg,
+        })
+        serializer.is_valid()
+        return serializer.errors
+
+    def test_negative_weight_is_rejected(self):
+        self.assertIn("weight_kg", self._serializer_errors("-1"))
+
+    def test_unreasonably_large_weight_is_rejected(self):
+        self.assertIn("weight_kg", self._serializer_errors("5000"))
+
+    def test_valid_weight_is_accepted(self):
+        self.assertNotIn("weight_kg", self._serializer_errors("12.500"))
+
+    def test_null_weight_is_accepted(self):
+        self.assertNotIn("weight_kg", self._serializer_errors(None))

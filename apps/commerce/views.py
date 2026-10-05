@@ -68,6 +68,7 @@ from .models import (
     MarketplaceOrder,
     MarketplaceOrderStatus,
     MarketplaceComplaint,
+    MarketplaceComplaintStatus,
     CatalogCategory,
 )
 from .services import (
@@ -120,6 +121,19 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_delay(task, *args, **kwargs) -> None:
+    """Enqueue a best-effort background task without letting a broker
+    outage (unreachable Redis, connection timeout) propagate into the
+    caller's HTTP request as a 500. CELERY_BROKER_CONNECTION_TIMEOUT /
+    CELERY_BROKER_TRANSPORT_OPTIONS bound how long this can block before
+    raising, so the caller is never left hanging indefinitely either."""
+    try:
+        task.delay(*args, **kwargs)
+    except Exception:
+        logger.exception("Failed to enqueue background task %s", getattr(task, "name", task))
+
 
 def _wallet_amount(value: int | None) -> int:
     return max(0, int(value or 0))
@@ -819,7 +833,7 @@ class ShopViewSet(viewsets.ModelViewSet):
         shop.verification_status = 'PENDING'
         shop.save(update_fields=['verification_status', 'updated_at'])
         sync_shop_verification_request(verification_request=svr, actor=request.user)
-        enqueue_shop_verification.delay(str(svr.id))
+        _safe_delay(enqueue_shop_verification, str(svr.id))
         return Response({'status': 'verification_requested', 'id': svr.id})
 
     @doc_decorator(
@@ -1127,7 +1141,11 @@ class ProductViewSet(viewsets.ModelViewSet):
             "catalog_categories",
             "gallery_images",
         )
+        # Soft-deleted products are never shown through this API, even to
+        # the shop that owns them - Django admin is the forensics path.
+        qs = qs.filter(is_deleted=False)
         shop_id = self.request.query_params.get("shop")
+        managing_requested_shop = False
         if shop_id:
             # Accepts either the shop's UUID or its slug - a bare
             # filter(shop_id=shop_id) crashed with a 500 for any non-UUID
@@ -1136,8 +1154,21 @@ class ProductViewSet(viewsets.ModelViewSet):
             try:
                 uuid.UUID(str(shop_id))
                 qs = qs.filter(shop_id=shop_id)
+                requested_shop = Shop.objects.filter(id=shop_id).first()
             except (ValueError, AttributeError, TypeError):
                 qs = qs.filter(shop__slug=shop_id)
+                requested_shop = Shop.objects.filter(slug=shop_id).first()
+            if requested_shop is not None:
+                user = self.request.user
+                managing_requested_shop = bool(
+                    user and not getattr(user, "is_anonymous", True)
+                    and (_provider_can_manage_shop(user, requested_shop) or user.is_staff)
+                )
+        if not managing_requested_shop:
+            # Public/anonymous/non-owner reads never see unpublished
+            # listings. A shop's own manager viewing their dashboard via
+            # ?shop=<their shop> still sees drafts/inactive products.
+            qs = qs.filter(is_active=True)
         owner_id = self.request.query_params.get("owner")
         if owner_id:
             try:
@@ -1315,7 +1346,7 @@ class ProductViewSet(viewsets.ModelViewSet):
     def check_authenticity(self, request, pk=None):
         product = self.get_object()
         pac = ProductAuthenticityCheck.objects.create(product=product, requested_by=request.user, provider=request.data.get('provider', 'local_ai'))
-        enqueue_product_auth_check.delay(str(pac.id))
+        _safe_delay(enqueue_product_auth_check, str(pac.id))
         return Response({'status': 'auth_check_requested', 'id': pac.id})
 
     @action(detail=True, methods=['post', 'delete'], url_path='broadcast')
@@ -1464,7 +1495,7 @@ class OrderViewSet(viewsets.ModelViewSet):
             notes=f'DirectPaymentIntent {intent.id}',
         )
 
-        evaluate_fraud_score.delay(str(order.id))
+        _safe_delay(evaluate_fraud_score, str(order.id))
 
         return Response({
             'status': 'pending',
@@ -1757,7 +1788,7 @@ class AIRecommendationViewSet(viewsets.ReadOnlyModelViewSet):
     )
     @action(detail=False, methods=['post'])
     def compute(self, request):
-        compute_recommendations.delay(str(request.user.id))
+        _safe_delay(compute_recommendations, str(request.user.id))
         return Response({'status': 'enqueued'})
 
 
@@ -3362,16 +3393,59 @@ class MarketplaceComplaintViewSet(viewsets.GenericViewSet, mixins.ListModelMixin
 
     def get_queryset(self):
         user = self.request.user
-        return (
-            MarketplaceComplaint.objects.filter(Q(user=user) | Q(order__shop__owner=user))
-            .distinct()
-            .select_related('order', 'user')
-            .order_by('-created_at')
-        )
+        base = MarketplaceComplaint.objects.select_related('order', 'order__shop', 'user').order_by('-created_at')
+        if getattr(user, 'is_staff', False):
+            # Staff see every complaint platform-wide (spec §16 dispute
+            # resolution) - a seller/buyer's own scoping below would
+            # otherwise hide it from the one role meant to arbitrate.
+            return base
+        managed_shop_ids = [s.id for s in Shop.objects.filter(owner=user)] + [
+            s.id for s in Shop.objects.filter(team_members__user=user, team_members__is_active=True)
+        ]
+        return base.filter(Q(user=user) | Q(order__shop_id__in=managed_shop_ids)).distinct()
 
     def list(self, request, *args, **kwargs):
         serializer = self.get_serializer(self.get_queryset(), many=True)
         return Response(serializer.data)
+
+    def _dispatch_resolution(self, request, target_status):
+        # get_object() applies get_queryset()'s buyer/seller/staff scoping
+        # first, so an unrelated user's complaint id 404s instead of
+        # leaking existence via a 403 from the role check below - same
+        # discoverability fix already applied to Fulfillment/Shipment/
+        # ReturnRequest (see shipping_views.py's _dispatch_transition).
+        complaint = self.get_object()
+        user = request.user
+        is_staff = bool(getattr(user, 'is_staff', False))
+        if not is_staff and not _provider_can_manage_shop(user, complaint.order.shop):
+            raise PermissionDenied("Only the seller, shop manager, or staff can update this complaint's status.")
+        complaint.status = target_status
+        update_fields = ['status']
+        if target_status == MarketplaceComplaintStatus.RESOLVED:
+            complaint.resolution_notes = str(request.data.get('resolution_notes') or '').strip()
+            complaint.resolved_by = user
+            complaint.resolved_at = timezone.now()
+            update_fields += ['resolution_notes', 'resolved_by', 'resolved_at']
+        complaint.save(update_fields=update_fields)
+        notification_services.create_notification(
+            user_id=str(complaint.user_id),
+            type=f'marketplace.complaint.{target_status}',
+            title='Your complaint was reviewed' if target_status == MarketplaceComplaintStatus.REVIEWED else 'Your complaint was resolved',
+            body=complaint.resolution_notes or f"Your complaint on order {complaint.order_id} is now {target_status}.",
+            target_type='marketplace_complaint',
+            target_id=str(complaint.id),
+            context={'order_id': str(complaint.order_id)},
+            dedup_key=f'complaint-{complaint.id}-{target_status}',
+        )
+        return Response(self.get_serializer(complaint).data)
+
+    @action(detail=True, methods=['post'])
+    def review(self, request, pk=None):
+        return self._dispatch_resolution(request, MarketplaceComplaintStatus.REVIEWED)
+
+    @action(detail=True, methods=['post'])
+    def resolve(self, request, pk=None):
+        return self._dispatch_resolution(request, MarketplaceComplaintStatus.RESOLVED)
 
     def create(self, request, *args, **kwargs):
         # New path: attachment already uploaded direct-to-S3 and confirmed

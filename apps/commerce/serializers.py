@@ -1003,6 +1003,15 @@ class ProductSerializer(serializers.ModelSerializer):
     length = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
     width = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
     height = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    # The real DB column shipping_services.calculate_rate_cents reads for
+    # WEIGHT-type rates - distinct from the free-form `weight` display
+    # attribute above (which lives in `attributes`, not a real column, and
+    # is purely cosmetic). 1000kg ceiling is a sanity bound, not a shipping
+    # policy - a heavier item isn't something per-unit parcel rates apply to.
+    weight_kg = serializers.DecimalField(
+        max_digits=8, decimal_places=3, required=False, allow_null=True,
+        min_value=Decimal("0"), max_value=Decimal("1000"),
+    )
 
     low_stock_threshold = serializers.IntegerField(required=False, min_value=0, allow_null=True)
     requires_shipping = serializers.BooleanField(required=False)
@@ -2863,10 +2872,15 @@ class MarketplaceOrderCreateSerializer(serializers.Serializer):
 
 
 class MarketplaceComplaintSerializer(serializers.ModelSerializer):
+    resolved_by_username = serializers.CharField(source='resolved_by.username', read_only=True, default=None)
+
     class Meta:
         model = MarketplaceComplaint
-        fields = ('id', 'order', 'user', 'text', 'attachment', 'status', 'created_at')
-        read_only_fields = ('id', 'status', 'created_at')
+        fields = (
+            'id', 'order', 'user', 'text', 'attachment', 'status',
+            'resolution_notes', 'resolved_by', 'resolved_by_username', 'resolved_at', 'created_at',
+        )
+        read_only_fields = ('id', 'status', 'resolution_notes', 'resolved_by', 'resolved_at', 'created_at')
 
 
 class MarketplaceComplaintCreateSerializer(serializers.Serializer):

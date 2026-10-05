@@ -35,6 +35,7 @@ from .models import (
     MarketplaceOrderStatus,
     MarketplaceComplaint,
     Promotion,
+    PromotionRedemption,
     CustomerAddress,
     ShippingMethod,
     ShippingZone,
@@ -242,8 +243,11 @@ def place_marketplace_order(*, buyer, shop_id, items, metadata=None):
 
         discount_cents = 0
         promotion = None
+        promotion_redemption = None
         if promo_code:
-            discount_cents, promotion = _apply_promotion(shop, promo_code, normalized_items, subtotal_cents)
+            discount_cents, promotion, promotion_redemption = _apply_promotion(
+                shop, promo_code, normalized_items, subtotal_cents, buyer
+            )
 
         shipping_cents = 0
         shipping_address = None
@@ -318,6 +322,9 @@ def place_marketplace_order(*, buyer, shop_id, items, metadata=None):
         if buyer_tx:
             buyer_tx.meta = {**(buyer_tx.meta or {}), 'order_id': str(order.id)}
             buyer_tx.save(update_fields=['meta'])
+        if promotion_redemption:
+            promotion_redemption.order = order
+            promotion_redemption.save(update_fields=['order'])
         items_to_create = [
             MarketplaceOrderItem(
                 order=order,
@@ -448,7 +455,7 @@ def _reserve_stock_for_items(normalized_items):
         product.save(update_fields=['stock_qty'])
 
 
-def _apply_promotion(shop, promo_code, normalized_items, subtotal_cents):
+def _apply_promotion(shop, promo_code, normalized_items, subtotal_cents, buyer):
     """Validate a buyer-supplied promo code and return the server-computed
     discount in cents. The client only ever supplies the code string -
     discount_type/discount_value/eligibility/usage_limit are all read from
@@ -468,6 +475,15 @@ def _apply_promotion(shop, promo_code, normalized_items, subtotal_cents):
         raise ValidationError({'promo_code': 'This promo code is not currently active.'})
     if promotion.usage_limit is not None and promotion.used_count >= promotion.usage_limit:
         raise ValidationError({'promo_code': 'This promo code has reached its usage limit.'})
+    if promotion.per_user_limit is not None:
+        # Safe without its own select_for_update: the promotion row lock
+        # taken above already serializes every concurrent redemption of
+        # this code (by any buyer), so two simultaneous checkouts by the
+        # same buyer can't both read the same pre-increment redemption
+        # count and both pass this check.
+        already_used = PromotionRedemption.objects.filter(promotion=promotion, user=buyer).count()
+        if already_used >= promotion.per_user_limit:
+            raise ValidationError({'promo_code': 'You have already used this promo code the maximum number of times.'})
 
     eligible_cents = subtotal_cents
     if promotion.applicable_products:
@@ -488,8 +504,9 @@ def _apply_promotion(shop, promo_code, normalized_items, subtotal_cents):
 
     promotion.used_count = promotion.used_count + 1
     promotion.save(update_fields=['used_count'])
+    redemption = PromotionRedemption.objects.create(promotion=promotion, user=buyer)
 
-    return discount_cents, promotion
+    return discount_cents, promotion, redemption
 
 
 def _calculate_items_total_cents(normalized_items):
@@ -543,23 +560,50 @@ def _has_confirmed_provider_payment(order):
     return status in {'paid', 'success', 'succeeded', 'settled'}
 
 
+def _release_stock_for_order(order):
+    """Restore stock_qty for every PHYSICAL item on a cancelled order. Mirrors
+    _reserve_stock_for_items: select_for_update locks the Product rows for
+    the remainder of this transaction so a concurrent checkout can't read a
+    stale stock_qty while the release is in flight."""
+    items = list(order.items.select_related('product').all())
+    product_ids = {item.product_id for item in items}
+    if not product_ids:
+        return
+    locked_products = {
+        p.id: p for p in Product.objects.filter(id__in=product_ids).select_for_update()
+    }
+    required_by_product = {}
+    for item in items:
+        product = locked_products.get(item.product_id)
+        if not product or product.inventory_type != 'PHYSICAL':
+            continue
+        required_by_product[product.id] = required_by_product.get(product.id, 0) + item.quantity
+    for product_id, qty in required_by_product.items():
+        product = locked_products[product_id]
+        product.stock_qty = int(product.stock_qty or 0) + qty
+        product.save(update_fields=['stock_qty'])
+
+
 def cancel_marketplace_order(order):
-    """Return locked buyer funds and mark the order as cancelled."""
+    """Return locked buyer funds, release reserved stock, and mark the order
+    as cancelled."""
     if order.status != MarketplaceOrderStatus.TEMPORAL:
         raise ValidationError('Only temporal marketplace orders can be cancelled.')
-    total_cents = _order_total_cents(order)
-    reference = f'marketplace-refund-{order.id}'
-    if getattr(order, 'buyer_debit_transaction_id', None):
-        refund_locked_booking_funds(
-            payer=order.buyer,
-            amount_cents=total_cents,
-            reference=reference,
-            meta={'order_id': str(order.id), 'source': 'marketplace_refund'},
-        )
-    order.status = MarketplaceOrderStatus.CANCELLED
-    order.metadata = {**(order.metadata or {}), 'cancelled_at': timezone.now().isoformat()}
-    order.save(update_fields=['status', 'metadata'])
-    transaction.on_commit(lambda: _schedule_marketplace_order_deletion(order.id))
+    with transaction.atomic():
+        total_cents = _order_total_cents(order)
+        reference = f'marketplace-refund-{order.id}'
+        if getattr(order, 'buyer_debit_transaction_id', None):
+            refund_locked_booking_funds(
+                payer=order.buyer,
+                amount_cents=total_cents,
+                reference=reference,
+                meta={'order_id': str(order.id), 'source': 'marketplace_refund'},
+            )
+        _release_stock_for_order(order)
+        order.status = MarketplaceOrderStatus.CANCELLED
+        order.metadata = {**(order.metadata or {}), 'cancelled_at': timezone.now().isoformat()}
+        order.save(update_fields=['status', 'metadata'])
+        transaction.on_commit(lambda: _schedule_marketplace_order_deletion(order.id))
     return order
 
 

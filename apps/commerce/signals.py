@@ -1,3 +1,4 @@
+import logging
 
 from django.db.models.signals import post_save
 from django.dispatch import receiver
@@ -5,13 +6,22 @@ from .models import Product, Shop, ShopFollow, AIRecommendation, ShopRole, ShopT
 from .tasks import compute_recommendations
 from apps.notifications.services import notify_engagement
 
+logger = logging.getLogger(__name__)
+
 
 @receiver(post_save, sender=Product)
 def on_product_save(sender, instance, created, **kwargs):
     # update AIRecommendation cache or enqueue recompute for followers
     if created:
-        # naive: compute recommendations for users following shop (background)
-        compute_recommendations.delay(str(instance.shop.owner.id))
+        # naive: compute recommendations for users following shop (background).
+        # This runs synchronously inside whatever request/command saved the
+        # Product, so a broker outage must not propagate - bounded by
+        # CELERY_BROKER_CONNECTION_TIMEOUT, caught here rather than left to
+        # crash the save() call.
+        try:
+            compute_recommendations.delay(str(instance.shop.owner.id))
+        except Exception:
+            logger.exception("Failed to enqueue recommendation recompute for shop owner %s", instance.shop.owner_id)
 
 
 @receiver(post_save, sender=Shop)

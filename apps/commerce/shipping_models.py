@@ -390,7 +390,11 @@ class ShipmentItem(models.Model):
     is_deleted = models.BooleanField(default=False)
 
     shipment = models.ForeignKey(Shipment, on_delete=models.CASCADE, related_name="items")
-    order_item = models.ForeignKey("commerce.MarketplaceOrderItem", on_delete=models.CASCADE, related_name="shipment_items")
+    # PROTECT, not CASCADE: mirrors MarketplaceOrderItem.product's own
+    # PROTECT-against-Product in models.py - no normal code path deletes a
+    # MarketplaceOrderItem, but if one ever did, it must not silently wipe
+    # the shipment audit trail of what was actually shipped for it.
+    order_item = models.ForeignKey("commerce.MarketplaceOrderItem", on_delete=models.PROTECT, related_name="shipment_items")
     quantity = models.PositiveIntegerField()
 
     class Meta:

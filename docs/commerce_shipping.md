@@ -67,7 +67,16 @@ unambiguous lookup, never a rule-priority engine. Five rate types:
 | `free` | `0` |
 | `threshold` | `0` if order subtotal ≥ `free_above_cents`, else `base_cents` |
 | `quantity` | `base_cents × total item quantity` |
-| `weight` | `base_cents × ceil(total weight_kg)`, 0 for a product with no `weight_kg` set |
+| `weight` | `base_cents × ceil(total weight_kg)`; **unavailable** (not `0`) if any item in the basket has no `weight_kg` set |
+
+A `weight` rate is deliberately never offered — not priced at `$0` — when
+product weight data is missing, so a seller who forgets to set
+`Product.weight_kg` never accidentally gives away free shipping. If a `weight`
+rate is the only rate configured for a method/zone and the basket is
+unweighed, that method simply doesn't appear in the options list; other rate
+types in the same zone (e.g. a `flat` fallback) are unaffected. See
+`shipping_services.calculate_rate_cents` (returns `None` to signal this) and
+`list_shipping_options` (filters `None` results out).
 
 See `shipping_services.calculate_rate_cents`. Adding distance-based, dimensional,
 carrier-API, or promotional rates later means adding a new `rate_type` branch here
@@ -226,9 +235,10 @@ methods — no change to checkout, fulfillment, or the state machines.
   within the request — fine at current scale; would need caching if zone/rate
   lookups become a hot path under load (not measured here — no load testing was
   performed as part of this task).
-- Weight-based rates require `Product.weight_kg` to be set per product; it
-  defaults to null (contributes 0kg), so this rate type silently under-charges
-  for un-weighed catalogs. No UI currently prompts sellers to fill it in.
+- Weight-based rates require `Product.weight_kg` to be set per product
+  (seller-editable on the `ProductEditorDrawer` weight field for `PHYSICAL`
+  inventory_type products). Missing weight makes the rate unavailable rather
+  than under-charging — see the rate-type table above.
 
 ## Local-environment note (not a code issue)
 

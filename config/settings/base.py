@@ -773,6 +773,19 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_SOFT_TIME_LIMIT = 300   # seconds - raises SoftTimeLimitExceeded for graceful cleanup
 CELERY_TASK_TIME_LIMIT = 360        # hard kill after 6 minutes
 
+# Without these, an unreachable broker (wrong host, Redis down, network
+# partition) makes .delay() block indefinitely waiting for a TCP connection -
+# including when called inline from an HTTP request path (e.g. fraud-score
+# scheduling during checkout), which would otherwise hang the buyer's
+# request instead of degrading gracefully. These bound that wait so a
+# broker outage fails fast (raises) rather than hanging the caller.
+CELERY_BROKER_CONNECTION_TIMEOUT = 5
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    "socket_connect_timeout": 5,
+    "socket_timeout": 5,
+    "max_retries": 1,
+}
+
 # Redeploy-safe periodic scheduling: django_celery_beat has been installed
 # (and migrated) since before this phase, but nothing ever pointed Celery
 # Beat at it - the default PersistentScheduler persists "last run" state to

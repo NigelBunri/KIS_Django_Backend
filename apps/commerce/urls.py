@@ -2,6 +2,7 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 from . import views
 from . import shipping_views
+from . import returns_views
 
 router = DefaultRouter()
 router.register(r'shops', views.ShopViewSet)
@@ -38,6 +39,8 @@ router.register(r'shipping-methods', shipping_views.ShippingMethodViewSet, basen
 router.register(r'shipping-rates', shipping_views.ShippingRateViewSet, basename='shipping-rates')
 router.register(r'fulfillments', shipping_views.FulfillmentViewSet, basename='fulfillments')
 router.register(r'shipments', shipping_views.ShipmentViewSet, basename='shipments')
+router.register(r'returns', returns_views.ReturnRequestViewSet, basename='returns')
+router.register(r'refunds', returns_views.RefundViewSet, basename='refunds')
 
 urlpatterns = [
     path(
