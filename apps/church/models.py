@@ -368,8 +368,12 @@ class PrayerRequest(TimeStampedUUIDModel):
 
 class PrayerWallEntry(TimeStampedUUIDModel):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="prayer_wall_entries")
+    source_request = models.ForeignKey(
+        PrayerRequest, null=True, blank=True, on_delete=models.SET_NULL, related_name="wall_entry"
+    )
     text = models.TextField()
     is_public = models.BooleanField(default=True)
+    is_answered = models.BooleanField(default=False)
     prayer_count = models.IntegerField(default=0)
     church_id = models.UUIDField(null=True, blank=True)
 

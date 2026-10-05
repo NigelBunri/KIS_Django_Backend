@@ -259,7 +259,7 @@ class Attendance(BaseEntity):
 
     event = models.ForeignKey(Event, related_name="attendances", on_delete=models.CASCADE)
     session = models.ForeignKey(EventSession, related_name="attendances", on_delete=models.CASCADE, null=True, blank=True)
-    user_id = models.UUIDField()
+    user_id = models.UUIDField(db_index=True)
     ticket = models.ForeignKey(Ticket, null=True, blank=True, on_delete=models.SET_NULL)
     status = models.CharField(max_length=32, choices=STATUS_CHOICES, default="invited")
     rsvp_at = models.DateTimeField(null=True, blank=True)

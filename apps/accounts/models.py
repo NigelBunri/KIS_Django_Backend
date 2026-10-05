@@ -13,6 +13,7 @@ Improvements included:
  - Clear extension points (SSO/SCIM, 2FA, billing webhooks)
 """
 from typing import Optional, Tuple, Iterable
+from django.contrib.postgres.indexes import GinIndex
 from django.db import models, transaction
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.utils import timezone
@@ -258,6 +259,14 @@ class User(AbstractBaseUser, PermissionsMixin, BaseEntity):
             models.Index(fields=["phone"]),
             models.Index(fields=["tier"]),
             models.Index(fields=["username"]),
+            # UnifiedSearchView._search_contacts (apps/core/views.py) filters
+            # on __icontains for all four fields below - plain btree indexes
+            # don't serve substring LIKE '%x%' queries, so without these the
+            # global search degrades to a full table scan at scale.
+            GinIndex(fields=['display_name'], name='accounts_user_dispname_trgm', opclasses=['gin_trgm_ops']),
+            GinIndex(fields=['username'], name='accounts_user_username_trgm', opclasses=['gin_trgm_ops']),
+            GinIndex(fields=['phone'], name='accounts_user_phone_trgm', opclasses=['gin_trgm_ops']),
+            GinIndex(fields=['email'], name='accounts_user_email_trgm', opclasses=['gin_trgm_ops']),
         ]
         verbose_name = "User"
         verbose_name_plural = "Users"

@@ -17326,11 +17326,23 @@ class ChannelContentCommentsView(APIView):
         if not _user_can_view_content(request.user, content):
             raise Http404
         sort = str(request.query_params.get("sort") or request.GET.get("sort") or "new").strip().lower()
+        from django.db.models import Count, Exists, OuterRef, Q
+
         qs = ChannelContentComment.objects.select_related("user").filter(content=content, is_deleted=False, parent__isnull=True)
+        # Annotate like/reply counts and the current user's like state up front so the
+        # serializer doesn't run 2-3 extra per-row queries (was O(n) N+1 on comment lists).
+        qs = qs.annotate(
+            _like_count=Count("reactions", distinct=True),
+            _reply_count=Count("replies", filter=Q(replies__is_deleted=False), distinct=True),
+        )
+        if getattr(request.user, "is_authenticated", False):
+            qs = qs.annotate(
+                _is_liked=Exists(
+                    ChannelCommentReaction.objects.filter(comment_id=OuterRef("pk"), user=request.user)
+                )
+            )
         if sort == "top":
-            # Sort by reaction count descending (annotated), then by created_at
-            from django.db.models import Count
-            qs = qs.annotate(_like_count=Count("reactions")).order_by("-_like_count", "-created_at")
+            qs = qs.order_by("-_like_count", "-created_at")
         elif sort == "pinned":
             qs = qs.order_by("-is_pinned", "-created_at")
         else:

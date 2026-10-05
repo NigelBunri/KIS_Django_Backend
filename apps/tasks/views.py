@@ -130,7 +130,9 @@ class TaskChannelListCreateView(APIView):
         elif assignee_filter:
             qs = qs.filter(assigned_to_id=assignee_filter)
 
-        serializer = TaskListSerializer(qs, many=True)
+        qs = qs.order_by("-created_at")
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        serializer = TaskListSerializer(qs[:limit], many=True)
         return Response({"tasks": serializer.data}, status=status.HTTP_200_OK)
 
     def post(self, request, partner_id, channel_id):
@@ -486,7 +488,9 @@ class PartnerMyTasksView(APIView):
         status_filter = request.query_params.get("status")
         if status_filter:
             qs = qs.filter(status=status_filter)
-        return Response({"tasks": TaskListSerializer(qs, many=True).data}, status=status.HTTP_200_OK)
+        qs = qs.order_by("-created_at")
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        return Response({"tasks": TaskListSerializer(qs[:limit], many=True).data}, status=status.HTTP_200_OK)
 
 
 class PartnerAllTasksView(APIView):
@@ -520,7 +524,8 @@ class PartnerAllTasksView(APIView):
             qs = qs.filter(assigned_to_id=assignee_filter)
 
         qs = qs.order_by("-created_at")
-        return Response({"tasks": TaskListSerializer(qs, many=True).data}, status=status.HTTP_200_OK)
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        return Response({"tasks": TaskListSerializer(qs[:limit], many=True).data}, status=status.HTTP_200_OK)
 
 
 class PartnerTaskSummaryView(APIView):

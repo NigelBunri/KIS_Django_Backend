@@ -104,9 +104,10 @@ class PetitionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="signatures")
     def signatures(self, request, pk=None):
         petition = self.get_object()
-        qs = PetitionSignature.objects.filter(petition=petition).select_related("user")
-        serializer = PetitionSignatureSerializer(qs, many=True)
-        return Response(serializer.data)
+        qs = PetitionSignature.objects.filter(petition=petition).select_related("user").order_by("-created_at")
+        page = self.paginate_queryset(qs)
+        serializer = PetitionSignatureSerializer(page, many=True)
+        return self.get_paginated_response(serializer.data)
 
 
 # ---------------------------------------------------------------------------

@@ -1490,7 +1490,9 @@ class PartnerViewSet(viewsets.ModelViewSet):
         assignee_id = request.query_params.get("assignee")
         if assignee_id:
             qs = qs.filter(assignee_id=assignee_id)
-        return Response(SupportTicketSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+        qs = qs.order_by("-created_at")
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        return Response(SupportTicketSerializer(qs[:limit], many=True).data, status=status.HTTP_200_OK)
 
     def _get_accessible_ticket(self, partner, ticket_id, user, *, require_manage=False):
         ticket = SupportTicket.objects.filter(id=ticket_id, partner=partner).select_related("requester").first()
@@ -1964,7 +1966,9 @@ class PartnerViewSet(viewsets.ModelViewSet):
         date_to = request.query_params.get("to")
         if date_to:
             qs = qs.filter(received_at__lte=date_to)
-        return Response(PartnerDonationSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+        qs = qs.order_by("-received_at")
+        limit = min(int(request.query_params.get("limit") or 200), 500)
+        return Response(PartnerDonationSerializer(qs[:limit], many=True).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["patch", "delete"], url_path=r"donations/(?P<donation_id>[^/.]+)")
     def donation_detail(self, request, pk=None, donation_id=None):

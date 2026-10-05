@@ -608,15 +608,24 @@ class ChannelContentCommentSerializer(serializers.ModelSerializer):
         )
 
     def get_like_count(self, obj: ChannelContentComment) -> int:
+        annotated = getattr(obj, "_like_count", None)
+        if annotated is not None:
+            return annotated
         return obj.reactions.count()
 
     def get_is_liked(self, obj: ChannelContentComment) -> bool:
+        annotated = getattr(obj, "_is_liked", None)
+        if annotated is not None:
+            return bool(annotated)
         request = self.context.get("request")
         if not request or not getattr(request.user, "is_authenticated", False):
             return False
         return obj.reactions.filter(user=request.user).exists()
 
     def get_reply_count(self, obj: ChannelContentComment) -> int:
+        annotated = getattr(obj, "_reply_count", None)
+        if annotated is not None:
+            return annotated
         return obj.replies.filter(is_deleted=False).count()
 
 

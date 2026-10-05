@@ -1,10 +1,9 @@
 """
-Fires WebsiteWebhook targets synchronously, inline, at the point of the
-triggering event — this deployment runs no Celery worker/beat process at
-all (2026-08-06 systems audit), so anything queued through Celery would
-simply never execute. A short timeout and a broad except keep a slow or
-unreachable target from ever blocking or failing the real request
-(publish/unpublish/form submit) it's attached to.
+Fires WebsiteWebhook targets via an async Celery task (apps.websites.tasks.
+deliver_website_webhook) queued from fire_webhook_event, so a slow or
+unreachable target_url never blocks the real request (publish/unpublish/
+form submit) that triggered it, and a transient failure gets retried
+instead of silently dropped.
 """
 from __future__ import annotations
 
@@ -32,9 +31,11 @@ def _sign(secret: str, body: bytes) -> str:
 
 
 def fire_webhook_event(website, event_type: str, payload: dict) -> None:
+    from .tasks import deliver_website_webhook
+
     webhooks = website.webhooks.filter(event_type=event_type, is_active=True)
     for webhook in webhooks:
-        _send_one(webhook, event_type, payload)
+        deliver_website_webhook.delay(str(webhook.id), event_type, payload)
 
 
 def _send_one(webhook, event_type: str, payload: dict) -> None:
@@ -42,8 +43,8 @@ def _send_one(webhook, event_type: str, payload: dict) -> None:
     # form, but the fetch itself runs from the KIS backend, which can reach
     # internal-only hosts a website owner has no business reaching (other
     # internal services, the cloud metadata endpoint, etc). Skip delivery
-    # rather than raise, matching this function's existing "never block the
-    # triggering request" contract.
+    # rather than raise — this is a policy rejection, not a failure worth
+    # retrying.
     if not is_safe_external_url(webhook.target_url):
         logger.info(
             "Website webhook delivery skipped for %s (%s): target_url is not an allowed external address",
@@ -52,12 +53,12 @@ def _send_one(webhook, event_type: str, payload: dict) -> None:
         return
     body = json.dumps({"event": event_type, "website_id": str(webhook.website_id), "data": payload}).encode()
     signature = _sign(webhook.secret, body)
-    try:
-        requests.post(
-            webhook.target_url,
-            data=body,
-            headers={"Content-Type": "application/json", "X-KIS-Signature": signature},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        logger.info("Website webhook delivery failed for %s (%s): %s", webhook.id, event_type, exc)
+    # Let request exceptions propagate: the Celery task wrapping this call
+    # retries on exactly this, instead of the old inline call that swallowed
+    # failures and dropped the delivery for good on the first timeout.
+    requests.post(
+        webhook.target_url,
+        data=body,
+        headers={"Content-Type": "application/json", "X-KIS-Signature": signature},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )

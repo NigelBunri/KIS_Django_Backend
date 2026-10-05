@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.db.models import Sum, Count
 from django.utils import timezone
+from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 from rest_framework import status, viewsets, filters
 from rest_framework.decorators import action
@@ -62,14 +63,15 @@ class PodcastChannelViewSet(viewsets.ModelViewSet):
 class PodcastEpisodeViewSet(viewsets.ModelViewSet):
     serializer_class = PodcastEpisodeSerializer
     permission_classes = [IsAuthenticated]
-    filter_backends = [filters.OrderingFilter]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["channel"]
     ordering_fields = ["published_at", "episode_number", "play_count"]
 
     def get_queryset(self):
         channel_id = self.kwargs.get("channel_pk")
         if channel_id:
             return PodcastEpisode.objects.filter(channel_id=channel_id)
-        return PodcastEpisode.objects.all()
+        return PodcastEpisode.objects.select_related("channel").all()
 
     @extend_schema(
         summary="Increment episode play count",

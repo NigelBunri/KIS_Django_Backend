@@ -88,11 +88,16 @@ class TithePledgeSerializer(serializers.ModelSerializer):
 
 
 class ChurchMembershipSerializer(serializers.ModelSerializer):
+    name = serializers.SerializerMethodField()
+    avatar_url = serializers.SerializerMethodField()
+
     class Meta:
         model = ChurchMembership
         fields = [
             "id",
             "user",
+            "name",
+            "avatar_url",
             "church_id",
             "tier",
             "join_date",
@@ -106,6 +111,14 @@ class ChurchMembershipSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "user", "created_at", "updated_at"]
+
+    def get_name(self, obj):
+        user = obj.user
+        return getattr(user, "display_name", None) or getattr(user, "username", None) or str(user.id)
+
+    def get_avatar_url(self, obj):
+        profile = getattr(obj.user, "profile", None)
+        return getattr(profile, "avatar_url", None) if profile else None
 
 
 class ChurchMembershipPublicSerializer(serializers.ModelSerializer):
@@ -303,6 +316,10 @@ class PrayerRequestSerializer(serializers.ModelSerializer):
 
 
 class PrayerWallEntrySerializer(serializers.ModelSerializer):
+    pray_count = serializers.IntegerField(source="prayer_count", read_only=True)
+    author_name = serializers.SerializerMethodField()
+    is_mine = serializers.SerializerMethodField()
+
     class Meta:
         model = PrayerWallEntry
         fields = [
@@ -310,12 +327,23 @@ class PrayerWallEntrySerializer(serializers.ModelSerializer):
             "user",
             "text",
             "is_public",
-            "prayer_count",
+            "is_answered",
+            "pray_count",
+            "author_name",
+            "is_mine",
             "church_id",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "user", "prayer_count", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "is_answered", "created_at", "updated_at"]
+
+    def get_author_name(self, obj):
+        name = obj.user.get_full_name() if hasattr(obj.user, "get_full_name") else ""
+        return name or getattr(obj.user, "username", "") or "Anonymous"
+
+    def get_is_mine(self, obj):
+        request = self.context.get("request")
+        return bool(request and request.user.is_authenticated and obj.user_id == request.user.id)
 
 
 class FastingRecordSerializer(serializers.ModelSerializer):

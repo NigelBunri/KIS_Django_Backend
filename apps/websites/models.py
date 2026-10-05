@@ -298,13 +298,11 @@ class WebsiteWebhookEvent(models.TextChoices):
 
 class WebsiteWebhook(BaseEntity):
     """A real integration point (not a plugin marketplace nobody would
-    populate) — fired synchronously, inline, at the point of the event
-    (apps.websites.webhooks.fire_webhook_event), not queued through
-    Celery: this deployment runs no Celery worker/beat process at all
-    (see the 2026-08-06 systems audit), so a queued task would simply
-    never execute. A slow/unreachable target gets a short timeout and
-    never blocks or fails the actual publish/submit request it's attached
-    to."""
+    populate) — fired async via a retrying Celery task
+    (apps.websites.tasks.deliver_website_webhook, queued from
+    apps.websites.webhooks.fire_webhook_event), so a slow/unreachable
+    target never blocks the actual publish/submit request it's attached
+    to, and a transient failure gets retried instead of dropped."""
 
     website = models.ForeignKey(Website, on_delete=models.CASCADE, related_name="webhooks")
     event_type = models.CharField(max_length=32, choices=WebsiteWebhookEvent.choices)

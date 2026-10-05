@@ -932,12 +932,29 @@ class AccountTierSerializer(serializers.ModelSerializer):
     def get_tier_rank(self, obj: AccountTier) -> int:
         return self._tier_rank(obj)
 
+    # price_cents is the stored unit; callers that just want a display
+    # amount (e.g. TiersDashboardScreen's admin revenue estimate) shouldn't
+    # each have to know the /100 convention.
+    price = serializers.SerializerMethodField()
+    # Tiers are a tiny, admin-managed table (a handful of rows), so one
+    # COUNT query per row here is negligible — unlike the same pattern on a
+    # large table, this never approaches N+1-at-scale territory.
+    subscriber_count = serializers.SerializerMethodField()
+
+    def get_price(self, obj: AccountTier) -> float:
+        return round((obj.price_cents or 0) / 100, 2)
+
+    def get_subscriber_count(self, obj: AccountTier) -> int:
+        return obj.subscription_set.filter(status=Subscription.STATUS_ACTIVE).count()
+
     class Meta:
         model = AccountTier
         fields = (
             "id",
             "name",
             "price_cents",
+            "price",
+            "subscriber_count",
             "features_json",
             "feature_list",
             "feature_tagline",

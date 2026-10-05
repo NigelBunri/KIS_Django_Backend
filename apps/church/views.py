@@ -9,6 +9,7 @@ from rest_framework.viewsets import ModelViewSet
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 from drf_spectacular.types import OpenApiTypes
+from common.pagination import StandardResultsSetPagination
 
 from .models import (
     ChurchGiving,
@@ -201,7 +202,27 @@ class ChurchMembershipViewSet(ModelViewSet):
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        return ChurchMembership.objects.filter(user=self.request.user)
+        base = ChurchMembership.objects.select_related("user", "user__profile")
+        # Reads (the member directory) are scoped to the whole church so
+        # members can see each other; writes stay self-only below so this
+        # broader scope on `list` can't be used to retrieve/modify someone
+        # else's membership record via the detail routes.
+        if self.action == "list":
+            church_id = self.request.query_params.get("church_id")
+            if not church_id:
+                church_id = (
+                    ChurchMembership.objects.filter(user=self.request.user)
+                    .values_list("church_id", flat=True)
+                    .first()
+                )
+            if not church_id:
+                return base.none()
+            qs = base.filter(church_id=church_id)
+            search = self.request.query_params.get("search")
+            if search:
+                qs = qs.filter(user__display_name__icontains=search)
+            return qs
+        return base.filter(user=self.request.user)
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
@@ -427,9 +448,22 @@ class PrayerRequestViewSet(ModelViewSet):
         if prayer.privacy in ("public", "anonymous"):
             PrayerWallEntry.objects.create(
                 user=prayer.user,
+                source_request=prayer,
                 text=prayer.text,
                 is_public=True,
+                is_answered=prayer.is_answered,
             )
+
+    def perform_update(self, serializer):
+        prayer = serializer.save()
+        # Keep the public wall mirror (created in perform_create above) in sync
+        # when the owner edits text/privacy/answered status on their request.
+        wall_entry = getattr(prayer, "wall_entry", None)
+        if wall_entry is not None:
+            wall_entry.text = prayer.text
+            wall_entry.is_answered = prayer.is_answered
+            wall_entry.is_public = prayer.privacy in ("public", "anonymous")
+            wall_entry.save(update_fields=["text", "is_answered", "is_public"])
 
     @extend_schema(summary="Increment prayer count for a request")
     @action(detail=True, methods=["post"], url_path="pray")
@@ -451,19 +485,28 @@ class PrayerWallView(APIView):
         summary="Get public prayer wall entries",
         parameters=[
             OpenApiParameter("church_id", OpenApiTypes.UUID, description="Filter by church"),
+            OpenApiParameter("is_answered", OpenApiTypes.BOOL, description="Filter by answered status"),
+            OpenApiParameter("mine", OpenApiTypes.BOOL, description="Only entries you submitted"),
         ],
     )
     def get(self, request):
-        qs = PrayerWallEntry.objects.filter(is_public=True)
+        qs = PrayerWallEntry.objects.filter(is_public=True).select_related("user").order_by("-created_at")
         church_id = request.query_params.get("church_id")
         if church_id:
             qs = qs.filter(church_id=church_id)
-        serializer = PrayerWallEntrySerializer(qs, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        is_answered = request.query_params.get("is_answered")
+        if is_answered is not None:
+            qs = qs.filter(is_answered=is_answered.lower() in ("1", "true", "yes"))
+        if request.query_params.get("mine", "").lower() in ("1", "true", "yes"):
+            qs = qs.filter(user=request.user)
+        paginator = StandardResultsSetPagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        serializer = PrayerWallEntrySerializer(page, many=True, context={"request": request})
+        return paginator.get_paginated_response(serializer.data)
 
     @extend_schema(summary="Post a new prayer wall entry")
     def post(self, request):
-        serializer = PrayerWallEntrySerializer(data=request.data)
+        serializer = PrayerWallEntrySerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         serializer.save(user=request.user)
         return Response(serializer.data, status=status.HTTP_201_CREATED)

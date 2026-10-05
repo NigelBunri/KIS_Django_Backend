@@ -27,6 +27,10 @@ router.register(r"royalties", RoyaltyRecordViewSet, basename="royalty-record")
 router.register(r"ebooks", EbookViewSet, basename="ebook")
 router.register(r"ppv", PPVEventViewSet, basename="ppv-event")
 router.register(r"news", NewsArticleViewSet, basename="news-article")
+# Flat, ?channel=<id>-filterable alias used by the mobile app's episode list
+# (the nested "podcasts/<channel>/episodes/" route below is kept for the RSS
+# feed and channel-scoped contexts).
+router.register(r"podcast-episodes", PodcastEpisodeViewSet, basename="podcast-episode-flat")
 
 # Nested router for episodes under a channel
 try:

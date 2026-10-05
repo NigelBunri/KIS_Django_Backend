@@ -109,9 +109,15 @@ class TicketViewSet(viewsets.ModelViewSet):
     - CRUD on tickets (tiers, sku, price, quantity)
     - Quick purchase endpoint (transactionally reserves stock and creates TicketSale)
     """
-    queryset = models.Ticket.objects.select_related("event").all()
     serializer_class = srl.TicketSerializer
     permission_classes = [IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        qs = models.Ticket.objects.select_related("event").all()
+        event_id = self.request.query_params.get("event")
+        if event_id:
+            qs = qs.filter(event_id=event_id)
+        return qs
 
     @swagger_auto_schema(
         method="post",
@@ -135,7 +141,12 @@ class TicketViewSet(viewsets.ModelViewSet):
 
         Expected body: {"qty": 2}
         """
-        ticket = self.get_object()
+        # select_for_update locks the row for the rest of this atomic block,
+        # so two concurrent purchases on the same ticket can't both read the
+        # same quantity_remaining and both succeed (oversell) — the second
+        # request blocks until the first commits, then rereads the updated
+        # count.
+        ticket = models.Ticket.objects.select_for_update().get(pk=self.get_object().pk)
         qty = int(request.data.get("qty", 1))
         buyer_id = request.user.id
 
@@ -177,10 +188,31 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     Features:
     - CRUD on attendance records
     - Check-in by QR (simplified; in production validate signed QR payloads)
+
+    Scoped to the requesting user's own records (user_id has no FK to the
+    user model — it's a plain UUID, like TicketSale.buyer_id elsewhere in
+    this app — so without this filter any authenticated user could list or
+    fetch every attendee's RSVP by id). Staff keep full visibility for
+    check-in/support tooling. user_id/status/rsvp_at are also server-set on
+    create instead of trusting the client body, which the mobile app never
+    sent anyway (POST only sends {"event": id}) — previously that left
+    user_id, a required non-null field, unset, so every RSVP 400'd.
     """
-    queryset = models.Attendance.objects.all()
     serializer_class = srl.AttendanceSerializer
     permission_classes = [IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        qs = models.Attendance.objects.all()
+        if not self.request.user.is_staff:
+            qs = qs.filter(user_id=self.request.user.id)
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(
+            user_id=self.request.user.id,
+            status="rsvped",
+            rsvp_at=timezone.now(),
+        )
 
     @swagger_auto_schema(
         method="post",

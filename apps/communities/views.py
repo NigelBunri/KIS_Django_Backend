@@ -354,7 +354,11 @@ class CommunityViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="members")
     def members(self, request, pk=None):
         community = self.get_object()
-        qs = CommunityMembership.objects.active().filter(community=community)
+        qs = CommunityMembership.objects.active().filter(community=community).select_related("user").order_by("-joined_at")
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = CommunityMembershipSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         serializer = CommunityMembershipSerializer(qs, many=True)
         return Response(serializer.data)
 

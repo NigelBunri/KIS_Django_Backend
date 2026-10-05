@@ -3037,6 +3037,77 @@ class ServiceBookingComplaintViewSet(viewsets.ModelViewSet):
             )
         ).distinct()
 
+    @action(detail=True, methods=["post"], url_path="resolve")
+    def resolve(self, request, pk=None):
+        complaint = self.get_object()
+        if not request.user.is_staff:
+            raise PermissionDenied("Only KCAN staff can resolve complaints.")
+
+        resolved_statuses = {
+            ServiceBookingComplaint.STATUS_RESOLVED_RELEASE,
+            ServiceBookingComplaint.STATUS_RESOLVED_REFUND,
+            ServiceBookingComplaint.STATUS_REJECTED,
+        }
+        if complaint.status in resolved_statuses:
+            return Response({"detail": "Complaint already resolved."}, status=status.HTTP_400_BAD_REQUEST)
+
+        action_value = str(request.data.get("action") or "").strip().lower()
+        note = request.data.get("note") or ""
+        if action_value not in (ServiceBookingComplaint.ACTION_RELEASE, ServiceBookingComplaint.ACTION_REFUND):
+            raise ValidationError({"action": "action must be 'release' or 'refund'."})
+
+        booking = complaint.booking
+        escrow = complaint.escrow or getattr(booking, "escrow", None)
+        payment = complaint.payment or getattr(booking, "payment", None)
+        reference = (payment.transaction_reference if payment else "") or complaint.transaction_reference or booking.payment_tx_ref
+        legacy_wallet_payment = bool(payment and str(payment.payment_method or "").lower() == "wallet")
+
+        try:
+            if action_value == ServiceBookingComplaint.ACTION_RELEASE:
+                if escrow and legacy_wallet_payment:
+                    release_locked_booking_funds(
+                        payer=booking.user,
+                        provider=booking.shop.owner,
+                        amount_cents=_wallet_amount(escrow.amount_cents),
+                        reference=reference,
+                        meta={"booking_id": str(booking.id), "complaint_id": str(complaint.id)},
+                    )
+                if escrow:
+                    escrow.status = ServiceBookingEscrow.STATUS_RELEASED
+                    escrow.released_at = timezone.now()
+                    escrow.released_by = request.user
+                    escrow.save(update_fields=["status", "released_at", "released_by"])
+                booking.status = ServiceBooking.STATUS_COMPLETED
+                booking.save(update_fields=["status"])
+                complaint.status = ServiceBookingComplaint.STATUS_RESOLVED_RELEASE
+            else:
+                if escrow and legacy_wallet_payment:
+                    refund_locked_booking_funds(
+                        payer=booking.user,
+                        amount_cents=_wallet_amount(escrow.amount_cents),
+                        reference=reference,
+                        meta={"booking_id": str(booking.id), "complaint_id": str(complaint.id)},
+                    )
+                if escrow:
+                    escrow.status = ServiceBookingEscrow.STATUS_REFUNDED
+                    escrow.refunded_at = timezone.now()
+                    escrow.refunded_by = request.user
+                    escrow.save(update_fields=["status", "refunded_at", "refunded_by"])
+                booking.status = ServiceBooking.STATUS_CANCELLED
+                booking.save(update_fields=["status"])
+                complaint.status = ServiceBookingComplaint.STATUS_RESOLVED_REFUND
+        except ValueError as exc:
+            raise ValidationError({"detail": str(exc)})
+
+        complaint.action = action_value
+        complaint.resolution_note = note
+        complaint.resolved_by = request.user
+        complaint.resolved_at = timezone.now()
+        complaint.save(update_fields=["status", "action", "resolution_note", "resolved_by", "resolved_at"])
+
+        serializer = self.get_serializer(complaint)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
 
 class ServiceBookingPaymentSatisfyView(APIView):
     permission_classes = [permissions.IsAuthenticated]
