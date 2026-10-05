@@ -277,6 +277,16 @@ KIS_AI_STORE_RESPONSES_ENABLED = _env_bool("KIS_AI_STORE_RESPONSES_ENABLED", Fal
 KIS_AI_MEDICAL_DIAGNOSIS_ENABLED = _env_bool("KIS_AI_MEDICAL_DIAGNOSIS_ENABLED", False)
 KIS_AI_FINANCIAL_ADVICE_ENABLED = _env_bool("KIS_AI_FINANCIAL_ADVICE_ENABLED", False)
 
+# Emergency SOS nearest-hospital lookup. No geospatial/places vendor is wired
+# in yet (see apps/health_ops/hospital_proximity.py); point this at a dotted
+# path implementing HospitalProximityProvider once one is configured. Left
+# unset, the SOS flow honestly reports hospital lookup as unavailable instead
+# of fabricating a result.
+HEALTH_HOSPITAL_PROXIMITY_PROVIDER = os.environ.get(
+    "HEALTH_HOSPITAL_PROXIMITY_PROVIDER",
+    "apps.health_ops.hospital_proximity.NullHospitalProximityProvider",
+)
+
 # Public web / growth safety. Public pages expose only published public content
 # and redacted metadata; embeds still obey their stricter embed flags/policies.
 KIS_PUBLIC_WEB_ENABLED = _env_bool("KIS_PUBLIC_WEB_ENABLED", True)
@@ -863,6 +873,28 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.broadcasts.tasks.sweep_stuck_education_bookings",
         "schedule": 60 * 60,
     },
+    # KIS Health production-completion audit: EmergencyDispatchSession is
+    # the one health_ops domain where "stuck" plausibly means "a patient is
+    # still waiting for help that never came" - see
+    # apps.health_ops.tasks.sweep_stuck_emergency_dispatch_sessions's own
+    # docstring. 10 minutes (far tighter than every other sweep's hourly
+    # cadence) because the 30-minute stuck threshold itself is already the
+    # safety margin; the sweep interval should be short relative to that,
+    # not another hour added on top of it.
+    "sweep-stuck-emergency-dispatch-sessions": {
+        "task": "apps.health_ops.tasks.sweep_stuck_emergency_dispatch_sessions",
+        "schedule": 10 * 60,
+    },
+    # PaymentBillingSession stuck PAYMENT_PENDING past its provider webhook
+    # — likely a lost/delayed webhook, not a security issue (the session
+    # can never self-certify PAID, see the Section 13 billing audit), but a
+    # patient stuck unable to receive paid-for care is a real operational
+    # gap worth surfacing. Hourly matches the project's standard sweep
+    # cadence for non-safety-critical reconciliation.
+    "sweep-stuck-billing-sessions": {
+        "task": "apps.health_ops.tasks.sweep_stuck_billing_sessions",
+        "schedule": 60 * 60,
+    },
     # Bible reading reminders (apps/bible/tasks.py wrapping the
     # dispatch_bible_reading_reminders management command). The command's
     # own default --lookback-minutes is 10; every 5 minutes keeps a
@@ -1076,3 +1108,13 @@ LOGGING = {
     },
     "root": {"handlers": ["console"], "level": os.environ.get("LOG_LEVEL", "DEBUG")},
 }
+
+# Emergency SOS nearest-hospital lookup (apps/health_ops/hospital_proximity.py).
+# No geospatial/Places vendor is integrated yet. To go live, implement
+# HospitalProximityProvider against a real vendor and point this at it, e.g.
+# "apps.health_ops.hospital_proximity.GooglePlacesHospitalProvider". Until
+# then this stays on the null provider, which returns no fabricated results.
+HEALTH_HOSPITAL_PROXIMITY_PROVIDER = os.environ.get(
+    "HEALTH_HOSPITAL_PROXIMITY_PROVIDER",
+    "apps.health_ops.hospital_proximity.NullHospitalProximityProvider",
+)

@@ -277,6 +277,18 @@ class HealthInstitutionSerializer(serializers.ModelSerializer):
             "userSafeMessage": "Health media is checked before it can be used in care workflows.",
         }
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Payout banking details (holder name, masked last4) are only
+        # relevant to someone who can actually manage billing for this
+        # institution — a rank-and-file staff/member doesn't need them,
+        # so they're stripped rather than handed to every authenticated
+        # member who can merely read the institution record.
+        if not data.get("can_manage"):
+            data["payout_account_name"] = None
+            data["payout_bank_last4"] = None
+        return data
+
 
 class HealthInstitutionPublicSerializer(serializers.ModelSerializer):
     """Minimal public-safe view of a HealthInstitution for the KISTube

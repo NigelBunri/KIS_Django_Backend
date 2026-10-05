@@ -320,6 +320,7 @@ urlpatterns = [
     path("api/v1/media/extended/", include("apps.broadcasts.media_extended_urls")),
     path("api/v1/business/", include("apps.commerce.business_urls")),
     path("api/v1/health/extended/", include("apps.health_ops.extended_urls")),
+    path("api/v1/health/clinical/", include("apps.health_ops.clinical_urls")),
     path("api/v1/stickers/packs/", StickerPackListView.as_view(), name="sticker-packs"),
 
     # --- JWT auth endpoints (SimpleJWT) ---

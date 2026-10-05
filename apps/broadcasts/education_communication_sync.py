@@ -35,16 +35,8 @@
 from __future__ import annotations
 
 from django.db import transaction
-from django.utils import timezone
-from django.utils.text import slugify
 
-from apps.chat.models import (
-    BaseConversationRole,
-    Conversation,
-    ConversationMember,
-    ConversationSettings,
-    ConversationType,
-)
+from apps.chat.models import ConversationType
 from apps.communities.models import (
     Community,
     CommunityJoinPolicy,
@@ -55,30 +47,25 @@ from apps.communities.models import (
 )
 from apps.groups.models import Group, GroupMembership, GroupRole
 from apps.channels.models import Channel
+from apps.partners.communication_sync_helpers import (
+    create_conversation as _create_conversation,
+    grant_community_admin as _grant_community_admin,
+    grant_conversation_admin as _grant_conversation_admin,
+    grant_group_admin as _grant_group_admin,
+    join_community as _join_community,
+    join_conversation as _join_conversation,
+    join_group as _join_group,
+    leave_community as _leave_community,
+    leave_conversation as _leave_conversation,
+    leave_group as _leave_group,
+    revoke_community_admin as _revoke_community_admin,
+    revoke_conversation_admin as _revoke_conversation_admin,
+    revoke_group_admin as _revoke_group_admin,
+    unique_slug as _unique_slug,
+)
 from apps.partners.models import PartnerMembership, PartnerMembershipStatus
 
 from .models import EducationEnrollmentStatus, EducationInstitutionStaffAssignmentStatus
-
-
-def _unique_slug(model, base: str, **scope_filter) -> str:
-    root = slugify(base) or model.__name__.lower()
-    candidate = root
-    suffix = 0
-    while model.objects.filter(slug=candidate, **scope_filter).exists():
-        suffix += 1
-        candidate = f"{root}-{suffix}"
-    return candidate
-
-
-def _create_conversation(*, conv_type: str, title: str, owner) -> Conversation:
-    conversation = Conversation.objects.create(
-        type=conv_type, title=title, created_by=owner,
-    )
-    ConversationSettings.objects.create(conversation=conversation)
-    ConversationMember.objects.create(
-        conversation=conversation, user=owner, base_role=BaseConversationRole.OWNER,
-    )
-    return conversation
 
 
 # ---------------------------------------------------------------------------
@@ -410,127 +397,6 @@ def on_institution_partner_disconnected(institution) -> None:
     return
 
 
-# ---------------------------------------------------------------------------
-# Low-level join/leave/admin helpers
-# ---------------------------------------------------------------------------
-
-def _join_conversation(conversation: Conversation, user) -> None:
-    member, created = ConversationMember.objects.get_or_create(
-        conversation=conversation, user=user,
-        defaults={"base_role": BaseConversationRole.MEMBER},
-    )
-    if not created and member.left_at is not None:
-        member.left_at = None
-        member.save(update_fields=["left_at"])
-
-
-def _leave_conversation(conversation: Conversation, user) -> None:
-    ConversationMember.objects.filter(
-        conversation=conversation, user=user, left_at__isnull=True,
-    ).update(left_at=timezone.now())
-
-
-def _grant_conversation_admin(conversation: Conversation, user) -> None:
-    member, created = ConversationMember.objects.get_or_create(
-        conversation=conversation, user=user,
-        defaults={"base_role": BaseConversationRole.ADMIN},
-    )
-    if created:
-        return
-    updates = []
-    if member.left_at is not None:
-        member.left_at = None
-        updates.append("left_at")
-    if member.base_role not in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
-        member.base_role = BaseConversationRole.ADMIN
-        updates.append("base_role")
-    if updates:
-        member.save(update_fields=updates)
-
-
-def _revoke_conversation_admin(conversation: Conversation, user) -> None:
-    ConversationMember.objects.filter(
-        conversation=conversation, user=user, base_role=BaseConversationRole.ADMIN,
-    ).update(base_role=BaseConversationRole.MEMBER)
-
-
-def _join_group(group: Group, user) -> None:
-    membership, created = GroupMembership.objects.get_or_create(
-        group=group, user=user, defaults={"role": GroupRole.MEMBER},
-    )
-    if not created and membership.left_at is not None:
-        membership.left_at = None
-        membership.save(update_fields=["left_at"])
-    _join_conversation(group.conversation, user)
-
-
-def _leave_group(group: Group, user) -> None:
-    GroupMembership.objects.filter(
-        group=group, user=user, left_at__isnull=True,
-    ).update(left_at=timezone.now())
-    _leave_conversation(group.conversation, user)
-
-
-def _grant_group_admin(group: Group, user) -> None:
-    membership, created = GroupMembership.objects.get_or_create(
-        group=group, user=user, defaults={"role": GroupRole.ADMIN},
-    )
-    if not created:
-        updates = []
-        if membership.left_at is not None:
-            membership.left_at = None
-            updates.append("left_at")
-        if membership.role not in (GroupRole.OWNER, GroupRole.ADMIN):
-            membership.role = GroupRole.ADMIN
-            updates.append("role")
-        if updates:
-            membership.save(update_fields=updates)
-    _grant_conversation_admin(group.conversation, user)
-
-
-def _revoke_group_admin(group: Group, user) -> None:
-    GroupMembership.objects.filter(
-        group=group, user=user, role=GroupRole.ADMIN,
-    ).update(role=GroupRole.MEMBER)
-    _revoke_conversation_admin(group.conversation, user)
-
-
-def _join_community(community: Community, user) -> None:
-    membership, created = CommunityMembership.objects.get_or_create(
-        community=community, user=user,
-        defaults={"role": CommunityRole.MEMBER, "status": CommunityMembershipStatus.ACTIVE},
-    )
-    if not created and membership.status != CommunityMembershipStatus.ACTIVE:
-        membership.status = CommunityMembershipStatus.ACTIVE
-        membership.left_at = None
-        membership.save(update_fields=["status", "left_at"])
-
-
-def _leave_community(community: Community, user) -> None:
-    CommunityMembership.objects.filter(
-        community=community, user=user, status=CommunityMembershipStatus.ACTIVE,
-    ).update(status=CommunityMembershipStatus.LEFT, left_at=timezone.now())
-
-
-def _grant_community_admin(community: Community, user) -> None:
-    membership, created = CommunityMembership.objects.get_or_create(
-        community=community, user=user,
-        defaults={"role": CommunityRole.ADMIN, "status": CommunityMembershipStatus.ACTIVE},
-    )
-    if not created:
-        updates = []
-        if membership.status != CommunityMembershipStatus.ACTIVE:
-            membership.status = CommunityMembershipStatus.ACTIVE
-            membership.left_at = None
-            updates += ["status", "left_at"]
-        if membership.role not in (CommunityRole.OWNER, CommunityRole.ADMIN):
-            membership.role = CommunityRole.ADMIN
-            updates.append("role")
-        if updates:
-            membership.save(update_fields=updates)
-
-
-def _revoke_community_admin(community: Community, user) -> None:
-    CommunityMembership.objects.filter(
-        community=community, user=user, role=CommunityRole.ADMIN,
-    ).update(role=CommunityRole.MEMBER)
+# Low-level join/leave/admin helpers now live in
+# apps.partners.communication_sync_helpers (imported above) — shared with
+# apps.health_ops.communication_sync rather than duplicated per domain.

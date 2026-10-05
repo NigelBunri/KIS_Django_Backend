@@ -689,6 +689,155 @@ def issue_health_institution_badges(*, case: VerificationCase, actor=None, badge
     return issued
 
 
+def sanitize_practitioner_evidence_metadata(metadata: dict | None) -> dict:
+    """Mirrors sanitize_health_evidence_metadata's shape, scoped to what a
+    practitioner credential review actually needs — never a raw document,
+    only reference lists (private_media_id pointers) plus a safe extra
+    bucket. License facts themselves (number, authority, jurisdiction,
+    expiry) live as structured fields on HealthPractitioner, not here —
+    this is strictly the evidence attached to the verification case."""
+    metadata = metadata or {}
+    safe = {
+        "identity_document": _safe_reference_list(metadata.get("identity_document")),
+        "license_document": _safe_reference_list(metadata.get("license_document")),
+        "qualification_documents": _safe_reference_list(metadata.get("qualification_documents")),
+        "proof_of_registration": _safe_reference_list(metadata.get("proof_of_registration")),
+        "private_references_only": True,
+    }
+    extra = metadata.get("extra")
+    if isinstance(extra, dict):
+        safe["extra"] = {
+            str(key): value
+            for key, value in extra.items()
+            if key not in {"raw", "raw_document", "document_base64", "base64", "image_base64", "document_data"}
+            and not (isinstance(value, str) and value.strip().lower().startswith("data:"))
+        }
+    return {key: value for key, value in safe.items() if value not in (None, [], {})}
+
+
+def practitioner_subject_for(practitioner) -> VerificationSubject | None:
+    return get_or_create_subject(
+        subject_type=VerificationSubjectType.HEALTH_PRACTITIONER,
+        subject_id=getattr(practitioner, "id", None),
+        owner=getattr(practitioner, "user", None),
+        display_name=getattr(practitioner, "legal_name", "") or "",
+        country=getattr(getattr(practitioner, "user", None), "country", "") or "",
+        metadata={
+            "legacy_model": f"{practitioner.__class__.__module__}.{practitioner.__class__.__name__}",
+            "profession_type": getattr(practitioner, "profession_type", "") or "",
+        },
+    )
+
+
+def current_practitioner_verification_status(practitioner) -> dict:
+    summary = verification_summary(VerificationSubjectType.HEALTH_PRACTITIONER, getattr(practitioner, "id", None))
+    normalized_id = normalize_subject_id(getattr(practitioner, "id", None))
+    subject = None
+    if normalized_id:
+        subject = VerificationSubject.objects.filter(
+            subject_type=VerificationSubjectType.HEALTH_PRACTITIONER,
+            subject_id=normalized_id,
+        ).first()
+    latest_case = None
+    if subject:
+        latest_case = subject.cases.order_by("-created_at").first()
+    summary["case"] = serialize_case_status(latest_case) if latest_case else None
+    return summary
+
+
+@transaction.atomic
+def start_practitioner_verification_case(*, practitioner, actor, evidence_metadata: dict | None = None, provider: str = "") -> VerificationCase | None:
+    subject = practitioner_subject_for(practitioner)
+    if not subject:
+        return None
+    adapter = get_provider_adapter(provider)
+    now = timezone.now()
+    case = VerificationCase.objects.create(
+        subject=subject,
+        requested_by=actor,
+        level="licensed_practitioner",
+        status=VerificationCaseStatus.SUBMITTED,
+        provider=adapter.name,
+        provider_status="not_configured",
+        evidence_metadata=sanitize_practitioner_evidence_metadata(evidence_metadata),
+        submitted_at=now,
+        public_summary={
+            "next_action": "manual_review",
+            "message": "Practitioner verification request received. Manual review is required to confirm licensing credentials.",
+        },
+    )
+    _apply_provider_handoff(
+        case,
+        adapter,
+        manual_message="Practitioner verification request received. Manual review is required to confirm licensing credentials.",
+    )
+    record_audit_event(subject=subject, case=case, actor=actor, action="practitioner_case.started", provider=case.provider)
+    return case
+
+
+@transaction.atomic
+def review_practitioner_case(*, case: VerificationCase, actor, action: str, notes: str = "", badge_codes: list[str] | None = None):
+    if case.subject.subject_type != VerificationSubjectType.HEALTH_PRACTITIONER:
+        raise ValueError("Verification case is not a practitioner case.")
+    now = timezone.now()
+    case.reviewed_by = actor
+    case.reviewed_at = now
+    if notes:
+        case.reviewer_notes = notes
+    issued_badges = []
+    if action == "approve":
+        case.status = VerificationCaseStatus.APPROVED
+        case.subject.current_status = VerificationCaseStatus.APPROVED
+        case.subject.current_level = case.level
+        case.subject.last_verified_at = now
+        case.subject.save(update_fields=["current_status", "current_level", "last_verified_at", "updated_at"])
+        issued_badges = issue_practitioner_badges(case=case, actor=actor, badge_codes=badge_codes)
+    elif action == "reject":
+        case.status = VerificationCaseStatus.REJECTED
+        case.subject.current_status = VerificationCaseStatus.REJECTED
+        case.subject.save(update_fields=["current_status", "updated_at"])
+    elif action == "needs_more_info":
+        case.status = VerificationCaseStatus.NEEDS_MORE_INFO
+        case.subject.current_status = VerificationCaseStatus.NEEDS_MORE_INFO
+        case.subject.save(update_fields=["current_status", "updated_at"])
+    else:
+        raise ValueError("Unsupported review action.")
+    case.save(update_fields=["reviewed_by", "reviewed_at", "reviewer_notes", "status", "updated_at"])
+    record_audit_event(
+        subject=case.subject,
+        case=case,
+        actor=actor,
+        action=f"practitioner_case.{action}",
+        metadata={"badge_codes": [badge.code for badge in issued_badges]},
+    )
+    return case, issued_badges
+
+
+def issue_practitioner_badges(*, case: VerificationCase, actor=None, badge_codes: list[str] | None = None) -> list[VerificationBadge]:
+    allowed = {VerificationBadgeCode.LICENSED_PROVIDER}
+    selected = [code for code in (badge_codes or []) if code in allowed] or [VerificationBadgeCode.LICENSED_PROVIDER]
+    issued = []
+    now = timezone.now()
+    for code in selected:
+        badge, _created = VerificationBadge.objects.update_or_create(
+            subject=case.subject,
+            code=code,
+            defaults={
+                "case": case,
+                "label": PUBLIC_BADGE_LABELS.get(code, code.replace("_", " ").title()),
+                "level": case.level,
+                "status": VerificationBadgeStatus.ACTIVE,
+                "public": True,
+                "issued_by": actor if getattr(actor, "is_authenticated", False) else None,
+                "issued_at": now,
+                "revoked_at": None,
+                "revoke_reason": "",
+            },
+        )
+        issued.append(badge)
+    return issued
+
+
 def education_institution_subject_for(institution) -> VerificationSubject | None:
     owner = getattr(institution, "owner", None)
     return get_or_create_subject(

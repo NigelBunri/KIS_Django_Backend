@@ -233,6 +233,44 @@ class HealthInstitution(TimeStampedUUIDModel):
     stripe_charges_enabled = models.BooleanField(default=False)
     stripe_payouts_enabled = models.BooleanField(default=False)
     stripe_details_submitted = models.BooleanField(default=False)
+    # Stable reference to this institution's communication Community —
+    # same persisted-FK convention as EducationInstitutionProgram.community
+    # (apps/broadcasts/models.py) and the same reasoning: created once,
+    # lazily, the first time a Partner Account is connected (see
+    # apps.health_ops.communication_sync.ensure_institution_community),
+    # never a slug lookup. String ref to avoid a circular import.
+    community = models.ForeignKey(
+        "communities.Community",
+        on_delete=models.SET_NULL,
+        related_name="health_institutions",
+        null=True,
+        blank=True,
+    )
+    # Canonical cross-reference to the legacy broadcasts/health_dashboard
+    # institution identity. Three separate "health institution" shapes
+    # exist in this codebase: apps.broadcasts.BroadcastHealthProfile's own
+    # client-editable JSON blob (the original, fully self-reported
+    # representation), apps.broadcasts.BroadcastHealthInstitution (a SQL
+    # projection of that same JSON, rebuilt on every profile save), and
+    # apps.health_dashboard.HealthDashboardInstitution (a presentation/CMS
+    # layer with a real OneToOneField straight onto
+    # BroadcastHealthInstitution). This HealthInstitution model is the
+    # fourth, independent, clinically-authoritative one. Before this field,
+    # the only link between it and the other three was a string stashed in
+    # `settings["legacy_institution_id"]` — a JSON key, not a real,
+    # indexed, constrained relationship, meaning nothing stopped two
+    # different code paths from silently disagreeing about identity. This
+    # FK is the single source of truth for "which legacy institution does
+    # this HealthInstitution correspond to, if any" — see
+    # apps.health_ops.views._bootstrap_health_ops_institution_from_broadcast,
+    # the only place this relationship is ever created.
+    legacy_broadcast_institution = models.OneToOneField(
+        "broadcasts.BroadcastHealthInstitution",
+        on_delete=models.SET_NULL,
+        related_name="health_ops_institution",
+        null=True,
+        blank=True,
+    )
 
     class Meta:
         db_table = "health_ops_institution"
@@ -272,6 +310,17 @@ class HealthService(TimeStampedUUIDModel):
     requires_assessment = models.BooleanField(default=False)
     assessment_schema = models.JSONField(default=dict, blank=True)
     base_cost_micro = models.BigIntegerField(default=0, validators=[MinValueValidator(0)])
+    # Stable reference to this service's communication Channel — mirrors
+    # EducationInstitutionCourse.channel exactly (same Partner-Account-
+    # gated, created-on-first-use convention). String ref to avoid a
+    # circular import.
+    channel = models.ForeignKey(
+        "channels.Channel",
+        on_delete=models.SET_NULL,
+        related_name="health_services",
+        null=True,
+        blank=True,
+    )
 
     class Meta:
         db_table = "health_ops_service"

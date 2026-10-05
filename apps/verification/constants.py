@@ -2,6 +2,7 @@ class VerificationSubjectType:
     USER = "user"
     SHOP = "shop"
     HEALTH_INSTITUTION = "health_institution"
+    HEALTH_PRACTITIONER = "health_practitioner"
     EDUCATION_INSTITUTION = "education_institution"
     PARTNER = "partner"
 
@@ -9,6 +10,7 @@ class VerificationSubjectType:
         (USER, "User"),
         (SHOP, "Shop"),
         (HEALTH_INSTITUTION, "Health Institution"),
+        (HEALTH_PRACTITIONER, "Health Practitioner"),
         (EDUCATION_INSTITUTION, "Education Institution"),
         (PARTNER, "Partner"),
     )

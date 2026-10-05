@@ -10,16 +10,35 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.viewsets import ModelViewSet
 
-from apps.accounts.models import User
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import IsAdminUser
+
+from apps.verification.constants import VerificationSubjectType
+from apps.verification.models import VerificationCase
+from apps.verification.services import (
+    current_practitioner_verification_status,
+    review_practitioner_case,
+    serialize_case_status,
+    start_practitioner_verification_case,
+)
+
+from .views import _can_manage_institution, _is_institution_member
+from .hospital_proximity import get_hospital_proximity_provider, is_hospital_proximity_configured
 
 from .extended_models import (
     AddictionRecoveryGroup,
+    Allergy,
     BabyMilestone,
     BloodTypeRegistry,
+    Condition,
     ConsultReview,
     EMedication,
     EmergencyAlert,
     HealthGoal,
+    HealthPractitioner,
+    Immunization,
     MentalHealthJournal,
     MentalHealthSession,
     MoodEntry,
@@ -30,20 +49,27 @@ from .extended_models import (
 )
 from .extended_serializers import (
     AddictionRecoveryGroupSerializer,
+    AllergySerializer,
     BabyMilestoneSerializer,
     BloodTypeRegistrySerializer,
+    ConditionSerializer,
     ConsultReviewSerializer,
     EMedicationSerializer,
     EmergencyAlertSerializer,
     HealthGoalProgressSerializer,
     HealthGoalSerializer,
+    HealthPractitionerSerializer,
+    ImmunizationSerializer,
     MentalHealthJournalSerializer,
     MentalHealthSessionSerializer,
     MoodEntrySerializer,
+    PractitionerDirectoryEntrySerializer,
     PregnancyTrackerSerializer,
     RecoveryMembershipSerializer,
     RecoveryMilestoneSerializer,
+    ReviewPractitionerCaseSerializer,
     SOSAlertSerializer,
+    StartPractitionerVerificationSerializer,
     SymptomsCheckSerializer,
     TelemedicineConsultSerializer,
 )
@@ -56,6 +82,14 @@ CRISIS_HOTLINES = {
     "US": [
         {"name": "National Suicide Prevention Lifeline", "number": "988", "hours": "24/7"},
         {"name": "Crisis Text Line", "number": "Text HOME to 741741", "hours": "24/7"},
+    ],
+    # Keyed under both the real ISO-3166 code ("GB", what the RN country
+    # picker actually sends) and the common colloquial "UK" — previously
+    # only "UK" existed, so selecting GB silently fell through to the
+    # generic DEFAULT entry instead of these real, detailed hotlines.
+    "GB": [
+        {"name": "Samaritans", "number": "116 123", "hours": "24/7"},
+        {"name": "PAPYRUS", "number": "0800 068 4141", "hours": "9am-midnight"},
     ],
     "UK": [
         {"name": "Samaritans", "number": "116 123", "hours": "24/7"},
@@ -76,29 +110,40 @@ CRISIS_HOTLINES = {
     ],
 }
 
+_TRIAGE_SEEK_CARE_LABEL = {
+    "immediate": "Immediately",
+    "within_24h": "Within 24 hours",
+    "routine": "At your next routine opportunity",
+}
+
+# `triage_level`/`recommendations` match the RN app's CheckResult contract
+# (SymptomCheckerScreen.tsx) exactly — this previously used different key
+# names (level/recommendation) and a disjoint set of level values, which the
+# screen could not read at all and crashed on (TRIAGE_LABELS[level] falls
+# through to `level.toUpperCase()`, which throws when level is undefined).
 MOCK_TRIAGE_RULES = [
     {
         "keywords": ["chest pain", "heart attack", "can't breathe", "difficulty breathing"],
-        "level": "emergency",
-        "recommendation": "Call emergency services (911/999) immediately. Do not drive yourself.",
+        "triage_level": "emergency",
+        "recommendations": ["Call emergency services (911/999) immediately. Do not drive yourself."],
         "urgency": "immediate",
     },
     {
         "keywords": ["fever", "temperature", "flu", "cough", "cold", "sore throat"],
-        "level": "moderate",
-        "recommendation": "Rest, stay hydrated. Consult a doctor if symptoms worsen or persist beyond 3 days.",
+        "triage_level": "moderate",
+        "recommendations": ["Rest, stay hydrated.", "Consult a doctor if symptoms worsen or persist beyond 3 days."],
         "urgency": "within_24h",
     },
     {
         "keywords": ["headache", "migraine", "nausea", "vomiting", "dizziness"],
-        "level": "moderate",
-        "recommendation": "Monitor symptoms. Visit a clinic if they persist or are severe.",
+        "triage_level": "moderate",
+        "recommendations": ["Monitor symptoms.", "Visit a clinic if they persist or are severe."],
         "urgency": "within_24h",
     },
     {
         "keywords": ["rash", "itch", "skin", "allergy"],
-        "level": "low",
-        "recommendation": "Consider an antihistamine. Schedule a dermatology or GP appointment.",
+        "triage_level": "mild",
+        "recommendations": ["Consider an antihistamine.", "Schedule a dermatology or GP appointment."],
         "urgency": "routine",
     },
 ]
@@ -108,19 +153,23 @@ def _triage_symptoms(symptoms: list[str]) -> dict:
     lowered = [s.lower() for s in symptoms]
     for rule in MOCK_TRIAGE_RULES:
         if any(kw in " ".join(lowered) for kw in rule["keywords"]):
-            return {
-                "level": rule["level"],
-                "recommendation": rule["recommendation"],
-                "urgency": rule["urgency"],
-                "matched_symptoms": symptoms,
-                "disclaimer": "This is a mock AI triage. Consult a qualified medical professional.",
-            }
+            matched = rule
+            break
+    else:
+        matched = {
+            "triage_level": "moderate",
+            "recommendations": ["Unable to match symptoms to a known pattern. Please consult a doctor."],
+            "urgency": "routine",
+        }
     return {
-        "level": "unknown",
-        "recommendation": "Unable to match symptoms. Please consult a doctor.",
-        "urgency": "routine",
+        "triage_level": matched["triage_level"],
+        "recommendations": matched["recommendations"],
+        "seek_care_within": _TRIAGE_SEEK_CARE_LABEL.get(matched["urgency"], "Routine"),
         "matched_symptoms": symptoms,
-        "disclaimer": "This is a mock AI triage. Consult a qualified medical professional.",
+        "disclaimer": (
+            "This triage is rule-based keyword matching, not a real AI model or a "
+            "clinical diagnosis. Always consult a qualified healthcare professional."
+        ),
     }
 
 
@@ -195,35 +244,156 @@ class ConsultReviewViewSet(ModelViewSet):
         serializer.save(reviewer=self.request.user)
 
 
-@extend_schema(
-    tags=["Health — Telemedicine"],
-    summary="Doctor Directory",
-    parameters=[OpenApiParameter("specialty", str, description="Filter by specialty")],
-    responses={200: {"type": "array", "items": {"type": "object"}}},
-)
-class DoctorDirectoryView(APIView):
+@extend_schema(tags=["Health — Practitioner Verification"])
+class MyPractitionerProfileView(APIView):
+    """Self-service profile for the authenticated user's own HealthPractitioner
+    record. A patient-facing call never reaches this view — see
+    PractitionerDirectoryView / PractitionerDirectoryEntrySerializer for the
+    narrow, public-safe shape."""
+
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        specialty = request.query_params.get("specialty", "")
-        # Scaffold: returns users flagged as staff (doctors).
-        # Extend with a DoctorProfile model when available.
-        qs = User.objects.filter(is_staff=True).values(
-            "id", "email", "first_name", "last_name"
-        )
+        practitioner = HealthPractitioner.objects.filter(user=request.user).first()
+        if not practitioner:
+            return Response({"detail": "No practitioner profile."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(HealthPractitionerSerializer(practitioner).data)
+
+    def _check_claimed_institution(self, request, serializer):
+        institution = serializer.validated_data.get("institution")
+        if institution is None:
+            return None
+        if not _is_institution_member(request.user, institution):
+            return Response(
+                {"institution": "You are not a member of this institution."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return None
+
+    def post(self, request):
+        if HealthPractitioner.objects.filter(user=request.user).exists():
+            return Response(
+                {"detail": "Practitioner profile already exists."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = HealthPractitionerSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        denied = self._check_claimed_institution(request, serializer)
+        if denied:
+            return denied
+        practitioner = serializer.save(user=request.user)
+        return Response(HealthPractitionerSerializer(practitioner).data, status=status.HTTP_201_CREATED)
+
+    def patch(self, request):
+        practitioner = HealthPractitioner.objects.filter(user=request.user).first()
+        if not practitioner:
+            return Response({"detail": "No practitioner profile."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = HealthPractitionerSerializer(practitioner, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        denied = self._check_claimed_institution(request, serializer)
+        if denied:
+            return denied
+        serializer.save()
+        return Response(serializer.data)
+
+
+@extend_schema(
+    tags=["Health — Practitioner Verification"],
+    summary="Directory of verifiable practitioners",
+    parameters=[
+        OpenApiParameter("specialty", str, description="Filter by specialty"),
+        OpenApiParameter("profession_type", str, description="Filter by profession type"),
+        OpenApiParameter("institution_id", str, description="Filter by institution"),
+    ],
+)
+class PractitionerDirectoryView(APIView):
+    """Patient-facing discovery endpoint — replaces the old is_staff-based
+    DoctorDirectoryView scaffold with real HealthPractitioner rows and real
+    verification badges. Never serializes license_number, registration_authority,
+    or verification evidence (see PractitionerDirectoryEntrySerializer)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = HealthPractitioner.objects.filter(is_active=True).select_related("institution")
+        specialty = request.query_params.get("specialty")
+        profession_type = request.query_params.get("profession_type")
+        institution_id = request.query_params.get("institution_id")
         if specialty:
-            # Placeholder — real implementation would filter via DoctorProfile.specialty
-            pass
-        doctors = [
+            qs = qs.filter(specialty__icontains=specialty)
+        if profession_type:
+            qs = qs.filter(profession_type=profession_type)
+        if institution_id:
+            qs = qs.filter(institution_id=institution_id)
+        practitioners = list(qs.order_by("legal_name")[:50])
+        return Response({"results": PractitionerDirectoryEntrySerializer(practitioners, many=True).data})
+
+
+class PractitionerVerificationStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, practitioner_id):
+        practitioner = get_object_or_404(HealthPractitioner, id=practitioner_id)
+        return Response(current_practitioner_verification_status(practitioner))
+
+
+class PractitionerVerificationStartView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, practitioner_id):
+        practitioner = get_object_or_404(HealthPractitioner, id=practitioner_id)
+        is_self = practitioner.user_id == request.user.id
+        can_manage_institution = bool(
+            practitioner.institution_id
+        ) and _can_manage_institution(request.user, practitioner.institution)
+        if not (is_self or can_manage_institution):
+            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = StartPractitionerVerificationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        case = start_practitioner_verification_case(
+            practitioner=practitioner,
+            actor=request.user,
+            evidence_metadata=serializer.validated_data.get("evidence_metadata") or {},
+        )
+        return Response(
             {
-                "id": str(d["id"]),
-                "name": f"{d['first_name']} {d['last_name']}".strip(),
-                "email": d["email"],
-                "specialty": specialty or "General Practice",
-            }
-            for d in qs[:50]
-        ]
-        return Response({"results": doctors})
+                "case": serialize_case_status(case),
+                "status": current_practitioner_verification_status(practitioner),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PractitionerVerificationReviewView(APIView):
+    permission_classes = [IsAdminUser]
+
+    @transaction.atomic
+    def post(self, request, practitioner_id, case_id):
+        practitioner = get_object_or_404(HealthPractitioner, id=practitioner_id)
+        case = VerificationCase.objects.select_related("subject").filter(
+            id=case_id,
+            subject__subject_type=VerificationSubjectType.HEALTH_PRACTITIONER,
+            subject__subject_id=practitioner.id,
+        ).first()
+        if not case:
+            raise ValidationError({"case_id": "Invalid health practitioner verification case."})
+        serializer = ReviewPractitionerCaseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        case, badges = review_practitioner_case(
+            case=case,
+            actor=request.user,
+            action=serializer.validated_data["action"],
+            notes=serializer.validated_data.get("notes", ""),
+            badge_codes=serializer.validated_data.get("badge_codes") or None,
+        )
+        return Response(
+            {
+                "case": serialize_case_status(case),
+                "badges": [{"code": badge.code, "label": badge.label, "level": badge.level} for badge in badges],
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +666,56 @@ class EMedicationViewSet(ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(patient=self.request.user)
 
+
+# ---------------------------------------------------------------------------
+# Patient clinical record — Condition / Allergy / Immunization
+# Self-service only for now — see the scope note on these models in
+# extended_models.py and KIS_HEALTH_CHECKLIST.md Section 4.
+# ---------------------------------------------------------------------------
+
+@extend_schema(tags=["Health — Patient Record"])
+class ConditionViewSet(ModelViewSet):
+    serializer_class = ConditionSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["status", "is_active"]
+    ordering_fields = ["onset_date", "created_at"]
+
+    def get_queryset(self):
+        return Condition.objects.filter(patient=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(patient=self.request.user)
+
+
+@extend_schema(tags=["Health — Patient Record"])
+class AllergyViewSet(ModelViewSet):
+    serializer_class = AllergySerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["severity", "is_active"]
+    ordering_fields = ["created_at"]
+
+    def get_queryset(self):
+        return Allergy.objects.filter(patient=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(patient=self.request.user)
+
+
+@extend_schema(tags=["Health — Patient Record"])
+class ImmunizationViewSet(ModelViewSet):
+    serializer_class = ImmunizationSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    ordering_fields = ["administered_date", "next_dose_due", "created_at"]
+
+    def get_queryset(self):
+        return Immunization.objects.filter(patient=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(patient=self.request.user)
+
     @extend_schema(
         summary="Medications with refill due today or overdue",
         responses={200: EMedicationSerializer(many=True)},
@@ -572,7 +792,7 @@ class EmergencyAlertViewSet(ModelViewSet):
 
 @extend_schema(
     tags=["Health — Emergency"],
-    summary="Create SOS alert and return nearest hospitals (scaffolded)",
+    summary="Create SOS alert and return nearest hospitals via the configured provider",
     request=SOSAlertSerializer,
     responses={201: {"type": "object"}},
 )
@@ -594,22 +814,24 @@ class SOSCreateView(APIView):
             status=EmergencyAlert.AlertStatus.ACTIVE,
         )
 
-        # Scaffold: nearest hospitals would be resolved via a geospatial query
-        # or a third-party Places API using (latitude, longitude).
-        nearest_hospitals = [
-            {
-                "name": "Nearest Hospital (scaffold)",
-                "distance_km": None,
-                "address": "Query a Places API with the provided coordinates.",
-                "phone": "N/A",
-            }
-        ]
+        provider = get_hospital_proximity_provider()
+        nearby = provider.find_nearby(data.get("latitude"), data.get("longitude"))
 
         return Response(
             {
                 "alert": EmergencyAlertSerializer(alert).data,
-                "nearest_hospitals": nearest_hospitals,
-                "note": "Hospital proximity data is scaffolded. Integrate a geospatial API for production.",
+                "nearest_hospitals": [
+                    {
+                        "name": h.name,
+                        "distance_km": h.distance_km,
+                        "address": h.address,
+                        "phone": h.phone,
+                        "latitude": h.latitude,
+                        "longitude": h.longitude,
+                    }
+                    for h in nearby
+                ],
+                "hospital_lookup_available": is_hospital_proximity_configured(),
             },
             status=status.HTTP_201_CREATED,
         )

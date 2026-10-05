@@ -24,7 +24,7 @@ from rest_framework.views import APIView
 from rest_framework.permissions import IsAdminUser
 
 from apps.accounts.tiers import get_user_tier_features, normalize_limit_value
-from apps.broadcasts.models import BroadcastHealthProfile
+from apps.broadcasts.models import BroadcastHealthInstitution, BroadcastHealthProfile
 from apps.billing.direct_payments import create_direct_payment_intent
 from apps.billing.services import debit_wallet_balance, get_wallet_account
 from apps.media.safety import validate_attachment_metadata_for_safe_messaging
@@ -91,6 +91,7 @@ from .models import (
     WellnessProgramStatus,
     WorkflowStatus,
 )
+from .extended_models import EMedication
 from .serializers import (
     AdmissionBedEndSerializer,
     AdmissionBedPayloadSerializer,
@@ -760,6 +761,8 @@ def _start_workflow_session(
     )
     from apps.health_ops.partner_sync import sync_patient_partner_membership
     sync_patient_partner_membership(institution=institution, user=user, label=service.name)
+    from apps.health_ops.communication_sync import sync_patient_service_communication
+    sync_patient_service_communication(workflow)
 
     now_value = timezone.now()
     sessions: list[EngineSession] = []
@@ -1148,6 +1151,19 @@ def _find_accessible_health_institution(user, institution_ref: str) -> HealthIns
 
 
 @transaction.atomic
+def _find_legacy_health_institution(clean_hint: str, broadcast_row: "BroadcastHealthInstitution | None") -> HealthInstitution | None:
+    """Canonical lookup for an existing HealthInstitution's legacy identity.
+    Prefers the real FK (set once a BroadcastHealthInstitution row is known)
+    over the historical settings[\"legacy_institution_id\"] string key, which
+    predates that FK and is kept only so rows created before this field
+    existed still resolve correctly."""
+    if broadcast_row is not None:
+        institution = HealthInstitution.objects.filter(legacy_broadcast_institution=broadcast_row).first()
+        if institution:
+            return institution
+    return HealthInstitution.objects.filter(settings__legacy_institution_id=clean_hint).first()
+
+
 def _bootstrap_health_ops_institution_from_broadcast(
     user, institution_hint: str
 ) -> tuple[HealthInstitution | None, Response | None]:
@@ -1156,6 +1172,7 @@ def _bootstrap_health_ops_institution_from_broadcast(
         return None, None
 
     selected_institution: dict[str, Any] | None = None
+    selected_broadcast_row: BroadcastHealthInstitution | None = None
     selected_role = ""
     for profile in BroadcastHealthProfile.objects.select_related("profile__user").all():
         for institution_payload in _extract_broadcast_institutions(profile.payload):
@@ -1176,6 +1193,9 @@ def _bootstrap_health_ops_institution_from_broadcast(
             if not selected_role:
                 return None, Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
             selected_institution = institution_payload
+            selected_broadcast_row = BroadcastHealthInstitution.objects.filter(
+                health_profile=profile, institution_uid=clean_hint,
+            ).first()
             break
         if selected_institution:
             break
@@ -1193,9 +1213,7 @@ def _bootstrap_health_ops_institution_from_broadcast(
     )
     timezone_name = _clean_service_reference(availability.get("timezone")) or "UTC"
 
-    institution = HealthInstitution.objects.filter(
-        settings__legacy_institution_id=clean_hint
-    ).first()
+    institution = _find_legacy_health_institution(clean_hint, selected_broadcast_row)
     if not institution:
         institution = HealthInstitution.objects.create(
             owner=owner_user,
@@ -1207,6 +1225,7 @@ def _bootstrap_health_ops_institution_from_broadcast(
                 "legacy_institution_id": clean_hint,
                 "legacy_source": "broadcast_health_profile",
             },
+            legacy_broadcast_institution=selected_broadcast_row,
             is_active=True,
         )
     else:
@@ -1228,9 +1247,15 @@ def _bootstrap_health_ops_institution_from_broadcast(
         if institution.settings != next_settings:
             institution.settings = next_settings
             needs_save = True
+        if selected_broadcast_row and institution.legacy_broadcast_institution_id != selected_broadcast_row.id:
+            institution.legacy_broadcast_institution = selected_broadcast_row
+            needs_save = True
         if needs_save:
             institution.save(
-                update_fields=["name", "institution_type", "timezone", "settings", "updated_at"]
+                update_fields=[
+                    "name", "institution_type", "timezone", "settings",
+                    "legacy_broadcast_institution", "updated_at",
+                ]
             )
 
     HealthInstitutionMembership.objects.update_or_create(
@@ -1280,6 +1305,7 @@ def _bootstrap_health_ops_context_from_broadcast(user, service_ref: str, institu
         return None, None
 
     selected_institution: dict[str, Any] | None = None
+    selected_broadcast_row: BroadcastHealthInstitution | None = None
     selected_role = ""
     for profile in BroadcastHealthProfile.objects.select_related("profile__user").all():
         for institution_payload in _extract_broadcast_institutions(profile.payload):
@@ -1300,6 +1326,9 @@ def _bootstrap_health_ops_context_from_broadcast(user, service_ref: str, institu
             if not selected_role:
                 return None, Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
             selected_institution = institution_payload
+            selected_broadcast_row = BroadcastHealthInstitution.objects.filter(
+                health_profile=profile, institution_uid=clean_hint,
+            ).first()
             break
         if selected_institution:
             break
@@ -1313,7 +1342,7 @@ def _bootstrap_health_ops_context_from_broadcast(user, service_ref: str, institu
     availability = selected_institution.get("availability") if isinstance(selected_institution.get("availability"), dict) else {}
     timezone_name = _clean_service_reference(availability.get("timezone")) or "UTC"
 
-    institution = HealthInstitution.objects.filter(settings__legacy_institution_id=clean_hint).first()
+    institution = _find_legacy_health_institution(clean_hint, selected_broadcast_row)
     if not institution:
         institution = HealthInstitution.objects.create(
             owner=owner_user,
@@ -1325,6 +1354,7 @@ def _bootstrap_health_ops_context_from_broadcast(user, service_ref: str, institu
                 "legacy_institution_id": clean_hint,
                 "legacy_source": "broadcast_health_profile",
             },
+            legacy_broadcast_institution=selected_broadcast_row,
             is_active=True,
         )
     else:
@@ -1346,8 +1376,16 @@ def _bootstrap_health_ops_context_from_broadcast(user, service_ref: str, institu
         if institution.settings != next_settings:
             institution.settings = next_settings
             needs_save = True
+        if selected_broadcast_row and institution.legacy_broadcast_institution_id != selected_broadcast_row.id:
+            institution.legacy_broadcast_institution = selected_broadcast_row
+            needs_save = True
         if needs_save:
-            institution.save(update_fields=["name", "institution_type", "timezone", "settings", "updated_at"])
+            institution.save(
+                update_fields=[
+                    "name", "institution_type", "timezone", "settings",
+                    "legacy_broadcast_institution", "updated_at",
+                ]
+            )
 
     HealthInstitutionMembership.objects.update_or_create(
         institution=institution,
@@ -1472,11 +1510,13 @@ class HealthInstitutionListCreateView(APIView):
         serializer = HealthInstitutionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         institution = serializer.save(owner=request.user, slug=_slugify_name(serializer.validated_data["name"]))
-        HealthInstitutionMembership.objects.get_or_create(
+        membership, _created = HealthInstitutionMembership.objects.get_or_create(
             institution=institution,
             user=request.user,
             defaults={"role": MembershipRole.OWNER, "is_active": True},
         )
+        from apps.health_ops.communication_sync import sync_membership_communication
+        sync_membership_communication(membership)  # no-op until a Partner Account is connected
         return Response({"institution": HealthInstitutionSerializer(institution, context={"request": request}).data}, status=status.HTTP_201_CREATED)
 
 
@@ -1722,6 +1762,8 @@ class HealthInstitutionPartnerConnectView(APIView):
 
         institution.partner = partner
         institution.save(update_fields=["partner"])
+        from apps.health_ops.communication_sync import on_institution_partner_connected
+        on_institution_partner_connected(institution)
         return Response(HealthInstitutionSerializer(institution, context={"request": request}).data, status=status.HTTP_200_OK)
 
     def delete(self, request, institution_id: str):
@@ -1731,6 +1773,8 @@ class HealthInstitutionPartnerConnectView(APIView):
 
         institution.partner = None
         institution.save(update_fields=["partner"])
+        from apps.health_ops.communication_sync import on_institution_partner_disconnected
+        on_institution_partner_disconnected(institution)
         return Response(HealthInstitutionSerializer(institution, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
@@ -4219,6 +4263,22 @@ class EmergencyDispatchSessionStepUpdateView(APIView):
         if "ambulance_reference" in payload_data:
             emergency_session.ambulance_reference = str(payload_data.get("ambulance_reference") or "").strip()
 
+        # dispatch_ambulance/track_response confirm real-world emergency
+        # response events (an ambulance was actually sent; paramedics
+        # actually arrived) — these must come from the institution's own
+        # dispatch staff, never be self-certified by the patient. Without
+        # this gate, a patient (by panic, mistake, or malice) could mark
+        # "ambulance dispatched"/"arrived" on their own emergency session
+        # with nobody real ever having been sent, which could suppress a
+        # genuine dispatch or escalation on the institution side. Reporting
+        # one's own location/symptoms (capture_location/triage_form)
+        # remains patient-writable — those are the patient's own facts.
+        if step_key in {"dispatch_ambulance", "track_response"} and not _is_institution_member(request.user, workflow.institution):
+            return Response(
+                {"detail": "Only institution emergency-response staff may confirm dispatch/arrival."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         if step_key == "capture_location" and is_completed:
             emergency_session.status = EmergencyDispatchStatus.TRIAGING
             emergency_session.started_at = emergency_session.started_at or now_value
@@ -4385,6 +4445,18 @@ class EmergencyDispatchTrackingView(APIView):
 
         status_value = str(data.get("status") or "").strip()
         if status_value:
+            # Same principle as the step-update view: DISPATCHED/IN_TRANSIT/
+            # ARRIVED/RESOLVED are real-world facts about an actual
+            # emergency response and must be confirmed by institution
+            # dispatch staff, not self-reported by the patient. CANCELLED
+            # is the one transition a patient legitimately originates
+            # themselves (calling off their own false alarm/no-longer-
+            # needed request).
+            if status_value != EmergencyDispatchStatus.CANCELLED and not _is_institution_member(request.user, workflow.institution):
+                return Response(
+                    {"detail": "Only institution emergency-response staff may update dispatch status."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             emergency_session.status = status_value
             if status_value == EmergencyDispatchStatus.DISPATCHED:
                 emergency_session.dispatched_at = emergency_session.dispatched_at or now_value
@@ -4475,6 +4547,17 @@ class EmergencyDispatchSessionEndView(APIView):
         status_value = str(serializer.validated_data.get("status") or EmergencyDispatchStatus.RESOLVED)
         summary = str(serializer.validated_data.get("summary") or "").strip()
         metadata_payload = serializer.validated_data.get("metadata", {})
+
+        # Marking an emergency RESOLVED is a real-world confirmation that
+        # response has genuinely concluded — only institution
+        # emergency-response staff may do that. A patient may still
+        # CANCELLED their own request (a legitimate false-alarm/no-longer-
+        # needed cancellation), matching the tracking view's same rule.
+        if status_value != EmergencyDispatchStatus.CANCELLED and not _is_institution_member(request.user, workflow.institution):
+            return Response(
+                {"detail": "Only institution emergency-response staff may resolve this emergency session."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         now_value = timezone.now()
         next_meta = emergency_session.metadata if isinstance(emergency_session.metadata, dict) else {}
@@ -4783,6 +4866,29 @@ class PharmacyFulfillmentSessionStepUpdateView(APIView):
             pharmacy_session.current_eta_minutes = payload_data.get("eta_minutes")
 
         if step_key == "verify_prescription" and is_completed:
+            # This step marks a prescription as verified — it must never be
+            # something the patient can self-certify. Require (a) the actor
+            # is institution staff, not the patient themselves, and (b) the
+            # payload names a real EMedication row, for this same patient,
+            # actually issued by a verified practitioner and not revoked.
+            # Previously this just flipped status on an arbitrary
+            # client-supplied payload with zero server-side check — a
+            # patient could call this endpoint directly and fabricate their
+            # own "verified" prescription.
+            if not _is_institution_member(request.user, pharmacy_session.institution):
+                return Response(
+                    {"detail": "Only pharmacy/institution staff may verify a prescription."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            prescription_id = payload_data.get("prescription_id")
+            prescription = EMedication.objects.filter(
+                id=prescription_id, patient=workflow.user,
+            ).first() if prescription_id else None
+            if not prescription or not prescription.is_verified_prescription:
+                return Response(
+                    {"detail": "payload.prescription_id must reference a real, unrevoked prescription for this patient."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             pharmacy_session.status = PharmacyFulfillmentStatus.VERIFYING
             pharmacy_session.started_at = pharmacy_session.started_at or now_value
         elif step_key == "validate_inventory" and is_completed:
@@ -5406,13 +5512,26 @@ class PaymentBillingSessionStepUpdateView(APIView):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
+            # An EXPLICIT client-supplied amount_paid_micro/amount_paid_kisc
+            # override is only ever trustworthy from (a) the real wallet
+            # debit performed synchronously below, or (b) institution
+            # billing staff recording an out-of-band payment (e.g. cash at
+            # reception) — never a patient's own claim for a real-provider
+            # payment. Absent an explicit (and now-authorized) override,
+            # amount_paid_micro provisionally defaults to the full payable
+            # amount — this is a display/gate placeholder for the pending
+            # checkout, not proof of payment, and is harmless on its own
+            # because (below) the PAID status itself can never be reached
+            # from this value alone; it requires real wallet debit or
+            # _health_provider_payment_confirmed (webhook-set).
+            is_billing_authority = _is_institution_member(request.user, workflow.institution)
             amount_paid_micro = payload_data.get("amount_paid_micro")
             amount_paid_kisc = payload_data.get("amount_paid_kisc")
             if amount_paid_kisc in (None, ""):
                 amount_paid_kisc = payload_data.get("amountPaidKisc")
             if amount_paid_kisc not in (None, ""):
                 amount_paid_micro = _kisc_to_micro(amount_paid_kisc, allow_empty=True)
-            if amount_paid_micro is not None:
+            if amount_paid_micro is not None and (legacy_wallet_payment or is_billing_authority):
                 billing_session.amount_paid_micro = max(0, int(amount_paid_micro))
             else:
                 billing_session.amount_paid_micro = max(
@@ -5474,7 +5593,18 @@ class PaymentBillingSessionStepUpdateView(APIView):
                 prefix = "kis-wallet" if legacy_wallet_payment else str(provider or _health_default_payment_provider()).replace("_", "-")
                 billing_session.payment_reference = f"{prefix}-{str(billing_session.id).replace('-', '')[:12]}"
             billing_session.payment_provider = KIS_WALLET_PROVIDER if legacy_wallet_payment else (provider or _health_default_payment_provider())
-            if legacy_wallet_payment or _health_provider_payment_confirmed(billing_session) or str(payload_data.get("payment_status") or payload_data.get("paymentStatus") or "").strip().lower() in {"paid", "success", "succeeded", "settled"}:
+            # FIX: this previously also accepted a bare client-supplied
+            # payload.payment_status == "paid" as sufficient proof of
+            # payment — a patient could flip their own bill to PAID with
+            # zero real money moving, by simply PATCHing this endpoint with
+            # {"payload": {"payment_status": "paid"}}. The only legitimate
+            # proofs are a real, synchronous wallet debit (just performed
+            # above) or the provider having actually confirmed payment via
+            # the real payment-provider webhook
+            # (apps.billing.direct_payments.reconcile_direct_payment_callback,
+            # which alone is allowed to write a "paid" payment_status into
+            # billing_session.payload/metadata — never this request body).
+            if legacy_wallet_payment or _health_provider_payment_confirmed(billing_session):
                 billing_session.status = PaymentBillingStatus.PAID
                 billing_session.paid_at = billing_session.paid_at or now_value
                 payload_data["payment_status"] = "paid"
@@ -5559,6 +5689,23 @@ class PaymentBillingSessionPayloadView(APIView):
         if not isinstance(metadata, dict):
             metadata = {}
 
+        # payment_status/paymentStatus is read as ground truth elsewhere
+        # (see _health_provider_payment_confirmed) and is only ever
+        # legitimately written by the real payment-provider webhook
+        # (apps.billing.direct_payments.reconcile_direct_payment_callback).
+        # Previously ANY caller with workflow access — including the
+        # patient themselves — could write it straight into
+        # billing_session.payload/metadata through this generic endpoint,
+        # which would then be read back as proof of payment by the
+        # authorize_payment step. Strip it from any non-billing-authority
+        # caller rather than trust it.
+        is_billing_authority = _is_institution_member(request.user, workflow.institution)
+        if not is_billing_authority:
+            payload_data.pop("payment_status", None)
+            payload_data.pop("paymentStatus", None)
+            metadata.pop("payment_status", None)
+            metadata.pop("paymentStatus", None)
+
         if merge:
             next_payload = billing_session.payload if isinstance(billing_session.payload, dict) else {}
             next_payload.update(payload_data)
@@ -5588,13 +5735,19 @@ class PaymentBillingSessionPayloadView(APIView):
         payload_data["payment_provider"] = billing_session.payment_provider
         if "payment_reference" in payload_data:
             billing_session.payment_reference = str(payload_data.get("payment_reference") or "").strip()
-        if "invoice_number" in payload_data:
-            billing_session.invoice_number = str(payload_data.get("invoice_number") or "").strip()
-        if "amount_paid_kisc" in payload_data:
-            billing_session.amount_paid_micro = max(0, int(_kisc_to_micro(payload_data.get("amount_paid_kisc"), allow_empty=True) or 0))
-            payload_data["amount_paid_micro"] = int(billing_session.amount_paid_micro or 0)
-        if "amount_paid_micro" in payload_data:
-            billing_session.amount_paid_micro = max(0, int(payload_data.get("amount_paid_micro") or 0))
+        # invoice_number/amount_paid_* are financial facts — only
+        # institution billing staff may set them directly here (e.g.
+        # recording an out-of-band/cash payment). A patient's claim about
+        # their own amount paid is never trusted; the real-provider path's
+        # amount is set only by the webhook reconciliation flow.
+        if is_billing_authority:
+            if "invoice_number" in payload_data:
+                billing_session.invoice_number = str(payload_data.get("invoice_number") or "").strip()
+            if "amount_paid_kisc" in payload_data:
+                billing_session.amount_paid_micro = max(0, int(_kisc_to_micro(payload_data.get("amount_paid_kisc"), allow_empty=True) or 0))
+                payload_data["amount_paid_micro"] = int(billing_session.amount_paid_micro or 0)
+            if "amount_paid_micro" in payload_data:
+                billing_session.amount_paid_micro = max(0, int(payload_data.get("amount_paid_micro") or 0))
         payload_data["amount_paid_kisc"] = _micro_to_kisc_text(billing_session.amount_paid_micro or 0)
         billing_session.save()
 
@@ -7453,7 +7606,17 @@ class NotificationReminderSessionEndView(APIView):
 
 
 class EngineContentBlockListCreateView(APIView):
-    permission_classes = [IsAuthenticated]
+    """EngineContentBlock is global, platform-wide reference content attached
+    to an EngineRegistry entry (e.g. "how a video consultation works") shown
+    to every patient and institution that uses that engine — it is not scoped
+    to any institution. Reading it is fine for any authenticated user; only
+    platform staff may author it, otherwise any patient could inject content
+    (including file_url/text_content) into what every other user sees."""
+
+    def get_permissions(self):
+        if self.request.method == "POST":
+            return [IsAdminUser()]
+        return [IsAuthenticated()]
 
     def get(self, request, engine_id):
         engine = get_object_or_404(EngineRegistry, id=engine_id)
@@ -7472,7 +7635,7 @@ class EngineContentBlockListCreateView(APIView):
 
 
 class EngineContentBlockDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAdminUser]
 
     @transaction.atomic
     def patch(self, request, engine_id, content_block_id):
