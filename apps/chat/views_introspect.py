@@ -66,6 +66,14 @@ class IntrospectView(APIView):
         if not display_name:
             display_name = username or (email.split("@")[0] if email else "")
 
+        # Human-readable fallback for callers/notifications when there's no
+        # display_name/username/email to show (phone-only signup, nothing
+        # else ever set) — never expose a placeholder/synthetic phone
+        # (phone_is_placeholder) as if it were a real, callable number.
+        phone = (getattr(user, "phone", "") or "").strip()
+        if getattr(user, "phone_is_placeholder", False):
+            phone = ""
+
         # Resolves via the same canonical path as the rest of the app
         # (active Subscription first, falling back to the denormalized
         # User.tier string with alias normalization) — previously this did
@@ -85,6 +93,7 @@ class IntrospectView(APIView):
             "username": username,
             "email": email,
             "display_name": display_name,
+            "phone": phone,
             "tier": tier_name,
             "isPremium": is_premium,
             "device_id": validated.get("device_id"),
