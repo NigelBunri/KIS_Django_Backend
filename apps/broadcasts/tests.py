@@ -34,6 +34,7 @@ from apps.broadcasts.models import (
     ChannelContentSave,
     ChannelModerationRecord,
     ChannelContentType,
+    ContentModerationStatus,
     ChannelContentFingerprint,
     ChannelFingerprintMatch,
     ChannelWatchHistory,
@@ -95,6 +96,23 @@ from apps.communities.models import Community, CommunityMembership, CommunityRol
 from apps.partners.models import Partner, PartnerJoinConfig, PartnerMembership, PartnerMembershipStatus
 from rest_framework import status
 from rest_framework.test import APITestCase, APITransactionTestCase
+
+
+def _approved_kwargs():
+    """ChannelContent.objects.create(**_approved_kwargs(), ...) for any
+    fixture that represents real, already-moderated public content - most
+    of this file's content fixtures predate ChannelContent's moderation
+    gate (see apps.broadcasts.moderation_gate.is_channel_content_broadcast_eligible)
+    and need this to still read as publicly visible now that status=
+    PUBLISHED/visibility=PUBLIC alone is correctly no longer sufficient.
+    A fresh dict per call, not a module-level constant, so moderation_
+    expires_at is always a real future timestamp relative to when the
+    test actually runs."""
+    return {
+        "moderation_status": ContentModerationStatus.PASSED,
+        "moderation_passed_at": timezone.now(),
+        "moderation_expires_at": timezone.now() + timedelta(days=90),
+    }
 
 
 class FeedEntryStoreTests(SimpleTestCase):
@@ -578,6 +596,7 @@ class BroadcastChannelApiTests(APITestCase):
             visibility=ChannelContent.Visibility.PUBLIC,
             published_at=timezone.now(),
             created_by=self.owner,
+            **_approved_kwargs(),
         )
 
         response = self.client.get("/api/v1/broadcasts/public/channels/api-channel/")
@@ -617,6 +636,7 @@ class BroadcastChannelApiTests(APITestCase):
             visibility=ChannelContent.Visibility.PUBLIC,
             published_at=timezone.now(),
             created_by=self.owner,
+            **_approved_kwargs(),
         )
         private_content = ChannelContent.objects.create(
             channel=self.channel,
@@ -658,6 +678,7 @@ class BroadcastChannelApiTests(APITestCase):
             published_at=timezone.now(),
             thumbnail_url="private/raw/thumb.jpg",
             created_by=self.owner,
+            **_approved_kwargs(),
         )
         ChannelContentAsset.objects.create(
             content=content,
@@ -817,6 +838,7 @@ class BroadcastChannelApiTests(APITestCase):
             visibility=ChannelContent.Visibility.PUBLIC,
             published_at=timezone.now(),
             created_by=self.owner,
+            **_approved_kwargs(),
         )
         draft = ChannelContent.objects.create(
             channel=self.channel,
@@ -1161,6 +1183,7 @@ class ChannelEmbedTests(APITestCase):
             thumbnail_url='https://cdn.example.com/thumb.jpg',
             metadata={'private_email': 'owner@example.com'},
             created_by=self.owner,
+            **_approved_kwargs(),
         )
         ChannelContentAsset.objects.create(
             content=self.content,
@@ -1285,6 +1308,7 @@ class ChannelEngagementTests(APITestCase):
             visibility=ChannelContent.Visibility.PUBLIC,
             published_at=timezone.now(),
             created_by=self.owner,
+            **_approved_kwargs(),
         )
 
     def test_react_save_comment_share_and_view_update_counts(self):
@@ -1390,6 +1414,7 @@ class ChannelContentViewDedupTests(APITestCase):
             visibility=ChannelContent.Visibility.PUBLIC,
             published_at=timezone.now(),
             created_by=self.owner,
+            **_approved_kwargs(),
         )
 
     def _view_url(self):
@@ -1471,6 +1496,7 @@ class ChannelContentAgeRestrictionTests(APITestCase):
             published_at=timezone.now(),
             created_by=self.owner,
             age_restriction=age_restriction,
+            **_approved_kwargs(),
         )
 
     def _can_view(self, user, content):
@@ -1671,12 +1697,12 @@ class KISTubePlatformScaleApiTests(APITestCase):
         self.content_a = ChannelContent.objects.create(
             channel=self.channel, content_type='video', title='First video',
             status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
-            published_at=timezone.now(),
+            published_at=timezone.now(), **_approved_kwargs(),
         )
         self.content_b = ChannelContent.objects.create(
             channel=self.channel, content_type='video', title='Second video',
             status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
-            published_at=timezone.now(),
+            published_at=timezone.now(), **_approved_kwargs(),
         )
 
     # ── Channel playlist item GET ───────────────────────────────────────
@@ -1794,13 +1820,13 @@ class KISTubePlatformScaleApiTests(APITestCase):
             channel=self.channel, content_type='video', title='Unrelated title',
             description='A deep dive into kingdom stewardship principles',
             status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
-            published_at=timezone.now(),
+            published_at=timezone.now(), **_approved_kwargs(),
         )
         by_tag = ChannelContent.objects.create(
             channel=self.channel, content_type='video', title='Also unrelated',
             tags=['stewardship', 'finance'],
             status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
-            published_at=timezone.now(),
+            published_at=timezone.now(), **_approved_kwargs(),
         )
 
         response = self.client.get('/api/v1/broadcasts/search/?q=stewardship')
@@ -1816,12 +1842,12 @@ class KISTubePlatformScaleApiTests(APITestCase):
             channel=self.channel, content_type='video', title='Unrelated',
             description='mentions covenant only in passing',
             status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
-            published_at=timezone.now() - timedelta(days=1),
+            published_at=timezone.now() - timedelta(days=1), **_approved_kwargs(),
         )
         title_match = ChannelContent.objects.create(
             channel=self.channel, content_type='video', title='Covenant explained',
             status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
-            published_at=timezone.now() - timedelta(days=2),
+            published_at=timezone.now() - timedelta(days=2), **_approved_kwargs(),
         )
 
         response = self.client.get('/api/v1/broadcasts/search/?q=covenant&sort=relevance')
@@ -1854,6 +1880,7 @@ class KISTubePlatformScaleApiTests(APITestCase):
             status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
             published_at=timezone.now(),
             metadata={'poll': {'question': 'Which service?', 'options': ['Sunday AM', 'Sunday PM']}},
+            **_approved_kwargs(),
         )
 
     def test_poll_vote_and_results(self):

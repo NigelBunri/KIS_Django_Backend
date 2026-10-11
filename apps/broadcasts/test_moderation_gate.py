@@ -424,11 +424,27 @@ class ChannelContentModerationDeleteTests(TestCase):
         self.assertEqual(self.content.visibility, ChannelContent.Visibility.PRIVATE)
         self.assertFalse(default_storage.exists(self.storage_path))
 
-    def test_non_delete_action_is_a_no_op_and_returns_false(self):
-        """ChannelContent has no pass/pending/block review lifecycle -
-        only delete means anything for it."""
+    def test_pass_action_is_now_handled_not_a_no_op(self):
+        """Was: "ChannelContent has no pass/pending/block review lifecycle
+        - only delete means anything for it" - that asymmetry is exactly
+        what apps.broadcasts.moderation_gate.apply_channel_content_moderation_decision
+        closes (see test_channel_content_moderation_lifecycle.py for full
+        coverage of the new lifecycle itself); this test now locks down
+        that the dispatcher actually reaches it instead of silently
+        no-opping."""
         result = resolve_and_apply_moderation_decision(
             "channel_content", str(self.content.id), action="pass", actor=self.owner,
+        )
+        self.assertTrue(result)
+        self.content.refresh_from_db()
+        self.assertFalse(self.content.is_deleted)
+        self.assertEqual(self.content.moderation_status, "passed")
+        self.assertIsNotNone(self.content.moderation_expires_at)
+        self.assertEqual(self.content.moderation_reviewed_by_id, self.owner.id)
+
+    def test_unhandled_action_is_still_a_no_op_and_returns_false(self):
+        result = resolve_and_apply_moderation_decision(
+            "channel_content", str(self.content.id), action="not_a_real_action", actor=self.owner,
         )
         self.assertFalse(result)
         self.content.refresh_from_db()

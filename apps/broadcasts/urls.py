@@ -199,6 +199,7 @@ from .views import (
     ChannelLiveStreamArchiveView,
     ChannelContentDownloadView,
     ChannelMembershipTierListView,
+    ChannelMembershipTierDetailView,
     ChannelMembershipView,
     TipCreatorView,
     ChannelContentTipView,
@@ -865,6 +866,7 @@ urlpatterns = [
     path("broadcasts/channel-contents/<uuid:content_id>/download/", ChannelContentDownloadView.as_view(), name="broadcast-channel-content-download"),
     # Task 5: channel membership tiers and membership
     path("broadcasts/channels/<uuid:channel_id>/membership-tiers/", ChannelMembershipTierListView.as_view(), name="broadcast-channel-membership-tiers"),
+    path("broadcasts/membership-tiers/<uuid:tier_id>/", ChannelMembershipTierDetailView.as_view(), name="broadcast-membership-tier-detail"),
     path("broadcasts/channels/<uuid:channel_id>/membership/", ChannelMembershipView.as_view(), name="broadcast-channel-membership"),
     path("broadcast-items/<str:content_id>/tip/", TipCreatorView.as_view(), name="tip-creator"),
     # Super Thanks / Super Chat tips

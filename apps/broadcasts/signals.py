@@ -6,6 +6,7 @@ from django.dispatch import receiver
 
 from apps.notifications.services import notify_engagement
 from .models import ChannelContent, ChannelContentComment, ChannelContentReaction
+from .services import resolve_channel_notification_recipients
 
 
 @receiver(post_save, sender=ChannelContent)
@@ -35,16 +36,23 @@ def notify_content_commented(sender, instance, created, **kwargs):
     if not created:
         return
     content = instance.content
-    notify_engagement(
-        owner_user_id=content.channel.owner_user_id,
-        actor_user=instance.user,
-        notification_type="channel.content.commented",
-        verb=f"commented on {content.title or content.channel.display_name}",
-        target_type="channel_content",
-        target_id=content.id,
-        target_title=instance.body[:200],
-        dedup_key=f"channel.content.commented:{instance.id}",
-    )
+    # Fans out to every resolved recipient - an individual owner (one
+    # recipient) or every OWNER/MANAGER role holder on an org-owned
+    # channel (see resolve_channel_notification_recipients). dedup_key is
+    # deliberately recipient-agnostic here; create_notification scopes
+    # dedup by (user_id, dedup_key) together, so the same key is safe to
+    # reuse across recipients without suppressing anyone's copy.
+    for recipient_id in resolve_channel_notification_recipients(content.channel):
+        notify_engagement(
+            owner_user_id=recipient_id,
+            actor_user=instance.user,
+            notification_type="channel.content.commented",
+            verb=f"commented on {content.title or content.channel.display_name}",
+            target_type="channel_content",
+            target_id=content.id,
+            target_title=instance.body[:200],
+            dedup_key=f"channel.content.commented:{instance.id}",
+        )
     # A reply is also worth telling the parent commenter about,
     # independently of the content owner above (skip if they're the same
     # person, or if this is itself a reply-to-yourself - notify_engagement
@@ -69,12 +77,16 @@ def notify_content_reacted(sender, instance, created, **kwargs):
     if not created:
         return
     content = instance.content
-    notify_engagement(
-        owner_user_id=content.channel.owner_user_id,
-        actor_user=instance.user,
-        notification_type="channel.content.reacted",
-        verb=f"reacted to {content.title or content.channel.display_name}",
-        target_type="channel_content",
-        target_id=content.id,
-        target_title=content.title,
-    )
+    # See notify_content_commented above for why this fans out over
+    # resolve_channel_notification_recipients instead of using
+    # content.channel.owner_user_id directly.
+    for recipient_id in resolve_channel_notification_recipients(content.channel):
+        notify_engagement(
+            owner_user_id=recipient_id,
+            actor_user=instance.user,
+            notification_type="channel.content.reacted",
+            verb=f"reacted to {content.title or content.channel.display_name}",
+            target_type="channel_content",
+            target_id=content.id,
+            target_title=content.title,
+        )
