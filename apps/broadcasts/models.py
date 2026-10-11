@@ -312,6 +312,22 @@ class BroadcastPlaylist(models.Model):
         return self.title
 
 
+class ContentModerationStatus(models.TextChoices):
+    """The single authoritative gate for public visibility, shared by both
+    BroadcastVideo and ChannelContent (BroadcastVideo's own nested
+    ModerationStatus below is kept as an alias of this one for backward
+    compatibility with existing imports/migrations - same values, one
+    definition) - see apps.broadcasts.moderation_gate. PENDING_REVIEW is
+    the default for every new upload: an AI-clean scan alone is NEVER
+    sufficient to make content public, only an explicit human PASS
+    (apps.moderation admin action) is. PASSED itself is not permanent -
+    see moderation_expires_at on each model."""
+    PENDING_REVIEW = "pending_review", "Pending review"
+    PASSED = "passed", "Passed"
+    BLOCKED = "blocked", "Blocked"
+    DELETED = "deleted", "Deleted"
+
+
 class ChannelContentType(models.TextChoices):
     VIDEO = "video", "Video"
     SHORT_VIDEO = "short_video", "Short video"
@@ -388,6 +404,27 @@ class ChannelContent(models.Model):
     )
     stats = models.JSONField(default=dict, blank=True)
     is_deleted = models.BooleanField(default=False, db_index=True)
+    # Mirrors BroadcastVideo.moderation_status/_passed_at/_expires_at/
+    # _reviewed_by exactly (reusing BroadcastVideo.ModerationStatus rather
+    # than a second enum, so the two can't drift) - see
+    # apps.broadcasts.moderation_gate.is_channel_content_broadcast_eligible.
+    # Independent of `status` (the creator's own publish/draft/schedule
+    # lifecycle) and `visibility` (who the creator wants to see it): this is
+    # the "has a human actually cleared this for public distribution" gate,
+    # same bar BroadcastVideo already holds every video to - an AI scan
+    # passing is never sufficient on its own. Defaults to PENDING_REVIEW,
+    # same fail-closed default as BroadcastVideo.
+    moderation_status = models.CharField(
+        max_length=16,
+        choices=ContentModerationStatus.choices,
+        default=ContentModerationStatus.PENDING_REVIEW,
+        db_index=True,
+    )
+    moderation_passed_at = models.DateTimeField(null=True, blank=True)
+    moderation_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    moderation_reviewed_by = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL, related_name="moderated_channel_contents",
+    )
     created_by = models.ForeignKey(
         User,
         null=True,
@@ -404,6 +441,7 @@ class ChannelContent(models.Model):
             models.Index(fields=["channel", "status", "published_at"]),
             models.Index(fields=["content_type", "status"]),
             models.Index(fields=["visibility", "is_deleted"]),
+            models.Index(fields=["moderation_status", "moderation_expires_at"]),
             GinIndex(fields=["search_vector"], name="channel_content_search_gin"),
         ]
 
@@ -3327,17 +3365,11 @@ class BroadcastVideo(models.Model):
         ("video", "Video"),
     ]
 
-    class ModerationStatus(models.TextChoices):
-        """The single authoritative gate for public visibility - see
-        apps.broadcasts.moderation_gate.is_broadcast_eligible(). PENDING_REVIEW
-        is the default for every new upload: an AI-clean scan alone is
-        NEVER sufficient to make a video public, only an explicit human
-        PASS (apps.moderation admin action) is. PASSED itself is not
-        permanent - see moderation_expires_at."""
-        PENDING_REVIEW = "pending_review", "Pending review"
-        PASSED = "passed", "Passed"
-        BLOCKED = "blocked", "Blocked"
-        DELETED = "deleted", "Deleted"
+    # Alias, not a second definition - see ContentModerationStatus above
+    # (hoisted to module level so ChannelContent can share it too without a
+    # forward reference to this class, which is defined later in this
+    # file). Same values as before this change, so no migration/data impact.
+    ModerationStatus = ContentModerationStatus
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=255)

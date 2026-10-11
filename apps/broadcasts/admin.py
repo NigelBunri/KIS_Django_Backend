@@ -5,9 +5,18 @@ from .models import (
     BroadcastChannelRole,
     BroadcastChannelSubscription,
     BroadcastPlaylist,
+    ChannelAdCampaign,
+    ChannelAdSlot,
     ChannelAnalyticsDailyRollup,
     ChannelContent,
     ChannelContentAsset,
+    ChannelContentComment,
+    ChannelContentCopyrightClaim,
+    ChannelContentReaction,
+    ChannelHomepageShelf,
+    ChannelLiveStream,
+    ChannelMembership,
+    ChannelMembershipTier,
     ChannelModerationRecord,
     Medium,
     Service,
@@ -62,10 +71,14 @@ class BroadcastPlaylistAdmin(admin.ModelAdmin):
 
 @admin.register(ChannelContent)
 class ChannelContentAdmin(admin.ModelAdmin):
-    list_display = ('id', 'channel', 'content_type', 'title', 'visibility', 'status', 'published_at', 'is_deleted')
-    list_filter = ('content_type', 'visibility', 'status', 'is_deleted')
+    list_display = (
+        'id', 'channel', 'content_type', 'title', 'visibility', 'status',
+        'moderation_status', 'moderation_expires_at', 'published_at', 'is_deleted',
+    )
+    list_filter = ('content_type', 'visibility', 'status', 'moderation_status', 'is_deleted')
     search_fields = ('title', 'description', 'text_plain', 'channel__handle', 'legacy_feed_entry_id')
     readonly_fields = ('created_at', 'updated_at')
+    raw_id_fields = ('channel', 'moderation_reviewed_by', 'created_by')
 
 
 @admin.register(ChannelContentAsset)
@@ -82,6 +95,99 @@ class ChannelModerationRecordAdmin(admin.ModelAdmin):
     list_filter = ('target_type', 'status', 'action', 'created_at')
     search_fields = ('reason', 'notes', 'channel__handle', 'channel__display_name', 'content__title', 'comment__body')
     readonly_fields = ('created_at', 'updated_at', 'resolved_at')
+
+
+@admin.register(ChannelLiveStream)
+class ChannelLiveStreamAdmin(admin.ModelAdmin):
+    list_display = (
+        'id', 'channel', 'title', 'status', 'provider', 'viewer_count',
+        'peak_viewer_count', 'scheduled_start_at', 'started_at', 'ended_at',
+    )
+    list_filter = ('status', 'provider', 'latency_mode', 'dvr_enabled')
+    search_fields = ('title', 'channel__handle', 'channel__display_name', 'provider_stream_id')
+    raw_id_fields = ('channel', 'content', 'created_by')
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(ChannelContentComment)
+class ChannelContentCommentAdmin(admin.ModelAdmin):
+    list_display = ('id', 'content', 'user', 'is_pinned', 'is_deleted', 'created_at')
+    list_filter = ('is_pinned', 'is_deleted')
+    search_fields = ('body', 'content__title', 'user__phone', 'user__username')
+    raw_id_fields = ('content', 'user', 'parent')
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(ChannelContentReaction)
+class ChannelContentReactionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'content', 'user', 'reaction', 'created_at')
+    list_filter = ('reaction',)
+    search_fields = ('content__title', 'user__phone', 'user__username')
+    raw_id_fields = ('content', 'user')
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(ChannelContentCopyrightClaim)
+class ChannelContentCopyrightClaimAdmin(admin.ModelAdmin):
+    list_display = (
+        'id', 'content', 'claimant_name', 'claimant_channel', 'claim_type',
+        'status', 'resolved_at', 'created_at',
+    )
+    list_filter = ('status', 'claim_type')
+    search_fields = ('claimant_name', 'asset_fingerprint', 'content__title', 'dispute_reason', 'resolution_notes')
+    raw_id_fields = ('content', 'claimant_channel')
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(ChannelAdCampaign)
+class ChannelAdCampaignAdmin(admin.ModelAdmin):
+    list_display = (
+        'id', 'title', 'advertiser_channel', 'status', 'budget_cents',
+        'spent_cents', 'currency', 'start_date', 'end_date',
+    )
+    list_filter = ('status', 'currency')
+    search_fields = ('title', 'advertiser_channel__handle', 'advertiser_channel__display_name')
+    raw_id_fields = ('advertiser_channel',)
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(ChannelAdSlot)
+class ChannelAdSlotAdmin(admin.ModelAdmin):
+    list_display = (
+        'id', 'content', 'campaign', 'placement', 'timestamp_seconds',
+        'is_skippable', 'impression_count', 'skip_count', 'created_at',
+    )
+    list_filter = ('placement', 'is_skippable')
+    search_fields = ('content__title', 'campaign__title')
+    raw_id_fields = ('content', 'campaign')
+    readonly_fields = ('created_at',)
+
+
+@admin.register(ChannelMembershipTier)
+class ChannelMembershipTierAdmin(admin.ModelAdmin):
+    list_display = ('id', 'channel', 'title', 'price_cents', 'currency', 'is_active', 'sort_order')
+    list_filter = ('is_active', 'currency')
+    search_fields = ('title', 'channel__handle', 'channel__display_name')
+    raw_id_fields = ('channel',)
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(ChannelMembership)
+class ChannelMembershipAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user', 'tier', 'status', 'started_at', 'expires_at')
+    list_filter = ('status',)
+    search_fields = ('user__phone', 'user__username', 'tier__title', 'payment_reference')
+    raw_id_fields = ('user', 'tier')
+    readonly_fields = ('started_at',)
+
+
+@admin.register(ChannelHomepageShelf)
+class ChannelHomepageShelfAdmin(admin.ModelAdmin):
+    list_display = ('id', 'channel', 'title', 'shelf_type', 'sort_order', 'is_active')
+    list_filter = ('shelf_type', 'is_active')
+    search_fields = ('title', 'channel__handle', 'channel__display_name')
+    raw_id_fields = ('channel',)
+    readonly_fields = ('created_at', 'updated_at')
 
 
 @admin.register(ChannelAnalyticsDailyRollup)

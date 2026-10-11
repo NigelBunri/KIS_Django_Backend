@@ -26,6 +26,7 @@ from .models import (
     ChannelContentComment,
     ChannelContentReaction,
     ChannelContentType,
+    ContentModerationStatus,
 )
 
 User = get_user_model()
@@ -57,6 +58,14 @@ class RecommendationReasonTests(TestCase):
             visibility=ChannelContent.Visibility.PUBLIC,
             published_at=timezone.now(),
             created_by=self.owner,
+            # ChannelContentRecommendationsView's base_qs is gated through
+            # filter_channel_content_broadcast_eligible - these fixtures
+            # need to read as real, already-moderated public content or
+            # they're correctly excluded from the recommendation feed
+            # entirely, same as every other content fixture in this app.
+            moderation_status=ContentModerationStatus.PASSED,
+            moderation_passed_at=timezone.now(),
+            moderation_expires_at=timezone.now() + datetime.timedelta(days=90),
         )
         defaults.update(overrides)
         return ChannelContent.objects.create(**defaults)
@@ -130,6 +139,9 @@ class RecommendationReasonTests(TestCase):
             visibility=ChannelContent.Visibility.PUBLIC,
             published_at=timezone.now(),
             created_by=other_owner,
+            moderation_status=ContentModerationStatus.PASSED,
+            moderation_passed_at=timezone.now(),
+            moderation_expires_at=timezone.now() + datetime.timedelta(days=90),
         )
 
         res = self.client.get(URL)

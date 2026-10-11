@@ -1,24 +1,45 @@
 """
-The single authoritative "may this go out to the public" rule for
-BroadcastVideo, per an explicit product requirement: an AI content-safety
-scan alone must NEVER be sufficient for public distribution, and a human
-PASS is never permanent - it must be revalidated periodically or the
-content silently loses eligibility again.
+The single authoritative "may this go out to the public" rule for both
+BroadcastVideo (legacy) and ChannelContent (the platform's real content
+model), per an explicit product requirement: an AI content-safety scan
+alone must NEVER be sufficient for public distribution, and a human PASS
+is never permanent - it must be revalidated periodically or the content
+silently loses eligibility again.
 
 BROADCAST_ALLOWED = True only when moderation_status == PASSED AND
 moderation_expires_at is set AND still in the future. Every other state
 (PENDING_REVIEW, BLOCKED, an expired PASSED, or a PASSED with no
 expiry at all - which should never happen once set_pass() is used, but
 is treated as ineligible rather than trusted if it somehow does) is
-NOT BROADCASTABLE. Fail closed, not fail open.
+NOT BROADCASTABLE. Fail closed, not fail open. Both models share this
+exact shape (same field names, same ContentModerationStatus values) but
+get separate is_*_eligible/filter_*_eligible functions below rather than
+one generic pair, because they are different Django models and a
+polymorphic "pass me either kind of object" helper would be harder to
+read at every call site than two short, obviously-parallel functions.
 
-Used from exactly two places by design, so there is one gate, not several
+is_broadcast_eligible / filter_broadcast_eligible (BroadcastVideo) are
+used from exactly two places by design, so there is one gate, not several
 copies of the same condition that could drift apart:
   - BroadcastVideoListView (queryset-level filter - what the public feed
     can even see)
   - BroadcastVideoStreamView (row-level re-check at request time - closes
     the gap between "was eligible when the feed was cached/rendered" and
     "is eligible right now", e.g. an approval expiring between the two)
+
+is_channel_content_broadcast_eligible / filter_channel_content_broadcast_eligible
+(ChannelContent) are wired into the four real public-facing choke points
+that same way:
+  - _user_can_view_content in views.py (the single gate behind content
+    detail, reactions, comments, polls, saves, shares, view events,
+    reports, clips, chapters, and related-content - 17 call sites get
+    this for free from one change)
+  - _content_is_public_web_safe in views.py (the single gate behind the
+    SEO public content page and the public sitemap)
+  - BroadcastChannelContentListCreateView.get (a channel's own public
+    content list)
+  - ChannelContentRecommendationsView.get (the cross-channel discovery/
+    recommendation feed)
 """
 from __future__ import annotations
 
@@ -45,6 +66,82 @@ def filter_broadcast_eligible(queryset: QuerySet) -> QuerySet:
         moderation_status=BroadcastVideo.ModerationStatus.PASSED,
         moderation_expires_at__gt=now,
     )
+
+
+# --- ChannelContent: same gate, same rigor, no second standard ---
+#
+# ChannelContent previously had no equivalent to the two functions above -
+# resolve_and_apply_moderation_decision's channel_content branch supported
+# only "delete", and every public-facing ChannelContent view relied solely
+# on status=PUBLISHED/visibility=PUBLIC, which is a PUBLISHING decision the
+# creator controls, not a SAFETY decision a human moderator controls. A
+# creator publishing something is not the same guarantee as a moderator
+# having reviewed it - this closes that gap using the exact same fail-closed
+# shape as BroadcastVideo above: PASSED + an unexpired moderation_expires_at
+# or it does not count as eligible, full stop.
+
+
+def is_channel_content_broadcast_eligible(content) -> bool:
+    from .models import ContentModerationStatus
+
+    if content.moderation_status != ContentModerationStatus.PASSED:
+        return False
+    if not content.moderation_expires_at:
+        return False
+    return content.moderation_expires_at > timezone.now()
+
+
+def filter_channel_content_broadcast_eligible(queryset: QuerySet) -> QuerySet:
+    """Same rule as is_channel_content_broadcast_eligible(), expressed as a
+    queryset filter - see filter_broadcast_eligible() above for why this
+    exists as a separate function rather than filtering in Python."""
+    from .models import ContentModerationStatus
+
+    now = timezone.now()
+    return queryset.filter(
+        moderation_status=ContentModerationStatus.PASSED,
+        moderation_expires_at__gt=now,
+    )
+
+
+def apply_channel_content_moderation_decision(content, *, action: str, actor, notes: str = "") -> None:
+    """ChannelContent equivalent of apply_moderation_decision() above, not
+    a reuse of that function directly - the two models share the same
+    moderation_status/_passed_at/_expires_at/_reviewed_by fields and the
+    same ContentModerationStatus values, but ChannelContent's "offline"
+    state is expressed via status=ARCHIVED/is_deleted (there is no
+    is_active on this model) rather than BroadcastVideo's is_active,
+    so the field names on save() necessarily differ. `action` is one of
+    "pass" | "pending" | "block" | "delete" - "delete" is routed to
+    delete_channel_content() instead of handled here, matching how
+    resolve_and_apply_moderation_decision already split the two below."""
+    from datetime import timedelta
+
+    from django.conf import settings
+
+    from .models import ContentModerationStatus
+
+    now = timezone.now()
+    if action == "pass":
+        content.moderation_status = ContentModerationStatus.PASSED
+        content.moderation_passed_at = now
+        window_days = int(getattr(settings, "BROADCAST_MODERATION_REVALIDATION_DAYS", 90))
+        content.moderation_expires_at = now + timedelta(days=window_days)
+        content.moderation_reviewed_by = actor
+        content.save(update_fields=[
+            "moderation_status", "moderation_passed_at", "moderation_expires_at",
+            "moderation_reviewed_by", "updated_at",
+        ])
+    elif action == "pending":
+        content.moderation_status = ContentModerationStatus.PENDING_REVIEW
+        content.moderation_reviewed_by = actor
+        content.save(update_fields=["moderation_status", "moderation_reviewed_by", "updated_at"])
+    elif action == "block":
+        content.moderation_status = ContentModerationStatus.BLOCKED
+        content.moderation_reviewed_by = actor
+        content.save(update_fields=["moderation_status", "moderation_reviewed_by", "updated_at"])
+    else:
+        raise ValueError(f"Unknown moderation action for channel_content: {action!r}")
 
 
 def apply_moderation_decision(video, *, action: str, actor, notes: str = "") -> None:
@@ -160,16 +257,16 @@ def resolve_and_apply_moderation_decision(target_type: str, target_id, *, action
     if target_type == "channel_content":
         from .models import ChannelContent
 
-        # Unlike BroadcastVideo, ChannelContent has no moderation_status/
-        # pass-fail review lifecycle (just status/visibility/is_deleted) -
-        # "delete" is the only action that means anything for it here.
-        if action != "delete":
-            return False
         content = ChannelContent.objects.filter(id=target_id).first()
         if content is None:
             return False
-        delete_channel_content(content, actor=actor, notes=notes)
-        return True
+        if action == "delete":
+            delete_channel_content(content, actor=actor, notes=notes)
+            return True
+        if action in ("pass", "pending", "block"):
+            apply_channel_content_moderation_decision(content, action=action, actor=actor, notes=notes)
+            return True
+        return False
     return False
 
 

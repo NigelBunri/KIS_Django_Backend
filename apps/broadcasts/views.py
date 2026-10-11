@@ -138,6 +138,7 @@ from apps.broadcasts.models import (
     ChannelModerationRecord,
     ChannelWatchHistory,
     ChannelContentType,
+    ContentModerationStatus,
     UserContentPlaylist,
     UserContentPlaylistItem,
     LiveStreamCamera,
@@ -15273,6 +15274,27 @@ def _user_can_edit_content(user, content: ChannelContent) -> bool:
     }
 
 
+def _channel_blocks_user(channel: BroadcastChannel, user) -> bool:
+    """True if `user` and the channel's individual owner have blocked each
+    other (via apps.moderation.UserBlock) in either direction - the
+    harassment case this exists for (a troll kept commenting/reacting on a
+    creator's content, or kept re-subscribing, after the creator blocked
+    them) cuts both ways regardless of who blocked whom first. Only
+    meaningful for owner_type=USER channels; an org-owned channel (shop/
+    health/education/partner) has no single accountable individual to
+    block against, so this always returns False for those."""
+    if channel.owner_type != BroadcastChannel.OwnerType.USER or not channel.owner_user_id:
+        return False
+    if not getattr(user, "is_authenticated", False):
+        return False
+    owner_id = channel.owner_user_id
+    if str(owner_id) == str(user.id):
+        return False
+    return UserBlock.objects.filter(
+        Q(blocker_id=owner_id, blocked_id=user.id) | Q(blocker_id=user.id, blocked_id=owner_id)
+    ).exists()
+
+
 def _channel_broadcast_metadata(channel: BroadcastChannel) -> dict[str, Any]:
     return {
         "channel_id": str(channel.id),
@@ -15372,15 +15394,20 @@ def _viewer_satisfies_age_restriction(user, content: ChannelContent) -> bool:
 
 
 def _user_can_view_content(user, content: ChannelContent) -> bool:
+    from .moderation_gate import is_channel_content_broadcast_eligible
+
     if content.is_deleted:
         return False
     can_manage = _user_can_edit_content(user, content)
     if content.visibility == ChannelContent.Visibility.PUBLIC and content.status == ChannelContent.Status.PUBLISHED:
         # A channel manager can always see their own published content
-        # regardless of its age rating - same as YouTube Studio letting a
-        # creator preview their own age-restricted upload without an age
-        # check. The gate only applies to everyone else on this public path.
+        # regardless of its age rating or moderation state - same as
+        # YouTube Studio letting a creator preview their own
+        # age-restricted/still-under-review upload without either check.
+        # Both gates only apply to everyone else on this public path.
         if not can_manage and not _viewer_satisfies_age_restriction(user, content):
+            return False
+        if not can_manage and not is_channel_content_broadcast_eligible(content):
             return False
         return content.channel.is_public and not content.channel.is_deleted
     return can_manage
@@ -15487,6 +15514,8 @@ def _safe_public_media_url(value: str) -> str:
 
 
 def _content_is_public_web_safe(content: ChannelContent) -> bool:
+    from .moderation_gate import is_channel_content_broadcast_eligible
+
     metadata = content.metadata if isinstance(content.metadata, dict) else {}
     if metadata.get("child_sensitive") or metadata.get("private_context") or metadata.get("contains_private_data"):
         return False
@@ -15496,6 +15525,7 @@ def _content_is_public_web_safe(content: ChannelContent) -> bool:
         and not content.is_deleted
         and content.channel.is_public
         and not content.channel.is_deleted
+        and is_channel_content_broadcast_eligible(content)
     )
 
 
@@ -15684,7 +15714,16 @@ def _first_public_asset(content: ChannelContent) -> dict:
 
 
 def _check_embed_access(request, content: ChannelContent):
+    from .moderation_gate import is_channel_content_broadcast_eligible
+
     if not _embeds_enabled():
+        raise Http404
+    # Unconditional, not folded into is_public below - a signed embed
+    # token (meant to unlock a private/unlisted video for embedding) must
+    # never double as a way around the human-moderation gate. Embeds are
+    # specifically served out to third-party sites, so this is the one
+    # choke point where a content safety hold matters most.
+    if not is_channel_content_broadcast_eligible(content):
         raise Http404
     policy, _ = ChannelEmbedPolicy.objects.get_or_create(channel=content.channel)
     if not policy.allow_embeds:
@@ -16340,6 +16379,8 @@ class BroadcastChannelSubscribeView(APIView):
 
     def post(self, request, channel_id):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False, is_public=True)
+        if _channel_blocks_user(channel, request.user):
+            raise PermissionDenied("You cannot subscribe to this channel.")
         subscription, created = BroadcastChannelSubscription.objects.get_or_create(
             channel=channel,
             user=request.user,
@@ -16434,7 +16475,11 @@ class BroadcastChannelContentListCreateView(APIView):
             raise Http404
         query = ChannelContent.objects.select_related("channel").filter(channel=channel, is_deleted=False)
         if not can_manage:
-            query = query.filter(visibility=ChannelContent.Visibility.PUBLIC, status=ChannelContent.Status.PUBLISHED)
+            from .moderation_gate import filter_channel_content_broadcast_eligible
+
+            query = filter_channel_content_broadcast_eligible(
+                query.filter(visibility=ChannelContent.Visibility.PUBLIC, status=ChannelContent.Status.PUBLISHED)
+            )
         status_filter = str(request.query_params.get("status") or "").strip()
         if status_filter and can_manage:
             query = query.filter(status=status_filter)
@@ -16545,6 +16590,15 @@ class ChannelContentDetailView(APIView):
         content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
         if not _user_can_edit_content(request.user, content):
             raise PermissionDenied("You cannot edit this content.")
+        # A previously-PASSED item whose actual substance changes needs a
+        # human to look at it again - the moderator who passed it reviewed
+        # the OLD title/description/text/text_doc, not whatever this PATCH
+        # is about to replace them with. Captured before mutation so the
+        # comparison below is against what was actually reviewed.
+        was_passed = content.moderation_status == ContentModerationStatus.PASSED
+        reviewable_fields = ("title", "description", "text_plain", "text_doc")
+        before = {field: getattr(content, field) for field in reviewable_fields}
+
         for field in ["title", "description", "text_plain", "thumbnail_url", "visibility", "status"]:
             if field in request.data:
                 setattr(content, field, str(request.data.get(field) or "").strip())
@@ -16569,6 +16623,22 @@ class ChannelContentDetailView(APIView):
             content.scheduled_at = _content_datetime_from_request(request.data.get("scheduled_at"))
         if "comments_disabled" in request.data:
             content.comments_disabled = bool(request.data.get("comments_disabled"))
+
+        # Live streams are exempt: a title/description tweak mid-broadcast
+        # must not yank an already-live stream out of public visibility
+        # until someone happens to call the Start endpoint again. Live
+        # content is moderated reactively (see _activate_live_stream_content)
+        # rather than via this pre-publication re-review gate.
+        if (
+            was_passed
+            and content.content_type != ChannelContentType.LIVE_STREAM
+            and any(getattr(content, field) != before[field] for field in reviewable_fields)
+        ):
+            content.moderation_status = ContentModerationStatus.PENDING_REVIEW
+            content.moderation_passed_at = None
+            content.moderation_expires_at = None
+            content.moderation_reviewed_by = None
+
         content.save()
         return Response(ChannelContentDetailSerializer(content, context={"request": request}).data)
 
@@ -16714,6 +16784,25 @@ class ChannelContentAssetUploadView(APIView):
             payload = prepare_channel_asset_payload(payload, content_type=content.content_type)
         payload = scan_channel_asset_payload_for_explicit_content(payload)
         asset = ChannelContentAsset.objects.create(content=content, **payload)
+        if content.moderation_status == ContentModerationStatus.PASSED:
+            # A moderator who passed this content reviewed the assets that
+            # existed at the time - a newly added asset (e.g. a creator
+            # attaching a new video/image to an already-approved post) has
+            # never been seen by that review, so the pass no longer covers
+            # the content as it now exists. The new asset's own
+            # per-file scan already ran just above
+            # (scan_channel_asset_payload_for_explicit_content, which
+            # raises before this point on an outright-prohibited file) -
+            # this is the separate "is the CONTENT as a whole still
+            # eligible for public distribution" gate, same distinction
+            # documented on ChannelContent.moderation_status.
+            content.moderation_status = ContentModerationStatus.PENDING_REVIEW
+            content.moderation_passed_at = None
+            content.moderation_expires_at = None
+            content.moderation_reviewed_by = None
+            content.save(update_fields=[
+                "moderation_status", "moderation_passed_at", "moderation_expires_at", "moderation_reviewed_by", "updated_at",
+            ])
         if asset.asset_type in ("video", "short_video") and asset.storage_path:
             # Best-effort Content ID scan right on upload, not just when a
             # channel manager happens to visit a fingerprint UI and submit
@@ -16748,6 +16837,34 @@ class ChannelContentAssetUploadView(APIView):
 
                 push_asset_to_kisvideo.delay(str(asset.id))
         return Response(ChannelContentAssetSerializer(asset).data, status=status.HTTP_201_CREATED)
+
+
+def _activate_live_stream_content(content_id):
+    """Publish a live stream's ChannelContent and, if it has never been
+    reviewed, auto-pass the moderation gate added in the ChannelContent
+    moderation lifecycle work. Live broadcasts cannot wait on a human
+    PASS the way VOD content does - that would make going live impossible
+    until a moderator happened to be available - so they are moderated
+    reactively instead: a moderator can still BLOCK/DELETE an in-progress
+    stream via the normal moderation action dispatcher at any time, but
+    going live does not itself require a prior human review. A content
+    row a moderator has already explicitly BLOCKED/DELETED is left alone,
+    not silently re-passed just because the stream (re)connected.
+    """
+    content = ChannelContent.objects.filter(id=content_id).first()
+    if not content:
+        return
+    content.status = ChannelContent.Status.PUBLISHED
+    content.visibility = ChannelContent.Visibility.PUBLIC
+    content.published_at = content.published_at or timezone.now()
+    content.save(update_fields=["status", "visibility", "published_at", "updated_at"])
+    if content.moderation_status == ContentModerationStatus.PENDING_REVIEW:
+        from .moderation_gate import apply_channel_content_moderation_decision
+
+        apply_channel_content_moderation_decision(
+            content, action="pass", actor=None,
+            notes="Auto-approved: live broadcast, reviewed reactively rather than pre-published.",
+        )
 
 
 class ChannelLiveStreamListCreateView(APIView):
@@ -16869,6 +16986,21 @@ class ChannelLiveStreamDetailView(APIView):
         return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
 
 
+def _derive_stream_key(live) -> str:
+    """The provider's own ingest_url already embeds its real stream key
+    (e.g. Mux's rtmp://.../app/{key}) - stream_key_hash on the model is a
+    hash of a locally-generated value that is never handed back to anyone,
+    so it cannot be used to recover a usable key. This extracts the same
+    key both ChannelLiveStreamStreamKeyView and the WHIP RTMP-fallback
+    response need, so the two don't drift."""
+    ingest_url = str(live.ingest_url or "").strip()
+    if "/app/" in ingest_url:
+        return ingest_url.rsplit("/", 1)[-1]
+    if ingest_url.startswith(("rtmp://", "rtmps://")) and live.provider == "disabled":
+        return str(live.provider_stream_id or live.id)
+    return ""
+
+
 class ChannelLiveStreamStreamKeyView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -16876,12 +17008,8 @@ class ChannelLiveStreamStreamKeyView(APIView):
         live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
         if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
             raise PermissionDenied("You cannot view ingest details for this live stream.")
-        stream_key = ""
+        stream_key = _derive_stream_key(live)
         ingest_url = str(live.ingest_url or "").strip()
-        if "/app/" in ingest_url:
-            stream_key = ingest_url.rsplit("/", 1)[-1]
-        elif ingest_url.startswith(("rtmp://", "rtmps://")) and live.provider == "disabled":
-            stream_key = str(live.provider_stream_id or live.id)
         if not stream_key:
             raise ValidationError({"stream_key": "Stream key is not available for this provider yet."})
         _channel_audit(
@@ -16918,7 +17046,7 @@ class ChannelLiveStreamStartView(APIView):
         live.started_at = live.started_at or timezone.now()
         live.save(update_fields=["status", "started_at", "updated_at"])
         if live.content_id:
-            ChannelContent.objects.filter(id=live.content_id).update(status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC, published_at=timezone.now())
+            _activate_live_stream_content(live.content_id)
         _channel_audit(request, action="channel_live.start", target_type="channel", target_id=live.channel_id, metadata={"stream_id": str(live.id), "content_id": str(live.content_id or "")})
         _notify_channel_subscribers(
             live.channel,
@@ -17020,6 +17148,8 @@ class ChannelLiveStreamWebhookView(APIView):
             live.status = mapped_status
             if mapped_status == "live" and not live.started_at:
                 live.started_at = timezone.now()
+                if live.content_id:
+                    _activate_live_stream_content(live.content_id)
             elif mapped_status in ("ended", "cancelled") and not live.ended_at:
                 live.ended_at = timezone.now()
 
@@ -17178,6 +17308,8 @@ class ChannelContentReactView(APIView):
         content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
         if not _user_can_view_content(request.user, content):
             raise Http404
+        if _channel_blocks_user(content.channel, request.user):
+            raise PermissionDenied("You cannot react to this channel's content.")
         reaction = str(request.data.get("reaction") or "like").strip().lower()[:32] or "like"
         obj, created = ChannelContentReaction.objects.update_or_create(
             content=content,
@@ -17344,6 +17476,8 @@ class ChannelContentCommentsView(APIView):
         content = get_object_or_404(ChannelContent.objects.select_related("channel"), id=content_id, is_deleted=False)
         if not _user_can_view_content(request.user, content):
             raise Http404
+        if _channel_blocks_user(content.channel, request.user):
+            raise PermissionDenied("You cannot comment on this channel's content.")
         channel_settings = content.channel.settings if isinstance(content.channel.settings, dict) else {}
         if channel_settings.get("comments_restricted") and not _user_can_manage_channel(request.user, content.channel):
             raise PermissionDenied("Comments are restricted for this channel.")
@@ -19699,6 +19833,8 @@ class ChannelContentSubtitleListView(APIView):
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
         subtitles = ChannelContentSubtitle.objects.filter(content=content)
         return Response({"results": ChannelContentSubtitleSerializer(subtitles, many=True).data})
 
@@ -19764,6 +19900,8 @@ class ChannelContentEndScreenView(APIView):
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
         try:
             end_screen = content.end_screen
         except ChannelContentEndScreen.DoesNotExist:
@@ -19799,6 +19937,8 @@ class ChannelContentCardsView(APIView):
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
         cards = ChannelContentCard.objects.filter(content=content)
         return Response({"results": ChannelContentCardSerializer(cards, many=True).data})
 
@@ -19893,18 +20033,21 @@ class ChannelContentRelatedView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, content_id):
+        from .moderation_gate import filter_channel_content_broadcast_eligible
+
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
-        related = (
+        if not _user_can_view_content(request.user, content):
+            raise Http404
+        related = filter_channel_content_broadcast_eligible(
             ChannelContent.objects
             .filter(
                 channel=content.channel,
                 content_type=content.content_type,
                 status=ChannelContent.Status.PUBLISHED,
+                visibility=ChannelContent.Visibility.PUBLIC,
                 is_deleted=False,
             )
-            .exclude(id=content.id)
-            .order_by("-published_at")[:10]
-        )
+        ).exclude(id=content.id).order_by("-published_at")[:10]
         return Response({"results": ChannelContentListSerializer(related, many=True, context={"request": request}).data})
 
 
@@ -20142,6 +20285,8 @@ class ChannelPublicClipsView(APIView):
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
         clips = ChannelContentClip.objects.filter(content=content, status='ready').order_by("-created_at")[:50]
         results = [
             {
@@ -20613,11 +20758,22 @@ class ChannelContentMyReactionsView(APIView):
 # ── Task 1c: WHIP proxy ───────────────────────────────────────────────────────
 
 class ChannelLiveStreamWhipView(APIView):
-    permission_classes = [AllowAny]
+    # SECURITY: stream_id is not a secret - it is the same public id shown
+    # on every live stream to any viewer of a public channel (detail view,
+    # list view, notifications). Without this check, anyone who could see
+    # a live stream could POST an SDP offer here and either get the real
+    # whip_url/stream_key proxied/returned to them (hijacking ingest) or
+    # open a second competing WebRTC publish session against the real
+    # provider. A creator going live from an in-browser WHIP encoder is
+    # already authenticated in their own app session, so requiring edit
+    # permission here costs that flow nothing.
+    permission_classes = [IsAuthenticated]
     parser_classes = []  # accept raw SDP body
 
     def post(self, request, stream_id):
-        stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel"), id=stream_id)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=stream.channel)):
+            raise PermissionDenied("You cannot publish to this live stream.")
         whip_url = (stream.metadata or {}).get("whip_url") or ""
         if whip_url and not is_safe_external_url(whip_url):
             # Defense in depth: whip_url can no longer be set by clients (see
@@ -20646,14 +20802,16 @@ class ChannelLiveStreamWhipView(APIView):
             except Exception as exc:
                 logger.warning("[WHIP] proxy error for stream %s: %s", stream_id, exc)
                 return Response({"error": "WHIP proxy failed", "detail": str(exc)}, status=502)
-        # No WHIP URL configured — return stream key so client can fall back to RTMP
-        key_value = (stream.metadata or {}).get("stream_key")
+        # No WHIP URL configured — return stream key so client can fall back to RTMP.
+        # (Reads the real ingest_url/key the same way ChannelLiveStreamStreamKeyView
+        # does - stream.metadata never actually holds these, so reading from there
+        # always returned null.)
         return Response(
             {
                 "error": "WHIP not configured for this stream",
                 "fallback": "rtmp",
-                "ingest_url": (stream.metadata or {}).get("ingest_url"),
-                "stream_key": key_value,
+                "ingest_url": str(stream.ingest_url or ""),
+                "stream_key": _derive_stream_key(stream),
             },
             status=501,
         )
@@ -20697,9 +20855,15 @@ class ChannelLiveStreamChatHistoryView(APIView):
         if not message_text:
             return Response({"error": "message required"}, status=400)
         user = request.user if request.user.is_authenticated else None
-        display_name = str(request.data.get("display_name") or "").strip()[:150]
-        if not display_name and user:
-            display_name = user.get_full_name() or str(user.username or "")
+        # SECURITY: an authenticated user's display_name always comes from
+        # their own account, never the request body - otherwise a logged-in
+        # attacker could impersonate any other user/creator's name in a
+        # public live chat. Anonymous/guest chat (no account) still accepts
+        # a client-supplied name since there is no identity to spoof FROM.
+        if user:
+            display_name = str(user.display_name or user.username or "")
+        else:
+            display_name = str(request.data.get("display_name") or "").strip()[:150]
         msg = LiveChatMessage.objects.create(
             stream=stream,
             user=user,
@@ -20729,7 +20893,9 @@ class BroadcastTrendingView(APIView):
 
         content_type_filter = str(request.query_params.get("content_type") or "").strip().lower()
 
-        qs = (
+        from .moderation_gate import filter_channel_content_broadcast_eligible
+
+        qs = filter_channel_content_broadcast_eligible(
             ChannelContent.objects
             .select_related("channel")
             .filter(
@@ -20775,7 +20941,7 @@ class BroadcastTrendingView(APIView):
                 "published_at": c.published_at.isoformat() if c.published_at else None,
                 "channel": {
                     "id": str(ch.id),
-                    "name": ch.name,
+                    "name": ch.display_name,
                     "handle": ch.handle,
                     "avatar_url": str(ch.avatar_url or ""),
                 },
@@ -20787,9 +20953,20 @@ class BroadcastTrendingView(APIView):
 # ── Task 3b: DVR Archive webhook ──────────────────────────────────────────────
 
 class ChannelLiveStreamArchiveView(APIView):
-    permission_classes = [AllowAny]  # webhook — caller verified by payload signature
+    # SECURITY: this is meant to be a provider/recording-pipeline webhook
+    # (same trust level as ChannelLiveStreamWebhookView), but unlike that
+    # view it was never actually checking a signature despite the comment
+    # claiming so - stream_id is a public, non-secret UUID, so without this
+    # check anyone could plant an arbitrary recording_url + title/thumbnail
+    # as a channel's "archived" stream content. Uses the same shared-secret
+    # header convention as ChannelLiveStreamWebhookView's generic fallback.
+    permission_classes = [AllowAny]
 
     def post(self, request, stream_id):
+        configured_secret = str(getattr(settings, "LIVE_STREAM_WEBHOOK_SECRET", os.getenv("LIVE_STREAM_WEBHOOK_SECRET", "")) or "")
+        supplied = request.headers.get("X-Live-Webhook-Secret") or request.headers.get("X-KIS-Live-Secret") or ""
+        if configured_secret and supplied != configured_secret:
+            return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
         stream = get_object_or_404(ChannelLiveStream, id=stream_id)
         recording_url = str(request.data.get("recording_url") or "").strip()
         duration_seconds = request.data.get("duration_seconds")
@@ -20907,6 +21084,55 @@ class ChannelMembershipTierListView(APIView):
             sort_order=int(request.data.get("sort_order") or 0),
         )
         return Response({"id": str(tier.id), "title": tier.title}, status=201)
+
+
+class ChannelMembershipTierDetailView(APIView):
+    """Edit/retire a single tier - the list/create view above has no
+    per-tier counterpart, so MembershipPerksEditor.tsx's save/delete calls
+    (patch/delete on /membership-tiers/<tier_id>/) had nowhere to land."""
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, tier_id):
+        tier = get_object_or_404(ChannelMembershipTier.objects.select_related("channel"), id=tier_id)
+        if not _user_can_manage_channel(request.user, tier.channel):
+            raise PermissionDenied("You cannot manage this channel's membership tiers.")
+        if "title" in request.data:
+            tier.title = str(request.data.get("title") or "").strip()[:100] or tier.title
+        if "description" in request.data:
+            tier.description = str(request.data.get("description") or "").strip()
+        if "price_cents" in request.data:
+            tier.price_cents = int(request.data.get("price_cents") or 0)
+        if "currency" in request.data:
+            tier.currency = str(request.data.get("currency") or tier.currency).upper()[:3]
+        if "perks" in request.data:
+            perks = request.data.get("perks")
+            if not isinstance(perks, list):
+                raise ValidationError({"perks": "Expected a list of strings."})
+            tier.perks = [str(p).strip() for p in perks if str(p).strip()]
+        if "sort_order" in request.data:
+            tier.sort_order = int(request.data.get("sort_order") or 0)
+        tier.save()
+        return Response({
+            "id": str(tier.id),
+            "title": tier.title,
+            "description": tier.description,
+            "price_cents": tier.price_cents,
+            "currency": tier.currency,
+            "perks": tier.perks or [],
+        })
+
+    def delete(self, request, tier_id):
+        tier = get_object_or_404(ChannelMembershipTier.objects.select_related("channel"), id=tier_id)
+        if not _user_can_manage_channel(request.user, tier.channel):
+            raise PermissionDenied("You cannot manage this channel's membership tiers.")
+        # Soft-retire, not a hard delete - existing ChannelMembership rows
+        # still reference this tier (on_delete=CASCADE would destroy a
+        # paying member's membership history), and the list view above
+        # already filters to is_active=True so retired tiers stop being
+        # offered without erasing who was a member of them.
+        tier.is_active = False
+        tier.save(update_fields=["is_active", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ChannelMembershipView(APIView):
@@ -21371,6 +21597,8 @@ class ChannelContentAudioTracksView(APIView):
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
         tracks = ChannelContentAudioTrack.objects.filter(content=content).order_by("-is_default", "language_code")
         return Response(ChannelContentAudioTrackSerializer(tracks, many=True).data)
 
@@ -21397,6 +21625,8 @@ class ChannelContentGeoRestrictionView(APIView):
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
         try:
             restriction = content.geo_restriction
         except ChannelContentGeoRestriction.DoesNotExist:
@@ -21423,6 +21653,8 @@ class ChannelContentPremiereView(APIView):
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
         try:
             premiere = content.premiere
         except ChannelContentPremiere.DoesNotExist:
@@ -21648,9 +21880,19 @@ class ChannelContentTranscriptView(APIView):
 
 
 class ChannelContentTranscriptWebhookView(APIView):
+    # SECURITY: this is a provider webhook (transcription pipeline reporting
+    # a job's result) with no signature check at all - any unauthenticated
+    # caller who could guess/observe a provider_job_id could overwrite that
+    # video's transcript/subtitles with arbitrary text, or mark a pending
+    # job failed. Same shared-secret convention as the other provider
+    # webhooks in this file (ChannelLiveStreamWebhookView, ...ArchiveView).
     permission_classes = [AllowAny]
 
     def post(self, request):
+        configured_secret = str(getattr(settings, "TRANSCRIPT_WEBHOOK_SECRET", os.getenv("TRANSCRIPT_WEBHOOK_SECRET", "")) or "")
+        supplied = request.headers.get("X-Transcript-Webhook-Secret") or ""
+        if configured_secret and supplied != configured_secret:
+            return Response({"detail": "Invalid transcript webhook signature."}, status=status.HTTP_403_FORBIDDEN)
         job_id = str(request.data.get("job_id") or "")
         if not job_id:
             return Response({"detail": "job_id required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -21684,10 +21926,23 @@ class ChannelContentRecommendationsView(APIView):
             .filter(user=user)
             .values_list("channel_id", flat=True)
         )
+        # A creator you blocked (or who blocked you) should not keep
+        # surfacing in your cross-channel discovery feed - same rule
+        # already applied to comments/reactions/subscribe via
+        # _channel_blocks_user, expressed here as a queryset exclusion
+        # since this is a single-user-owned-channel check at scale, not a
+        # per-row permission call.
+        blocked_user_ids = set(
+            UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
+        ) | set(
+            UserBlock.objects.filter(blocked=user).values_list("blocker_id", flat=True)
+        )
+
+        from .moderation_gate import filter_channel_content_broadcast_eligible
 
         # Score = (is_subscribed * 3) + (avg_watch_pct / 33) + log(engagement + 1)
         # Done in Python to avoid dialect-specific SQL; fetch candidates first
-        base_qs = (
+        base_qs = filter_channel_content_broadcast_eligible(
             ChannelContent.objects
             .filter(
                 status="published",
@@ -21697,6 +21952,7 @@ class ChannelContentRecommendationsView(APIView):
                 published_at__gte=timezone.now() - timedelta(days=90),
             )
             .exclude(id__in=watched_ids)
+            .exclude(channel__owner_type=BroadcastChannel.OwnerType.USER, channel__owner_user_id__in=blocked_user_ids)
             .annotate(
                 avg_watch_pct=Avg("watch_events__watch_percent"),
                 reaction_count=Count("reactions", distinct=True),
@@ -21781,11 +22037,20 @@ class ChannelRevenueAnalyticsView(APIView):
 
     def get(self, request, channel_id):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
-        role = _viewer_channel_role(channel, request.user)
+        role = _user_channel_role(request.user, channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         from django.db.models import Sum, Count
-        period_days = int(request.query_params.get("days") or 30)
+        # RevenueAnalyticsPanel.tsx sends ?period=7d|30d|90d, never ?days=N -
+        # this endpoint only ever read "days", so every period selection in
+        # the UI silently did nothing and always rendered the default 30-day
+        # window. "days" is kept too (harmless) in case any other direct
+        # caller already relies on it.
+        period_param = str(request.query_params.get("period") or "").strip().lower()
+        if period_param.endswith("d") and period_param[:-1].isdigit():
+            period_days = int(period_param[:-1])
+        else:
+            period_days = int(request.query_params.get("days") or 30)
         cutoff = timezone.now() - timedelta(days=period_days)
 
         # Content tips (Super Thanks)
@@ -21812,35 +22077,43 @@ class ChannelRevenueAnalyticsView(APIView):
             )
         )
 
-        # Ad impressions revenue (stub — no CPM rate yet; placeholder)
+        # Ad impressions revenue - same flat per-impression rate
+        # ChannelAdImpressionView actually charges advertisers
+        # (AD_COST_PER_IMPRESSION_CENTS), so this reflects real spend
+        # rather than being left out of the total entirely.
         ad_slots = ChannelAdSlot.objects.filter(content__channel=channel)
         ad_impressions = ChannelAdImpression.objects.filter(
-            slot__in=ad_slots, created_at__gte=cutoff
+            slot__in=ad_slots, created_at__gte=cutoff, slot__campaign__isnull=False,
         ).count()
+        ad_revenue_cents = ad_impressions * AD_COST_PER_IMPRESSION_CENTS
 
         def _safe(val):
             return int(val or 0)
 
+        # Flat field names to match RevenueAnalyticsPanel.tsx's RevenueData
+        # type exactly (super_thanks_amount, not super_thanks.total_cents) -
+        # the nested shape this previously returned didn't match what the
+        # screen reads at all, so every figure except ad_impressions always
+        # rendered as a confident $0 / 0 regardless of real revenue.
         return Response({
             "period_days": period_days,
             "currency": "USD",
-            "super_thanks": {
-                "total_cents": _safe(content_tips["total"]),
-                "count": _safe(content_tips["count"]),
-            },
-            "super_chat": {
-                "total_cents": _safe(live_tips["total"]),
-                "count": _safe(live_tips["count"]),
-            },
-            "memberships": {
-                "active_count": _safe(membership_revenue["count"]),
-                "estimated_monthly_cents": _safe(membership_revenue["monthly_total"]),
-            },
+            "super_thanks_amount": _safe(content_tips["total"]),
+            "super_thanks_count": _safe(content_tips["count"]),
+            "super_chat_amount": _safe(live_tips["total"]),
+            "super_chat_count": _safe(live_tips["count"]),
+            "memberships_active": _safe(membership_revenue["count"]),
+            # Dollars, not cents - unlike every *_amount field above, the
+            # frontend uses this one directly (membershipsEst, no /100)
+            # rather than through fmt()'s cents->dollars conversion.
+            "memberships_est_monthly": _safe(membership_revenue["monthly_total"]) / 100,
             "ad_impressions": ad_impressions,
+            "ad_revenue_cents": ad_revenue_cents,
             "total_estimated_cents": (
                 _safe(content_tips["total"])
                 + _safe(live_tips["total"])
                 + _safe(membership_revenue["monthly_total"])
+                + ad_revenue_cents
             ),
         })
 
@@ -21859,7 +22132,7 @@ class ChannelContentAutoChaptersView(APIView):
 
     def post(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
-        role = _viewer_channel_role(content.channel, request.user)
+        role = _user_channel_role(request.user, content.channel)
         if role not in ("owner", "staff", "editor"):
             raise PermissionDenied()
 
@@ -21922,12 +22195,14 @@ class ChannelContentProductsView(APIView):
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
+        if not _user_can_view_content(request.user, content):
+            raise Http404
         tags = ChannelContentProduct.objects.filter(content=content).order_by("timestamp_seconds")
         return Response(ChannelContentProductSerializer(tags, many=True).data)
 
     def post(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
-        role = _viewer_channel_role(content.channel, request.user)
+        role = _user_channel_role(request.user, content.channel)
         if role not in ("owner", "staff", "editor"):
             raise PermissionDenied()
         data = dict(request.data)
@@ -21943,7 +22218,7 @@ class ChannelContentProductDetailView(APIView):
 
     def delete(self, request, content_id, tag_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
-        role = _viewer_channel_role(content.channel, request.user)
+        role = _user_channel_role(request.user, content.channel)
         if role not in ("owner", "staff", "editor"):
             raise PermissionDenied()
         tag = get_object_or_404(ChannelContentProduct, id=tag_id, content=content)
@@ -21976,7 +22251,7 @@ class ChannelLiveStreamTargetsView(APIView):
 
     def get(self, request, stream_id):
         live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
-        role = _viewer_channel_role(live_stream.channel, request.user)
+        role = _user_channel_role(request.user, live_stream.channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         targets = ChannelLiveStreamTarget.objects.filter(live_stream=live_stream)
@@ -21984,7 +22259,7 @@ class ChannelLiveStreamTargetsView(APIView):
 
     def post(self, request, stream_id):
         live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
-        role = _viewer_channel_role(live_stream.channel, request.user)
+        role = _user_channel_role(request.user, live_stream.channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         data = dict(request.data)
@@ -22001,7 +22276,7 @@ class ChannelLiveStreamTargetDetailView(APIView):
 
     def delete(self, request, stream_id, target_id):
         live_stream = get_object_or_404(ChannelLiveStream, id=stream_id)
-        role = _viewer_channel_role(live_stream.channel, request.user)
+        role = _user_channel_role(request.user, live_stream.channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         target = get_object_or_404(ChannelLiveStreamTarget, id=target_id, live_stream=live_stream)
@@ -22193,7 +22468,7 @@ class ChannelContentCopyrightClaimsView(APIView):
 
     def get(self, request, channel_id):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
-        role = _viewer_channel_role(channel, request.user)
+        role = _user_channel_role(request.user, channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         claims = ChannelContentCopyrightClaim.objects.filter(
@@ -22203,6 +22478,14 @@ class ChannelContentCopyrightClaimsView(APIView):
 
     def post(self, request, channel_id):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        # SECURITY: this had no permission check at all - any authenticated
+        # user could file a copyright claim "as" any channel_id they put in
+        # the URL, impersonating a claimant they don't manage. Filing a
+        # claim is a channel-management action on the claimant side, same
+        # bar as every other owner/staff-only action on a channel.
+        role = _user_channel_role(request.user, channel)
+        if role not in ("owner", "staff"):
+            raise PermissionDenied("You cannot file a copyright claim on behalf of this channel.")
         content_id = request.data.get("content_id")
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
         claim = ChannelContentCopyrightClaim.objects.create(
@@ -22220,7 +22503,7 @@ class ChannelContentCopyrightDisputeView(APIView):
 
     def post(self, request, claim_id):
         claim = get_object_or_404(ChannelContentCopyrightClaim, id=claim_id)
-        role = _viewer_channel_role(claim.content.channel, request.user)
+        role = _user_channel_role(request.user, claim.content.channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         if claim.status not in (ChannelContentCopyrightClaim.Status.PENDING, ChannelContentCopyrightClaim.Status.MATCHED):
@@ -22237,7 +22520,7 @@ class ChannelAudienceDemographicsView(APIView):
 
     def get(self, request, channel_id):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
-        role = _viewer_channel_role(channel, request.user)
+        role = _user_channel_role(request.user, channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         from django.db.models import Sum
@@ -22257,16 +22540,22 @@ class ChannelAudienceDemographicsView(APIView):
             cc = row["country_code"] or "ZZ"
             by_age[ab] = by_age.get(ab, 0) + int(row["total_views"] or 0)
             by_country[cc] = by_country.get(cc, 0) + int(row["total_views"] or 0)
+        # Field names match AudienceDemographicsPanel.tsx's DemographicsData
+        # type exactly (age_groups/top_countries) - this previously sent
+        # age_buckets/countries, which the frontend never reads, so the
+        # panel always rendered "No age data yet"/"No country data yet"
+        # regardless of real data (compounding the _viewer_channel_role
+        # NameError this endpoint also had, fixed separately).
         return Response({
             "period_days": period_days,
-            "age_buckets": [{"age_bucket": k, "view_count": v} for k, v in sorted(by_age.items(), key=lambda x: -x[1])],
-            "countries": [{"country_code": k, "view_count": v} for k, v in sorted(by_country.items(), key=lambda x: -x[1])[:20]],
+            "age_groups": [{"age_bucket": k, "view_count": v} for k, v in sorted(by_age.items(), key=lambda x: -x[1])],
+            "top_countries": [{"country_code": k, "view_count": v} for k, v in sorted(by_country.items(), key=lambda x: -x[1])[:20]],
         })
 
     def post(self, request, channel_id):
         """Ingest demographic snapshot data (called by analytics pipeline)."""
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
-        role = _viewer_channel_role(channel, request.user)
+        role = _user_channel_role(request.user, channel)
         if role not in ("owner", "staff") and not request.user.is_staff:
             raise PermissionDenied()
         rows = request.data.get("rows") or []
@@ -22293,7 +22582,7 @@ class ChannelAdCampaignView(APIView):
 
     def get(self, request, channel_id):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
-        role = _viewer_channel_role(channel, request.user)
+        role = _user_channel_role(request.user, channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         campaigns = ChannelAdCampaign.objects.filter(advertiser_channel=channel).order_by("-created_at")
@@ -22301,7 +22590,7 @@ class ChannelAdCampaignView(APIView):
 
     def post(self, request, channel_id):
         channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
-        role = _viewer_channel_role(channel, request.user)
+        role = _user_channel_role(request.user, channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         ser = ChannelAdCampaignSerializer(data=request.data)
@@ -22310,17 +22599,50 @@ class ChannelAdCampaignView(APIView):
         return Response(ChannelAdCampaignSerializer(campaign).data, status=status.HTTP_201_CREATED)
 
 
+# Flat CPM-style rate, not a real-time bid/auction - shared by
+# ChannelAdImpressionView (what a campaign is actually charged) and
+# ChannelRevenueAnalyticsView (what that same spend is worth to the
+# channel showing the ad), so the two can never drift apart.
+AD_COST_PER_IMPRESSION_CENTS = 10
+
+
+def _ad_slot_is_servable(slot) -> bool:
+    """A slot with no campaign is unsold/house inventory - always
+    servable. A slot tied to a campaign is only servable while that
+    campaign is ACTIVE and (when it has a real budget set) hasn't already
+    spent through it - otherwise viewers kept being served, and
+    advertisers kept being charged for, a paused/ended/exhausted campaign
+    forever, since nothing ever re-checked campaign state after slot
+    creation. budget_cents == 0 is treated as "no cap configured yet"
+    (unbounded), not "zero budget", matching the field's PositiveIntegerField
+    default - the model has no separate is_unlimited flag."""
+    campaign = getattr(slot, "campaign", None)
+    if not campaign:
+        return True
+    if campaign.status != ChannelAdCampaign.Status.ACTIVE:
+        return False
+    if campaign.budget_cents > 0 and campaign.spent_cents >= campaign.budget_cents:
+        return False
+    return True
+
+
 class ChannelAdSlotView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
-        slots = ChannelAdSlot.objects.filter(content=content).order_by("timestamp_seconds")
+        slots = ChannelAdSlot.objects.filter(content=content).select_related("campaign").order_by("timestamp_seconds")
+        # Managers see every slot they configured (including paused/ended/
+        # exhausted ones) so they can review and resume them; anyone else
+        # hitting this (the actual ad-serving path during playback) only
+        # ever sees slots that should currently be shown to a viewer.
+        if not _user_can_manage_channel(request.user, content.channel):
+            slots = [slot for slot in slots if _ad_slot_is_servable(slot)]
         return Response(ChannelAdSlotSerializer(slots, many=True).data)
 
     def post(self, request, content_id):
         content = get_object_or_404(ChannelContent, id=content_id, is_deleted=False)
-        role = _viewer_channel_role(content.channel, request.user)
+        role = _user_channel_role(request.user, content.channel)
         if role not in ("owner", "staff"):
             raise PermissionDenied()
         ser = ChannelAdSlotSerializer(data=request.data)
@@ -22332,8 +22654,21 @@ class ChannelAdSlotView(APIView):
 class ChannelAdImpressionView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, slot_id):
-        slot = get_object_or_404(ChannelAdSlot, id=slot_id)
+        slot = get_object_or_404(ChannelAdSlot.objects.select_related("campaign"), id=slot_id)
+        if not _ad_slot_is_servable(slot):
+            raise ValidationError({"detail": "This ad slot's campaign is no longer active."})
+        # Checked against the campaign's remaining budget BEFORE charging
+        # (not just after), so the very last impression that would tip
+        # spend over budget is rejected outright rather than being charged
+        # and overshooting - an advertiser's budget_cents is a hard cap,
+        # not a soft target.
+        cost_per_impression_cents = AD_COST_PER_IMPRESSION_CENTS
+        if slot.campaign_id:
+            campaign = slot.campaign
+            if campaign.budget_cents > 0 and campaign.spent_cents + cost_per_impression_cents > campaign.budget_cents:
+                raise ValidationError({"detail": "This ad slot's campaign has exhausted its budget."})
         skipped = bool(request.data.get("skipped", False))
         clicked = bool(request.data.get("clicked", False))
         impression = ChannelAdImpression.objects.create(
@@ -22348,10 +22683,17 @@ class ChannelAdImpressionView(APIView):
             skip_count=models.F("skip_count") + (1 if skipped else 0),
         )
         if slot.campaign_id:
-            cost_per_impression = 10  # 10 cents per impression (stub)
-            ChannelAdCampaign.objects.filter(id=slot.campaign_id).update(
-                spent_cents=models.F("spent_cents") + cost_per_impression
-            )
+            campaign.spent_cents = models.F("spent_cents") + cost_per_impression_cents
+            campaign.save(update_fields=["spent_cents", "updated_at"])
+            campaign.refresh_from_db(fields=["spent_cents", "budget_cents", "status"])
+            # Budget was never actually enforced before this fix - spend
+            # could run past budget_cents forever. Auto-end the campaign
+            # the moment it reaches its budget so the next slot fetch (and
+            # the servability check above, on any further impression
+            # attempt) correctly stops serving it.
+            if campaign.budget_cents > 0 and campaign.spent_cents >= campaign.budget_cents and campaign.status == ChannelAdCampaign.Status.ACTIVE:
+                campaign.status = ChannelAdCampaign.Status.ENDED
+                campaign.save(update_fields=["status", "updated_at"])
         return Response(ChannelAdImpressionSerializer(impression).data, status=status.HTTP_201_CREATED)
 
 
@@ -22425,10 +22767,21 @@ class BroadcastSearchView(APIView):
         date_to = request.query_params.get("date_to", "")
         sort = request.query_params.get("sort", "relevance")
 
-        qs = ChannelContent.objects.filter(
-            status="published",
-            visibility="public",
-            is_deleted=False,
+        from .moderation_gate import filter_channel_content_broadcast_eligible
+
+        # filter_channel_content_broadcast_eligible, not just the bare
+        # status/visibility filter - search was never wired into the
+        # ChannelContent moderation gate (the other 4 real public choke
+        # points were: _user_can_view_content, _content_is_public_web_safe,
+        # BroadcastChannelContentListCreateView, ChannelContentRecommendationsView)
+        # so a never-reviewed or explicitly BLOCKED item was fully public
+        # and searchable by anyone regardless of moderation_status.
+        qs = filter_channel_content_broadcast_eligible(
+            ChannelContent.objects.filter(
+                status="published",
+                visibility="public",
+                is_deleted=False,
+            )
         ).select_related("channel")
 
         # Real Postgres full-text search against search_vector (kept in
@@ -22513,9 +22866,13 @@ class BroadcastSearchSuggestView(APIView):
             .filter(Q(display_name__icontains=q) | Q(handle__icontains=q))
             .order_by("-subscriber_count")[:5]
         )
+        from .moderation_gate import filter_channel_content_broadcast_eligible
+
         contents = (
-            ChannelContent.objects.filter(
-                status="published", visibility="public", is_deleted=False, title__icontains=q,
+            filter_channel_content_broadcast_eligible(
+                ChannelContent.objects.filter(
+                    status="published", visibility="public", is_deleted=False, title__icontains=q,
+                )
             )
             .order_by("-published_at")[:5]
         )
@@ -22614,7 +22971,18 @@ class ChannelAnalyticsImpressionsCTRView(APIView):
         total_impressions = totals["total_impressions"] or 0
         total_views = totals["total_views"] or 0
         total_watch_time = totals["total_watch_time"] or 0
-        ctr = round(total_views / total_impressions * 100, 2) if total_impressions else 0.0
+        # OUT OF CURRENT PRODUCT SCOPE, not a bug to "fix" here: nothing in
+        # this codebase ever writes ChannelAnalyticsDailyRollup.impressions -
+        # a real impressions metric needs a client-reported "this card was
+        # actually rendered to the viewer" event (the same architecture
+        # ChannelAdImpression already uses for ads), not something this
+        # list endpoint can infer on its own. ctr_percent is therefore
+        # always 0 today, which would be indistinguishable from "a real
+        # 0% CTR" if returned as a number - has_impression_data makes that
+        # distinction explicit instead of silently lying to a creator about
+        # their content's performance.
+        has_impression_data = total_impressions > 0
+        ctr = round(total_views / total_impressions * 100, 2) if has_impression_data else None
 
         by_content_qs = (
             rollups.filter(content__isnull=False)
@@ -22636,7 +23004,7 @@ class ChannelAnalyticsImpressionsCTRView(APIView):
                 "title": row["content__title"] or "",
                 "impressions": imp,
                 "views": vws,
-                "ctr_percent": round(vws / imp * 100, 2) if imp else 0.0,
+                "ctr_percent": round(vws / imp * 100, 2) if imp else None,
                 "avg_watch_time": row["avg_watch_time"] or 0,
             })
 
@@ -22645,6 +23013,7 @@ class ChannelAnalyticsImpressionsCTRView(APIView):
             "total_impressions": total_impressions,
             "total_views": total_views,
             "ctr_percent": ctr,
+            "has_impression_data": has_impression_data,
             "avg_watch_time_seconds": total_watch_time,
             "by_content": by_content,
         })
@@ -22862,10 +23231,14 @@ class ChannelCategoryBrowseView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, slug):
-        qs = ChannelContent.objects.filter(
-            status="published",
-            visibility="public",
-            is_deleted=False,
+        from .moderation_gate import filter_channel_content_broadcast_eligible
+
+        qs = filter_channel_content_broadcast_eligible(
+            ChannelContent.objects.filter(
+                status="published",
+                visibility="public",
+                is_deleted=False,
+            )
         ).filter(
             Q(channel__category__icontains=slug) | Q(tags__icontains=slug)
         ).order_by("-published_at").select_related("channel")

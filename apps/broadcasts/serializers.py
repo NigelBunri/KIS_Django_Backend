@@ -730,6 +730,16 @@ class ChannelLiveStreamSerializer(serializers.ModelSerializer):
     content_id = serializers.UUIDField(source="content.id", read_only=True)
     ingest_url = serializers.SerializerMethodField()
     stream_key_available = serializers.SerializerMethodField()
+    metadata = serializers.SerializerMethodField()
+
+    # Internal-only keys stored in ChannelLiveStream.metadata that must
+    # never reach a non-manager viewer. whip_url in particular is the
+    # encoder ingest target (same sensitivity as ingest_url/stream_key,
+    # which are already gated below) - serializing it unredacted would
+    # let anyone who can view a public live stream also hijack its ingest.
+    _INTERNAL_METADATA_KEYS = frozenset({
+        "whip_url", "provider_raw", "stream_key", "raw_stream_key_returned",
+    })
 
     class Meta:
         model = ChannelLiveStream
@@ -780,6 +790,12 @@ class ChannelLiveStreamSerializer(serializers.ModelSerializer):
 
     def get_stream_key_available(self, obj: ChannelLiveStream) -> bool:
         return bool(obj.stream_key_hash and self._can_view_ingest_details(obj))
+
+    def get_metadata(self, obj: ChannelLiveStream) -> dict:
+        data = obj.metadata or {}
+        if self._can_view_ingest_details(obj):
+            return data
+        return {k: v for k, v in data.items() if k not in self._INTERNAL_METADATA_KEYS}
 
 
 def _education_humanize(value) -> str:
