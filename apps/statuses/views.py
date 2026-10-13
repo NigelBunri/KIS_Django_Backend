@@ -615,7 +615,11 @@ class StatusViewSet(viewsets.ModelViewSet):
         client_id = (request.data.get("client_id") or "").strip() or None
 
         from apps.chat.services import get_or_create_direct_conversation
-        from apps.statuses.services import StatusReplyDeliveryError, deliver_status_reply_message
+        from apps.statuses.services import (
+            StatusReplyDeliveryError,
+            build_status_preview_context,
+            deliver_status_reply_message,
+        )
 
         # A second, independent bug hiding behind the ImportError above:
         # this call previously passed user_a=/user_b_id= keyword args, but
@@ -645,6 +649,7 @@ class StatusViewSet(viewsets.ModelViewSet):
                 sender_id=str(request.user.id),
                 text=text,
                 client_id=client_id,
+                status_context=build_status_preview_context(status_item, request, is_reaction=False),
             )
         except StatusReplyDeliveryError:
             return Response(
@@ -701,7 +706,11 @@ class StatusViewSet(viewsets.ModelViewSet):
         client_id = (request.data.get("client_id") or "").strip() or None
 
         from apps.chat.services import get_or_create_direct_conversation
-        from apps.statuses.services import StatusReplyDeliveryError, deliver_status_reply_message
+        from apps.statuses.services import (
+            StatusReplyDeliveryError,
+            build_status_preview_context,
+            deliver_status_reply_message,
+        )
 
         try:
             conversation, _created = get_or_create_direct_conversation(request.user, status_item.user)
@@ -714,6 +723,7 @@ class StatusViewSet(viewsets.ModelViewSet):
                 sender_id=str(request.user.id),
                 text=emoji,
                 client_id=client_id,
+                status_context=build_status_preview_context(status_item, request, is_reaction=True),
             )
         except StatusReplyDeliveryError:
             return Response(

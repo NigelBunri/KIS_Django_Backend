@@ -138,7 +138,35 @@ class StatusReplyDeliveryError(Exception):
     (caller's fault)."""
 
 
-def deliver_status_reply_message(*, conversation_id: str, sender_id: str, text: str, client_id: str | None = None) -> dict:
+def build_status_preview_context(status_item, request, *, is_reaction: bool) -> dict:
+    """Snapshot of the status being replied/reacted to, carried on the
+    resulting chat message so the receiver's chat bubble can show what the
+    reply/reaction was actually about (preview media or text) instead of a
+    bare, context-free message — see Message.statusContext on the Nest
+    side. A snapshot, not a live reference: the status itself expires/gets
+    deleted independently, so this is captured once at send time."""
+    preview_url = None
+    if status_item.file:
+        url = status_item.file.url
+        preview_url = request.build_absolute_uri(url) if request else url
+    return {
+        "status_id": str(status_item.id),
+        "status_type": status_item.type,
+        "is_reaction": is_reaction,
+        "preview_text": status_item.text or "",
+        "preview_url": preview_url,
+        "preview_style": status_item.style or None,
+    }
+
+
+def deliver_status_reply_message(
+    *,
+    conversation_id: str,
+    sender_id: str,
+    text: str,
+    client_id: str | None = None,
+    status_context: dict | None = None,
+) -> dict:
     """Creates the actual reply message via Nest.js/MongoDB — the only place
     real chat content lives (Django has no Message model at all; see
     RealtimeInternalController.sendMessageAsUser on the Nest side). This is
@@ -189,6 +217,15 @@ def deliver_status_reply_message(*, conversation_id: str, sender_id: str, text: 
     # behavior) - no regression for older app versions.
     if client_id:
         payload["clientId"] = client_id
+    if status_context:
+        payload["statusContext"] = {
+            "statusId": status_context.get("status_id"),
+            "statusType": status_context.get("status_type"),
+            "isReaction": bool(status_context.get("is_reaction")),
+            "previewText": status_context.get("preview_text") or "",
+            "previewUrl": status_context.get("preview_url"),
+            "previewStyle": status_context.get("preview_style"),
+        }
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
