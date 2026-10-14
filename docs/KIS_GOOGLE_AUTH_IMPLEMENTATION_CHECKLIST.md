@@ -67,7 +67,7 @@ Policy decisions locked in by product owner on 2026-10-14:
 - [x] H5. ⏭ Linking does not invalidate unrelated sessions — link-complete only writes `verification`, never touches `Device`/session state.
 
 ## I. Testing (spec §10)
-- [x] I1. ✅ Django: targeted suite (`kis_auth_bridge`, `accounts`, `otp`, `referrals`, `notifications`, `common.test_observability_phase9`) — 573 tests, 3 pre-existing/unrelated failures. Full repo-wide suite run separately — see `KIS_GOOGLE_AUTH_TEST_REPORT.md` for final count.
+- [x] I1. ✅ Django: targeted suite — 573 tests, 3 pre-existing/unrelated failures. Full repo-wide suite (3060 tests, ×2 runs) — zero regressions in apps.otp/apps.kis_auth_bridge/apps.accounts; all other failures pre-existing or concurrency-flaky in unrelated apps. See `KIS_GOOGLE_AUTH_TEST_REPORT.md`.
 - [x] I2. ✅ kis-auth: `npm test` — 7 suites/48 tests passed, 0 failed, 8 suites/60 tests skipped (missing local Postgres/Redis — environment limitation, not a failure).
 - [x] I3. ✅ Nest backend: `pnpm test` — 250/264 tests passed; 14 failures all in unrelated chat/messages/reactions specs (Mongo-dependent, pre-existing); both auth-relevant specs (`django-auth.service.spec.ts`, `internal-signing.spec.ts`) passed.
 - [x] I4. ✅ Mobile: `jest` 6/6 passed; `tsc --noEmit` 0 errors; ESLint not run (repo-wide pre-existing config breakage, unrelated to this migration — documented limitation, not a skipped check we chose to skip).
@@ -81,5 +81,5 @@ Policy decisions locked in by product owner on 2026-10-14:
 - [x] K1. ✅ `KIS_GOOGLE_AUTH_MIGRATION_AUDIT.md`
 - [x] K2. ✅ This checklist, kept current
 - [x] K3. ✅ `KIS_GOOGLE_AUTH_SECURITY_REVIEW.md`
-- [ ] K4. 🚧 `KIS_GOOGLE_AUTH_TEST_REPORT.md` — pending final full-suite Django result
+- [x] K4. ✅ `KIS_GOOGLE_AUTH_TEST_REPORT.md` — full-suite Django result recorded; zero regressions in apps.otp/apps.kis_auth_bridge/apps.accounts
 - [x] K5. ✅ `KIS_GOOGLE_AUTH_DEPLOYMENT_RUNBOOK.md`
