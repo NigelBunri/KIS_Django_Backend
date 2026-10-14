@@ -1,6 +1,25 @@
 # KIS Google Auth Migration — Deployment Runbook
 
-Date: 2026-10-14. Nothing in this migration has been deployed, migrated, or flag-flipped against any real staging/production environment. All changes described here exist only in each repo's local working tree on `main`, uncommitted, pending review.
+Date: 2026-10-14.
+
+## 0. Actual production deployment record (2026-10-14, 18:10–18:22 UTC)
+
+Executed against the AWS Lightsail production host, following the deployment sequence below exactly, with explicit authorization from the product owner.
+
+- **Pre-flight**: `.env.django`/`.env.nest` backed up (`*.before-deploy.2026-10-14-181033`). Shared `DJANGO_INTERNAL_TOKEN` confirmed matching between Django/Nest via hash comparison (no secret printed). Discovered production's `.env.django` **already had `KIS_AUTH_ENABLED`, `KIS_AUTH_REGISTRATION_ENABLED`, `KIS_AUTH_RECOVERY_ENABLED`, `KIS_AUTH_LINK_ENABLED` explicitly set to `True`** (not relying on the code default at all) — this migration's flag-enablement code change was therefore a no-op for this environment specifically; Google Auth registration/link/recovery had already been live in production independent of this session's work. Also discovered `SMS_CHANNEL_ENABLED=True`/`WHATSAPP_CHANNEL_ENABLED=True` were explicitly set — meaning the removed OTP-via-SMS/WhatsApp path was actively enabled (not dormant) before removal.
+- **Django only deployed** (manual §4.1) — `backend/Nestjs` had zero code changes in this migration, so its container was left untouched and unrestarted.
+- `git pull origin main` on `/opt/kis/services/django/app`: fast-forward `35ace91..7a13c21`, clean.
+- `docker build` succeeded. Tagged and pushed `ghcr.io/nigelbunri/kis-django:production` and the dated rollback tag **`2026-10-14-1814`** (use this tag for rollback — see §6).
+- `docker compose up -d --force-recreate --no-deps django` — container recreated, became healthy within ~15s.
+- `manage.py check`: no issues. `manage.py migrate`: `Applying otp.0005_delete_phoneotp... OK` — **this ran against the real production database**, by explicit authorization, after the full local test suite and diff review were complete. `makemigrations --check --dry-run`: no changes detected.
+- Env vars confirmed loaded in the live container: `KIS_AUTH_ENABLED=True`, `KIS_AUTH_REGISTRATION_ENABLED=True`, `KIS_AUTH_RECOVERY_ENABLED=True`, `KIS_AUTH_LINK_ENABLED=True`, `KISAUTH_INTERNAL_HMAC_SECRET` configured.
+- Health checks: both `https://api.kingdomimpactventures.org/health/` and `https://chat.kingdomimpactventures.org/health` returned `200` (`db: ok`, `cache: ok`). Zero errors in Django's logs in the 10 minutes following restart.
+- Smoke test: `POST /api/v1/auth/otp/channels/` → `404` (route removed, confirmed). `POST /api/v1/auth/password/forgot/` → `404` (confirmed). `POST /api/v1/kis-auth/link/initiate/` → `401` (route live, requires auth, as expected). `POST /api/v1/kis-auth/recovery/complete/` → `400` (route live, requires a body, as expected).
+- Incidental finding, not a defect introduced by this migration: production email actually sends via AWS SES over SMTP (`EMAIL_HOST=email-smtp.eu-west-2.amazonaws.com`), **not** Resend as the codebase's comments/audit assumed (`RESEND_API_KEY` is unset in production; `EMAIL_BACKEND` is Django's SMTP backend). The health endpoint's `resend_configured: false` is accurate and not a problem — it just means email delivery (used by the `ParentRecoveryInitView` fallback for unlinked accounts) runs on a different provider than the code comments describe. Worth a documentation correction in `apps/notifications/email_service.py`'s comments in a follow-up, not corrected in this session since it's a pre-existing documentation-vs-reality mismatch, not a functional bug.
+- **Not done in this session**: the `KIS` mobile app's changes (skippable linking screen, OTP screen removal) **cannot be deployed through this runbook at all** — they require a new app store release. Production's Django/kis-auth backend now fully supports the new flows; the mobile UI changes will only reach users once a new build ships through the App Store/Play Store release process, which is entirely outside SSH/Docker and wasn't performed in this session.
+- Infobip/SMS/WhatsApp credentials remain present in production's `.env.django` (now unused since the code that read them was removed) — left in place rather than proactively deleted, since removing production secrets wasn't explicitly requested and they're harmless-but-unused now.
+
+Everything below this point is the general-purpose runbook prepared before the above deployment; it remains accurate for future deployments (e.g. the mobile release, or any rollback).
 
 ## 1. What changed, per repo
 
