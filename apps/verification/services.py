@@ -1439,6 +1439,21 @@ def review_user_case(*, case: VerificationCase, actor, action: str, notes: str =
                     "public": True,
                     "issued_by": actor,
                     "issued_at": now,
+                    # A user-identity badge is the only one in this module
+                    # that expires on its own - every other subject type's
+                    # badge is permanent until explicitly revoked. 90 days,
+                    # per product requirement: re-verifying calls this same
+                    # path again, and update_or_create renews THIS row
+                    # (the unique (subject, code) constraint is what makes
+                    # that safe) rather than creating a duplicate - pushing
+                    # expires_at another 90 days out. public_badges_for_subject
+                    # /_subjects already exclude an expired-by-date badge at
+                    # read time regardless of status (models_q_not_expired),
+                    # so display correctness never depends on anything
+                    # flipping `status` - see apps.verification.tasks for
+                    # the reminder/expiry-status-hygiene job that does
+                    # that separately, on its own schedule.
+                    "expires_at": now + timezone.timedelta(days=90),
                     "revoked_at": None,
                     "revoke_reason": "",
                 },

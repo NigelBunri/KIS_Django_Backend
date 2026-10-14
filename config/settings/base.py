@@ -972,6 +972,27 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.testimony.tasks.expire_stale_testimonies_task",
         "schedule": 24 * 60 * 60,
     },
+    # Verification badge/case expiry reminders (30/14/7/1 days by default -
+    # VERIFICATION_EXPIRY_REMINDER_DAYS overrides) and the 90-day
+    # user-identity badge renewal cycle that review_user_case now applies
+    # on approval. schedule_verification_expiry_notifications and
+    # expire_overdue_verification_badges (apps/verification/services.py)
+    # already existed as real, generic, already-dedup-safe functions -
+    # and a management command already wrapped the first one - but
+    # neither was ever actually scheduled, the same "built but never
+    # scheduled" gap the media-upload sweeps above had before Beat was
+    # wired up for those. Daily matches the day-granularity reminder
+    # windows; expiry-status cleanup doesn't need to run more often than
+    # that since display correctness never depends on it (see
+    # apps.verification.tasks's module docstring).
+    "send-verification-renewal-reminders": {
+        "task": "apps.verification.tasks.send_verification_renewal_reminders",
+        "schedule": 24 * 60 * 60,
+    },
+    "expire-overdue-user-verification-badges": {
+        "task": "apps.verification.tasks.expire_overdue_user_verification_badges",
+        "schedule": 24 * 60 * 60,
+    },
 }
 
 # NEW: media-service URL for background removal microservice

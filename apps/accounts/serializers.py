@@ -480,6 +480,7 @@ class UserSerializer(serializers.ModelSerializer):
     profile = ProfileSerializer(read_only=True)
     verification_summary = serializers.SerializerMethodField()
     has_pin = serializers.SerializerMethodField()
+    badges = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -578,6 +579,29 @@ class UserSerializer(serializers.ModelSerializer):
         except ProfilePreferences.DoesNotExist:
             return False
 
+    def get_badges(self, obj: User) -> list:
+        return _public_badges_for_user(obj, self.context)
+
+
+def _public_badges_for_user(obj: User, context: dict) -> list:
+    """Shared by UserSerializer and PublicUserSerializer. Call sites that
+    serialize MANY users at once (a conversation's participants, a search
+    results page, etc.) must pre-populate
+    context["public_badges_by_subject_id"] with a single batched
+    apps.verification.services.public_badges_for_subjects(...) call before
+    serializing — see ConversationViewSet.get_serializer_context for the
+    reference implementation. Falls back to a per-object query only when
+    that context key is absent, which is correct (not an N+1) for
+    single-object serialization (retrieve/self-profile), but would be an
+    N+1 if a list view forgot to populate the batched context."""
+    from apps.verification.constants import VerificationSubjectType
+    from apps.verification.services import public_badges_for_subject
+
+    batched = context.get("public_badges_by_subject_id")
+    if batched is not None:
+        return batched.get(str(obj.id), [])
+    return public_badges_for_subject(VerificationSubjectType.USER, obj.id)
+
 
 class PublicUserSerializer(serializers.ModelSerializer):
     """
@@ -587,8 +611,15 @@ class PublicUserSerializer(serializers.ModelSerializer):
     exclude-based field list (everything except password/is_superuser/
     is_staff/user_permissions/groups) was never actually safe to hand back
     for a request about someone ELSE's account, only for the user's own.
+    `badges` is the one exception - public by definition (see
+    apps.verification.services.public_badges_for_subject's `public=True`
+    filter), safe to show for any user anywhere they're represented.
     """
     profile = ProfileSerializer(read_only=True)
+    badges = serializers.SerializerMethodField()
+
+    def get_badges(self, obj: User) -> list:
+        return _public_badges_for_user(obj, self.context)
 
     class Meta:
         model = User
@@ -597,6 +628,7 @@ class PublicUserSerializer(serializers.ModelSerializer):
             "display_name",
             "username",
             "tier",
+            "badges",
             "trust_score",
             "country",
             "profile",

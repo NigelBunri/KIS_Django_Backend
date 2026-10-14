@@ -32,11 +32,12 @@ from .services import (
 
 
 def _grant_verification_badge_feature(user) -> None:
-    # UserVerificationStartView correctly enforces require_feature(user,
-    # "verification_badge", ...) — a real, intentional Business-Pro-and-up
-    # paywall (see apps/accounts/tier_presets.py). These tests predate that
-    # gate and need a qualifying tier to exercise the verification flow
-    # itself rather than being blocked by the (correct) paywall.
+    # No-op as of 2026-10-14: UserVerificationStartView's
+    # require_feature("verification_badge") paywall was removed — identity
+    # verification is available to every tier now. Left in place (rather
+    # than deleting every call site) since setting a qualifying tier is
+    # harmless and these tests don't depend on the user's tier being
+    # exactly "Free" for anything else.
     from apps.accounts.tiers import ensure_default_account_tiers
 
     ensure_default_account_tiers()
@@ -59,6 +60,20 @@ class UserVerificationFlowTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(response.data["verified"])
         self.assertEqual(response.data["badges"], [])
+
+    def test_free_tier_user_can_start_a_verification_case(self):
+        # The "verification_badge" Business-Pro+ paywall was removed from
+        # UserVerificationStartView (2026-10-14) — identity verification
+        # must work for every tier, including the default "Free".
+        free_user = User.objects.create_user(phone="+237670020099", password="TestPass123!", country="CM")
+        self.assertEqual(free_user.tier, "Free")
+        self.client.force_authenticate(user=free_user)
+        response = self.client.post(
+            reverse("verification:user-start"),
+            {"evidence_metadata": {}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
     def test_user_can_start_case_with_private_evidence_metadata(self):
         self.client.force_authenticate(user=self.user)
@@ -121,6 +136,52 @@ class UserVerificationFlowTests(APITestCase):
             ).exists()
         )
         self.assertTrue(verification_summary(VerificationSubjectType.USER, self.user.id)["verified"])
+
+    def test_approved_user_badges_expire_in_90_days_and_renew_the_same_row_on_reapproval(self):
+        self.client.force_authenticate(user=self.user)
+        created = self.client.post(reverse("verification:user-start"), {"evidence_metadata": {}}, format="json")
+        case_id = created.data["case"]["id"]
+
+        self.client.force_authenticate(user=self.staff)
+        self.client.post(
+            reverse("verification:staff-user-review", kwargs={"case_id": case_id}),
+            {"action": "approve"},
+            format="json",
+        )
+
+        badge = VerificationBadge.objects.get(
+            subject__subject_type=VerificationSubjectType.USER,
+            subject__subject_id=self.user.id,
+            code=VerificationBadgeCode.VERIFIED_USER,
+        )
+        self.assertIsNotNone(badge.expires_at)
+        expected = timezone.now() + timezone.timedelta(days=90)
+        self.assertLess(abs((badge.expires_at - expected).total_seconds()), 60)
+
+        # Re-verification (a second case + approval for the SAME user)
+        # must renew this exact row, not create a duplicate - the unique
+        # (subject, code) constraint is what this test actually proves.
+        original_badge_id = badge.id
+        self.client.force_authenticate(user=self.user)
+        second_case = self.client.post(reverse("verification:user-start"), {"evidence_metadata": {}}, format="json")
+        second_case_id = second_case.data["case"]["id"]
+        self.client.force_authenticate(user=self.staff)
+        self.client.post(
+            reverse("verification:staff-user-review", kwargs={"case_id": second_case_id}),
+            {"action": "approve"},
+            format="json",
+        )
+        badge.refresh_from_db()
+        self.assertEqual(badge.id, original_badge_id)
+        self.assertGreater(badge.expires_at, expected - timezone.timedelta(minutes=1))
+        self.assertEqual(
+            VerificationBadge.objects.filter(
+                subject__subject_type=VerificationSubjectType.USER,
+                subject__subject_id=self.user.id,
+                code=VerificationBadgeCode.VERIFIED_USER,
+            ).count(),
+            1,
+        )
 
     def test_public_trust_summary_excludes_private_verification_payloads(self):
         subject = user_subject_for(self.user)

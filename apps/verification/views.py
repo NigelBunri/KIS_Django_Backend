@@ -7,8 +7,6 @@ from rest_framework.views import APIView
 
 from apps.accounts.jwt_auth import DeviceBoundJWTAuthentication
 
-from apps.accounts.feature_gate import require_feature
-
 from .constants import VerificationSubjectType
 from .models import VerificationAuditEvent, VerificationBadge, VerificationCase
 from .providers import provider_public_status, verify_webhook_signature
@@ -91,11 +89,10 @@ class UserVerificationStartView(APIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def post(self, request):
-        require_feature(
-            request.user,
-            "verification_badge",
-            "Verification badges are available on Business Pro plans and above. Upgrade to apply.",
-        )
+        # No tier gate — identity verification (and the resulting badge)
+        # is available to every user regardless of plan, per explicit
+        # product decision 2026-10-14. Previously required
+        # "verification_badge" (Business Pro+) via require_feature.
         serializer = UserVerificationStartSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         case = start_user_verification_case(

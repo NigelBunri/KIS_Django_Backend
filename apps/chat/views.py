@@ -318,6 +318,40 @@ class ConversationViewSet(viewsets.ModelViewSet):
             return DirectConversationCreateSerializer
         return ConversationDetailSerializer
 
+    def paginate_queryset(self, queryset):
+        # Stashed so get_serializer_context (called right after this, by
+        # GenericAPIView.get_serializer) can batch-fetch every participant's
+        # badges in ONE query instead of ConversationMemberSerializer's
+        # nested UserSerializer hitting apps.verification once per
+        # participant per conversation - the N+1 that public_badges_for_subjects
+        # exists specifically to avoid. memberships are already
+        # prefetch_related('memberships__user') on get_queryset, so
+        # iterating here costs nothing extra.
+        page = super().paginate_queryset(queryset)
+        self._badge_scope_conversations = page if page is not None else (
+            list(queryset) if self.action in ('list', 'search', 'participant_search') else None
+        )
+        return page
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        conversations = getattr(self, '_badge_scope_conversations', None)
+        if conversations:
+            from apps.verification.constants import VerificationSubjectType
+            from apps.verification.services import public_badges_for_subjects
+
+            user_ids = {
+                str(member.user_id)
+                for convo in conversations
+                for member in convo.memberships.all()
+                if member.left_at is None
+            }
+            if user_ids:
+                context['public_badges_by_subject_id'] = public_badges_for_subjects(
+                    VerificationSubjectType.USER, user_ids,
+                )
+        return context
+
     def perform_create(self, serializer):
         serializer.save()
 
@@ -348,8 +382,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
             ).distinct()
         # get_queryset() already applies the pinned/activity/id ordering
         # above; re-slicing here just caps the search result count.
-        qs = qs[:50]
-        data = ConversationListSerializer(qs, many=True, context={"request": request}).data
+        results = list(qs[:50])
+        self._badge_scope_conversations = results
+        data = ConversationListSerializer(results, many=True, context=self.get_serializer_context()).data
         return Response({"results": data, "count": len(data)}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["get"], url_path="participant-search")
@@ -373,9 +408,24 @@ class ConversationViewSet(viewsets.ModelViewSet):
             )
             .order_by("user__display_name", "user__phone")[:50]
         )
+        # Built as raw dicts, not UserSerializer/PublicUserSerializer -
+        # badges must be fetched and merged in explicitly here too, same
+        # one-query-for-everyone pattern as ConversationViewSet.search,
+        # since UserSerializer._public_badges_for_user's batched-context
+        # path never runs for a response that bypasses serializers
+        # entirely.
+        from apps.verification.constants import VerificationSubjectType
+        from apps.verification.services import public_badges_for_subjects
+
+        members = list(qs)
+        badges_by_user_id = public_badges_for_subjects(
+            VerificationSubjectType.USER,
+            {str(member.user_id) for member in members},
+        )
+
         results = []
         seen: set[tuple[str, str]] = set()
-        for member in qs:
+        for member in members:
             key = (str(member.conversation_id), str(member.user_id))
             if key in seen:
                 continue
@@ -389,6 +439,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                         "display_name": member.user.display_name or member.user.phone or f"User {member.user_id}",
                         "phone": member.user.phone,
                         "username": member.user.username,
+                        "badges": badges_by_user_id.get(str(member.user_id), []),
                     },
                     "membership_display_name": member.display_name,
                     "base_role": member.base_role,
