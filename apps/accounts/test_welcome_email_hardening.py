@@ -40,7 +40,7 @@ def _save_with_email(email):
     return _save
 
 
-@override_settings(SECURE_SSL_REDIRECT=False, KIS_PHONE_VERIFICATION_ENABLED=False)
+@override_settings(SECURE_SSL_REDIRECT=False)
 class WelcomeEmailFailureVisibilityTests(TestCase):
     def setUp(self):
         self.client = APIClient()

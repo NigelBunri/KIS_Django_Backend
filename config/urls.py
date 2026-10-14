@@ -273,7 +273,6 @@ urlpatterns = [
     # fully disconnected shadow-user model system with placeholder business
     # logic. The app remains installed (migrations/table access preserved
     # for any existing data) but is no longer part of the public API surface.
-    path("api/v1/", include("apps.otp.urls")),
     path("api/v1/kis-auth/", include("apps.kis_auth_bridge.urls")),
     # SCIM 2.0 provisioning - outside /api/v1/ deliberately, since IdPs
     # (Okta/Azure AD) expect the conventional /scim/v2/ base path when an

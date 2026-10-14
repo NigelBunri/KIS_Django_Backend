@@ -1053,9 +1053,9 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
         device_id = (request.data.get("device_id") or "").strip()
         device_platform = (request.data.get("device_platform") or "").strip()
         device_name = (request.data.get("device_name") or "").strip()
-        # Best-effort SIM cross-check (Android only, no OTP available while
-        # KIS_PHONE_VERIFICATION_ENABLED is off): logged for review, never
-        # blocks account creation since many Android devices can't expose it.
+        # Best-effort SIM cross-check (Android only, no OTP exists anymore):
+        # logged for review, never blocks account creation since many
+        # Android devices can't expose it.
         sim_phone_number = (request.data.get("sim_phone_number") or "").strip()
         if not device_id:
             return Response({"detail": "Device id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1109,61 +1109,42 @@ class RegisterView(mixins.CreateModelMixin, viewsets.GenericViewSet):
         except Exception as exc:
             logger.warning("Welcome notification failed for user_id=%s: %s", user.id, exc.__class__.__name__)
 
-        # Verification is suspended (KIS_PHONE_VERIFICATION_ENABLED=false): skip the
-        # OTP step entirely and activate + log the account in immediately.
-        if not settings.KIS_PHONE_VERIFICATION_ENABLED:
-            v = dict(user.verification or {})
-            v["phone"] = {
-                "verified": True,
-                "verified_at": timezone.now().isoformat(),
-                "verified_via": "sim_match" if sim_number_matched else "unverified_otp_suspended",
-            }
-            user.verification = v
-            user.status = "active"
-            user.is_active = True
-            user.save(update_fields=["verification", "status", "is_active", "updated_at"])
+        # Phone verification via OTP has been fully removed (KIS Google Auth
+        # migration, 2026-10) — every account activates and logs in
+        # immediately at registration. Real identity verification is now the
+        # optional-but-encouraged Google link (apps.kis_auth_bridge), which
+        # sets email_verified from a trusted assertion, not this phone flag.
+        v = dict(user.verification or {})
+        v["phone"] = {
+            "verified": True,
+            "verified_at": timezone.now().isoformat(),
+            "verified_via": "sim_match" if sim_number_matched else "unverified_otp_removed",
+        }
+        user.verification = v
+        user.status = "active"
+        user.is_active = True
+        user.save(update_fields=["verification", "status", "is_active", "updated_at"])
 
-            # Referral rewards are no longer granted at account activation -
-            # see apps.referrals.services.apply_referral_reward_if_pending's
-            # docstring. The Referral row created by register_referral()
-            # (elsewhere in this view) stays PENDING until a real qualifying
-            # subscription payment triggers qualify_referral().
+        # Referral rewards are no longer granted at account activation -
+        # see apps.referrals.services.apply_referral_reward_if_pending's
+        # docstring. The Referral row created by register_referral()
+        # (elsewhere in this view) stays PENDING until a real qualifying
+        # subscription payment triggers qualify_referral().
 
-            tokens = issue_tokens_for_user(user, device_id=device_id)
-            return Response(
-                {
-                    "success": True,
-                    "pending_verification": False,
-                    "phone_verified": True,
-                    "access": tokens["access"],
-                    "refresh": tokens["refresh"],
-                    "user": {
-                        "id": user.id,
-                        "phone": getattr(user, "phone", None),
-                        "status": user.status,
-                        "is_active": user.is_active,
-                        "phone_verified": True,
-                    },
-                },
-                status=status.HTTP_201_CREATED,
-            )
-
-        # Do NOT issue tokens yet - the account must be phone-verified first.
-        # Tokens are issued by OtpVerifyView after successful code verification.
-        phone_verified = bool(
-            (user.verification or {}).get("phone", {}).get("verified")
-        )
+        tokens = issue_tokens_for_user(user, device_id=device_id)
         return Response(
             {
                 "success": True,
-                "pending_verification": not phone_verified,
-                "phone_verified": phone_verified,
+                "pending_verification": False,
+                "phone_verified": True,
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
                 "user": {
                     "id": user.id,
                     "phone": getattr(user, "phone", None),
-                    "status": getattr(user, "status", "pending"),
+                    "status": user.status,
                     "is_active": user.is_active,
-                    "phone_verified": phone_verified,
+                    "phone_verified": True,
                 },
             },
             status=status.HTTP_201_CREATED,
@@ -1520,21 +1501,6 @@ class TwoFactorStatusView(APIView):
             "method": "totp" if (tf and tf.enabled) else None,
             "setup_complete": bool(tf and tf.enabled and (tf.meta or {}).get("verified")),
         }, status=status.HTTP_200_OK)
-
-
-@extend_schema(summary="Get OTP status for the authenticated user", tags=["Auth"])
-class OTPStatusView(APIView):
-    authentication_classes = (DeviceBoundJWTAuthentication,)
-    permission_classes = (IsAuthenticated,)
-
-    def get(self, request):
-        from apps.otp.models import PhoneOTP
-        phone = getattr(request.user, "phone", None)
-        has_pending = False
-        if phone:
-            recent = PhoneOTP.objects.filter(phone=phone).order_by("-created_at").first()
-            has_pending = bool(recent and recent.expires_at > timezone.now())
-        return Response({"has_pending": has_pending}, status=status.HTTP_200_OK)
 
 
 @extend_schema(
@@ -3801,9 +3767,12 @@ class ParentRecoveryInitView(APIView):
         # Always return the same message regardless of whether user exists -
         # and, importantly, regardless of whether they have a verified email.
         # Only a VERIFIED email is eligible to authorize replacing the
-        # primary device (see apps.otp purpose="email_verify"); an
-        # unverified email on file must never become authoritative here, so
-        # this silently no-ops for that user rather than sending anything.
+        # primary device. As of the KIS Google Auth migration, email_verified
+        # is set only from a trusted, validated Google identity assertion
+        # (apps.kis_auth_bridge) — email OTP no longer exists as a way to
+        # reach this state. An unverified email on file must never become
+        # authoritative here, so this silently no-ops for that user rather
+        # than sending anything.
         if user and getattr(user, "email_verified", False) and user.email:
             import secrets as _secrets
             recovery_code = _secrets.token_urlsafe(24)

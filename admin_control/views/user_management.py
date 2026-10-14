@@ -179,8 +179,7 @@ class AdminUserBlockView(APIView):
     Distinct from ban/suspend: also revokes every active device session
     immediately (ban/suspend historically didn't - block is the "kick them
     out right now" action) and sets is_active=False, which is what
-    LoginSerializer's password-login path actually checks (the status
-    string alone only blocks apps.otp's OTP-login path).
+    LoginSerializer's password-login path actually checks.
     """
     permission_classes = [IsAuthenticated, IsAdminControlUser]
     required_permission = "users.moderate"

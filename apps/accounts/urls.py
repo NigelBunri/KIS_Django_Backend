@@ -21,7 +21,6 @@ from .views import (
     TwoFactorEnableView,
     TwoFactorDisableView,
     TwoFactorStatusView,
-    OTPStatusView,
     E2EERegisterKeysView,
     E2EEFetchBundleView,
     E2EEFetchDeviceBundlesView,
@@ -107,7 +106,6 @@ urlpatterns = [
     path("auth/2fa/enable/", TwoFactorEnableView.as_view(), name="auth-2fa-enable"),
     path("auth/2fa/disable/", TwoFactorDisableView.as_view(), name="auth-2fa-disable"),
     path("auth/2fa/status/", TwoFactorStatusView.as_view(), name="auth-2fa-status"),
-    path("auth/otp/status/", OTPStatusView.as_view(), name="auth-otp-status"),
     # Android Restore Credentials (Zero-Tap Sign-In / device migration) —
     # registration happens on an already-authenticated device, authentication
     # happens with no session at all on a brand-new device.

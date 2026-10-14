@@ -48,9 +48,9 @@ class Notification(BaseEntity):
     # SMS removed (comms architecture migration, Sep 2026) - the generic
     # notification-broadcast SMS dispatch had zero call sites creating
     # channel="SMS" deliveries anywhere in the codebase, confirmed by a
-    # full-repo grep before removal. This is unrelated to the OTP-specific
-    # SMS path (apps.otp.views), which is a live, separate integration and
-    # stays in place until the staged cutover's replacement is verified.
+    # full-repo grep before removal. The OTP-specific SMS path (apps.otp,
+    # Infobip) has since been removed too (KIS Google Auth migration,
+    # 2026-10) — there is no SMS channel left anywhere in KIS.
     # CharField choices aren't DB-enforced, so no migration is needed and
     # no historical row is invalidated by this change.
     PRIORITY = [

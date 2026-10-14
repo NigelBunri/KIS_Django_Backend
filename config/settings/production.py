@@ -25,15 +25,6 @@ if _is_weak_secret(DJANGO_INTERNAL_TOKEN) or DJANGO_INTERNAL_TOKEN in {"dev-inte
 if os.environ.get("ALLOW_ALL_HOSTS", "").strip().lower() in ("1", "true", "yes", "on"):
     raise ImproperlyConfigured("ALLOW_ALL_HOSTS must not be enabled in production.")
 
-if os.environ.get("OTP_DEBUG_LOG_CODES", "").strip().lower() in ("1", "true", "yes", "on"):
-    raise ImproperlyConfigured("OTP_DEBUG_LOG_CODES must not be enabled in production.")
-
-if os.environ.get("OTP_OVERRIDE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
-    raise ImproperlyConfigured("OTP_OVERRIDE_ENABLED must not be enabled in production.")
-
-if os.environ.get("OTP_OVERRIDE_CODE", "").strip():
-    raise ImproperlyConfigured("OTP_OVERRIDE_CODE must not be set in production.")
-
 if os.environ.get("VERIFICATION_LIVE_PROVIDER_CALLS_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
     raise ImproperlyConfigured("Verification live provider calls must not be enabled in production.")
 

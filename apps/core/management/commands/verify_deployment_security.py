@@ -128,7 +128,6 @@ class Command(BaseCommand):
             f"INTERNAL_SIGNATURE_MAX_SKEW_SECONDS={skew}",
         )
 
-        check("OTP debug logging disabled", not _env_bool("OTP_DEBUG_LOG_CODES"), "OTP_DEBUG_LOG_CODES is not enabled")
         check(
             "HTTPS security flags",
             bool(settings.SECURE_SSL_REDIRECT and settings.SESSION_COOKIE_SECURE and settings.CSRF_COOKIE_SECURE),

@@ -212,7 +212,7 @@ class ApplyReferralRewardIfPendingTests(TestCase):
         self.assertEqual(result.status, Referral.STATUS_QUALIFIED)
 
 
-@override_settings(SECURE_SSL_REDIRECT=False, KIS_PHONE_VERIFICATION_ENABLED=False)
+@override_settings(SECURE_SSL_REDIRECT=False)
 class RegistrationIntegrationVerificationSuspendedTests(TestCase):
     """Matches the current production default: registration activates the
     account immediately, with no separate OTP step. Pre-deployment
@@ -273,70 +273,7 @@ class RegistrationIntegrationVerificationSuspendedTests(TestCase):
         )
 
 
-@override_settings(SECURE_SSL_REDIRECT=False, KIS_PHONE_VERIFICATION_ENABLED=True)
-class OtpVerifyIntegrationTests(TestCase):
-    """When verification is live, registration only creates a PENDING
-    referral. Pre-deployment hardening pass: OTP verification completing
-    must NOT grant the legacy reward either — the referral stays PENDING
-    until a real qualifying payment, regardless of which activation path
-    (immediate registration or OTP verify) the account took."""
-
-    def setUp(self):
-        self.client = APIClient()
-        self.referrer = _make_user("+237699100040")
-        self.code = ReferralCode.get_or_create_for_user(self.referrer)
-
-    def test_registration_creates_pending_referral_without_granting_reward_yet(self):
-        res = self.client.post("/api/v1/auth/register/", {
-            "phone_country_code": "+237", "phone_number": "699100041", "country": "CM",
-            "password": "TestPass12!", "password2": "TestPass12!",
-            "device_id": "otp-device-1", "device_platform": "android",
-            "referral_code": self.code.code,
-        }, format="json")
-        self.assertEqual(res.status_code, 201)
-        self.assertTrue(res.data["pending_verification"])
-        new_user = User.objects.get(phone_number="699100041")
-        self.assertEqual(
-            Referral.objects.get(referred_user=new_user).status, Referral.STATUS_PENDING,
-        )
-        self.assertEqual(_points_balance(self.referrer), 0)
-
-    @override_settings(OTP_OVERRIDE_ENABLED=True, OTP_OVERRIDE_CODE="676139")
-    def test_completing_otp_verification_grants_no_reward_and_referral_stays_pending(self):
-        self.client.post("/api/v1/auth/register/", {
-            "phone_country_code": "+237", "phone_number": "699100042", "country": "CM",
-            "password": "TestPass12!", "password2": "TestPass12!",
-            "device_id": "otp-device-2", "device_platform": "android",
-            "referral_code": self.code.code,
-        }, format="json")
-        res = self.client.post("/api/v1/auth/otp/verify/", {
-            "country": "CM", "phone": "+237699100042", "purpose": "register",
-            "code": "676139", "device_id": "otp-device-2",
-        }, format="json")
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(_points_balance(self.referrer), 0)
-        new_user = User.objects.get(phone_number="699100042")
-        self.assertEqual(
-            Referral.objects.get(referred_user=new_user).status, Referral.STATUS_PENDING,
-        )
-
-    @override_settings(OTP_OVERRIDE_ENABLED=True, OTP_OVERRIDE_CODE="676139")
-    def test_a_login_purpose_otp_verify_does_not_grant_or_double_grant(self):
-        self.client.post("/api/v1/auth/register/", {
-            "phone_country_code": "+237", "phone_number": "699100043", "country": "CM",
-            "password": "TestPass12!", "password2": "TestPass12!",
-            "device_id": "otp-device-3", "device_platform": "android",
-            "referral_code": self.code.code,
-        }, format="json")
-        res = self.client.post("/api/v1/auth/otp/verify/", {
-            "country": "CM", "phone": "+237699100043", "purpose": "login",
-            "code": "676139", "device_id": "otp-device-3",
-        }, format="json")
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(_points_balance(self.referrer), 0)
-
-
-@override_settings(SECURE_SSL_REDIRECT=False, KIS_PHONE_VERIFICATION_ENABLED=False)
+@override_settings(SECURE_SSL_REDIRECT=False)
 class SingleAuthoritativeReferralEngineEndToEndTests(TestCase):
     """Pre-deployment hardening pass, CRITICAL requirement: there must be
     exactly ONE authoritative referral reward engine, end to end through

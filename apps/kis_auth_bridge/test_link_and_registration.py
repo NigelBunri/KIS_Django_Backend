@@ -117,6 +117,27 @@ class KisAuthLinkTests(TestCase):
             actor_id=self.user.id, action="account.google_identity_linked"
         ).first()
         self.assertIsNotNone(entry)
+        self.user.refresh_from_db()
+        google = self.user.verification.get("google")
+        self.assertIsNotNone(google)
+        self.assertTrue(google["linked"])
+        self.assertEqual(google["email"], "person@example.com")
+        self.assertTrue(google["email_verified"])
+
+    def test_link_does_not_touch_contact_email(self):
+        # Linking an existing account must never silently change its
+        # contact email/email_verified - only registration and the
+        # dedicated email-change flow may do that.
+        self.user.email = "original@example.com"
+        self.user.email_verified = False
+        self.user.save(update_fields=["email", "email_verified"])
+        self.client_api.force_authenticate(self.user)
+        verified = _verified_link(kis_user_id=str(self.user.id))
+        with patch("apps.kis_auth_bridge.views.redeem_authorization_code", return_value=verified):
+            self.client_api.post(LINK_COMPLETE_URL, {"code": "x", "redirect_uri": "y"}, format="json")
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.email, "original@example.com")
+        self.assertFalse(self.user.email_verified)
 
 
 @override_settings(
@@ -215,6 +236,10 @@ class KisAuthRegistrationTests(TestCase):
         self.assertFalse(user.has_usable_password())
         self.assertEqual(user.email, verified.provider_email)
         self.assertTrue(user.email_verified)
+        google = user.verification.get("google")
+        self.assertIsNotNone(google)
+        self.assertTrue(google["linked"])
+        self.assertEqual(google["email"], verified.provider_email)
 
         mock_link.assert_called_once_with(
             kis_user_id=str(user.id),

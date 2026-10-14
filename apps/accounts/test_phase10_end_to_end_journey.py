@@ -51,7 +51,7 @@ def _auth_client(user: User, device_id: str) -> APIClient:
     return client
 
 
-@override_settings(SECURE_SSL_REDIRECT=False, KIS_PHONE_VERIFICATION_ENABLED=False)
+@override_settings(SECURE_SSL_REDIRECT=False)
 class FullUserJourneyAcrossPhasesTests(TestCase):
     def setUp(self):
         self.referrer = User.objects.create_user(phone="+237699900001", password="TestPass12!", country="CM")

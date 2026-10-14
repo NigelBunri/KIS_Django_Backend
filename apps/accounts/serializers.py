@@ -492,6 +492,15 @@ class UserSerializer(serializers.ModelSerializer):
             "last_login_at",
             "last_password_change_at",
             "email_verified",
+            # Holds trust-sensitive state this serializer must never let a
+            # client set directly - most importantly apps.kis_auth_bridge's
+            # google.{linked,email,email_verified} block (see
+            # KisAuthLinkCompleteView/KisAuthRegistrationCompleteView),
+            # which the client must never be able to forge via a raw PATCH
+            # (that would let a caller claim a Google link without ever
+            # redeeming a real identity assertion). Legitimate writers set
+            # the model field directly, bypassing this serializer.
+            "verification",
             # tier/status/is_active must never be settable via a raw PATCH to
             # this generic serializer — tier changes belong exclusively to
             # apps.billing's apply_tier_upgrade flow (Phase 3), and status/
@@ -1335,25 +1344,11 @@ class LoginSerializer(serializers.Serializer):
                 "error_code": "account_disabled",
             })
 
-        # Block login if phone has never been verified (account bypassed verification).
-        # Gated by KIS_PHONE_VERIFICATION_ENABLED — suspended deployments skip this entirely.
-        phone_verified = bool(
-            (getattr(user, "verification", None) or {}).get("phone", {}).get("verified")
-        )
-        if settings.KIS_PHONE_VERIFICATION_ENABLED and not phone_verified:
-            user_phone = (
-                str(getattr(user, "phone", "") or "")
-                or _compose_phone(
-                    getattr(user, "phone_country_code", ""),
-                    getattr(user, "phone_number", ""),
-                )
-                or phone_raw
-            )
-            raise serializers.ValidationError({
-                "detail": _("Please verify your phone number before logging in."),
-                "error_code": "phone_not_verified",
-                "phone": user_phone,
-            })
+        # Phone-verification-at-login gating (KIS_PHONE_VERIFICATION_ENABLED)
+        # was removed along with email/SMS OTP (KIS Google Auth migration,
+        # 2026-10) — phone/password login no longer requires a verified
+        # phone, matching the permanent "suspended" behavior this flag used
+        # to default to.
 
         if not phone_e164:
             try:

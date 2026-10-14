@@ -2,8 +2,8 @@
 Email delivery service for KIS notifications.
 
 This module is the single, unified entry point for every outbound email in
-the app — OTP codes, receipts, welcome/digest/invite mail, generic
-notification-channel email, all of it goes through send_notification_email()
+the app — device-recovery codes, receipts, welcome/digest/invite mail,
+generic notification-channel email, all of it goes through send_notification_email()
 below. Production sends via Resend's HTTP API (config/settings/production.py
 sets EMAIL_BACKEND to apps.notifications.resend_backend.ResendEmailBackend);
 this is the one seam to repoint if email delivery moves out to its own
@@ -23,56 +23,6 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
     "default": (
         "{title}",
         "<p>{body}</p>",
-    ),
-    # One shared "code" visual per purpose, distinct copy per purpose — the
-    # audit's core finding was a single generic OTP email used for every
-    # purpose (same wording for a login code and a password-reset code).
-    # "otp" itself stays as a generic fallback for any purpose without its
-    # own entry below, rather than crashing/looking broken.
-    "otp": (
-        "Your KIS verification code: {code}",
-        "<h2>Your verification code is <strong>{code}</strong></h2>"
-        "<p>It expires in {ttl_minutes} minutes. Do not share this code.</p>",
-    ),
-    "otp_register": (
-        "Your KIS verification code: {code}",
-        "<h2>Welcome to KIS</h2>"
-        "<p>Use the code below to finish creating your account.</p>"
-        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
-        "<p>It expires in {ttl_minutes} minutes. If you didn't request this, "
-        "you can safely ignore this email.</p>",
-    ),
-    "otp_login": (
-        "Your KIS sign-in code: {code}",
-        "<h2>Sign in to KIS</h2>"
-        "<p>Use the code below to sign in.</p>"
-        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
-        "<p>It expires in {ttl_minutes} minutes. If this wasn't you, your "
-        "account is still safe — just ignore this email.</p>",
-    ),
-    "otp_web_login": (
-        "Your KIS web sign-in code: {code}",
-        "<h2>Sign in to KIS on the web</h2>"
-        "<p>Use the code below to sign in to KIS from your browser.</p>"
-        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
-        "<p>It expires in {ttl_minutes} minutes. If you didn't request this, "
-        "you can safely ignore this email.</p>",
-    ),
-    "otp_email_verify": (
-        "Verify your email for KIS: {code}",
-        "<h2>Verify your email</h2>"
-        "<p>Use the code below to confirm this email address belongs to you.</p>"
-        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
-        "<p>It expires in {ttl_minutes} minutes.</p>",
-    ),
-    "otp_reset": (
-        "Reset your KIS password",
-        "<h2>Password Reset</h2>"
-        "<p>Use the code below to reset your password.</p>"
-        "<h2 style=\"letter-spacing:4px;\">{code}</h2>"
-        "<p>It expires in {ttl_minutes} minutes. If you didn't request this, "
-        "someone may have mistyped your phone number — your password stays "
-        "unchanged unless this code is used.</p>",
     ),
     "payment_receipt": (
         "Payment confirmed — {amount} {currency}",
@@ -145,10 +95,6 @@ def _from_email() -> str:
 # site that isn't on this list fails safe (logged, no send) rather than
 # silently reintroducing an email KIS decided not to send anymore.
 #
-#   DEVICE_AUTH_FALLBACK      — email OTP is the fallback once KIS Auth/SMS
-#                                can't complete register/login/reset; still
-#                                needed for accounts with no phone/no Google
-#                                link.
 #   DEVICE_RECOVERY_FALLBACK  — legacy ParentRecoveryInitView path; KIS Auth
 #                                recovery is now primary, this remains the
 #                                fallback for accounts that never linked
@@ -169,7 +115,6 @@ def _from_email() -> str:
 #                                blanket send.
 EMAIL_PURPOSE_ALLOWLIST: frozenset[str] = frozenset({
     "default",
-    "otp", "otp_register", "otp_login", "otp_web_login", "otp_email_verify", "otp_reset",
     "device_recovery",
     "gift_membership",
     "livestream_guest_invite",
@@ -222,30 +167,6 @@ def send_notification_email(
     except Exception as exc:
         logger.warning("Email send failed to %s: %s", to_email[:8] + "...", exc)
         return False
-
-
-# Maps an OTP purpose (apps.otp.views.ALLOWED_PURPOSES) to its own branded
-# copy above. Deliberately not "reset" -> "otp_reset" implied by naming
-# alone — kept explicit so an unrecognized/future purpose falls back to the
-# generic "otp" template via .get() below instead of a KeyError.
-_OTP_PURPOSE_TEMPLATE_KEYS: dict[str, str] = {
-    "register": "otp_register",
-    "login": "otp_login",
-    "web_login": "otp_web_login",
-    "email_verify": "otp_email_verify",
-    "reset": "otp_reset",
-}
-
-
-def send_otp_email(to_email: str, code: str, ttl_minutes: int = 5, purpose: str = "login") -> bool:
-    template_key = _OTP_PURPOSE_TEMPLATE_KEYS.get(purpose, "otp")
-    return send_notification_email(
-        to_email=to_email,
-        title=f"Your KIS verification code: {code}",
-        body=f"Your code is {code}. Expires in {ttl_minutes} minutes.",
-        template_key=template_key,
-        context={"code": code, "ttl_minutes": ttl_minutes},
-    )
 
 
 def send_payment_receipt_email(to_email: str, amount: str, currency: str, tx_ref: str) -> bool:

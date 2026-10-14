@@ -30,11 +30,8 @@ def _run_production_import(overrides: dict[str, str]) -> subprocess.CompletedPro
         "REDIS_URL": "redis://localhost:6379/0",
         "OBJECT_STORAGE_PROVIDER": "s3",
         "ALLOW_ALL_HOSTS": "",
-        "OTP_DEBUG_LOG_CODES": "",
         "VERIFICATION_LIVE_PROVIDER_CALLS_ENABLED": "",
         "VERIFICATION_PROVIDER_SANDBOX_NETWORK_ENABLED": "",
-        "OTP_OVERRIDE_ENABLED": "",
-        "OTP_OVERRIDE_CODE": "",
         "INTERNAL_SIGNATURE_REQUIRED": "",
         "NEST_INTERNAL_TOKEN": "",
     }

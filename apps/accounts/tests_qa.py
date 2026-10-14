@@ -57,9 +57,9 @@ class AuthSessionTests(TestCase):
     def setUp(self):
         self.client = APIClient()
 
-    @override_settings(KIS_PHONE_VERIFICATION_ENABLED=True)
-    def test_register_creates_unverified_user(self):
-        """Registration succeeds and marks phone as pending verification."""
+    def test_register_activates_account_immediately(self):
+        """Registration succeeds and activates the account immediately — OTP
+        phone verification was fully removed (KIS Google Auth migration)."""
         res = self.client.post("/api/v1/auth/register/", {
             "phone": "+237670000101",
             "phone_country_code": "+237",
@@ -72,26 +72,9 @@ class AuthSessionTests(TestCase):
         }, format="json")
         self.assertEqual(res.status_code, 201)
         self.assertTrue(res.data["success"])
-        self.assertTrue(res.data["pending_verification"])
+        self.assertFalse(res.data["pending_verification"])
         user = User.objects.get(phone="+237670000101")
-        self.assertFalse(user.verification.get("phone", {}).get("verified"))
-
-    @override_settings(KIS_PHONE_VERIFICATION_ENABLED=True)
-    def test_login_blocked_for_unverified_phone(self):
-        """Unverified user cannot log in — gets phone_not_verified error."""
-        User.objects.create_user(phone="+237670000102", password="TestPass12!", country="CM")
-        res = self.client.post("/api/v1/auth/login/", {
-            "phone": "+237670000102",
-            "password": "TestPass12!",
-            "device_id": DEVICE_ID,
-        }, format="json")
-        self.assertEqual(res.status_code, 400)
-        data = res.json()
-        # LoginView flattens DRF list-wrapped errors to plain strings
-        error_code = data.get("error_code")
-        if isinstance(error_code, list):
-            error_code = error_code[0]
-        self.assertEqual(error_code, "phone_not_verified")
+        self.assertTrue(user.verification.get("phone", {}).get("verified"))
 
     def test_login_succeeds_for_verified_user(self):
         """Verified user receives access + refresh tokens on login."""
@@ -584,13 +567,6 @@ class CoreAPIHealthTests(TestCase):
         res = self.anon.get("/api/v1/tiers/")
         self.assertIn(res.status_code, [200, 404])
 
-    def test_otp_channels_public(self):
-        """OTP channels endpoint is public."""
-        res = self.anon.get("/api/v1/auth/otp/channels/")
-        self.assertEqual(res.status_code, 200)
-        self.assertIn("whatsapp", res.data)
-        self.assertIn("sms", res.data)
-
     def test_profile_languages_sync(self):
         """Profile language sync accepts a list."""
         res = self.client.post("/api/v1/profile-languages/sync/", {
@@ -692,112 +668,4 @@ class OfflineResilienceTests(TestCase):
         self.assertEqual(res.status_code, 400)
         self.assertEqual(res["Content-Type"].split(";")[0], "application/json")
 
-    def test_otp_initiate_no_phone_returns_json(self):
-        """OTP initiate with no phone returns a JSON response, not 500."""
-        res = self.client.post("/api/v1/auth/otp/initiate/", {
-            "channel": "whatsapp",
-            "purpose": "register",
-        }, format="json")
-        self.assertIn(res.status_code, [400, 429])
-        self.assertEqual(res["Content-Type"].split(";")[0], "application/json")
 
-    def test_verify_with_expired_otp_returns_json(self):
-        """OTP verify with wrong code returns JSON 400."""
-        make_verified_user("+237670011001")
-        res = self.client.post("/api/v1/auth/otp/verify/", {
-            "phone": "+237670011001",
-            "purpose": "register",
-            "code": "000000",
-            "device_id": DEVICE_ID,
-        }, format="json")
-        self.assertIn(res.status_code, [400, 404])
-        self.assertEqual(res["Content-Type"].split(";")[0], "application/json")
-
-
-# ---------------------------------------------------------------------------
-# OTP Verification Flow — maps to KIS-QA-081 sub-tests
-# ---------------------------------------------------------------------------
-class OTPVerificationFlowTests(TestCase):
-    """Full OTP initiate → verify flow using the override code."""
-
-    def setUp(self):
-        self.client = APIClient()
-
-    @override_settings(OTP_OVERRIDE_ENABLED=True, OTP_OVERRIDE_CODE="676139")
-    def test_override_code_verifies_without_real_otp_delivery(self):
-        """Override code 676139 passes verification even without SMS delivery."""
-        from apps.otp.models import PhoneOTP
-        from apps.otp.views import make_code_hash
-        user = make_verified_user("+237670012001")
-        # Simulate OTP initiation (creates OTP record)
-        code = "123456"
-        code_hash = make_code_hash("+237670012001", "register", code)
-        PhoneOTP.objects.create(
-            phone="+237670012001", purpose="register",
-            code_hash=code_hash,
-            expires_at=timezone.now() + timezone.timedelta(minutes=5),
-            attempts=0,
-        )
-        # Verify with override code — should succeed
-        user.verification = {}
-        user.save(update_fields=["verification"])
-        res = self.client.post("/api/v1/auth/otp/verify/", {
-            "phone": "+237670012001",
-            "purpose": "register",
-            "code": "676139",
-            "device_id": DEVICE_ID,
-            "device_platform": "android",
-            "country": "CM",
-        }, format="json")
-        self.assertEqual(res.status_code, 200)
-        self.assertTrue(res.data["success"])
-        self.assertIn("access", res.data)
-
-    @override_settings(OTP_OVERRIDE_ENABLED=True, OTP_OVERRIDE_CODE="676139")
-    def test_override_code_works_without_any_prior_otp_record(self):
-        """Override code works even if no OTP was ever initiated."""
-        make_verified_user("+237670012002")
-        User.objects.filter(phone="+237670012002").update(
-            verification={}, is_active=True
-        )
-        res = self.client.post("/api/v1/auth/otp/verify/", {
-            "phone": "+237670012002",
-            "purpose": "register",
-            "code": "676139",
-            "device_id": DEVICE_ID,
-            "device_platform": "android",
-            "country": "CM",
-        }, format="json")
-        self.assertIn(res.status_code, [200, 404])
-
-    def test_wrong_otp_increments_attempts(self):
-        """Wrong OTP code increments the attempt counter."""
-        from apps.otp.models import PhoneOTP
-        from apps.otp.views import make_code_hash
-        make_verified_user("+237670012003")
-        code_hash = make_code_hash("+237670012003", "register", "111111")
-        otp = PhoneOTP.objects.create(
-            phone="+237670012003", purpose="register",
-            code_hash=code_hash,
-            expires_at=timezone.now() + timezone.timedelta(minutes=5),
-            attempts=0,
-        )
-        self.client.post("/api/v1/auth/otp/verify/", {
-            "phone": "+237670012003",
-            "purpose": "register",
-            "code": "999999",
-            "device_id": DEVICE_ID,
-            "country": "CM",
-        }, format="json")
-        otp.refresh_from_db()
-        self.assertEqual(otp.attempts, 1)
-
-    def test_password_reset_flow(self):
-        """Password reset initiation returns success."""
-        make_verified_user("+237670012004")
-        res = self.client.post("/api/v1/auth/password/forgot/", {
-            "phone": "+237670012004",
-            "channel": "whatsapp",
-            "country": "CM",
-        }, format="json")
-        self.assertIn(res.status_code, [200, 429])

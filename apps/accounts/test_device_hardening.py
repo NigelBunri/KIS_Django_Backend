@@ -6,11 +6,10 @@ Regression tests for the device/auth production-hardening pass:
     device_id whitespace
   - DeviceQRToken.consume() cannot be double-consumed by a concurrent request
   - Password change revokes every OTHER device, leaves the current one alone
-  - Password reset revokes EVERY device (including the one used to reset)
   - Parent-device recovery revokes the old parent through the same
     token_version-bump + E2EE-wipe path as every other revocation, and is
-    gated on a verified email
-  - The new email_verify OTP purpose sets User.email_verified
+    gated on a verified email (now set only via a trusted Google identity
+    assertion — see apps.kis_auth_bridge)
 
 Run:
   python3 manage.py test apps.accounts.test_device_hardening --keepdb -v 2
@@ -22,9 +21,6 @@ from django.db import IntegrityError, connection, transaction
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
-
-from apps.otp.models import PhoneOTP
-from apps.otp.views import make_code_hash
 
 from .models import Device, DeviceQRToken, E2EDeviceKey
 from .tests_qa_full import make_verified_user, auth_client
@@ -182,43 +178,6 @@ class PasswordChangeDeviceInvalidationTests(TestCase):
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)
-class PasswordResetDeviceInvalidationTests(TestCase):
-    def setUp(self):
-        self.user = make_verified_user("+237700000105")
-        self.dev_a = Device.objects.create(
-            user=self.user, device_id="dev-a", platform="ios",
-            is_parent=True, token_version=1, last_seen_at=timezone.now(),
-        )
-        self.dev_b = Device.objects.create(
-            user=self.user, device_id="dev-b", platform="android",
-            is_parent=False, token_version=1, last_seen_at=timezone.now(),
-        )
-
-    def _seed_reset_otp(self, code="123456"):
-        PhoneOTP.objects.create(
-            phone=self.user.phone,
-            purpose="reset",
-            code_hash=make_code_hash(self.user.phone, "reset", code),
-            expires_at=timezone.now() + timezone.timedelta(minutes=5),
-        )
-
-    def test_reset_revokes_every_device_including_the_resetting_one(self):
-        self._seed_reset_otp()
-        client = APIClient()
-        res = client.post("/api/v1/auth/password/reset/", {
-            "phone": self.user.phone,
-            "code": "123456",
-            "new_password": "AnotherNewPass12!",
-        }, format="json")
-        self.assertEqual(res.status_code, 200, res.data)
-
-        dev_a = Device.objects.get(user=self.user, device_id="dev-a")
-        dev_b = Device.objects.get(user=self.user, device_id="dev-b")
-        self.assertIsNotNone(dev_a.revoked_at)
-        self.assertIsNotNone(dev_b.revoked_at)
-
-
-@override_settings(SECURE_SSL_REDIRECT=False)
 class ParentRecoveryConfirmTests(TestCase):
     def setUp(self):
         self.user = make_verified_user("+237700000106")
@@ -295,38 +254,3 @@ class ParentRecoveryConfirmTests(TestCase):
             self.assertFalse(mock_send.called)
 
 
-@override_settings(SECURE_SSL_REDIRECT=False)
-class EmailVerifyOtpPurposeTests(TestCase):
-    def setUp(self):
-        self.user = make_verified_user("+237700000107")
-        self.user.email = "verify-me@example.com"
-        self.user.save(update_fields=["email"])
-        self.assertFalse(self.user.email_verified)
-
-    def test_correct_code_marks_email_verified(self):
-        PhoneOTP.objects.create(
-            phone=self.user.phone,
-            purpose="email_verify",
-            code_hash=make_code_hash(self.user.phone, "email_verify", "654321"),
-            expires_at=timezone.now() + timezone.timedelta(minutes=5),
-        )
-        client = APIClient()
-        res = client.post("/api/v1/auth/otp/verify/", {
-            "phone": self.user.phone,
-            "purpose": "email_verify",
-            "code": "654321",
-            "country": "CM",
-        }, format="json")
-        self.assertEqual(res.status_code, 200, res.data)
-        self.user.refresh_from_db()
-        self.assertTrue(self.user.email_verified)
-
-    def test_initiate_rejects_non_email_channel_for_this_purpose(self):
-        client = APIClient()
-        res = client.post("/api/v1/auth/otp/initiate/", {
-            "phone": self.user.phone,
-            "purpose": "email_verify",
-            "channel": "sms",
-            "country": "CM",
-        }, format="json")
-        self.assertEqual(res.status_code, 400)

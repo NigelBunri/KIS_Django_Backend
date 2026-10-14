@@ -143,34 +143,27 @@ SECURE_HSTS_PRELOAD = _env_bool("SECURE_HSTS_PRELOAD", not DEBUG)
 if _env_bool("USE_X_FORWARDED_PROTO", False):
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
-# Phone verification (OTP) gate. Suspended by default - accounts register and
-# log in without an SMS code. Set KIS_PHONE_VERIFICATION_ENABLED=true to restore
-# the requirement.
-KIS_PHONE_VERIFICATION_ENABLED = _env_bool("KIS_PHONE_VERIFICATION_ENABLED", False)
+# Email/SMS OTP authentication has been fully removed (KIS Google Auth
+# migration, 2026-10). Accounts register, log in, and recover access via
+# phone+password (unchanged) and the optional-but-encouraged KIS Auth
+# Google link/recovery flow (apps.kis_auth_bridge). There is no OTP gate
+# left to flip.
 
-# KIS Auth (Google-backed identity/recovery) rollout gates. All default
-# False — the kis_auth_bridge endpoints exist once deployed regardless
-# (gated only by whether KISAUTH_INTERNAL_HMAC_SECRET is configured, which
-# fails closed), but these give an explicit, reversible staged-rollout
-# switch independent of that, matching the mobile app's own
-# KIS_AUTH_RECOVERY_ENABLED flag naming.
-KIS_AUTH_ENABLED = _env_bool("KIS_AUTH_ENABLED", False)
-KIS_AUTH_REGISTRATION_ENABLED = _env_bool("KIS_AUTH_REGISTRATION_ENABLED", False)
-KIS_AUTH_RECOVERY_ENABLED = _env_bool("KIS_AUTH_RECOVERY_ENABLED", False)
+# KIS Auth (Google-backed identity/recovery) rollout gates. Enabled by
+# default now that KIS is moving to production — the kis_auth_bridge
+# endpoints fail closed on their own if KISAUTH_INTERNAL_HMAC_SECRET isn't
+# configured, so this is a staged-rollout switch, not the only safety net.
+# Still overridable per-environment via env var.
+KIS_AUTH_ENABLED = _env_bool("KIS_AUTH_ENABLED", True)
+KIS_AUTH_REGISTRATION_ENABLED = _env_bool("KIS_AUTH_REGISTRATION_ENABLED", True)
+KIS_AUTH_RECOVERY_ENABLED = _env_bool("KIS_AUTH_RECOVERY_ENABLED", True)
 # Gates "Link Google Account" (Settings) specifically — separate from
 # RECOVERY because linking is a prerequisite capability recovery depends
 # on, not the same user journey; you may want accounts linking ahead of
-# turning recovery on for anyone.
-KIS_AUTH_LINK_ENABLED = _env_bool("KIS_AUTH_LINK_ENABLED", False)
-
-# SMS/WhatsApp OTP + notification channels — disabled by default while email
-# (via Resend) is the only active delivery channel. Both channels' code
-# (apps/otp/views.py, apps/notifications/tasks.py) still exists behind
-# Infobip, but sms_configured()/whatsapp_configured() require these flags to
-# be true in addition to Infobip credentials, so Infobip is never actually
-# called until someone deliberately re-enables one of these.
-SMS_CHANNEL_ENABLED = _env_bool("SMS_CHANNEL_ENABLED", False)
-WHATSAPP_CHANNEL_ENABLED = _env_bool("WHATSAPP_CHANNEL_ENABLED", False)
+# turning recovery on for anyone. Linking itself stays optional for the
+# end user regardless of this flag — this only controls whether the
+# server-side endpoints are reachable at all.
+KIS_AUTH_LINK_ENABLED = _env_bool("KIS_AUTH_LINK_ENABLED", True)
 
 # Email provider - Resend (HTTP API), the single unified email system for
 # every outbound email. See config/settings/production.py for how this
@@ -332,27 +325,6 @@ FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON", "")
 # Legacy FCM server-key fallback kept for older deployments while Firebase Admin is rolled out.
 FCM_SERVER_KEY = os.environ.get("FCM_SERVER_KEY", os.environ.get("FIREBASE_SERVER_KEY", ""))
 FIREBASE_SERVER_KEY = os.environ.get("FIREBASE_SERVER_KEY", "")
-
-# Debug-only OTP code logging. Keep false unless explicitly debugging locally.
-OTP_DEBUG_LOG_CODES = _env_bool("OTP_DEBUG_LOG_CODES", False)
-
-# Infobip - SMS and WhatsApp OTP delivery
-INFOBIP_API_KEY = os.environ.get("INFOBIP_API_KEY", "").strip()
-INFOBIP_BASE = os.environ.get("INFOBIP_BASE", "").strip().rstrip("/")
-INFOBIP_SMS_SENDER = os.environ.get("INFOBIP_SMS_SENDER", "").strip()
-
-# WhatsApp Business sender number (digits only, no leading +), e.g. 237676000000
-WHATSAPP_SENDER_NUMBER = os.environ.get("WHATSAPP_SENDER_NUMBER", "").strip()
-# Optional: Meta-approved template name for first-contact OTP delivery
-WHATSAPP_TEMPLATE_NAME = os.environ.get("WHATSAPP_TEMPLATE_NAME", "").strip()
-WHATSAPP_TEMPLATE_LANGUAGE = os.environ.get("WHATSAPP_TEMPLATE_LANGUAGE", "en").strip() or "en"
-
-# Override OTP code that always passes verification - development/QA only.
-# No default value: an override is only active when BOTH OTP_OVERRIDE_ENABLED
-# is explicitly true AND OTP_OVERRIDE_CODE is set. production.py refuses to
-# start if either is configured. Never commit a real value for either.
-OTP_OVERRIDE_ENABLED = _env_bool("OTP_OVERRIDE_ENABLED", False)
-OTP_OVERRIDE_CODE = os.environ.get("OTP_OVERRIDE_CODE", "").strip()
 
 # Verification / KYC / KYB providers.
 # Phase 1 only reads configuration. Live provider calls are introduced in later phases.
@@ -635,7 +607,6 @@ REST_FRAMEWORK = {
         "admin_sustained": _env_throttle_rate("THROTTLE_ADMIN_SUSTAINED", dev_default="6000/day", prod_default="5000/day"),
         "login": _env_throttle_rate("THROTTLE_LOGIN", dev_default="6000/min", prod_default="30/min"),
         "register": _env_throttle_rate("THROTTLE_REGISTER", dev_default="6000/min", prod_default="20/min"),
-        "otp": _env_throttle_rate("THROTTLE_OTP", dev_default="6000/min", prod_default="20/min"),
         # UserViewSet.check-status is AllowAny/unauthenticated (a device
         # needs it before it has a session) and takes a raw phone number,
         # returning whether it's registered plus account status/verification
@@ -994,15 +965,6 @@ CELERY_BEAT_SCHEDULE = {
     "purge-expired-statuses": {
         "task": "apps.statuses.tasks.purge_expired_statuses_task",
         "schedule": 60 * 60,
-    },
-    # PhoneOTP rows (phone number + attempt count, tied to a hashed but
-    # still purpose-identifying OTP code) had no cleanup of any kind -
-    # every registration/login/reset/email-verify code ever issued stayed
-    # in the table forever, well past the point it serves any purpose
-    # (the code itself is already unusable once expires_at passes).
-    "purge-expired-otp-codes": {
-        "task": "apps.otp.tasks.purge_expired_otp_codes_task",
-        "schedule": 24 * 60 * 60,
     },
     # 14-day testimony expiration (unpublish, not delete) - see
     # apps.testimony.tasks.expire_stale_testimonies's docstring.

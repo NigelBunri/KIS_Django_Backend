@@ -6,9 +6,12 @@ re-checks the user exists and is active, checks the JWT's purpose claim
 against the specific operation being performed, and only then executes
 the SAME device-promotion + token-issuance transaction that
 apps.accounts.views.ParentRecoveryConfirmView already uses for the
-legacy (email/phone OTP) recovery path — reused via import, not
-reimplemented, so both paths stay behaviorally identical except for how
-the caller proved they're allowed to recover this account.
+legacy email-link recovery path (apps.accounts.views.ParentRecoveryInitView
+— the documented fallback for accounts that never linked Google; email/SMS
+OTP itself was removed in the KIS Google Auth migration, 2026-10) —
+reused via import, not reimplemented, so both paths stay behaviorally
+identical except for how the caller proved they're allowed to recover
+this account.
 """
 from __future__ import annotations
 
@@ -67,6 +70,24 @@ _ALLOWED_EVENT_TYPES = {
     "registration.exchange_succeeded",
     "registration.exchange_failed",
 }
+
+
+def _google_link_metadata(user: User, *, provider_email: str | None, provider_email_verified: bool) -> dict:
+    """Build the `verification["google"]` block recorded on successful link
+    or registration. Only ever called from inside this module, after a KIS
+    Auth JWT has already been signature/issuer/audience/expiry verified and
+    purpose-checked - never from client-supplied data directly. Read-only to
+    clients: `UserSerializer.Meta.read_only_fields` excludes `verification`
+    from any PATCH, so this is the only way this block is ever set.
+    """
+    verification = dict(user.verification or {})
+    verification["google"] = {
+        "linked": True,
+        "email": provider_email,
+        "email_verified": bool(provider_email_verified),
+        "linked_at": timezone.now().isoformat(),
+    }
+    return verification
 
 
 class KisAuthRecoveryCompleteView(APIView):
@@ -268,6 +289,19 @@ class KisAuthLinkCompleteView(APIView):
             logger.warning("kis_auth_bridge.link_complete.user_mismatch")
             return Response({"detail": GENERIC_ERROR}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Deliberately does NOT touch user.email/email_verified here - this
+        # is linking an existing account's Google identity, not changing its
+        # contact email (see spec: avoid auto-changing primary contact email
+        # without an explicit policy). The google-connected status is its own
+        # field so account settings can show it independently of the
+        # contact email's verification state.
+        request.user.verification = _google_link_metadata(
+            request.user,
+            provider_email=verified.provider_email,
+            provider_email_verified=verified.provider_email_verified,
+        )
+        request.user.save(update_fields=["verification"])
+
         AuditLog.log(
             actor=request.user,
             action="account.google_identity_linked",
@@ -424,7 +458,24 @@ class KisAuthRegistrationCompleteView(APIView):
                     user.email_verified = True
                 if is_enterprise_sso:
                     user.phone_is_placeholder = True
-                user.save(update_fields=["password", "email", "email_verified", "phone_is_placeholder"])
+                # Registration always implies a Google (or enterprise OIDC)
+                # link by definition - unlike KisAuthLinkCompleteView, there
+                # is no separate "link succeeded but email not verified" case
+                # to distinguish, since this account has no other identity.
+                user.verification = _google_link_metadata(
+                    user,
+                    provider_email=verified.provider_email,
+                    provider_email_verified=verified.provider_email_verified,
+                )
+                user.save(
+                    update_fields=[
+                        "password",
+                        "email",
+                        "email_verified",
+                        "phone_is_placeholder",
+                        "verification",
+                    ]
+                )
 
                 now = timezone.now()
                 Device.objects.update_or_create(
