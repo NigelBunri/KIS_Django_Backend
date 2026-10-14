@@ -112,7 +112,16 @@ class KisAuthLinkTests(TestCase):
                 LINK_COMPLETE_URL, {"code": "x", "redirect_uri": "y"}, format="json"
             )
         self.assertEqual(resp.status_code, 200)
-        self.assertTrue(resp.json()["linked"])
+        body = resp.json()
+        self.assertTrue(body["linked"])
+        # The response itself carries the google block - the caller must
+        # never need a second GET (e.g. /users/me/) just to learn this,
+        # since relying solely on that second round-trip was exactly what
+        # left the mobile "Connect to Google" UI stuck showing the wrong
+        # state whenever that follow-up call didn't land.
+        self.assertIsNotNone(body.get("google"))
+        self.assertTrue(body["google"]["linked"])
+        self.assertEqual(body["google"]["email"], "person@example.com")
         entry = AuditLog.objects.filter(
             actor_id=self.user.id, action="account.google_identity_linked"
         ).first()

@@ -320,7 +320,20 @@ class KisAuthLinkCompleteView(APIView):
             },
         )
 
-        return Response({"ok": True, "linked": True})
+        # Returning the google block directly means the caller never needs
+        # a second round-trip (e.g. a follow-up GET /users/me/) just to
+        # learn what it already caused - it already has the authoritative
+        # value right here, from the same request that just wrote it. A
+        # client-side "refetch my profile after linking" step is a
+        # reasonable belt-and-suspenders addition, but must never be the
+        # ONLY way "already connected" gets reflected - that previously
+        # left the UI showing "Connect to Google" again until the next
+        # app restart whenever that refetch didn't actually land (e.g. an
+        # in-flight request got deduped against a concurrent, pre-link
+        # checkAuth() call to the same endpoint; a transient client-side
+        # network hiccup; or any other reason that second call silently
+        # didn't complete).
+        return Response({"ok": True, "linked": True, "google": request.user.verification.get("google")})
 
 
 class KisAuthRegistrationCompleteView(APIView):
