@@ -2,6 +2,24 @@
 
 Date: 2026-10-14
 
+## 0. Post-ship finding: the redirect domain itself was broken (2026-10-14, same day)
+
+During manual testing, a Google-link attempt completed on Google's side but the user was returned to a literal 404 instead of the app. Root cause: **`kis.app`, used for every KIS Auth mobile redirect URI (link/recovery/registration), is not owned by KIS** — its bare domain 302-redirects to a domain-parking marketplace listing, and it serves no `apple-app-site-association` file and nothing at any `/auth/*` path (confirmed directly via `curl`). This meant:
+- Universal Links could never verify against it on any device, regardless of app configuration.
+- `react-native-inappbrowser-reborn`'s `openAuth()` (`ASWebAuthenticationSession`/Custom Tabs) does **not** depend on Universal Link verification and should intercept the callback purely by URL-prefix match before any page loads — this is the primary, intended path and was working as designed.
+- When that interception doesn't happen (native module unavailable in the test build, emulator, etc.), the code falls back to `Linking.openURL`, which depends entirely on Universal Links — and since those could never verify, the browser loaded the real, nonexistent page and 404'd.
+
+**Fix**: moved KIS Auth's three redirect URIs to `go.kingdomimpactventures.org`, a subdomain KIS actually controls (same Cloudflare zone as `api.`/`chat.`). Added as a second associated domain/intent-filter on each platform, alongside the existing `kis.app` entries (not replacing — `kis.app` is still used for unrelated content-sharing deep links, e.g. broadcasts/channels/shorts, whose own ownership is a separate, unresolved issue out of scope here). `deepLinkRouter.ts` needed no changes — it matches on path only, never host.
+
+Server-side (done directly against production, with the product owner's explicit authorization for each write):
+- nginx now serves a real AASA file and a fallback page per auth purpose at `go.kingdomimpactventures.org`, each attempting an immediate `kis://` custom-scheme hand-off (no domain verification needed at all) with a manual link as backup.
+- The existing shared `kingdomimpactventures.org` Let's Encrypt cert was expanded (via `certbot --expand`) to cover the new subdomain; verified no other domain on the cert broke.
+- kis-auth's `kis-mobile` client row had the 3 new URIs **appended** to `allowed_redirect_uris` (old `kis.app` entries left in place, not removed, in case any already-shipped test build still references them).
+
+**Known remaining gap**: `go.kingdomimpactventures.org/.well-known/assetlinks.json` was deployed with the correct Android package name (`com.kingdom.impact`) but a placeholder `sha256_cert_fingerprints` value — this needs the real value from Google Play Console → App integrity → App signing key certificate before Android App Links will actually verify. iOS is fully correct and complete (Team ID `K692889KRM`, bundle ID `com.kingdomimpactventures.kis`).
+
+This finding does not change anything in §1–9 below — the trust model, assertion verification, and linking logic were never the problem; only the transport-layer redirect domain was.
+
 ## 1. Trust boundaries
 
 ```
