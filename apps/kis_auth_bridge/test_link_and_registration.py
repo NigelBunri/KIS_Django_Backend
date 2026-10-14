@@ -124,6 +124,25 @@ class KisAuthLinkTests(TestCase):
         self.assertEqual(google["email"], "person@example.com")
         self.assertTrue(google["email_verified"])
 
+    def test_link_complete_redeems_with_the_client_id_the_mobile_app_actually_authorized_as(self):
+        # Regression guard: CLIENT_ID in views.py was "kis-django" for
+        # every bridge endpoint (link/recovery/registration) until
+        # 2026-10-14 - kis-auth's exchange endpoint rejects a redemption
+        # whose client_id doesn't match what /authorize originally used,
+        # and the mobile app always authorizes as "kis-mobile", not
+        # "kis-django" (which was never even a registered client in
+        # kis-auth's own database). That mismatch broke every real
+        # mobile redemption silently - this test exists so reverting the
+        # constant is caught immediately instead of only surfacing as a
+        # live "Unable to finish linking" report from production.
+        self.client_api.force_authenticate(self.user)
+        verified = _verified_link(kis_user_id=str(self.user.id))
+        with patch(
+            "apps.kis_auth_bridge.views.redeem_authorization_code", return_value=verified
+        ) as mock_redeem:
+            self.client_api.post(LINK_COMPLETE_URL, {"code": "x", "redirect_uri": "y"}, format="json")
+        mock_redeem.assert_called_once_with(code="x", client_id="kis-mobile", redirect_uri="y")
+
     def test_link_does_not_touch_contact_email(self):
         # Linking an existing account must never silently change its
         # contact email/email_verified - only registration and the

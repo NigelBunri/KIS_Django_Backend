@@ -48,7 +48,16 @@ from .link_ticket import LinkTicketError, mint_link_ticket
 logger = logging.getLogger("security.kis_auth_bridge")
 
 GENERIC_ERROR = "We could not complete this authentication request."
-CLIENT_ID = "kis-django"
+# The OAuth client_id the ORIGINAL /authorize request used — kis-auth's
+# exchange endpoint rejects any redemption whose client_id doesn't match
+# what the code was minted with (payload.clientId !== body.client_id,
+# see kis-auth's exchange.controller.ts), as a standard authorization-
+# code-flow binding check. Every caller of this bridge is the KIS mobile
+# app, which always authorizes as "kis-mobile" - NOT "kis-django" (that
+# string was never even registered as a client in kis-auth's database;
+# it silently broke every recovery/link/registration redemption, since
+# Django and kis-auth never agreed on this value — fixed 2026-10-14).
+CLIENT_ID = "kis-mobile"
 
 _JWT_AUTH = (DeviceBoundJWTAuthentication,)
 
