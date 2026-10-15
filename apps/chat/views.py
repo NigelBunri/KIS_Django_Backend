@@ -47,7 +47,6 @@ from .services import allocate_conversation_seq, get_or_create_direct_conversati
 from apps.notifications.realtime import notify_main_tab_badges_updated
 
 from apps.accounts.models import User
-from apps.moderation.models import UserBlock
 from apps.partners.models import Partner
 from apps.partners.services import (
     ensure_partner_policy,
@@ -471,17 +470,19 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
         peer_user = _resolve_peer_user(request.user, request.data)
 
-        # Reject at creation rather than letting a DM room get created that
-        # ws_perms will then refuse every send into anyway (see UserBlock
-        # check added there) - avoids a confusing "created fine, then every
-        # send silently fails" UX and a permanently-unusable ghost row.
-        blocked = UserBlock.objects.filter(
-            Q(blocker=request.user, blocked=peer_user)
-            | Q(blocker=peer_user, blocked=request.user)
-        ).exists()
-        if blocked:
-            raise PermissionDenied("You can't start a conversation with this user.")
-
+        # AND-060: this used to reject DM creation outright whenever a
+        # UserBlock existed in EITHER direction, with the explicit
+        # reasoning "ws_perms will refuse every send into it anyway" -
+        # that ws_perms-side rejection is exactly the bidirectional
+        # send-blocking bug fixed just above in ws_perms() (ConversationViewSet.ws_perms),
+        # and this check shared the same flaw: it also blocked the
+        # person who did the blocking from creating other legitimate new
+        # conversations with that user by mistake, and would have
+        # blocked the BLOCKED user's own side from ever starting (or
+        # resuming) contact at all, not just being unseen by the
+        # blocker. Required behavior is private, receive-side-only
+        # blocking (see ws_perms' comment) - creation must not be gated
+        # on it either.
         conversation, created = get_or_create_direct_conversation(
             user_a=request.user,
             user_b=peer_user,
@@ -1068,32 +1069,38 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if member.is_blocked:
             return Response({"isMember": True, "isBlocked": True, "role": member.base_role, "scopes": []})
 
-        # Real interpersonal blocking (apps.moderation.UserBlock) was never
-        # actually wired into chat: nothing ever sets member.is_blocked
-        # above, and nothing else in this view - or anywhere in NestJS -
-        # queried UserBlock before this. Nest's assertMember() already
-        # throws whenever this endpoint reports isBlocked=True and is
-        # called before every real-time action (send/edit/delete/typing/
-        # receipts/reactions/calls), so fixing the computation here is
-        # enough to make a block actually take effect across all of them
-        # without touching each handler individually. Scoped to DIRECT
-        # conversations only - blocking someone shouldn't silently pull
-        # you out of a GROUP/CHANNEL/COMMUNITY room you both happen to be
-        # in, only stop new direct engagement between the two of you.
-        is_blocked_by_user = False
-        if conversation.type == ConversationType.DIRECT:
-            other_member = ConversationMember.objects.filter(
-                conversation=conversation, left_at__isnull=True,
-            ).exclude(user_id=user_id).first()
-            if other_member:
-                is_blocked_by_user = UserBlock.objects.filter(
-                    Q(blocker_id=user_id, blocked_id=other_member.user_id)
-                    | Q(blocker_id=other_member.user_id, blocked_id=user_id)
-                ).exists()
-
-        if is_blocked_by_user:
-            return Response({"isMember": True, "isBlocked": True, "role": member.base_role, "scopes": []})
-
+        # AND-060 (live-tested regression, found 2026-10-15): this used to
+        # compute isBlocked from apps.moderation.UserBlock across EITHER
+        # direction (blocker OR blocked), and NestJS's assertMember()
+        # throws "Conversation is blocked" + hard-rejects the socket.emit
+        # entirely whenever this endpoint reports isBlocked=True - called
+        # before every real-time action (send/edit/delete/typing/
+        # receipts/reactions/calls). That made a block symmetric and
+        # send-rejecting for BOTH participants: exactly the "blocking
+        # affects both participants, chat appears locked for both" bug
+        # this same AND-060 fix (KIS commit 327cc16, mobile-side) already
+        # removed the client-side causes of - this server-side gate
+        # reintroduced the identical symmetric failure one layer down,
+        # and is why two completely unrelated test accounts with any
+        # historical UserBlock row between them (in EITHER direction)
+        # could never exchange messages again, confirmed live via a
+        # real device test: every send acked back
+        # {"ok":false,"error":"Conversation is blocked"} at
+        # assertMember, for BOTH accounts.
+        #
+        # Required behavior (this app's actual block design): blocking is
+        # private to the blocker's own client - the blocked person keeps
+        # sending normally (so they're never tipped off), and the blocker
+        # simply never sees/receives those messages. That's already
+        # implemented as a receive-side filter in useChatMessaging.ts's
+        # onIncomingMessage (mobile), keyed off the same UserBlock
+        # relationship. A conversation-membership permission check is the
+        # wrong layer to enforce a receive-side-only, single-direction
+        # UX concern - it has no way to express "let user A send, but
+        # don't let user B receive," only "let both act" or "let neither."
+        # member.is_blocked above is a distinct, moderator-driven
+        # per-conversation flag (e.g. muting a disruptive member within a
+        # group) and is untouched by this.
         can_send = True
         settings = ConversationSettings.objects.filter(conversation=conversation).first()
         if (
