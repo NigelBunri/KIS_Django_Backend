@@ -119,7 +119,7 @@ from .family_accessibility import serialize_family_accessibility_preferences, up
 from .tiers import ensure_default_account_tiers, get_user_tier_features, public_account_tiers_qs
 from apps.partners.models import Partner, PartnerApplication, PartnerJobPost
 from apps.partners.serializers import PartnerListSerializer, PartnerApplicationDetailSerializer, PartnerJobPostSerializer
-from apps.commerce.models import LoyaltyPoint
+from apps.commerce.models import LoyaltyPoint, Shop
 from apps.billing.models import WalletAccount, CreditAccount
 from apps.billing.services import credits_to_cents
 from admin_control.audit.logging import AuditLogger
@@ -609,6 +609,32 @@ def _partner_profile_summary(user: User, request) -> dict:
         "partner_profiles_is_unlimited": limit_info["is_unlimited"],
         "partner_profiles_can_create": can_create,
     }
+
+
+def _shop_profile_summary(user: User) -> dict:
+    """Mirrors _partner_profile_summary above (AND-247/AND-260 fix) -
+    the client had no way to know a shop requires a Business+ plan
+    (ShopViewSet.perform_create enforces the "shops_limit" tier feature,
+    apps/commerce/views.py) until the user filled out the whole create-shop
+    form and submitted it, only to be bounced with a plan-upgrade error.
+    "Create Partner" already avoids this (see partner_profiles_can_create
+    above) by disabling its CTA up front - this gives "Create Shop" the
+    same up-front signal.
+    """
+    features = get_user_tier_features(user)
+    # _normalize_partner_limit is generic (int / "unlimited" / None), not
+    # partner-specific despite the name - reused here for shops_limit.
+    limit_info = _normalize_partner_limit(features.get("shops_limit"))
+    count = Shop.objects.filter(owner=user, is_deleted=False).count()
+    can_create = limit_info["is_unlimited"] or bool(limit_info["allowed"] and count < limit_info["allowed"])
+    return {
+        "shop_profiles_count": count,
+        "shop_profiles_limit_value": limit_info["allowed"],
+        "shop_profiles_limit_label": limit_info["label"],
+        "shop_profiles_is_unlimited": limit_info["is_unlimited"],
+        "shop_profiles_can_create": can_create,
+    }
+
 
 class BroadcastersDirectoryView(APIView):
     """
@@ -2050,6 +2076,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
         ).data
         payload["tiers"] = AccountTierSerializer(public_account_tiers_qs(), many=True).data
         payload.update(_partner_profile_summary(request.user, request))
+        payload.update(_shop_profile_summary(request.user))
 
         # --- connection stats (own profile: count only, degree is always None) ---
         connection_count = UserConnection.objects.filter(
@@ -2986,6 +3013,34 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             from_user=request.user, to_user=target,
             note=request.data.get("note", ""),
         )
+        # AND-477: sending a connection request never notified the
+        # recipient at all — no in-app notification, no push — so a
+        # request could sit unseen indefinitely. create_notification
+        # schedules both an in-app row AND a push delivery (see
+        # apps/notifications/services.py's own docstring: "Every in-app
+        # notification also gets a related push delivery"), so one call
+        # covers both. Non-blocking: a notification-pipeline failure must
+        # never fail the connection request itself.
+        try:
+            from apps.notifications.services import create_notification
+
+            # target_id is intentionally omitted: Notification.target_id is
+            # a UUIDField, but UserConnection uses a plain integer PK (see
+            # the conn.id values below) - passing str(conn.id) raised
+            # ValidationError("not a valid UUID") on every call, silently
+            # swallowed by this same try/except, which is how this had no
+            # test coverage catching it until the regression tests below.
+            create_notification(
+                user_id=target.id,
+                type="connection_request",
+                title="New connection request",
+                body=f"{request.user.display_name or request.user.username} wants to connect with you.",
+                priority="MEDIUM",
+                target_type="connection",
+                dedup_key=f"connection_request:{conn.id}",
+            )
+        except Exception as exc:
+            logger.warning("Connection-request notification failed for conn_id=%s: %s", conn.id, exc.__class__.__name__)
         return Response(ConnectionSerializer(conn).data, status=201)
 
     def partial_update(self, request, pk=None, **kwargs):
@@ -3002,6 +3057,26 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             from apps.chat.services import get_or_create_direct_conversation
 
             get_or_create_direct_conversation(conn.from_user, conn.to_user)
+            # AND-477: the original sender never learned their request was
+            # accepted — no notification, and (see people_you_may_know
+            # below) no way for their own suggestions feed to reflect it
+            # either, so an accepted request looked permanently "Pending"
+            # on their end. Notify them the same way the request itself
+            # now is.
+            try:
+                from apps.notifications.services import create_notification
+
+                create_notification(
+                    user_id=conn.from_user_id,
+                    type="connection_accepted",
+                    title="Connection accepted",
+                    body=f"{request.user.display_name or request.user.username} accepted your connection request.",
+                    priority="MEDIUM",
+                    target_type="connection",
+                    dedup_key=f"connection_accepted:{conn.id}",
+                )
+            except Exception as exc:
+                logger.warning("Connection-accepted notification failed for conn_id=%s: %s", conn.id, exc.__class__.__name__)
         return Response(ConnectionSerializer(conn).data)
 
     @action(detail=False, methods=["get"], url_path="search")
@@ -3060,25 +3135,41 @@ class ConnectionViewSet(viewsets.ModelViewSet):
         user = request.user
         profile = getattr(user, "profile", None)
         industry = getattr(profile, "industry", "") or ""
-        connected_ids = set(
-            UserConnection.objects.filter(
-                Q(from_user=user) | Q(to_user=user),
-                status=UserConnection.STATUS_ACCEPTED,
-            ).values_list("from_user_id", flat=True)
-        ) | set(
-            UserConnection.objects.filter(
-                Q(from_user=user) | Q(to_user=user),
-                status=UserConnection.STATUS_ACCEPTED,
-            ).values_list("to_user_id", flat=True)
+        # AND-477 ("accepted connection requests remain pending"): this
+        # previously only excluded ACCEPTED connections from the
+        # candidate pool and never returned a connection_status field at
+        # all — unlike the sibling `search` action just above, which
+        # already computes one. Two compounding bugs followed: (1) a user
+        # with an already-pending request kept reappearing here as a new
+        # "Connect" suggestion instead of being excluded like `search`
+        # already excludes them, and (2) once a request WAS accepted,
+        # this feed had no way to ever say so — the client's
+        # ConnectionsScreen reads item.connection_status to decide
+        # Connect/Pending/Connected, and against an always-undefined
+        # field it can only ever fall back to "Connect" or its own
+        # locally-cached "Pending" flag, never "Connected". Mirror
+        # `search`'s connection_map so both endpoints agree.
+        existing_conns = UserConnection.objects.filter(
+            Q(from_user=user) | Q(to_user=user),
+            status__in=(UserConnection.STATUS_PENDING, UserConnection.STATUS_ACCEPTED),
         )
-        connected_ids.add(user.id)
+        connection_map = {}
+        other_ids = set()
+        for conn in existing_conns:
+            other_id = conn.to_user_id if conn.from_user_id == user.id else conn.from_user_id
+            other_ids.add(other_id)
+            connection_map[str(other_id)] = (
+                "accepted" if conn.status == UserConnection.STATUS_ACCEPTED
+                else ("pending_sent" if conn.from_user_id == user.id else "pending_received")
+            )
+        excluded_ids = other_ids | {user.id}
         UserModel = get_user_model()
         if industry:
-            suggestions = UserModel.objects.exclude(id__in=connected_ids).filter(
+            suggestions = UserModel.objects.exclude(id__in=excluded_ids).filter(
                 profile__industry=industry
             ).select_related("profile")[:20]
         else:
-            suggestions = UserModel.objects.exclude(id__in=connected_ids).select_related("profile")[:20]
+            suggestions = UserModel.objects.exclude(id__in=excluded_ids).select_related("profile")[:20]
         data = []
         for u in suggestions:
             p = getattr(u, "profile", None)
@@ -3088,6 +3179,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 "headline": getattr(p, "headline", ""),
                 "avatar_url": getattr(p, "avatar_url", ""),
                 "industry": getattr(p, "industry", ""),
+                "connection_status": connection_map.get(str(u.id), "none"),
             })
         return Response(data)
 

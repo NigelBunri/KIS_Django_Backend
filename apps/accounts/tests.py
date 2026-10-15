@@ -1044,3 +1044,77 @@ class ConnectionApiTests(APITestCase):
         response = self.client.patch(f"/api/v1/connections/{conn_id}/", {"status": "accepted"}, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+
+    # AND-477: sending/accepting a connection request never notified anyone
+    # at all (no in-app row, no push) — a request could sit unseen
+    # indefinitely, and an accepted request gave the original sender no
+    # signal their own pending state had changed.
+    def test_sending_request_notifies_recipient(self):
+        from apps.notifications.models import Notification
+
+        self.client.force_authenticate(self.alice)
+        self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+
+        notif = Notification.objects.get(user_id=self.bob.id, type="connection_request")
+        self.assertEqual(notif.target_type, "connection")
+
+    def test_accepting_request_notifies_original_sender(self):
+        from apps.notifications.models import Notification
+
+        self.client.force_authenticate(self.alice)
+        create_response = self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+        conn_id = create_response.data["id"]
+
+        self.client.force_authenticate(self.bob)
+        self.client.patch(f"/api/v1/connections/{conn_id}/", {"status": "accepted"}, format="json")
+
+        notif = Notification.objects.get(user_id=self.alice.id, type="connection_accepted")
+        self.assertEqual(notif.target_type, "connection")
+
+    def test_declining_request_does_not_notify_sender(self):
+        from apps.notifications.models import Notification
+
+        self.client.force_authenticate(self.alice)
+        create_response = self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+        conn_id = create_response.data["id"]
+
+        self.client.force_authenticate(self.bob)
+        self.client.patch(f"/api/v1/connections/{conn_id}/", {"status": "rejected"}, format="json")
+
+        self.assertFalse(Notification.objects.filter(user_id=self.alice.id, type="connection_accepted").exists())
+
+    # AND-477: people_you_may_know never returned connection_status at all
+    # (unlike the sibling `search` action, which already did) and only
+    # excluded ACCEPTED connections from its candidate pool, not PENDING
+    # ones — so an already-pending candidate kept reappearing as a fresh
+    # "Connect" suggestion, and an accepted one could never show as
+    # "Connected" since the field it depends on was always missing.
+    def test_people_you_may_know_excludes_pending_candidate(self):
+        self.client.force_authenticate(self.alice)
+        self.client.post("/api/v1/connections/", {"user_id": str(self.bob.id)}, format="json")
+
+        response = self.client.get("/api/v1/connections/people-you-may-know/")
+
+        ids = [row["id"] for row in response.data]
+        self.assertNotIn(str(self.bob.id), ids)
+
+    def test_people_you_may_know_still_excludes_accepted_connection(self):
+        # Industry-matched so carol would otherwise appear as a suggestion.
+        self.carol.profile.industry = "Technology"
+        self.carol.profile.save(update_fields=["industry", "updated_at"])
+
+        self.client.force_authenticate(self.alice)
+        create_response = self.client.post("/api/v1/connections/", {"user_id": str(self.carol.id)}, format="json")
+        conn_id = create_response.data["id"]
+        self.client.force_authenticate(self.carol)
+        self.client.patch(f"/api/v1/connections/{conn_id}/", {"status": "accepted"}, format="json")
+
+        self.client.force_authenticate(self.alice)
+        response = self.client.get("/api/v1/connections/people-you-may-know/")
+
+        # An accepted connection must never resurface as a "new suggestion"
+        # to send another request to - confirms the pending-exclusion fix
+        # above didn't accidentally stop excluding the accepted case that
+        # already worked before it.
+        ids = [row["id"] for row in response.data]
+        self.assertNotIn(str(self.carol.id), ids)

@@ -1,5 +1,6 @@
 # apps/channels/serializers.py
 from rest_framework import serializers
+from django.utils.text import slugify
 
 from apps.channels.models import Channel, Subchannel
 from apps.partners.services import partner_user_can_send_channel
@@ -25,6 +26,20 @@ class ChannelImageUrlSerializerMixin:
 
     def validate_avatar_url(self, value):
         return normalize_image_payload(value)
+
+
+def _generate_channel_slug(name, *, partner=None, community=None) -> str:
+    """Mirrors apps/commerce/serializers.py's _generate_shop_slug -
+    Channel.slug is unique_together with (partner, slug) and
+    (community, slug), not globally unique, so uniqueness only needs to be
+    checked within the same partner/community scope."""
+    base = slugify((name or "").strip()) or "channel"
+    slug = base
+    suffix = 1
+    while Channel.objects.filter(partner=partner, community=community, slug=slug).exists():
+        slug = f"{base}-{suffix}"
+        suffix += 1
+    return slug
 
 
 def _member_for(channel: Channel, user):
@@ -182,6 +197,28 @@ class ChannelCreateSerializer(ChannelImageUrlSerializerMixin, serializers.ModelS
     """
 
     conversation_id = serializers.UUIDField(source="conversation.id", read_only=True)
+    # AND-208: "unable to create a partner channel" - Channel.slug has no
+    # model-level blank=True/default, so the DRF-generated field was
+    # required=True and every client that only sends name/channel_type/
+    # partner (the mobile app's PartnerChannelsPanel never collected or
+    # sent a slug at all) got a 400 on "slug" and just saw a generic
+    # "Unable to create channel." alert. Every existing test for this
+    # endpoint happened to pass slug explicitly, which is how this shipped
+    # unnoticed.
+    #
+    # required=False alone isn't enough to fix this: Channel's
+    # unique_together = [("partner", "slug"), ("community", "slug")]
+    # makes ModelSerializer auto-attach a UniqueTogetherValidator, and
+    # that validator's enforce_required_fields() independently demands
+    # every participating field be present in the raw input - regardless
+    # of the field's own required flag - and raises its own "This field
+    # is required." error if it's missing. read_only=True is the fix DRF
+    # actually wants here (it also drops the field from that validator's
+    # field set entirely), and matches how apps/commerce/serializers.py's
+    # ShopSerializer already treats its own slug (fully server-derived,
+    # never client-writable). Auto-derive it from name in create() below,
+    # mirroring that same file's _generate_shop_slug/_generate_product_slug.
+    slug = serializers.SlugField(read_only=True)
 
     class Meta:
         model = Channel
@@ -220,6 +257,14 @@ class ChannelCreateSerializer(ChannelImageUrlSerializerMixin, serializers.ModelS
     def create(self, validated_data):
         request = self.context["request"]
         user = request.user
+
+        # slug is read_only above, so it's never in validated_data here -
+        # always server-derived from name.
+        validated_data["slug"] = _generate_channel_slug(
+            validated_data.get("name"),
+            partner=validated_data.get("partner"),
+            community=validated_data.get("community"),
+        )
 
         from apps.chat.models import (
             Conversation,
