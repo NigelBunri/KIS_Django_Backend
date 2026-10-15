@@ -22240,6 +22240,22 @@ class ChannelContentProductsView(APIView):
             raise PermissionDenied()
         data = dict(request.data)
         data["content"] = str(content_id)
+        # AND-169: product_id has no blank=True/default on the model, so
+        # the serializer (which lists it in `fields`, not
+        # `read_only_fields`) made it required=True - but
+        # ProductTagStudio.tsx, the only client that calls this endpoint,
+        # tags an arbitrary external product by title/URL and never
+        # collects or sends a product_id at all (there's no internal
+        # commerce-catalog picker in that UI, nothing else in this
+        # codebase ever queries ChannelContentProduct by product_id - see
+        # the model's own "Tag a commerce product at a specific timestamp"
+        # docstring, which in practice means "tag ANY product, including
+        # ones outside our own catalog"). Every real submission from that
+        # screen 400'd on this field. Auto-generate an opaque id when the
+        # client omits one, rather than requiring a UI the product doesn't
+        # actually have a picker for.
+        if not str(data.get("product_id") or "").strip():
+            data["product_id"] = f"ext-{uuid.uuid4()}"
         ser = ChannelContentProductSerializer(data=data)
         ser.is_valid(raise_exception=True)
         tag = ser.save(content=content)

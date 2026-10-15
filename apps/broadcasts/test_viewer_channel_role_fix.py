@@ -84,6 +84,29 @@ class ProductTagsTests(ViewerChannelRoleFixTestBase):
 
         self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
 
+    # AND-169: ChannelContentProduct.product_id has no blank=True/default,
+    # so the serializer made it required=True - but ProductTagStudio.tsx
+    # (the only client that calls this endpoint) tags an arbitrary
+    # external product by title/URL and never collects or sends a
+    # product_id at all. The test above always passed one explicitly,
+    # which is exactly why this never had coverage catching the real
+    # client's payload shape failing validation 100% of the time.
+    def test_owner_can_create_product_tag_without_a_product_id(self):
+        self.client.force_authenticate(self.owner)
+
+        res = self.client.post(
+            f"/api/v1/broadcasts/channel-contents/{self.content.id}/products/",
+            {
+                "product_title": "Mug",
+                "product_url": "https://example.com/mug",
+                "timestamp_seconds": 5,
+            },
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertTrue(res.data.get("product_id"))
+
 
 class AutoChaptersTests(ViewerChannelRoleFixTestBase):
     def test_owner_can_trigger_auto_chapters(self):
