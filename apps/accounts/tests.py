@@ -597,6 +597,64 @@ class AccountsE2EEBundleTests(APITestCase):
             self.assertIn("signed_prekey", item)
             self.assertIn("one_time_prekey", item)
 
+    def test_one_time_prekey_is_consumed_exactly_once(self):
+        # setUp gives target_a exactly one prekey (prekey_id=100). The
+        # first fetch must consume it (mark consumed_at, hand it out);
+        # the second fetch for the SAME device must NOT hand out the
+        # identical prekey again - this is the X3DH property a race in
+        # E2EEFetchBundleView's select_for_update()+transaction.atomic()
+        # block would violate (two sessions established against the same
+        # one-time key material). Single-threaded here (Django's test
+        # client has no real concurrency), so this locks in the
+        # non-concurrent exactly-once guarantee; see this test class's
+        # docstring note below for why the actual race window itself
+        # isn't exercised by this suite.
+        url = f"/api/v1/auth/e2ee/keys/{self.target.id}/?device_id=target_a"
+
+        first = self.client.get(url)
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(first.data["one_time_prekey"])
+        self.assertEqual(first.data["one_time_prekey"]["id"], 100)
+
+        second = self.client.get(url)
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        # Exhausted - target_a only ever had one prekey in setUp.
+        self.assertIsNone(second.data["one_time_prekey"])
+        # The signed prekey (not one-time) is still returned even with no
+        # one-time prekey left - a signed-prekey-only bundle is a valid,
+        # weaker-forward-secrecy X3DH fallback, not an error state.
+        self.assertIn("signed_prekey", second.data)
+        self.assertIsNotNone(second.data["signed_prekey"]["key"])
+
+        consumed = E2EPreKey.objects.get(user=self.target, device=self.target_a, prekey_id=100)
+        self.assertIsNotNone(consumed.consumed_at)
+
+    def test_revoked_device_bundle_is_not_fetchable(self):
+        self.target_a.revoked_at = timezone.now()
+        self.target_a.save(update_fields=["revoked_at"])
+
+        single = self.client.get(f"/api/v1/auth/e2ee/keys/{self.target.id}/?device_id=target_a")
+        self.assertEqual(single.status_code, status.HTTP_404_NOT_FOUND)
+
+        multi = self.client.get(
+            reverse("auth-e2ee-keys-user-devices", kwargs={"user_id": self.target.id})
+        )
+        self.assertEqual(multi.status_code, status.HTTP_200_OK)
+        returned_ids = {item["device_id"] for item in multi.data["devices"]}
+        self.assertNotIn("target_a", returned_ids)
+        self.assertIn("target_b", returned_ids)
+
+    def test_revoking_a_device_deletes_its_e2ee_keys(self):
+        from .views import revoke_device_session
+
+        self.assertTrue(E2EDeviceKey.objects.filter(user=self.target, device=self.target_a).exists())
+        self.assertTrue(E2EPreKey.objects.filter(user=self.target, device=self.target_a).exists())
+
+        revoke_device_session(self.target, self.target_a, reason="test_revoke")
+
+        self.assertFalse(E2EDeviceKey.objects.filter(user=self.target, device=self.target_a).exists())
+        self.assertFalse(E2EPreKey.objects.filter(user=self.target, device=self.target_a).exists())
+
 
 class AccountsProfileCoreTests(APITestCase):
     def setUp(self):
