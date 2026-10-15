@@ -4,7 +4,9 @@ from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.broadcasts.models import BroadcastChannel, EducationInstitution
+from apps.accounts.models import AccountTier, Subscription
+from apps.accounts.tiers import ensure_default_account_tiers
+from apps.broadcasts.models import BroadcastChannel, BroadcastChannelSubscription, EducationInstitution
 from apps.commerce.models import Shop
 from apps.health_ops.models import HealthInstitution
 from apps.partners.models import Partner
@@ -148,3 +150,60 @@ class BroadcastChannelOrgOwnershipTests(APITestCase):
         get_response = self.client.get(f'/api/v1/broadcasts/channels/{user_channel.handle}/')
         self.assertEqual(get_response.status_code, status.HTTP_200_OK, get_response.data)
         self.assertNotIn('owner_id', get_response.data)
+
+
+class BroadcastChannelAutoSubscribeOnCreateTests(APITestCase):
+    """AND-133: "the admin also has to subscribe" - a channel's creator
+    never saw their own channel in Subscriptions unless they separately,
+    manually subscribed to it like any other viewer (BroadcastChannelRole,
+    created unconditionally above, is a distinct concept from
+    BroadcastChannelSubscription). The creator is now auto-subscribed."""
+
+    def setUp(self):
+        # Channel creation is tier-gated (Free tier's channels_create
+        # limit is 0, apps/accounts/tier_presets.py) - give the creator a
+        # Pro subscription so creation itself succeeds and this test can
+        # focus purely on the auto-subscribe behavior.
+        ensure_default_account_tiers()
+        pro_tier = AccountTier.objects.filter(name__iexact='Pro').first()
+        User = get_user_model()
+        self.creator = User.objects.create_user(
+            phone='5559830101', username='bco_autosub_creator', password='secret', country='NG',
+        )
+        if pro_tier:
+            Subscription.objects.create(user=self.creator, tier=pro_tier, status='active')
+
+    def test_creating_a_channel_auto_subscribes_the_creator(self):
+        self.client.force_authenticate(self.creator)
+
+        response = self.client.post(
+            CHANNEL_CREATE_URL,
+            {'handle': 'bco-autosub-channel', 'display_name': 'Autosub channel'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        channel_id = response.data['id']
+        self.assertTrue(
+            BroadcastChannelSubscription.objects.filter(channel_id=channel_id, user=self.creator).exists()
+        )
+        channel = BroadcastChannel.objects.get(id=channel_id)
+        self.assertEqual(channel.subscriber_count, 1)
+
+    def test_auto_subscription_is_created_even_for_a_private_channel(self):
+        # BroadcastChannelSubscribeView (the normal subscribe endpoint)
+        # requires is_public=True - the creator must still see their own
+        # channel in Subscriptions even when it's private, so this must
+        # not go through that same gate.
+        self.client.force_authenticate(self.creator)
+
+        response = self.client.post(
+            CHANNEL_CREATE_URL,
+            {'handle': 'bco-autosub-private', 'display_name': 'Private autosub channel', 'is_public': False},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(
+            BroadcastChannelSubscription.objects.filter(channel_id=response.data['id'], user=self.creator).exists()
+        )

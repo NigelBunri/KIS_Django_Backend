@@ -16305,6 +16305,26 @@ class BroadcastChannelListCreateView(APIView):
         # once channel.owner_user_id is empty, which it is for every
         # non-USER owner_type here).
         BroadcastChannelRole.objects.get_or_create(channel=channel, user=request.user, role=BroadcastChannelRole.Role.OWNER)
+        # AND-133: "the admin also has to subscribe" - having a
+        # BroadcastChannelRole granted nothing for the Subscriptions list
+        # itself (a separate concept, BroadcastChannelSubscription), so a
+        # channel's own creator never saw their own channel there unless
+        # they manually subscribed to it like any other viewer - unlike
+        # most comparable platforms, where creating a channel implies
+        # following/subscribing to your own content by default. Auto-
+        # subscribing the creator here (not via BroadcastChannelSubscribeView,
+        # which requires is_public=True - the owner must always be able to
+        # see their own channel in Subscriptions regardless of its
+        # visibility) also keeps subscriber_count consistent with every
+        # other path that creates a subscription row.
+        _, subscription_created = BroadcastChannelSubscription.objects.get_or_create(
+            channel=channel,
+            user=request.user,
+            defaults={"notifications": BroadcastChannelSubscription.NotificationLevel.PERSONALIZED},
+        )
+        if subscription_created:
+            BroadcastChannel.objects.filter(id=channel.id).update(subscriber_count=models.F("subscriber_count") + 1)
+            channel.refresh_from_db(fields=["subscriber_count"])
         return Response(BroadcastChannelDetailSerializer(channel, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
