@@ -928,7 +928,38 @@ class ConversationViewSet(viewsets.ModelViewSet):
         )
         return Response({"user_ids": [str(uid) for uid in user_ids]})
 
-    
+    @action(
+        detail=True,
+        methods=['get'],
+        url_path='muted-member-ids',
+        permission_classes=[],
+        authentication_classes=[],
+    )
+    def muted_member_ids(self, request, pk=None):
+        # Internal-only: lets Nest's push pipeline skip notifying a member
+        # who muted this specific conversation (ChatRoomHandlers.tsx's
+        # handleMuteConversation sets ConversationMember.is_muted via the
+        # /mute/ action above) - notifyNewMessage previously only checked a
+        # user's GLOBAL "notif_messages" preference and DND hours, never
+        # per-conversation mute, so muting one chat had literally no effect
+        # on whether its push notifications kept arriving.
+        require_internal_auth(request)
+
+        try:
+            conversation = Conversation.objects.get(pk=pk)
+        except Conversation.DoesNotExist:
+            return Response({"user_ids": []}, status=404)
+
+        user_ids = list(
+            ConversationMember.objects.filter(
+                conversation=conversation,
+                left_at__isnull=True,
+                is_muted=True,
+            ).values_list("user_id", flat=True)
+        )
+        return Response({"user_ids": [str(uid) for uid in user_ids]})
+
+
     @action(
         detail=True,
         methods=['get'],
