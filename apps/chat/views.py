@@ -16,7 +16,7 @@ from rest_framework import viewsets, mixins, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.exceptions import ValidationError, PermissionDenied
+from rest_framework.exceptions import ValidationError, PermissionDenied, NotFound
 from rest_framework.views import APIView
 from rest_framework_simplejwt.authentication import JWTAuthentication
 
@@ -31,10 +31,14 @@ from .models import (
     ConversationSendPolicy,
     ConversationJoinPolicy,
     ConversationRequestState,
+    Sticker,
+    StickerLibraryEntry,
 )
 from .serializers import (
     ConversationListSerializer,
     ConversationDetailSerializer,
+    StickerSerializer,
+    StickerLibraryEntrySerializer,
     ConversationCreateSerializer,
     DirectConversationCreateSerializer,
     ConversationMemberSerializer,
@@ -1427,3 +1431,170 @@ class StickerPackListView(APIView):
 
     def get(self, request):
         return Response(_BUILTIN_STICKER_PACKS, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# Sticker library (account-wide, reusable across every conversation)
+# ---------------------------------------------------------------------------
+
+STICKER_LIBRARY_MAX_PAGE_SIZE = 60
+STICKER_LIBRARY_DEFAULT_PAGE_SIZE = 30
+
+
+def _paginate(queryset, request, default_size=STICKER_LIBRARY_DEFAULT_PAGE_SIZE):
+    try:
+        page = max(1, int(request.query_params.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = int(request.query_params.get("page_size", default_size))
+    except (TypeError, ValueError):
+        page_size = default_size
+    page_size = max(1, min(page_size, STICKER_LIBRARY_MAX_PAGE_SIZE))
+
+    total = queryset.count()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages)
+    start = (page - 1) * page_size
+    items = list(queryset[start:start + page_size])
+    return items, {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
+class StickerCreateView(APIView):
+    """
+    POST /api/v1/stickers/
+    body: { "assetId": "<uuid>", "captionText": "<optional>" }
+
+    Creates the one, stable Sticker row for an already-uploaded,
+    already-owned image (see POST /uploads/file with context="sticker",
+    visibility="public" — the mobile StickerEditor uploads there first,
+    then calls this with the returned assetId). Also creates the
+    creator's own StickerLibraryEntry, so a created sticker is immediately
+    visible in "My Stickers" without a second request.
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.media.models import MediaAsset
+
+        asset_id = str(request.data.get("assetId") or request.data.get("asset_id") or "").strip()
+        if not asset_id:
+            raise ValidationError({"detail": "assetId is required."})
+
+        try:
+            asset = MediaAsset.objects.get(id=asset_id)
+        except (MediaAsset.DoesNotExist, ValueError, TypeError):
+            raise ValidationError({"detail": "Unknown assetId."})
+
+        # Only the uploader may turn their own asset into a sticker — this
+        # is the one place that ever checks asset ownership for this
+        # feature; everything downstream (saving, sending, viewing) trusts
+        # the Sticker row's own `owner`, never re-derives it from the asset.
+        if asset.owner_id != request.user.id:
+            raise PermissionDenied("You can only create a sticker from your own upload.")
+        if asset.moderation_state == "quarantined" or asset.status == "blocked":
+            raise ValidationError({"detail": "This image cannot be used as a sticker."})
+
+        # Stamp purpose/context so the existing media-signed-url access
+        # chokepoint (apps.media.services.access.can_user_access_media)
+        # actually dispatches to the "sticker" access_authorizer registered
+        # in apps/chat/media_hooks.py — without this, that endpoint denies
+        # every non-owner by default ("a missing hook must never silently
+        # mean everyone can see this"), which would make a saved sticker
+        # unrenderable for anyone but its original creator.
+        if asset.purpose != "sticker" or asset.context != "sticker":
+            asset.purpose = "sticker"
+            asset.context = "sticker"
+            asset.save(update_fields=["purpose", "context"])
+
+        caption_text = str(request.data.get("captionText") or request.data.get("caption_text") or "").strip()[:120]
+
+        sticker = Sticker.objects.create(
+            owner=request.user,
+            asset=asset,
+            caption_text=caption_text,
+        )
+        entry, _ = StickerLibraryEntry.objects.get_or_create(user=request.user, sticker=sticker)
+
+        return Response(
+            StickerLibraryEntrySerializer(entry, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class StickerLibraryListView(APIView):
+    """
+    GET /api/v1/stickers/library/?section=all|created|saved&page=&page_size=
+
+    Account-wide — not scoped to any one conversation. "created" = entries
+    for stickers this user owns; "saved" = entries for stickers someone
+    else owns that this user added to their own library.
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        section = str(request.query_params.get("section") or "all").strip().lower()
+        qs = (
+            StickerLibraryEntry.objects.filter(user=request.user, sticker__is_removed=False)
+            .select_related("sticker", "sticker__owner")
+        )
+        if section == "created":
+            qs = qs.filter(sticker__owner_id=request.user.id)
+        elif section == "saved":
+            qs = qs.exclude(sticker__owner_id=request.user.id)
+        qs = qs.order_by("-added_at", "-id")
+
+        items, meta = _paginate(qs, request)
+        data = StickerLibraryEntrySerializer(items, many=True, context={"request": request}).data
+        return Response({"results": data, "meta": meta}, status=status.HTTP_200_OK)
+
+
+class StickerSaveView(APIView):
+    """
+    POST /api/v1/stickers/<uuid:sticker_id>/save/
+
+    Idempotent: saving a sticker already in the caller's library just
+    returns the existing entry rather than erroring or duplicating it.
+    Never touches the Sticker row itself or its owner's own entry.
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, sticker_id=None):
+        try:
+            sticker = Sticker.objects.get(id=sticker_id, is_removed=False)
+        except (Sticker.DoesNotExist, ValueError, TypeError):
+            raise NotFound("Sticker not found.")
+
+        entry, created = StickerLibraryEntry.objects.get_or_create(user=request.user, sticker=sticker)
+        return Response(
+            StickerLibraryEntrySerializer(entry, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class StickerLibraryEntryDeleteView(APIView):
+    """
+    DELETE /api/v1/stickers/library/<uuid:entry_id>/
+
+    Removes only the CALLER's own library entry. Scoped to
+    StickerLibraryEntry.objects.filter(user=request.user, ...) rather than
+    looking the entry up by id alone first — a user cannot even discover
+    whether an entry id belongs to someone else via a different error
+    code, let alone delete it; it is simply not found for them.
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, entry_id=None):
+        deleted, _ = StickerLibraryEntry.objects.filter(id=entry_id, user=request.user).delete()
+        if not deleted:
+            raise NotFound("Sticker library entry not found.")
+        return Response(status=status.HTTP_204_NO_CONTENT)

@@ -377,3 +377,16 @@ register_purpose("partner_resource", _PurposeSpec(
     target_types=("partners.PartnerResource",), allow_attach=False,
     visibility_class="restricted",
 ))
+# Sticker library (apps.chat.Sticker/StickerLibraryEntry) - a sticker's
+# whole point is to be reusable in any conversation the saver is in, so
+# access is deliberately NOT conversation-scoped like a normal chat
+# attachment. allow_attach=False: apps.chat creates the Sticker row
+# itself directly against the confirmed assetId, never through the
+# generic MediaAssetAttachView dance. access_authorizer registered in
+# apps/chat/media_hooks.py (ChatConfig.ready()), same pattern as
+# profile_avatar/profile_cover in apps/accounts/media_hooks.py.
+register_purpose("sticker", _PurposeSpec(
+    context="sticker", moderation_context="sticker", retention_days=None,
+    target_types=("chat.Sticker",), allow_attach=False,
+    visibility_class="public_catalog",
+))

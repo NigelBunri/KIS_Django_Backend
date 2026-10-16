@@ -586,3 +586,42 @@ class MessageThreadLinkSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         validators = []
+
+
+# ---------------------------------------------------------------------------
+# Sticker library
+# ---------------------------------------------------------------------------
+
+class StickerSerializer(serializers.Serializer):
+    """Read-only. assetId is deliberately the only asset reference exposed
+    here — the client resolves a fresh signed image URL itself via the
+    existing GET /api/v1/media/assets/<assetId>/signed-url/ endpoint
+    (presigned URLs expire in ~1h; baking one into this payload would go
+    stale long before a sticker library entry is ever re-fetched)."""
+
+    id = serializers.UUIDField()
+    owner_id = serializers.SerializerMethodField()
+    asset_id = serializers.SerializerMethodField()
+    caption_text = serializers.CharField()
+    created_at = serializers.DateTimeField()
+
+    def get_owner_id(self, obj):
+        return str(obj.owner_id) if obj.owner_id else None
+
+    def get_asset_id(self, obj):
+        return str(obj.asset_id)
+
+
+class StickerLibraryEntrySerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    added_at = serializers.DateTimeField()
+    sticker = serializers.SerializerMethodField()
+    is_mine = serializers.SerializerMethodField()
+
+    def get_sticker(self, obj):
+        return StickerSerializer(obj.sticker).data
+
+    def get_is_mine(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        return bool(user and user.is_authenticated and obj.sticker.owner_id == user.id)

@@ -7,3 +7,6 @@ class ChatConfig(AppConfig):
 
     def ready(self):
         from . import signals  # noqa: F401
+        from .media_hooks import register as register_media_hooks
+
+        register_media_hooks()

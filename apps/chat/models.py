@@ -649,3 +649,98 @@ class ContactShareLink(models.Model):
 
     def is_redeemable(self) -> bool:
         return self.is_active and not self.is_expired()
+
+
+# ---------------------------------------------------------------------------
+# Sticker library (account-wide, reusable across every conversation)
+# ---------------------------------------------------------------------------
+
+class Sticker(models.Model):
+    """
+    A user-created custom sticker's permanent record. The image itself is
+    an apps.media.MediaAsset (created via the existing POST /uploads/file
+    endpoint with context="sticker", visibility="public" - this reuses the
+    same safety-scanned, S3-backed upload pipeline every other image
+    upload already goes through, rather than inventing a second one).
+
+    Deliberately separate from StickerLibraryEntry below: a Sticker row is
+    the one, stable, shared asset - created exactly once, by exactly one
+    owner. A StickerLibraryEntry is "this sticker is in this user's
+    library," which can exist for many users pointing at the same Sticker
+    (the creator's own entry, plus one per person who saved it from a
+    chat). Deleting a library entry never touches the Sticker row or its
+    MediaAsset - other users' entries (and the asset itself) must survive
+    regardless of what any one user does to their own copy.
+
+    visibility on the underlying MediaAsset is deliberately "public" (any
+    authenticated KIS user, not just conversation participants) rather
+    than trying to replicate per-conversation attachment ACLs here: once
+    sent in a chat and saved, a sticker must be freely reusable in any
+    other conversation the saver is in, including ones the original
+    conversation's other participants were never part of. This matches
+    the zero-ACL precedent the built-in sticker packs (StickerPackListView)
+    already set - stickers are low-sensitivity, inherently shareable
+    content, not private media. The bucket itself stays private either
+    way (gated by Django auth + signed URLs, never a public bucket).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="created_stickers",
+    )
+    asset = models.ForeignKey(
+        "media.MediaAsset",
+        on_delete=models.PROTECT,
+        related_name="stickers",
+    )
+    # The optional text overlay the creator composed in StickerEditor —
+    # stored for search/accessibility, not re-rendered (it's already baked
+    # into the captured PNG itself).
+    caption_text = models.CharField(max_length=120, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    # Soft-removal only (e.g. future moderation action) — never a hard
+    # delete, since other users' StickerLibraryEntry rows must keep
+    # resolving to *something* explainable rather than a dangling FK.
+    is_removed = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = "chat_sticker"
+        ordering = ["-created_at"]
+
+
+class StickerLibraryEntry(models.Model):
+    """
+    "This sticker is in this user's library" — the reusable-across-every-
+    chat-room relationship the whole feature is built around. One row per
+    (user, sticker): the creator gets one automatically the moment they
+    create it (see apps.chat.views.StickerLibraryCreateView), and anyone
+    who saves a sticker they received in a chat gets their own. Removing
+    this row only ever removes *this user's* access to it from the picker
+    — it can never cascade to the Sticker row or anyone else's entry.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="sticker_library_entries",
+    )
+    sticker = models.ForeignKey(
+        Sticker,
+        on_delete=models.CASCADE,
+        related_name="library_entries",
+    )
+    added_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "chat_sticker_library_entry"
+        ordering = ["-added_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "sticker"],
+                name="uniq_sticker_library_entry_per_user",
+            ),
+        ]

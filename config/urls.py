@@ -11,7 +11,13 @@ from rest_framework_simplejwt.views import (
     TokenVerifyView,       # POST: { token } -> {} if valid
 )
 from apps.accounts.views import DeviceBoundTokenRefreshView, LoginView
-from apps.chat.views import StickerPackListView
+from apps.chat.views import (
+    StickerPackListView,
+    StickerCreateView,
+    StickerLibraryListView,
+    StickerSaveView,
+    StickerLibraryEntryDeleteView,
+)
 from apps.media.views import UploadFileView
 from apps.broadcasts.views import BroadcastVideoUploadView
 
@@ -321,6 +327,15 @@ urlpatterns = [
     path("api/v1/health/extended/", include("apps.health_ops.extended_urls")),
     path("api/v1/health/clinical/", include("apps.health_ops.clinical_urls")),
     path("api/v1/stickers/packs/", StickerPackListView.as_view(), name="sticker-packs"),
+    # Sticker library — account-wide, reusable-across-every-conversation
+    # custom stickers (distinct from the built-in packs above). Static
+    # literal sub-paths ("library/", "packs/") only, with any <uuid:...>
+    # converter strictly after one, so there is no routing ambiguity with
+    # the packs path above regardless of declaration order.
+    path("api/v1/stickers/", StickerCreateView.as_view(), name="sticker-create"),
+    path("api/v1/stickers/library/", StickerLibraryListView.as_view(), name="sticker-library-list"),
+    path("api/v1/stickers/library/<uuid:entry_id>/", StickerLibraryEntryDeleteView.as_view(), name="sticker-library-entry-delete"),
+    path("api/v1/stickers/<uuid:sticker_id>/save/", StickerSaveView.as_view(), name="sticker-save"),
 
     # --- JWT auth endpoints (SimpleJWT) ---
     # Obtain access/refresh with username/password

@@ -401,6 +401,17 @@ UPLOAD_CONTEXTS: dict[str, UploadContextConfig] = {
         max_bytes=_task_report_max_bytes,
         key_prefix="partners/resources",
     ),
+    # Stickers upload through the legacy multipart endpoint (POST
+    # /uploads/file, context="sticker") rather than this presigned-intent
+    # flow — this entry exists purely so register_purpose("sticker", ...)
+    # in apps/media/purposes.py passes its "is this a real context"
+    # validation, which checks UPLOAD_CONTEXTS regardless of which actual
+    # upload path a given purpose uses.
+    "sticker": UploadContextConfig(
+        allowed_content_types=_profile_image_allowed_content_types,
+        max_bytes=_profile_image_max_bytes,
+        key_prefix="stickers",
+    ),
 }
 
 

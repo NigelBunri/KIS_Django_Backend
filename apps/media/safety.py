@@ -29,6 +29,7 @@ SAFE_UPLOAD_CONTEXTS = {
     "verification",
     "status",
     "bible",
+    "sticker",
     "general",
 }
 
