@@ -316,6 +316,36 @@ class UserBlockViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         blocked = serializer.validated_data["blocked"]
+
+        # CONFIRMED gap: this endpoint only ever handled creating a block -
+        # the mobile app's unblockContact() (BlockedContactsScreen.tsx) has
+        # always posted {blocked: userId, action: 'unblock'} here, but
+        # `action` was never read anywhere in this method, so an "unblock"
+        # request silently fell through to the SAME get_or_create() below
+        # and just found/left the existing block row untouched. The app's
+        # own local AsyncStorage block list still cleared (so chat
+        # messages reappeared for the user), but every OTHER consumer of
+        # UserBlock that queries the server directly - critically
+        # checkBlockedAmong, the server-authoritative check gating call
+        # invites - kept treating the pair as blocked forever, with no way
+        # to ever undo it through the app. None of UserBlock's many
+        # consumers across the codebase filter on is_deleted (it's never
+        # actually set anywhere), so a hard delete is the correct, fully
+        # effective undo here, not a soft-delete flag nothing checks.
+        if str(request.data.get("action", "")).lower() == "unblock":
+            deleted_count, _ = models.UserBlock.objects.filter(
+                blocker=request.user, blocked=blocked,
+            ).delete()
+            if deleted_count:
+                models.AuditLog.objects.create(
+                    actor_id=request.user.id,
+                    action="moderation.user_block.delete",
+                    target_type="USER",
+                    target_id=blocked.id,
+                    metadata={},
+                )
+            return Response({"blocked": False}, status=status.HTTP_200_OK)
+
         reason = serializer.validated_data.get("reason", "")
         block, created = models.UserBlock.objects.get_or_create(
             blocker=request.user,
