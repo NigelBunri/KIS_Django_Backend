@@ -764,6 +764,128 @@ class PartnerPostModerationEnforcementApiTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
 
+class PartnerPostEditDeleteSecurityApiTests(TestCase):
+    """PATCH/DELETE /api/v1/partners/posts/{id}/ had no permission check at
+    all beyond IsAuthenticated — any partner member could edit or hard-
+    delete any other member's post, bypassing delete_post's real author/
+    admin/legal-hold checks entirely. The mobile client's edit action was
+    also pointed at a nonexistent .../edit/ custom path (confirmed via a
+    direct grep: no such action is registered on PartnerPostViewSet),
+    so every edit attempt 404'd before this fix. Mirrors the identical,
+    already-fixed bug in apps.communities.CommunityPostViewSet."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(phone="+237670005101", country="CM", password="pass1234")
+        self.author = User.objects.create_user(phone="+237670005102", country="CM", password="pass1234")
+        self.other_member = User.objects.create_user(phone="+237670005103", country="CM", password="pass1234")
+        conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Edit Security Partner", description="", created_by=self.owner,
+        )
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        ConversationMember.objects.create(conversation=conversation, user=self.author, base_role=BaseConversationRole.MEMBER)
+        ConversationMember.objects.create(conversation=conversation, user=self.other_member, base_role=BaseConversationRole.MEMBER)
+        self.partner = Partner.objects.create(
+            owner=self.owner, name="Edit Security Partner", slug="edit-security-partner", main_conversation=conversation,
+        )
+        PartnerMembership.objects.create(partner=self.partner, user=self.author, role="member", status=PartnerMembershipStatus.MEMBER)
+        PartnerMembership.objects.create(partner=self.partner, user=self.other_member, role="member", status=PartnerMembershipStatus.MEMBER)
+        self.post = PartnerPost.objects.create(
+            partner=self.partner, author=self.author, text_plain="Original text", text_preview="Original text",
+        )
+
+    @staticmethod
+    def _doc(text):
+        # Matches common.rich_text.build_plain_text_document's exact
+        # output shape — confirmed directly via manage.py shell. The
+        # `styled_text: {text}` shortcut referenced in
+        # prepare_partner_rich_text_attrs is DEAD CODE: neither
+        # PartnerPostSerializer nor PartnerPostCreateSerializer declares
+        # `styled_text` as an actual field, so DRF's to_internal_value()
+        # silently strips it before validate() ever runs — attrs never
+        # contains it regardless of what a client sends. `text` (a real
+        # JSONField in Meta.fields, backed by the model's JSONField) is
+        # the only input that genuinely reaches the server.
+        return {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
+
+    def test_author_can_edit_own_post(self):
+        self.client.force_authenticate(self.author)
+
+        response = self.client.patch(
+            f"/api/v1/partners/posts/{self.post.id}/", {"text": self._doc("Edited by author")}, format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.post.refresh_from_db()
+        self.assertEqual(self.post.text_plain, "Edited by author")
+
+    def test_owner_can_edit_any_members_post(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.patch(
+            f"/api/v1/partners/posts/{self.post.id}/", {"text": self._doc("Edited by owner")}, format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_other_member_cannot_edit_someone_elses_post(self):
+        self.client.force_authenticate(self.other_member)
+
+        response = self.client.patch(
+            f"/api/v1/partners/posts/{self.post.id}/", {"text": self._doc("Hijacked")}, format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.post.refresh_from_db()
+        self.assertEqual(self.post.text_plain, "Original text")
+
+    def test_text_plain_alone_is_silently_ignored_not_an_error(self):
+        # Regression guard for the exact bug this class exists to catch:
+        # text_plain is read-only, so submitting ONLY it must not raise,
+        # but must also not change the post's content.
+        self.client.force_authenticate(self.author)
+
+        response = self.client.patch(f"/api/v1/partners/posts/{self.post.id}/", {"text_plain": "Ignored"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.post.refresh_from_db()
+        self.assertEqual(self.post.text_plain, "Original text")
+
+    def test_other_member_cannot_fully_replace_someone_elses_post(self):
+        # PUT (update, not partial_update) must carry the identical guard -
+        # both override the same base method differently, easy to cover one
+        # and miss the other.
+        self.client.force_authenticate(self.other_member)
+
+        response = self.client.put(
+            f"/api/v1/partners/posts/{self.post.id}/",
+            {"text_plain": "Hijacked via PUT", "partner": str(self.partner.id)},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    def test_raw_delete_verb_is_blocked_even_for_the_author(self):
+        # Real deletion must go through delete_post (soft delete + legal-
+        # hold check) - the raw DRF DELETE route is blocked outright, not
+        # just permission-gated, so there is only ever one deletion path.
+        self.client.force_authenticate(self.author)
+
+        response = self.client.delete(f"/api/v1/partners/posts/{self.post.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertTrue(PartnerPost.objects.filter(id=self.post.id, is_deleted=False).exists())
+
+    def test_delete_post_action_still_works_for_the_author(self):
+        self.client.force_authenticate(self.author)
+
+        response = self.client.post(f"/api/v1/partners/posts/{self.post.id}/delete/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.post.refresh_from_db()
+        self.assertTrue(self.post.is_deleted)
+
+
 class PartnerJobPostingTierGateApiTests(TestCase):
     """jobs/update_job only ever checked _user_can_manage_partner — any
     manager/admin/owner could post jobs regardless of ANY tier at all.

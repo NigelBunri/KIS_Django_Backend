@@ -4988,6 +4988,49 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
         role = self._member_role(partner, user)
         return partner.owner_id == user.id or role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN)
 
+    def _can_edit_post(self, post, user) -> bool:
+        return post.author_id == user.id or self._user_can_manage(post.partner, user)
+
+    def update(self, request, *args, **kwargs):
+        # PATCH /partners/posts/{id}/ had no permission check at all beyond
+        # IsAuthenticated — any partner member could edit any other
+        # member's post. Mirrors the identical fix already applied to
+        # apps.communities.CommunityPostViewSet.update. The mobile client
+        # (PartnerFeedScreen.tsx's editEndpoint) was also pointed at a
+        # nonexistent .../edit/ custom action — now fixed to call this
+        # standard detail route instead, same as the community feed does.
+        post = self.get_object()
+        if not self._can_edit_post(post, request.user):
+            raise PermissionDenied("You don't have permission to edit this post.")
+        response = super().update(request, *args, **kwargs)
+        notify_nest_of_partner_event(
+            partner_id=str(post.partner_id),
+            event="partner.post_updated",
+            user_ids=[uid for uid in active_partner_member_ids(post.partner) if uid != str(request.user.id)],
+            data={"postId": str(post.id)},
+        )
+        return response
+
+    def partial_update(self, request, *args, **kwargs):
+        # No notify call here: UpdateModelMixin.partial_update calls
+        # self.update(), which resolves to THIS class's override above —
+        # calling notify again here would double-fire the live event for
+        # every PATCH (confirmed as a real duplicate-event bug the first
+        # time this exact pattern was fixed, for communities).
+        post = self.get_object()
+        if not self._can_edit_post(post, request.user):
+            raise PermissionDenied("You don't have permission to edit this post.")
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        # Real deletion is intentionally routed through delete_post below
+        # (soft delete + permission + legal-hold check). The default
+        # DELETE verb had zero permission check and would hard-delete via
+        # the ORM — block it outright rather than maintain a second,
+        # divergent deletion path. Mirrors the identical fix already
+        # applied to apps.communities.CommunityPostViewSet.destroy.
+        raise PermissionDenied("Use the delete action to remove a post.")
+
     def get_queryset(self):
         user = self.request.user
         blocked_ids = UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
@@ -5110,6 +5153,17 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
             },
             actor=self.request.user,
         )
+        # Unlike apps.communities' equivalent (notify_post_created), this
+        # was never wired — the partner feed had no live-update push at
+        # all, only a manual pull-to-refresh. Scheduled posts don't
+        # publish yet, so nobody else should be nudged to refresh for one.
+        if post.status == PartnerPostStatus.PUBLISHED:
+            notify_nest_of_partner_event(
+                partner_id=str(partner.id),
+                event="partner.post_created",
+                user_ids=[uid for uid in active_partner_member_ids(partner) if uid != str(self.request.user.id)],
+                data={"postId": str(post.id), "authorId": str(self.request.user.id)},
+            )
 
     @action(detail=True, methods=["post"], url_path="comment")
     def comment(self, request, pk=None):
@@ -5143,6 +5197,14 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
                 "user_id": str(request.user.id),
             },
             actor=request.user,
+        )
+        # Mirrors notify_post_created above — same live-update gap existed
+        # for comments (apps.communities' notify_comment_created equivalent).
+        notify_nest_of_partner_event(
+            partner_id=str(post.partner_id),
+            event="partner.comment_created",
+            user_ids=[uid for uid in active_partner_member_ids(post.partner) if uid != str(request.user.id)],
+            data={"postId": str(post.id), "commentId": str(comment.id), "authorId": str(request.user.id)},
         )
         return Response(PartnerPostCommentSerializer(comment).data, status=status.HTTP_201_CREATED)
 
@@ -5234,6 +5296,12 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Legal hold is enabled for this partner.")
         post.is_deleted = True
         post.save(update_fields=["is_deleted"])
+        notify_nest_of_partner_event(
+            partner_id=str(post.partner_id),
+            event="partner.post_deleted",
+            user_ids=active_partner_member_ids(post.partner),
+            data={"postId": str(post.id)},
+        )
         return Response({"detail": "Post deleted."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="broadcast")
