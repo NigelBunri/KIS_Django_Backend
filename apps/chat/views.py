@@ -60,6 +60,7 @@ from apps.partners.services import (
 )
 from apps.partners.services import dispatch_partner_webhooks
 from apps.groups.models import Group, GroupMembership, GroupRole
+from apps.groups.services import reactivate_group_membership
 from apps.channels.models import Channel
 from apps.communities.models import Community, CommunityMembership, CommunityRole
 
@@ -533,6 +534,22 @@ class ConversationViewSet(viewsets.ModelViewSet):
             member.base_role = base_role
             member.save(update_fields=["left_at", "base_role"])
 
+        # This conversation may be the backing conversation of a Group
+        # (apps.groups.Group.conversation, related_name "group") - Group
+        # membership is tracked in its own GroupMembership table, separate
+        # from ConversationMember above, so adding someone here alone left
+        # them able to chat but permanently missing from the group's own
+        # member list (GET /chat-groups/{id}/members/ reads GroupMembership,
+        # never ConversationMember) even after a refresh. Keep both in sync
+        # via the same helper GroupViewSet's own add/join flows use.
+        try:
+            group = conversation.group
+        except Group.DoesNotExist:
+            group = None
+        if group:
+            group_role = base_role if base_role in GroupRole.values else GroupRole.MEMBER
+            reactivate_group_membership(group, user, role=group_role)
+
         return Response(ConversationMemberSerializer(member).data, status=201)
 
     @action(detail=True, methods=['post'], url_path='members/remove')
@@ -574,6 +591,21 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
         member.left_at = timezone.now()
         member.save(update_fields=["left_at"])
+
+        # Mirror of the sync in add_member above - without this, removing
+        # someone via the chat UI would leave their GroupMembership row
+        # active, so they'd still show up in the group's own member list
+        # (and could still rejoin/act as a member there) despite being
+        # removed from the conversation.
+        try:
+            group = conversation.group
+        except Group.DoesNotExist:
+            group = None
+        if group:
+            GroupMembership.objects.filter(
+                group=group, user_id=user_id, left_at__isnull=True,
+            ).update(left_at=timezone.now())
+
         return Response(ConversationMemberSerializer(member).data, status=200)
 
     @action(detail=True, methods=['post'], url_path='members/role')
@@ -608,6 +640,21 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
         member.base_role = base_role
         member.save(update_fields=["base_role"])
+
+        # Mirror of the sync in add_member/remove_member above - keep the
+        # group's own GroupMembership.role in step with the conversation
+        # role change, or the group's member list would keep showing the
+        # member's old role after promoting/demoting them via the chat UI.
+        try:
+            group = conversation.group
+        except Group.DoesNotExist:
+            group = None
+        if group:
+            group_role = base_role if base_role in GroupRole.values else GroupRole.MEMBER
+            GroupMembership.objects.filter(
+                group=group, user_id=user_id, left_at__isnull=True,
+            ).update(role=group_role)
+
         return Response(ConversationMemberSerializer(member).data, status=200)
 
     # ------------------------------------------------------------------

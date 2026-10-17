@@ -37,6 +37,7 @@ from apps.accounts.models import User
 from apps.partners.models import Partner as PartnerModel, PartnerMembership, PartnerMembershipStatus
 from apps.communities.models import CommunityMembership, CommunityRole
 from apps.chat.models import ConversationMember, BaseConversationRole
+from apps.groups.services import reactivate_group_membership
 
 
 @extend_schema_view(
@@ -155,40 +156,12 @@ class GroupViewSet(viewsets.ModelViewSet):
         )
 
     def _reactivate_group_membership(self, group: Group, user, *, role=None):
-        """
-        Create-or-reactivate GroupMembership + ConversationMember for
-        (group, user). joined_at is restamped to now() only when actually
-        (re)activating from a nonexistent/left/banned state - never on a
-        redundant call against an already-active membership - so a rejoin
-        starts a new pre-join-history boundary (see the email/E2EE-history
-        audit: new members can never decrypt messages sent before they
-        joined, so an accurate joined_at is what lets the client draw that
-        boundary correctly across leave/rejoin cycles) without disturbing
-        an active member's real original join time.
-        """
-        role = role or GroupRole.MEMBER
-        membership, created = GroupMembership.objects.get_or_create(
-            group=group,
-            user=user,
-            defaults={"role": role},
-        )
-        if not created and (membership.left_at is not None or membership.is_banned):
-            membership.left_at = None
-            membership.is_banned = False
-            membership.joined_at = timezone.now()
-            membership.save(update_fields=["left_at", "is_banned", "joined_at"])
-
-        cm, cm_created = ConversationMember.objects.get_or_create(
-            conversation=group.conversation,
-            user=user,
-            defaults={"base_role": BaseConversationRole.MEMBER},
-        )
-        if not cm_created and cm.left_at is not None:
-            cm.left_at = None
-            cm.joined_at = timezone.now()
-            cm.save(update_fields=["left_at", "joined_at"])
-
-        return membership, cm
+        # Shared with ConversationViewSet.add_member (apps.chat.views) so a
+        # member added via either the group's own UI or the chat/conversation
+        # "Add member" UI always gets both a GroupMembership and a
+        # ConversationMember row - see reactivate_group_membership's own
+        # docblock for why that sync matters.
+        return reactivate_group_membership(group, user, role=role)
 
     def _community_access_all(self, community_id, user) -> bool:
         if not community_id:
