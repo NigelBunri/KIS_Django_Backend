@@ -149,6 +149,7 @@ def notify_status_discussion_event(*, status_id: str, event: str, payload: dict)
     import urllib.request
 
     from django.conf import settings
+    from django.core.serializers.json import DjangoJSONEncoder
 
     from apps.chat.internal_signing import sign_internal_request
 
@@ -160,17 +161,31 @@ def notify_status_discussion_event(*, status_id: str, event: str, payload: dict)
         return
 
     url = f"{base}/internal/status-discussions/{status_id}/broadcast"
-    body = {"event": event, "payload": payload}
-    data = json.dumps(body).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        **sign_internal_request("POST", url, body, secret=token),
-    }
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
+        # payload carries whatever _serialize_comment/the reaction dict put
+        # in it, which includes a real datetime object (created_at) - the
+        # plain json module (used both below AND inside sign_internal_
+        # request's own signature hash, a shared utility this function
+        # can't change the serialization behavior of without touching every
+        # other internal-call site that reuses it) can't encode that at
+        # all. Round-tripping through DjangoJSONEncoder once up front turns
+        # it into its JSON-safe (isoformat string) form before either
+        # dumps call touches it, so the signature is computed over the
+        # exact same bytes that get sent. The whole call is wrapped (not
+        # just the HTTP request below) so that - or any other encoding/
+        # network hiccup - is swallowed-and-logged like this function's own
+        # docstring promises, rather than propagating up and failing the
+        # real, already-persisted write it's reporting on.
+        body = json.loads(json.dumps({"event": event, "payload": payload}, cls=DjangoJSONEncoder))
+        data = json.dumps(body).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            **sign_internal_request("POST", url, body, secret=token),
+        }
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=4) as resp:
             resp.read()
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except Exception as exc:
         logger.info("status_discussion_broadcast_failed status_id=%s event=%s error=%s", status_id, event, exc)
 
 
