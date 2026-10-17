@@ -116,17 +116,48 @@ def _conversation_unread_counts(user) -> tuple[int, int]:
 
     message_unread = 0
     partner_unread = 0
-    memberships = (
+    memberships = list(
         ConversationMember.objects.select_related("conversation")
         .filter(user=user, left_at__isnull=True, is_hidden=False)
         .exclude(notification_level=ConversationNotificationLevel.NONE)
         .exclude(conversation__type=ConversationType.POST)
         .exclude(conversation__type=ConversationType.THREAD)
-        .only("last_read_seq", "conversation_id", "conversation__last_message_seq")
+        .only("last_read_seq", "conversation_id", "conversation__last_message_seq", "conversation__type")
     )
-    for member in memberships.iterator():
+
+    # A blocked contact's DM must never contribute to the Messages badge -
+    # same requirement as hiding it from the chat list itself. Blocking is
+    # bidirectional for this purpose (get_blocked_user_ids covers both "I
+    # blocked them" and "they blocked me"), and resolving each direct
+    # conversation's OTHER participant is done as one bulk query up front
+    # rather than per-membership, to avoid an N+1 here.
+    from apps.moderation.services import get_blocked_user_ids
+
+    blocked_user_ids = get_blocked_user_ids(user)
+    other_participant_by_conversation: dict[str, str] = {}
+    if blocked_user_ids:
+        direct_conversation_ids = [
+            member.conversation_id for member in memberships
+            if member.conversation.type == ConversationType.DIRECT
+        ]
+        if direct_conversation_ids:
+            other_members = (
+                ConversationMember.objects.filter(
+                    conversation_id__in=direct_conversation_ids,
+                    left_at__isnull=True,
+                )
+                .exclude(user_id=user.id)
+                .values_list("conversation_id", "user_id")
+            )
+            for conversation_id, other_user_id in other_members:
+                other_participant_by_conversation[str(conversation_id)] = str(other_user_id)
+
+    for member in memberships:
         unread = max(int(member.conversation.last_message_seq or 0) - int(member.last_read_seq or 0), 0)
         if unread <= 0:
+            continue
+        other_user_id = other_participant_by_conversation.get(str(member.conversation_id))
+        if other_user_id and other_user_id in blocked_user_ids:
             continue
         if str(member.conversation_id) in partner_conversation_ids:
             partner_unread += unread

@@ -49,6 +49,12 @@ class GroupDetailSerializer(serializers.ModelSerializer):
             "owner",
             "is_archived",
             "conversation_id",
+            # Writable (via PATCH /api/v1/chat-groups/{id}/, owner-only -
+            # see GroupViewSet.perform_update) - previously exposed nowhere
+            # at all, so "Approval required to join" in ChatInfoPage.tsx had
+            # no way to ever actually change it; every group was stuck at
+            # the model default (OPEN) regardless of what the toggle showed.
+            "join_policy",
             "created_at",
             "updated_at",
         ]

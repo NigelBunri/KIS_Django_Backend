@@ -203,6 +203,40 @@ class MainTabBadgeCountsAPITest(APITestCase):
         self.assertEqual(response.data["counts"]["Messages"], 3)
         self.assertIn("sources", response.data)
 
+    def test_blocked_contacts_dm_never_contributes_to_messages_badge(self):
+        # _conversation_unread_counts previously summed every active DM's
+        # unread count with no awareness of blocking at all - a blocked
+        # contact could still send messages (per this app's actual block
+        # design: private to the blocker, the blocked person is never
+        # tipped off and keeps sending normally), and every one of those
+        # kept inflating the Messages badge even though the chat itself is
+        # hidden from the list entirely.
+        from apps.chat.models import Conversation, ConversationMember, ConversationType, BaseConversationRole
+        from apps.moderation.models import UserBlock
+
+        blocked_contact = get_user_model().objects.create_user(
+            phone="+15550001012", country="US", password="password12345",
+        )
+        UserBlock.objects.create(blocker=self.user, blocked=blocked_contact)
+
+        conversation = Conversation.objects.create(
+            type=ConversationType.DIRECT,
+            created_by=blocked_contact,
+            last_message_seq=10,
+            last_message_preview="Hello",
+        )
+        ConversationMember.objects.create(
+            conversation=conversation, user=self.user, base_role=BaseConversationRole.MEMBER, last_read_seq=0,
+        )
+        ConversationMember.objects.create(
+            conversation=conversation, user=blocked_contact, base_role=BaseConversationRole.MEMBER, last_read_seq=10,
+        )
+
+        response = self.client.get("/api/v1/notifications/main-tab-badge-counts/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["counts"]["Messages"], 0)
+
     def test_source_notifications_increment_and_decrement_exact_badge_tabs(self):
         cases = [
             ("BIBLE_DAILY_MEDITATION", "bible_meditation_post", "bible", "Bible"),

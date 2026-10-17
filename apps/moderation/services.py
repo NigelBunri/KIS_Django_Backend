@@ -39,6 +39,20 @@ BULK_VIOLATION_THRESHOLD = 10
 BULK_VIOLATION_WINDOW_MINUTES = 15
 
 
+def get_blocked_user_ids(user) -> set[str]:
+    """Every user id blocked in EITHER direction with `user` (they blocked
+    someone, or someone blocked them) - the shared helper behind every
+    "hide/exclude content involving a blocked user" check in the app
+    (status visibility, conversation unread badge counts, ...). Extracted
+    here from apps.statuses.services (which now just delegates to this)
+    so apps that have nothing to do with statuses - e.g. apps.notifications'
+    badge_counts.py - don't need to import the statuses app just for this.
+    """
+    blocked_by_me = models.UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
+    blocked_me = models.UserBlock.objects.filter(blocked=user).values_list("blocker_id", flat=True)
+    return {str(value) for value in blocked_by_me} | {str(value) for value in blocked_me}
+
+
 def request_ip(request) -> str:
     forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "") if request else ""
     if forwarded:

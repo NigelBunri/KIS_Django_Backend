@@ -1,8 +1,10 @@
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.urls import reverse
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -12,6 +14,8 @@ from apps.media.tests import _mock_s3_client
 from apps.moderation.models import AuditLog, Flag, UserBlock
 from apps.statuses.models import (
     StatusAudienceTarget,
+    StatusComment,
+    StatusHide,
     StatusItem,
     StatusItemView,
     StatusModerationStatus,
@@ -305,46 +309,52 @@ class StatusPrivacyContractTests(APITestCase):
 
 
 class StatusReplyTests(StatusPrivacyContractTests):
-    """apps/statuses/views.py::reply() - the known priority bug for Phase 4.
-
-    Reuses StatusPrivacyContractTests' fixtures (author/viewer/excluded/
-    stranger, with author<->viewer and author<->excluded as mutual
-    contacts) since reply() needs the exact same visibility matrix
-    can_view_status() already covers.
-
-    deliver_status_reply_message is patched at the apps.statuses.views
-    import site (not apps.statuses.services, since views.py does
-    `from apps.statuses.services import ... deliver_status_reply_message`
-    inside the method - patching the origin module wouldn't affect the
-    name already bound into views' local scope at call time) - this is a
-    real Django-side unit test, not a live Django<->Nest integration test,
-    so the actual HTTP call to Nest.js is deliberately not exercised here.
-    """
+    """apps/statuses/views.py::reply() - now a thin back-compat alias that
+    creates a top-level StatusComment (no parent) directly, with no call
+    to Nest/chat at all - see StatusCommentTests for the full comment/
+    reply-threading contract and apps/statuses/services.py's
+    deliver_status_reply_message docstring for why the old chat-delivery
+    path (this class used to mock and assert against) was removed: it
+    polluted the viewer's and author's ordinary chat history with every
+    status reply, and depended on a synchronous Django->Nest HTTP call
+    that had never actually worked in production (wrong internal token
+    name, wrong call signature - see git history)."""
 
     def _reply_url(self, status_item) -> str:
         return f"/api/v1/statuses/{status_item.id}/reply/"
 
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_reply_succeeds_for_visible_status_and_delivers_via_nest(self, mock_deliver):
-        mock_deliver.return_value = {"ok": True, "messageId": "msg-123", "seq": 1}
+    def test_reply_succeeds_for_visible_status_and_creates_a_comment(self):
         status_item = self._create_status(author=self.author)
 
         self.client.force_authenticate(self.viewer)
         res = self.client.post(self._reply_url(status_item), {"text": "Nice status!"})
 
         self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
-        self.assertEqual(res.json()["message_id"], "msg-123")
-        self.assertTrue(res.json()["conversation_id"])
-        mock_deliver.assert_called_once()
-        _, kwargs = mock_deliver.call_args
-        self.assertEqual(kwargs["sender_id"], str(self.viewer.id))
-        self.assertEqual(kwargs["text"], "Nice status!")
+        self.assertEqual(res.json()["text"], "Nice status!")
+        self.assertIsNone(res.json()["parent_id"])
+        comment = StatusComment.objects.get(id=res.json()["id"])
+        self.assertEqual(comment.status_id, status_item.id)
+        self.assertEqual(comment.author_id, self.viewer.id)
         self.assertTrue(
-            AuditLog.objects.filter(action="status.reply", target_id=status_item.id).exists()
+            AuditLog.objects.filter(action="status.comment", target_id=status_item.id).exists()
         )
 
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_reply_returns_404_when_viewer_is_excluded_from_audience(self, mock_deliver):
+    def test_reply_never_creates_a_chat_conversation_or_message(self):
+        # The old implementation called get_or_create_direct_conversation
+        # and Nest's send-as-user endpoint - neither apps.chat.models nor
+        # any HTTP client should be touched by this path anymore.
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+
+        with patch("apps.statuses.services.deliver_status_reply_message") as mock_deliver:
+            res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        mock_deliver.assert_not_called()
+        self.assertNotIn("conversation_id", res.json())
+        self.assertNotIn("message_id", res.json())
+
+    def test_reply_returns_404_when_viewer_is_excluded_from_audience(self):
         status_item = self._create_status(
             author=self.author,
             visibility=StatusVisibility.CONTACTS_EXCEPT,
@@ -355,20 +365,18 @@ class StatusReplyTests(StatusPrivacyContractTests):
         res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
 
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
-        mock_deliver.assert_not_called()
+        self.assertEqual(StatusComment.objects.count(), 0)
 
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_reply_returns_404_for_stranger_outside_contacts(self, mock_deliver):
+    def test_reply_returns_404_for_stranger_outside_contacts(self):
         status_item = self._create_status(author=self.author)
 
         self.client.force_authenticate(self.stranger)
         res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
 
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
-        mock_deliver.assert_not_called()
+        self.assertEqual(StatusComment.objects.count(), 0)
 
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_reply_returns_404_when_viewer_is_blocked(self, mock_deliver):
+    def test_reply_returns_404_when_viewer_is_blocked(self):
         status_item = self._create_status(author=self.author)
         UserBlock.objects.create(blocker=self.author, blocked=self.viewer)
 
@@ -376,10 +384,9 @@ class StatusReplyTests(StatusPrivacyContractTests):
         res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
 
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
-        mock_deliver.assert_not_called()
+        self.assertEqual(StatusComment.objects.count(), 0)
 
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_reply_returns_403_when_author_disabled_replies(self, mock_deliver):
+    def test_reply_returns_403_when_author_disabled_replies(self):
         status_item = self._create_status(
             author=self.author, reply_permission=StatusReplyPermission.NOBODY,
         )
@@ -388,32 +395,16 @@ class StatusReplyTests(StatusPrivacyContractTests):
         res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
 
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-        mock_deliver.assert_not_called()
+        self.assertEqual(StatusComment.objects.count(), 0)
 
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_reply_rejects_empty_text(self, mock_deliver):
+    def test_reply_rejects_empty_text(self):
         status_item = self._create_status(author=self.author)
 
         self.client.force_authenticate(self.viewer)
         res = self.client.post(self._reply_url(status_item), {"text": "   "})
 
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-        mock_deliver.assert_not_called()
-
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_reply_returns_502_when_nest_delivery_fails(self, mock_deliver):
-        from apps.statuses.services import StatusReplyDeliveryError
-
-        mock_deliver.side_effect = StatusReplyDeliveryError("boom")
-        status_item = self._create_status(author=self.author)
-
-        self.client.force_authenticate(self.viewer)
-        res = self.client.post(self._reply_url(status_item), {"text": "Hi"})
-
-        self.assertEqual(res.status_code, status.HTTP_502_BAD_GATEWAY)
-        self.assertFalse(
-            AuditLog.objects.filter(action="status.reply", target_id=status_item.id).exists()
-        )
+        self.assertEqual(StatusComment.objects.count(), 0)
 
     def test_reply_returns_404_for_missing_status(self):
         import uuid
@@ -424,38 +415,144 @@ class StatusReplyTests(StatusPrivacyContractTests):
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
 
 
+class StatusCommentTests(StatusPrivacyContractTests):
+    """The full comments/replies contract: threaded replies, pagination,
+    idempotency, and that a reply can never be attached to a different
+    status by manipulating parent_id."""
+
+    def _comments_url(self, status_item) -> str:
+        return f"/api/v1/statuses/{status_item.id}/comments/"
+
+    def test_reply_to_a_comment_is_threaded_under_it(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+        top_level = self.client.post(self._comments_url(status_item), {"text": "First!"}).json()
+
+        self.client.force_authenticate(self.author)
+        res = self.client.post(
+            self._comments_url(status_item),
+            {"text": "Thanks!", "parent_id": top_level["id"]},
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(res.json()["parent_id"], top_level["id"])
+
+        replies = self.client.get(self._comments_url(status_item), {"parent_id": top_level["id"]})
+        self.assertEqual(replies.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(replies.json()["results"]), 1)
+        self.assertEqual(replies.json()["results"][0]["text"], "Thanks!")
+
+        top_level_list = self.client.get(self._comments_url(status_item))
+        self.assertEqual(top_level_list.json()["results"][0]["reply_count"], 1)
+
+    def test_cannot_reply_to_a_reply(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+        top_level = self.client.post(self._comments_url(status_item), {"text": "First!"}).json()
+        reply = self.client.post(
+            self._comments_url(status_item), {"text": "A reply", "parent_id": top_level["id"]},
+        ).json()
+
+        res = self.client.post(
+            self._comments_url(status_item), {"text": "Reply to a reply", "parent_id": reply["id"]},
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_parent_id_from_a_different_status_is_rejected(self):
+        status_a = self._create_status(author=self.author)
+        status_b = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+        comment_on_a = self.client.post(self._comments_url(status_a), {"text": "On A"}).json()
+
+        # Attempting to attach a reply to status B, using a parent_id that
+        # is a real comment id but belongs to status A - must be rejected,
+        # not silently reparented onto B.
+        res = self.client.post(
+            self._comments_url(status_b), {"text": "Sneaky", "parent_id": comment_on_a["id"]},
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(StatusComment.objects.filter(status=status_b).exists())
+
+    def test_duplicate_submission_with_same_client_id_does_not_create_a_second_comment(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+
+        first = self.client.post(
+            self._comments_url(status_item), {"text": "Hi", "client_id": "retry-key-1"},
+        )
+        second = self.client.post(
+            self._comments_url(status_item), {"text": "Hi", "client_id": "retry-key-1"},
+        )
+
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.assertEqual(first.json()["id"], second.json()["id"])
+        self.assertEqual(StatusComment.objects.filter(status=status_item).count(), 1)
+
+    def test_comments_endpoint_returns_404_for_viewer_outside_audience(self):
+        status_item = self._create_status(
+            author=self.author,
+            visibility=StatusVisibility.CONTACTS_EXCEPT,
+            targets=[self.excluded],
+        )
+
+        self.client.force_authenticate(self.excluded)
+        res = self.client.get(self._comments_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_comments_rejects_text_over_2000_characters(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(self._comments_url(status_item), {"text": "x" * 2001})
+
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_comments_pagination_returns_has_more(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+        for i in range(5):
+            self.client.post(self._comments_url(status_item), {"text": f"Comment {i}"})
+
+        res = self.client.get(self._comments_url(status_item), {"limit": 3})
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.json()["results"]), 3)
+        self.assertTrue(res.json()["has_more"])
+
+
 class StatusReactionTests(StatusPrivacyContractTests):
-    """apps/statuses/views.py::react()/reactions() - heart/emoji quick-
-    reactions. Same visibility/permission gating as reply() (reuses the
-    same fixtures), plus the owner-only aggregate view react() writes a
-    StatusReaction row for."""
+    """apps/statuses/views.py::react()/unreact()/reactions() - heart/emoji
+    quick-reactions, persisted directly (no chat delivery - see
+    StatusReplyTests' docstring for why), with reactions() now readable by
+    any authorized viewer (previously owner-only) and grouped by emoji."""
 
     def _react_url(self, status_item) -> str:
         return f"/api/v1/statuses/{status_item.id}/react/"
 
+    def _unreact_url(self, status_item) -> str:
+        return f"/api/v1/statuses/{status_item.id}/unreact/"
+
     def _reactions_url(self, status_item) -> str:
         return f"/api/v1/statuses/{status_item.id}/reactions/"
 
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_react_delivers_via_nest_and_records_reaction(self, mock_deliver):
-        mock_deliver.return_value = {"ok": True, "messageId": "msg-456", "seq": 1}
+    def test_react_records_reaction_with_no_chat_delivery(self):
         status_item = self._create_status(author=self.author)
-
         self.client.force_authenticate(self.viewer)
-        res = self.client.post(self._react_url(status_item), {"emoji": "❤️"})
+
+        with patch("apps.statuses.services.deliver_status_reply_message") as mock_deliver:
+            res = self.client.post(self._react_url(status_item), {"emoji": "❤️"})
 
         self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
-        self.assertEqual(res.json()["message_id"], "msg-456")
-        mock_deliver.assert_called_once()
-        _, kwargs = mock_deliver.call_args
-        self.assertEqual(kwargs["text"], "❤️")
+        mock_deliver.assert_not_called()
         self.assertTrue(
             StatusReaction.objects.filter(status=status_item, user=self.viewer, emoji="❤️").exists()
         )
 
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_second_reaction_from_same_user_replaces_the_first(self, mock_deliver):
-        mock_deliver.return_value = {"ok": True, "messageId": "msg-1", "seq": 1}
+    def test_second_reaction_from_same_user_replaces_the_first(self):
         status_item = self._create_status(author=self.author)
         self.client.force_authenticate(self.viewer)
 
@@ -467,29 +564,181 @@ class StatusReactionTests(StatusPrivacyContractTests):
             StatusReaction.objects.get(status=status_item, user=self.viewer).emoji, "😂",
         )
 
-    @patch("apps.statuses.services.deliver_status_reply_message")
-    def test_react_returns_404_for_stranger_outside_contacts(self, mock_deliver):
+    def test_unreact_removes_the_reaction(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+        self.client.post(self._react_url(status_item), {"emoji": "❤️"})
+
+        res = self.client.post(self._unreact_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.json()["removed"])
+        self.assertFalse(StatusReaction.objects.filter(status=status_item, user=self.viewer).exists())
+
+    def test_unreact_when_no_reaction_exists_is_a_harmless_no_op(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(self._unreact_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.json()["removed"])
+
+    def test_react_returns_404_for_stranger_outside_contacts(self):
         status_item = self._create_status(author=self.author)
 
         self.client.force_authenticate(self.stranger)
         res = self.client.post(self._react_url(status_item), {"emoji": "❤️"})
 
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
-        mock_deliver.assert_not_called()
+        self.assertFalse(StatusReaction.objects.filter(status=status_item).exists())
 
-    def test_reactions_endpoint_is_owner_only(self):
+    def test_reactions_endpoint_is_readable_by_any_authorized_viewer_grouped_by_emoji(self):
         status_item = self._create_status(author=self.author)
         StatusReaction.objects.create(status=status_item, user=self.viewer, emoji="❤️")
+        StatusReaction.objects.create(status=status_item, user=self.excluded, emoji="❤️")
 
         self.client.force_authenticate(self.author)
         owner_res = self.client.get(self._reactions_url(status_item))
         self.assertEqual(owner_res.status_code, status.HTTP_200_OK)
-        self.assertEqual(owner_res.json()["reaction_count"], 1)
-        self.assertEqual(owner_res.json()["results"][0]["emoji"], "❤️")
+        self.assertEqual(owner_res.json()["reaction_count"], 2)
+        self.assertEqual(owner_res.json()["groups"][0]["emoji"], "❤️")
+        self.assertEqual(owner_res.json()["groups"][0]["count"], 2)
+        self.assertEqual(len(owner_res.json()["groups"][0]["users"]), 2)
+
+        # A regular authorized viewer (not the owner) can read the exact
+        # same grouped data now - this used to 404 for anyone but the author.
+        self.client.force_authenticate(self.viewer)
+        viewer_res = self.client.get(self._reactions_url(status_item))
+        self.assertEqual(viewer_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(viewer_res.json()["reaction_count"], 2)
+        self.assertEqual(viewer_res.json()["my_reaction"], "❤️")
+
+    def test_reactions_endpoint_still_404s_for_a_viewer_outside_the_audience(self):
+        status_item = self._create_status(
+            author=self.author,
+            visibility=StatusVisibility.CONTACTS_EXCEPT,
+            targets=[self.excluded],
+        )
+
+        self.client.force_authenticate(self.excluded)
+        res = self.client.get(self._reactions_url(status_item))
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class StatusHideTests(StatusPrivacyContractTests):
+    """Per-viewer "hide this one status" - apps/statuses/views.py's
+    hide_status()/unhide_status(), distinct from StatusMute (hides every
+    status from a given author)."""
+
+    def test_hiding_a_status_removes_it_from_only_my_list(self):
+        status_item = self._create_status(author=self.author)
 
         self.client.force_authenticate(self.viewer)
-        non_owner_res = self.client.get(self._reactions_url(status_item))
-        self.assertEqual(non_owner_res.status_code, status.HTTP_404_NOT_FOUND)
+        hide_res = self.client.post(f"/api/v1/statuses/{status_item.id}/hide/")
+        self.assertEqual(hide_res.status_code, status.HTTP_200_OK)
+
+        my_list = self.client.get(reverse("statuses:status-list")).json()["results"]
+        self.assertEqual([e for e in my_list if e["user"]["id"] == str(self.author.id)], [])
+
+        # The excluded user (also a contact of author, not hiding) still sees it.
+        self.client.force_authenticate(self.excluded)
+        other_list = self.client.get(reverse("statuses:status-list")).json()["results"]
+        self.assertTrue(any(e["user"]["id"] == str(self.author.id) for e in other_list))
+
+    def test_unhiding_restores_visibility(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+        self.client.post(f"/api/v1/statuses/{status_item.id}/hide/")
+
+        unhide_res = self.client.post(f"/api/v1/statuses/{status_item.id}/unhide/")
+        self.assertEqual(unhide_res.status_code, status.HTTP_200_OK)
+        self.assertTrue(unhide_res.json()["removed"])
+
+        my_list = self.client.get(reverse("statuses:status-list")).json()["results"]
+        self.assertTrue(any(e["user"]["id"] == str(self.author.id) for e in my_list))
+
+    def test_hiding_does_not_delete_the_status_for_its_owner(self):
+        status_item = self._create_status(author=self.author)
+        self.client.force_authenticate(self.viewer)
+        self.client.post(f"/api/v1/statuses/{status_item.id}/hide/")
+
+        self.client.force_authenticate(self.author)
+        owner_list = self.client.get(reverse("statuses:status-list")).json()["results"]
+        self.assertTrue(any(e["user"]["id"] == str(self.author.id) for e in owner_list))
+
+
+class StatusExpiryTests(StatusPrivacyContractTests):
+    """72-hour maximum lifetime: server-computed from creation time, not
+    client-controllable, and enforced on every read path."""
+
+    def test_new_status_expires_at_is_72_hours_from_creation(self):
+        before = timezone.now()
+        status_item = self._create_status(author=self.author)
+        # _create_status uses StatusItem.objects.create() directly (not the
+        # create serializer/perform_create path exercised by the real POST
+        # endpoint below) - save()'s own fallback is what's under test here.
+        expected = before + timedelta(hours=StatusItem.MAX_LIFETIME_HOURS)
+        self.assertGreaterEqual(status_item.expires_at, expected - timedelta(seconds=5))
+        self.assertLessEqual(status_item.expires_at, expected + timedelta(seconds=5))
+
+    def test_create_endpoint_clamps_expiry_to_72_hours_even_if_client_sends_its_own(self):
+        self.client.force_authenticate(self.author)
+        before = timezone.now()
+
+        res = self.client.post(
+            "/api/v1/statuses/",
+            {
+                "type": "text",
+                "text": "Hello",
+                # A client-supplied expires_at must be ignored entirely -
+                # StatusCreateSerializer declares it read_only.
+                "expires_at": (before + timedelta(days=30)).isoformat(),
+            },
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        created = StatusItem.objects.get(id=res.json()["id"])
+        max_allowed = before + timedelta(hours=StatusItem.MAX_LIFETIME_HOURS)
+        self.assertLessEqual(created.expires_at, max_allowed + timedelta(seconds=5))
+
+    def test_expired_status_is_excluded_from_list_and_all_discussion_endpoints(self):
+        status_item = self._create_status(author=self.author)
+        StatusItem.objects.filter(id=status_item.id).update(
+            expires_at=timezone.now() - timedelta(seconds=1),
+        )
+
+        self.client.force_authenticate(self.viewer)
+        listing = self.client.get(reverse("statuses:status-list")).json()["results"]
+        self.assertEqual([e for e in listing if e["user"]["id"] == str(self.author.id)], [])
+
+        react_res = self.client.post(f"/api/v1/statuses/{status_item.id}/react/", {"emoji": "❤️"})
+        self.assertEqual(react_res.status_code, status.HTTP_404_NOT_FOUND)
+
+        comment_res = self.client.post(
+            f"/api/v1/statuses/{status_item.id}/comments/", {"text": "too late"},
+        )
+        self.assertEqual(comment_res.status_code, status.HTTP_404_NOT_FOUND)
+
+        reactions_res = self.client.get(f"/api/v1/statuses/{status_item.id}/reactions/")
+        self.assertEqual(reactions_res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_changing_the_device_clock_cannot_extend_a_status_past_72_hours(self):
+        # expires_at is computed from timezone.now() on the server at
+        # create time and never recomputed from anything client-supplied on
+        # any later request - there's no endpoint that re-derives it from a
+        # client timestamp at all, so there's nothing for a spoofed device
+        # clock to influence. This test documents that invariant: reading a
+        # status back (e.g. after a reaction) must never move expires_at.
+        status_item = self._create_status(author=self.author)
+        original_expiry = status_item.expires_at
+
+        self.client.force_authenticate(self.viewer)
+        self.client.post(f"/api/v1/statuses/{status_item.id}/react/", {"emoji": "❤️"})
+
+        status_item.refresh_from_db()
+        self.assertEqual(status_item.expires_at, original_expiry)
 
 
 class StatusDeletionAndMutationTests(StatusPrivacyContractTests):

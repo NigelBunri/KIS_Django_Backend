@@ -44,6 +44,7 @@ class ConversationSettingsSerializer(serializers.ModelSerializer):
             "max_subroom_depth",
             "message_retention_days",
             "allow_reactions",
+            "reactions_admin_only",
             "allow_stickers",
             "allow_attachments",
             "created_at",

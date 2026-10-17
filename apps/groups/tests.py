@@ -344,3 +344,131 @@ class GroupMembershipReactivationTests(APITestCase):
         members_response = self.client.get(f"/api/v1/chat-groups/{self.group.id}/members/")
         member_ids = {m["user"]["id"] for m in members_response.data}
         self.assertIn(str(self.member.id), member_ids)
+
+
+class InviteLinkAndJoinPolicyTests(APITestCase):
+    """
+    invite_link() was admin/owner-only for BOTH its GET (view/share the
+    current link) and POST (regenerate) branches - the task this covers
+    was "allow other members to generate/share the group invite link",
+    which GET being admin-only made impossible for a plain member.
+    join_by_invite() separately never consulted group.join_policy at all,
+    so a group with "Approval required to join" (GroupJoinPolicy.REQUEST)
+    still let anyone with the link join immediately - the exact bypass
+    request_join()/approve_request() exist to prevent.
+    """
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            phone="+237670009920", password="TestPass12!", country="CM",
+        )
+        self.member = User.objects.create_user(
+            phone="+237670009921", password="TestPass12!", country="CM",
+        )
+        self.stranger = User.objects.create_user(
+            phone="+237670009922", password="TestPass12!", country="CM",
+        )
+        conversation = Conversation.objects.create(
+            type=ConversationType.GROUP, title="Invite Policy Test Group", created_by=self.owner,
+        )
+        self.group = Group.objects.create(
+            name="Invite Policy Test Group",
+            slug="invite-policy-test-group",
+            owner=self.owner,
+            conversation=conversation,
+            join_policy=GroupJoinPolicy.OPEN,
+        )
+        GroupMembership.objects.create(group=self.group, user=self.owner, role="owner")
+        ConversationMember.objects.create(
+            conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER,
+        )
+        GroupMembership.objects.create(group=self.group, user=self.member, role="member")
+        ConversationMember.objects.create(
+            conversation=conversation, user=self.member, base_role=BaseConversationRole.MEMBER,
+        )
+
+    def test_a_plain_member_can_view_the_invite_link(self):
+        self.client.force_authenticate(self.member)
+        response = self.client.get(f"/api/v1/chat-groups/{self.group.id}/invite-link/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(response.data.get("invite_link"))
+
+    def test_a_non_member_cannot_view_the_invite_link(self):
+        # 404, not 403: GroupViewSet.get_queryset() already scopes groups to
+        # the requester's own membership, so a non-member's get_object()
+        # never resolves far enough to reach this action's own permission
+        # check at all - same hide-not-reveal posture this app uses
+        # elsewhere for content a caller has no business knowing exists.
+        self.client.force_authenticate(self.stranger)
+        response = self.client.get(f"/api/v1/chat-groups/{self.group.id}/invite-link/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_a_plain_member_cannot_regenerate_the_invite_link(self):
+        self.client.force_authenticate(self.member)
+        response = self.client.post(f"/api/v1/chat-groups/{self.group.id}/invite-link/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_the_owner_can_regenerate_the_invite_link(self):
+        self.client.force_authenticate(self.owner)
+        first = self.client.get(f"/api/v1/chat-groups/{self.group.id}/invite-link/").data["invite_link"]
+
+        self.client.force_authenticate(self.owner)
+        second = self.client.post(f"/api/v1/chat-groups/{self.group.id}/invite-link/").data["invite_link"]
+
+        self.assertNotEqual(first, second)
+
+    def test_join_by_invite_joins_immediately_when_policy_is_open(self):
+        self.group.invite_token = "open-policy-token"
+        self.group.save(update_fields=["invite_token"])
+        self.client.force_authenticate(self.stranger)
+
+        response = self.client.post(
+            "/api/v1/chat-groups/join-by-invite/", {"invite_token": "open-policy-token"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data.get("pending"))
+        self.assertTrue(
+            GroupMembership.objects.filter(
+                group=self.group, user=self.stranger, left_at__isnull=True,
+            ).exists()
+        )
+
+    def test_join_by_invite_creates_a_request_instead_of_joining_when_approval_required(self):
+        self.group.join_policy = GroupJoinPolicy.REQUEST
+        self.group.invite_token = "request-policy-token"
+        self.group.save(update_fields=["join_policy", "invite_token"])
+        self.client.force_authenticate(self.stranger)
+
+        response = self.client.post(
+            "/api/v1/chat-groups/join-by-invite/", {"invite_token": "request-policy-token"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertTrue(response.data.get("pending"))
+        self.assertFalse(
+            GroupMembership.objects.filter(
+                group=self.group, user=self.stranger, left_at__isnull=True,
+            ).exists()
+        )
+        self.assertTrue(
+            GroupJoinRequest.objects.filter(group=self.group, user=self.stranger).exists()
+        )
+
+    def test_join_policy_is_writable_via_group_patch_by_the_owner(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.patch(
+            f"/api/v1/chat-groups/{self.group.id}/", {"join_policy": "request"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.group.refresh_from_db()
+        self.assertEqual(self.group.join_policy, GroupJoinPolicy.REQUEST)
+
+    def test_join_policy_cannot_be_changed_by_a_plain_member(self):
+        self.client.force_authenticate(self.member)
+        response = self.client.patch(
+            f"/api/v1/chat-groups/{self.group.id}/", {"join_policy": "request"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.group.refresh_from_db()
+        self.assertEqual(self.group.join_policy, GroupJoinPolicy.OPEN)

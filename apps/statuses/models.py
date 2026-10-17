@@ -96,9 +96,15 @@ class StatusItem(models.Model):
             models.Index(fields=["user", "created_at"]),
         ]
 
+    # Hard product ceiling: 72 hours from creation, no matter what a
+    # caller passes (expires_at is read-only on StatusCreateSerializer, and
+    # StatusViewSet.perform_create clamps every tier's configured retention
+    # to this same ceiling) - see MAX_LIFETIME_HOURS below.
+    MAX_LIFETIME_HOURS = 72
+
     def save(self, *args, **kwargs):
         if not self.expires_at:
-            self.expires_at = timezone.now() + timedelta(days=2)
+            self.expires_at = timezone.now() + timedelta(hours=self.MAX_LIFETIME_HOURS)
         super().save(*args, **kwargs)
 
     def is_active(self) -> bool:
@@ -187,6 +193,84 @@ class StatusReaction(models.Model):
 
     def __str__(self) -> str:
         return f"StatusReaction {self.status_id} by {self.user_id} ({self.emoji})"
+
+
+class StatusComment(models.Model):
+    """A comment on a status, or a reply to another comment on the SAME
+    status - the dedicated, persistent status-discussion data model this
+    app previously lacked entirely (replies used to be delivered as real
+    chat messages via deliver_status_reply_message, which both polluted
+    the viewer's/owner's ordinary conversation history and made "reply to
+    a status" depend on a cross-service HTTP call to Nest succeeding -
+    see apps/statuses/views.py's comments()/reply() for the fix).
+
+    One level of nesting only (parent must itself have parent=None) -
+    matches the product spec ("replies to comments"), not arbitrarily deep
+    threads. Enforced in StatusViewSet.comments(), not here, so a bad row
+    can't silently exist from a bug elsewhere without at least being
+    caught by CheckConstraint below for the common case of a reply
+    pointing at a reply.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    status = models.ForeignKey(StatusItem, on_delete=models.CASCADE, related_name="comments")
+    author = models.ForeignKey(User, on_delete=models.CASCADE, related_name="status_comments")
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="replies",
+        help_text="Null for a top-level comment; set for a reply to another comment on the same status.",
+    )
+    text = models.TextField(max_length=2000)
+    # Client-generated idempotency key, same convention as the pre-existing
+    # reply/react actions' client_id - a double-tap/retry on a slow network
+    # reuses the same key, so create() below can return the existing row
+    # instead of creating a duplicate comment.
+    client_id = models.CharField(max_length=64, blank=True, default="")
+    is_deleted = models.BooleanField(default=False)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["status", "author", "client_id"],
+                condition=models.Q(client_id__gt=""),
+                name="status_comment_unique_client_id",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["status", "parent", "created_at"]),
+            models.Index(fields=["parent", "created_at"]),
+        ]
+        ordering = ["created_at"]
+
+    def __str__(self) -> str:
+        kind = "reply" if self.parent_id else "comment"
+        return f"Status{kind.capitalize()} {self.id} on {self.status_id} by {self.author_id}"
+
+
+class StatusHide(models.Model):
+    """Per-viewer, per-status-item hide ("not interested in this one") -
+    distinct from StatusMute (which hides every status from a given
+    author) and from StatusItem.is_deleted/expires_at (which remove the
+    item for everyone). Only ever filters what THIS user's own feed/list
+    shows; never affects the author or any other viewer."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="status_hides")
+    status = models.ForeignKey(StatusItem, on_delete=models.CASCADE, related_name="hidden_by")
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "status"], name="status_hide_unique"),
+        ]
+        indexes = [
+            models.Index(fields=["user", "status"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"StatusHide {self.user_id} -> {self.status_id}"
 
 
 class StatusMute(models.Model):

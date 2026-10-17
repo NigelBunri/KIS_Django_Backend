@@ -11,11 +11,13 @@ from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import NotFound, ValidationError
 
 from apps.accounts.models import User, UserContact
 from apps.moderation.models import AuditLog, Flag, UserBlock
 from apps.statuses.models import (
+    StatusComment,
+    StatusHide,
     StatusItem,
     StatusItemView,
     StatusMute,
@@ -142,6 +144,38 @@ class StatusViewSet(viewsets.ModelViewSet):
             for value in StatusMute.objects.filter(user=self.request.user).values_list("muted_user_id", flat=True)
         }
 
+    def _get_hidden_status_ids(self) -> set[str]:
+        return {
+            str(value)
+            for value in StatusHide.objects.filter(user=self.request.user).values_list("status_id", flat=True)
+        }
+
+    def _get_viewable_status_or_404(self, pk) -> StatusItem:
+        """Shared re-validation for every discussion action (react/unreact/
+        reactions/comments/hide) - every one of them must independently
+        re-check that the requesting user can actually see this status
+        (not blocked, in-audience, not pending/blocked moderation) rather
+        than trusting that a prior list/view call already proved it, since
+        a status's audience/block state can change between requests. 404,
+        not 403, for the same hide-not-reveal reason reply()/react() above
+        already use for a status outside the caller's audience."""
+        try:
+            status_item = self._base_status_queryset().get(id=pk)
+        except StatusItem.DoesNotExist:
+            raise NotFound("Status not found.")
+
+        blocked_user_ids = self._get_blocked_user_ids()
+        _, _, mutual_contact_ids = self._get_status_contacts()
+        if not self._can_view_status(
+            status_item,
+            viewer_id=str(self.request.user.id),
+            blocked_user_ids=blocked_user_ids,
+            author_contact_ids=self._get_author_contact_ids({str(status_item.user_id)}),
+            mutual_contact_ids=mutual_contact_ids,
+        ):
+            raise NotFound("Status not found.")
+        return status_item
+
     def _get_author_contact_ids(self, author_ids: set[str]) -> dict[str, set[str]]:
         if not author_ids:
             return {}
@@ -234,10 +268,12 @@ class StatusViewSet(viewsets.ModelViewSet):
         _, _, mutual_contact_ids = self._get_status_contacts()
         blocked_user_ids = self._get_blocked_user_ids()
         muted_user_ids = self._get_muted_user_ids()
+        hidden_status_ids = self._get_hidden_status_ids()
         base_items = (
             self.filter_queryset(self.get_queryset())
             .exclude(user_id__in=blocked_user_ids)
             .exclude(user_id__in=muted_user_ids)
+            .exclude(id__in=hidden_status_ids)
             .order_by("-created_at")
         )
         base_items = list(base_items)
@@ -318,18 +354,22 @@ class StatusViewSet(viewsets.ModelViewSet):
             incoming_bytes = file_obj.size if file_obj else (resolved_intent.size_bytes if resolved_intent else None)
             if incoming_bytes is not None and incoming_bytes > limit_bytes:
                 raise ValidationError({"detail": "Status file exceeds your storage limit."})
-        # Hard product cap: a status lives for at most 2 days no matter what
-        # a tier's status_retention_days preset says (some tiers configure
-        # up to 14) - StatusItem.save()'s own fallback already defaults to
-        # 2 days when expires_at is omitted, so clamping here just makes
-        # every tier actually honor that ceiling instead of only the ones
-        # with no explicit retention preset.
+        # Hard product cap: a status lives for at most
+        # StatusItem.MAX_LIFETIME_HOURS (72h) no matter what a tier's
+        # status_retention_days preset says (some tiers configure up to 14
+        # days) - StatusItem.save()'s own fallback already uses the same
+        # ceiling when expires_at is omitted, so clamping here just makes
+        # every tier actually honor it instead of only the ones with no
+        # explicit retention preset. A client can never extend this by
+        # sending its own expires_at - StatusCreateSerializer declares it
+        # read_only, and it's computed here server-side from
+        # timezone.now() regardless of anything in the request.
         retention_days = features.get("status_retention_days")
         if isinstance(retention_days, int) and retention_days > 0:
-            retention_days = min(retention_days, 2)
+            retention_hours = min(retention_days * 24, StatusItem.MAX_LIFETIME_HOURS)
         else:
-            retention_days = 2
-        expires_at = timezone.now() + timedelta(days=retention_days)
+            retention_hours = StatusItem.MAX_LIFETIME_HOURS
+        expires_at = timezone.now() + timedelta(hours=retention_hours)
         serializer.save(user=user, expires_at=expires_at)
 
     @action(detail=False, methods=["get"], url_path="mine")
@@ -421,8 +461,14 @@ class StatusViewSet(viewsets.ModelViewSet):
         _, _, mutual_contact_ids = self._get_status_contacts()
         blocked_user_ids = self._get_blocked_user_ids()
         muted_user_ids = self._get_muted_user_ids()
+        hidden_status_ids = self._get_hidden_status_ids()
 
-        items = self.get_queryset().exclude(user_id__in=blocked_user_ids).exclude(user_id__in=muted_user_ids)
+        items = (
+            self.get_queryset()
+            .exclude(user_id__in=blocked_user_ids)
+            .exclude(user_id__in=muted_user_ids)
+            .exclude(id__in=hidden_status_ids)
+        )
         if type_filter:
             items = items.filter(type=type_filter)
         if query:
@@ -569,131 +615,183 @@ class StatusViewSet(viewsets.ModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    def _user_preview(self, user) -> dict:
+        return {
+            "id": str(user.id),
+            "display_name": user.display_name or user.phone or f"User {user.id}",
+            "avatar_url": getattr(getattr(user, "profile", None), "avatar_url", None),
+        }
+
     @action(detail=True, methods=["post"], url_path="reply")
     def reply(self, request, pk=None):
-        try:
-            status_item = self._base_status_queryset().get(id=pk)
-        except StatusItem.DoesNotExist:
-            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+        """Back-compat alias for the original quick-reply box: creates a
+        top-level StatusComment (no parent) - see comments() below for the
+        real, full-featured endpoint (supports parent_id for threaded
+        replies, pagination for reads). Kept so older app builds that still
+        call /reply/ keep working unchanged.
 
-        # Was previously missing entirely - this endpoint only checked
-        # reply_permission, never whether the caller can actually see the
-        # status at all. That meant a user excluded from a status's
-        # audience (or blocked, or looking at a still-pending-review item)
-        # could still successfully reply to it, as long as the author
-        # hadn't set reply_permission=nobody - a real authorization bypass,
-        # not just a missing frontend affordance (get_reply_allowed() on
-        # the serializer already computed the correct answer for the UI,
-        # but the backend action itself never enforced it). 404, not 403 -
-        # matches this codebase's existing hide-not-reveal convention for
-        # content a caller has no business knowing exists.
-        blocked_user_ids = self._get_blocked_user_ids()
-        _, _, mutual_contact_ids = self._get_status_contacts()
-        if not self._can_view_status(
-            status_item,
-            viewer_id=str(request.user.id),
-            blocked_user_ids=blocked_user_ids,
-            author_contact_ids=self._get_author_contact_ids({str(status_item.user_id)}),
-            mutual_contact_ids=mutual_contact_ids,
-        ):
-            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+        Previously delivered the reply as a real chat message via
+        deliver_status_reply_message, into a direct conversation it would
+        get_or_create between the viewer and the status's author - this
+        both polluted the two participants' ordinary chat history with
+        every single status reply, and meant a reply's success depended on
+        a synchronous HTTP round-trip to Nest (wrong internal token name
+        and a wrong call signature meant this path had never actually
+        worked in production - see git history). Replies/comments now live
+        entirely in StatusComment, scoped to the status, never touching
+        apps.chat at all.
+        """
+        return self._create_comment(request, pk, parent_id=None)
+
+    @action(detail=True, methods=["get", "post"], url_path="comments")
+    def comments(self, request, pk=None):
+        """GET: list comments for this status - top-level only by default,
+        or a single comment's replies when ?parent_id= is given (so the
+        Replies tab can lazily load a thread's replies instead of fetching
+        every reply for every comment up front). Supports ?before= (an
+        ISO timestamp or comment id) for incremental loading of older
+        comments/replies.
+
+        POST: create a comment (parent_id absent) or a reply to an
+        existing comment on the SAME status (parent_id present) - see
+        _create_comment for the full validation (text required, 2000-char
+        cap, reply_permission, visibility, client_id idempotency, and that
+        a reply's parent really does belong to this exact status, not a
+        different one supplied via a tampered parent_id).
+        """
+        if request.method == "POST":
+            parent_id = (request.data.get("parent_id") or "").strip() or None
+            return self._create_comment(request, pk, parent_id=parent_id)
+
+        status_item = self._get_viewable_status_or_404(pk)
+        parent_id = (request.query_params.get("parent_id") or "").strip() or None
+        try:
+            limit = max(1, min(int(request.query_params.get("limit", 30)), 100))
+        except (TypeError, ValueError):
+            limit = 30
+        before_raw = (request.query_params.get("before") or "").strip()
+
+        qs = StatusComment.objects.filter(status=status_item, is_deleted=False)
+        qs = qs.filter(parent_id=parent_id) if parent_id else qs.filter(parent__isnull=True)
+        if before_raw:
+            try:
+                before_comment = StatusComment.objects.get(id=before_raw)
+                qs = qs.filter(created_at__lt=before_comment.created_at)
+            except (StatusComment.DoesNotExist, ValueError):
+                pass
+        qs = qs.select_related("author", "author__profile").order_by("-created_at")[: limit + 1]
+
+        rows = list(qs)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        rows.reverse()  # chronological for display, newest-fetched-first for pagination above
+
+        reply_counts: dict[str, int] = {}
+        if not parent_id and rows:
+            counted = (
+                StatusComment.objects.filter(parent_id__in=[r.id for r in rows], is_deleted=False)
+                .values("parent_id")
+                .annotate(n=Count("id"))
+            )
+            reply_counts = {str(row["parent_id"]): row["n"] for row in counted}
+
+        results = [
+            {
+                "id": str(row.id),
+                "parent_id": str(row.parent_id) if row.parent_id else None,
+                "author": self._user_preview(row.author),
+                "text": row.text,
+                "created_at": row.created_at,
+                "reply_count": reply_counts.get(str(row.id), 0),
+                "is_mine": row.author_id == request.user.id,
+            }
+            for row in rows
+        ]
+        return Response(
+            {"status_id": str(status_item.id), "results": results, "has_more": has_more},
+            status=status.HTTP_200_OK,
+        )
+
+    def _create_comment(self, request, pk, *, parent_id: str | None):
+        from apps.statuses.services import notify_status_discussion_event
+
+        status_item = self._get_viewable_status_or_404(pk)
 
         if status_item.reply_permission == "nobody":
             return Response({"detail": "Replies disabled for this status."}, status=status.HTTP_403_FORBIDDEN)
 
         text = (request.data.get("text") or "").strip()
         if not text:
-            return Response({"detail": "Reply text is required."}, status=status.HTTP_400_BAD_REQUEST)
-        # Optional, client-generated idempotency key (same convention as a
-        # normal chat send's clientId - see chatTypes.ts on the RN side).
-        # A double-tap before the UI disables the send button re-uses the
-        # same key, so Nest's createIdempotent (keyed on conversationId +
-        # clientId) returns the existing message instead of creating a
-        # second one. Older app versions that don't send this yet get no
-        # regression - Nest already falls back to a random clientId of its
-        # own when none is forwarded, exactly like before this field existed.
-        client_id = (request.data.get("client_id") or "").strip() or None
+            return Response({"detail": "Comment text is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(text) > 2000:
+            return Response({"detail": "Comment is too long (2000 characters max)."}, status=status.HTTP_400_BAD_REQUEST)
 
-        from apps.chat.services import get_or_create_direct_conversation
-        from apps.statuses.services import (
-            StatusReplyDeliveryError,
-            build_status_preview_context,
-            deliver_status_reply_message,
+        parent = None
+        if parent_id:
+            try:
+                parent = StatusComment.objects.get(id=parent_id, status=status_item, is_deleted=False)
+            except (StatusComment.DoesNotExist, ValueError):
+                # Deliberately the same "not found" shape as a bad status id -
+                # never reveal whether parent_id exists on a DIFFERENT status,
+                # which is exactly the "attach a reply to a different status by
+                # manipulating an id" case this guards against.
+                return Response({"detail": "Comment not found."}, status=status.HTTP_404_NOT_FOUND)
+            if parent.parent_id:
+                return Response({"detail": "Cannot reply to a reply."}, status=status.HTTP_400_BAD_REQUEST)
+
+        client_id = (request.data.get("client_id") or "").strip()
+        if client_id:
+            existing = StatusComment.objects.filter(
+                status=status_item, author=request.user, client_id=client_id,
+            ).first()
+            if existing:
+                return Response(
+                    self._serialize_comment(existing, is_mine=True),
+                    status=status.HTTP_200_OK,
+                )
+
+        comment = StatusComment.objects.create(
+            status=status_item,
+            author=request.user,
+            parent=parent,
+            text=text,
+            client_id=client_id,
         )
-
-        # A second, independent bug hiding behind the ImportError above:
-        # this call previously passed user_a=/user_b_id= keyword args, but
-        # the real signature is positional (user_a, user_b) and takes User
-        # instances, not a bare id - and it returns a (Conversation, bool)
-        # tuple, not a single Conversation. That mismatch would have raised
-        # TypeError every time too, just never reached by real traffic
-        # since the Message import above always failed first.
-        try:
-            conversation, _created = get_or_create_direct_conversation(request.user, status_item.user)
-        except Exception:
-            return Response({"detail": "Could not open conversation."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        # The real message content lives entirely in Nest.js/MongoDB, not
-        # in a Django-ORM model (there is no Message model in apps.chat -
-        # the previous `from apps.chat.models import ... Message` import
-        # here was unconditionally raising ImportError on every single
-        # call, so this endpoint has never actually worked). This delivers
-        # the reply through the same real send pipeline a live chat send
-        # uses (seq allocation + message persistence + realtime emit to
-        # the conversation room), via a dedicated internal endpoint - see
-        # deliver_status_reply_message's docstring for exactly what it
-        # does and does not do.
-        try:
-            result = deliver_status_reply_message(
-                conversation_id=str(conversation.id),
-                sender_id=str(request.user.id),
-                text=text,
-                client_id=client_id,
-                status_context=build_status_preview_context(status_item, request, is_reaction=False),
-            )
-        except StatusReplyDeliveryError:
-            return Response(
-                {"detail": "Could not deliver your reply right now. Please try again."},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
-        message_id = str(result.get("messageId") or "")
         AuditLog.objects.create(
             actor_id=request.user.id,
-            action="status.reply",
+            action="status.comment" if parent is None else "status.comment_reply",
             target_type="STATUS",
             target_id=status_item.id,
-            metadata={"message_id": message_id, "text_len": len(text)},
+            metadata={"comment_id": str(comment.id), "parent_id": parent_id, "text_len": len(text)},
         )
-        return Response(
-            {"replied": True, "message_id": message_id, "conversation_id": str(conversation.id)},
-            status=status.HTTP_201_CREATED,
+        notify_status_discussion_event(
+            status_id=str(status_item.id),
+            event="status.comment_added",
+            payload=self._serialize_comment(comment, is_mine=False),
         )
+        return Response(self._serialize_comment(comment, is_mine=True), status=status.HTTP_201_CREATED)
+
+    def _serialize_comment(self, comment: StatusComment, *, is_mine: bool) -> dict:
+        return {
+            "id": str(comment.id),
+            "parent_id": str(comment.parent_id) if comment.parent_id else None,
+            "author": self._user_preview(comment.author),
+            "text": comment.text,
+            "created_at": comment.created_at,
+            "reply_count": 0,
+            "is_mine": is_mine,
+        }
 
     @action(detail=True, methods=["post"], url_path="react")
     def react(self, request, pk=None):
-        """Heart/emoji quick-reaction. Same authorization, chat-delivery,
-        and idempotency handling as reply() above (a reaction IS a reply
-        as far as the recipient's chat room is concerned) - the only
-        addition is upserting a StatusReaction row so the status owner can
-        see an aggregate "who reacted, with what" via the reactions
-        action below, without it living only as a message buried in their
-        conversation list."""
-        try:
-            status_item = self._base_status_queryset().get(id=pk)
-        except StatusItem.DoesNotExist:
-            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+        """Heart/emoji quick-reaction - persists directly to StatusReaction
+        only. Previously also delivered the reaction as a real chat message
+        via deliver_status_reply_message (same chat-polluting, cross-
+        service-dependent path reply() used - see its docstring above for
+        why that was removed)."""
+        from apps.statuses.services import notify_status_discussion_event
 
-        blocked_user_ids = self._get_blocked_user_ids()
-        _, _, mutual_contact_ids = self._get_status_contacts()
-        if not self._can_view_status(
-            status_item,
-            viewer_id=str(request.user.id),
-            blocked_user_ids=blocked_user_ids,
-            author_contact_ids=self._get_author_contact_ids({str(status_item.user_id)}),
-            mutual_contact_ids=mutual_contact_ids,
-        ):
-            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+        status_item = self._get_viewable_status_or_404(pk)
 
         if status_item.reply_permission == "nobody":
             return Response({"detail": "Reactions disabled for this status."}, status=status.HTTP_403_FORBIDDEN)
@@ -703,77 +801,174 @@ class StatusViewSet(viewsets.ModelViewSet):
             return Response({"detail": "An emoji is required."}, status=status.HTTP_400_BAD_REQUEST)
         if len(emoji) > 16:
             return Response({"detail": "Invalid emoji."}, status=status.HTTP_400_BAD_REQUEST)
-        client_id = (request.data.get("client_id") or "").strip() or None
 
-        from apps.chat.services import get_or_create_direct_conversation
-        from apps.statuses.services import (
-            StatusReplyDeliveryError,
-            build_status_preview_context,
-            deliver_status_reply_message,
-        )
-
-        try:
-            conversation, _created = get_or_create_direct_conversation(request.user, status_item.user)
-        except Exception:
-            return Response({"detail": "Could not open conversation."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        try:
-            result = deliver_status_reply_message(
-                conversation_id=str(conversation.id),
-                sender_id=str(request.user.id),
-                text=emoji,
-                client_id=client_id,
-                status_context=build_status_preview_context(status_item, request, is_reaction=True),
-            )
-        except StatusReplyDeliveryError:
-            return Response(
-                {"detail": "Could not deliver your reaction right now. Please try again."},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
-        StatusReaction.objects.update_or_create(
+        # update_or_create on the (status, user) unique constraint is what
+        # makes "react again with a different emoji" REPLACE the existing
+        # reaction rather than stack a second row for the same user - the
+        # product's single-reaction-per-user-per-status rule is enforced by
+        # the DB constraint itself (status_item_unique_reaction), not just
+        # this upsert's good behavior.
+        reaction, created = StatusReaction.objects.update_or_create(
             status=status_item, user=request.user, defaults={"emoji": emoji, "created_at": timezone.now()},
         )
-
-        message_id = str(result.get("messageId") or "")
         AuditLog.objects.create(
             actor_id=request.user.id,
             action="status.react",
             target_type="STATUS",
             target_id=status_item.id,
-            metadata={"message_id": message_id, "emoji": emoji},
+            metadata={"emoji": emoji, "created": created},
+        )
+        notify_status_discussion_event(
+            status_id=str(status_item.id),
+            event="status.reaction_changed",
+            payload={"status_id": str(status_item.id), "user_id": str(request.user.id), "emoji": emoji},
         )
         return Response(
-            {"reacted": True, "message_id": message_id, "conversation_id": str(conversation.id)},
+            {"reacted": True, "emoji": emoji, "status_id": str(status_item.id)},
             status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="unreact")
+    def unreact(self, request, pk=None):
+        from apps.statuses.services import notify_status_discussion_event
+
+        status_item = self._get_viewable_status_or_404(pk)
+        deleted, _ = StatusReaction.objects.filter(status=status_item, user=request.user).delete()
+        if deleted:
+            AuditLog.objects.create(
+                actor_id=request.user.id,
+                action="status.unreact",
+                target_type="STATUS",
+                target_id=status_item.id,
+                metadata={},
+            )
+            notify_status_discussion_event(
+                status_id=str(status_item.id),
+                event="status.reaction_changed",
+                payload={"status_id": str(status_item.id), "user_id": str(request.user.id), "emoji": None},
+            )
+        return Response(
+            {"reacted": False, "removed": bool(deleted), "status_id": str(status_item.id)},
+            status=status.HTTP_200_OK,
         )
 
     @action(detail=True, methods=["get"], url_path="reactions")
     def reactions(self, request, pk=None):
-        try:
-            status_item = self.get_queryset().get(id=pk, user=request.user)
-        except StatusItem.DoesNotExist:
-            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+        """Reactions grouped by emoji, with per-group participant previews -
+        available to any viewer who can see the status (previously
+        owner-only), since the Reactions tab is something every authorized
+        viewer, not just the author, can open."""
+        status_item = self._get_viewable_status_or_404(pk)
 
         rows = (
             StatusReaction.objects.filter(status=status_item)
-            .select_related("user")
+            .select_related("user", "user__profile")
             .order_by("-created_at")
         )
-        results = [
-            {
-                "id": str(row.user_id),
-                "display_name": row.user.display_name or row.user.phone or f"User {row.user_id}",
-                "emoji": row.emoji,
-                "created_at": row.created_at,
-            }
-            for row in rows
-        ]
+        groups: dict[str, dict] = {}
+        my_reaction = None
+        for row in rows:
+            if row.user_id == request.user.id:
+                my_reaction = row.emoji
+            bucket = groups.setdefault(row.emoji, {"emoji": row.emoji, "count": 0, "users": []})
+            bucket["count"] += 1
+            bucket["users"].append({**self._user_preview(row.user), "created_at": row.created_at})
+
+        ordered_groups = sorted(groups.values(), key=lambda g: g["count"], reverse=True)
         return Response(
             {
                 "status_id": str(status_item.id),
-                "reaction_count": len(results),
-                "results": results,
+                "reaction_count": sum(g["count"] for g in ordered_groups),
+                "groups": ordered_groups,
+                "my_reaction": my_reaction,
             },
             status=status.HTTP_200_OK,
         )
+
+    @action(detail=True, methods=["post"], url_path="hide")
+    def hide_status(self, request, pk=None):
+        """Per-viewer "not interested in this one" - affects only the
+        caller's own feed/list (StatusHide, filtered in list()/search()
+        above), never the author or any other viewer, and distinct from
+        StatusMute (hides every status from a given author, not just one)."""
+        try:
+            status_item = self._base_status_queryset().get(id=pk)
+        except StatusItem.DoesNotExist:
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        StatusHide.objects.get_or_create(user=request.user, status=status_item)
+        AuditLog.objects.create(
+            actor_id=request.user.id,
+            action="status.hide",
+            target_type="STATUS",
+            target_id=status_item.id,
+            metadata={},
+        )
+        return Response({"hidden": True, "status_id": str(status_item.id)}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="unhide")
+    def unhide_status(self, request, pk=None):
+        try:
+            status_uuid = uuid.UUID(str(pk))
+        except (TypeError, ValueError):
+            return Response({"detail": "Status not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        deleted, _ = StatusHide.objects.filter(user=request.user, status_id=status_uuid).delete()
+        AuditLog.objects.create(
+            actor_id=request.user.id,
+            action="status.unhide",
+            target_type="STATUS",
+            target_id=status_uuid,
+            metadata={"removed": deleted > 0},
+        )
+        return Response({"hidden": False, "removed": bool(deleted), "status_id": str(status_uuid)}, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="can-view",
+        permission_classes=[],
+        authentication_classes=[],
+    )
+    def can_view(self, request, pk=None):
+        """Internal-only: lets Nest's status.join socket handler re-verify
+        (DjangoConversationClient.canViewStatus) that a user may join the
+        status:{id} realtime room before letting them subscribe to its
+        reaction/comment events - the same can_view_status rule every REST
+        read/write path in this file already enforces, so a user excluded
+        from a status's audience can't eavesdrop on its discussion via a
+        socket subscription just because the REST endpoints are locked
+        down. No request.user here - the query param is the user Nest is
+        checking on behalf of, not the (service) caller."""
+        from apps.chat.internal_auth import require_internal_auth
+
+        require_internal_auth(request)
+
+        user_id = str(request.query_params.get("user_id") or "").strip()
+        if not user_id:
+            return Response({"can_view": False}, status=400)
+
+        try:
+            status_item = self._base_status_queryset().get(id=pk)
+        except StatusItem.DoesNotExist:
+            return Response({"can_view": False}, status=404)
+
+        blocked_by_me = set(UserBlock.objects.filter(blocker_id=user_id).values_list("blocked_id", flat=True))
+        blocked_me = set(UserBlock.objects.filter(blocked_id=user_id).values_list("blocker_id", flat=True))
+        blocked_user_ids = {str(v) for v in blocked_by_me | blocked_me}
+
+        outgoing = set(
+            UserContact.objects.filter(user_id=user_id, contact_user__isnull=False)
+            .values_list("contact_user_id", flat=True)
+        )
+        author_contact_ids = {str(status_item.user_id): {str(v) for v in outgoing}}
+
+        from .services import can_view_status
+
+        can_view = can_view_status(
+            status_item,
+            viewer_id=user_id,
+            blocked_user_ids=blocked_user_ids,
+            author_contact_ids=author_contact_ids,
+        )
+        return Response({"can_view": can_view}, status=200)

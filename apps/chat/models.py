@@ -364,6 +364,14 @@ class ConversationSettings(models.Model):
         default=True,
         help_text="Whether message reactions are allowed in this conversation.",
     )
+    reactions_admin_only = models.BooleanField(
+        default=False,
+        help_text=(
+            "If true, only admins/owners may add a reaction (members can "
+            "still see existing reactions) - a finer-grained restriction "
+            "than allow_reactions (which is all-or-nothing for everyone)."
+        ),
+    )
     allow_stickers = models.BooleanField(
         default=True,
         help_text="Whether stickers are allowed in this conversation.",

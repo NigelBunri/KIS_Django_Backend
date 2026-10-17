@@ -1197,6 +1197,16 @@ class ConversationViewSet(viewsets.ModelViewSet):
             if member.base_role not in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
                 can_send = False
 
+        # "Only admins can react" (ChatInfoPage.tsx's reactionsAdminOnly
+        # toggle) - mirrors send_policy's admin-only gate above, just for
+        # reactions.ts's EVT.REACT handler instead of a message send.
+        can_react = True
+        if member.base_role == BaseConversationRole.READONLY:
+            can_react = False
+        if settings and settings.reactions_admin_only:
+            if member.base_role not in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
+                can_react = False
+
         scopes = []
         if member.base_role in (BaseConversationRole.OWNER, BaseConversationRole.ADMIN):
             scopes.append("chat:admin")
@@ -1229,6 +1239,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
             "isBlocked": False,
             "role": member.base_role,
             "canSend": can_send,
+            "canReact": can_react,
             "scopes": scopes,
         })
 

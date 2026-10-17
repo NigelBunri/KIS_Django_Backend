@@ -483,15 +483,31 @@ class GroupViewSet(viewsets.ModelViewSet):
     def invite_link(self, request, pk=None):
         """
         GET  — return the current invite link (generates one if absent).
+              Any active member may call this - sharing the existing link
+              is a normal everyday action (matches WhatsApp/Telegram: any
+              member can share the group's invite link), not an admin
+              privilege. Previously gated to admins only, which is what
+              made "allow other members to generate/share the group
+              invite link" unreachable for a plain member.
         POST — regenerate the invite token (invalidates the old link).
-        Only admins/owners may call this.
+              Admin/owner only - regenerating revokes the link for
+              everyone who already has it, which is a real consequence a
+              plain member shouldn't be able to trigger unilaterally.
         """
         group = self.get_object()
         membership = self._get_membership(group, request.user)
-        if not self._is_admin(membership):
-            raise PermissionDenied("Only admins can manage the invite link.")
+        if not membership and group.owner_id != request.user.id:
+            raise PermissionDenied("You are not a member of this group.")
 
-        if request.method == "POST" or not group.invite_token:
+        if request.method == "POST":
+            if not self._is_admin(membership) and group.owner_id != request.user.id:
+                raise PermissionDenied("Only admins can regenerate the invite link.")
+            group.invite_token = secrets.token_urlsafe(24)
+            group.save(update_fields=["invite_token"])
+        elif not group.invite_token:
+            # First-ever GET with no link yet: still needs a real token to
+            # return, same generation logic the old admin-only POST branch
+            # used - just reachable by any member now, not just admins.
             group.invite_token = secrets.token_urlsafe(24)
             group.save(update_fields=["invite_token"])
 
@@ -522,5 +538,22 @@ class GroupViewSet(viewsets.ModelViewSet):
         if existing and existing.is_banned:
             return Response({"detail": "You are banned from this group."}, status=status.HTTP_403_FORBIDDEN)
 
+        # Previously joined immediately regardless of join_policy - a group
+        # with "Approval required to join" (GroupJoinPolicy.REQUEST) still
+        # let anyone with the invite link join on the spot, the exact same
+        # bypass request_join()/approve_request() exist to prevent. Route
+        # through the real join-request flow instead when that policy is
+        # set, same as request_join() above.
+        if group.join_policy == GroupJoinPolicy.REQUEST:
+            obj, _ = GroupJoinRequest.objects.get_or_create(
+                group=group,
+                user=request.user,
+                defaults={"message": "Joined via invite link"},
+            )
+            return Response(
+                {"detail": "Join request sent for approval.", "group_id": str(group.id), "pending": True},
+                status=status.HTTP_202_ACCEPTED,
+            )
+
         self._reactivate_group_membership(group, request.user)
-        return Response({"detail": "Joined successfully.", "group_id": str(group.id)})
+        return Response({"detail": "Joined successfully.", "group_id": str(group.id), "pending": False})

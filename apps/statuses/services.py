@@ -124,11 +124,54 @@ def purge_expired_statuses(*, limit: int = 500, grace_days: int = 7) -> dict:
 
 
 def get_blocked_user_ids(user) -> set[str]:
-    from apps.moderation.models import UserBlock
+    from apps.moderation.services import get_blocked_user_ids as _shared_get_blocked_user_ids
 
-    blocked_by_me = UserBlock.objects.filter(blocker=user).values_list("blocked_id", flat=True)
-    blocked_me = UserBlock.objects.filter(blocked=user).values_list("blocker_id", flat=True)
-    return {str(value) for value in blocked_by_me} | {str(value) for value in blocked_me}
+    return _shared_get_blocked_user_ids(user)
+
+
+def notify_status_discussion_event(*, status_id: str, event: str, payload: dict) -> None:
+    """Best-effort realtime push to Nest's status:{id} socket room (see
+    RealtimeInternalController.statusDiscussionBroadcast on the Nest side,
+    joined via the status.join socket event after Nest re-verifies
+    visibility against can_view_status through DjangoConversationClient.
+    canViewStatus). Deliberately swallow-and-log every failure: the REST
+    response the caller already sent back is the authoritative record of
+    whether the reaction/comment was saved - a dropped push just means an
+    already-open sheet doesn't update until its next refetch, never a lost
+    reaction/comment. Mirrors deliver_status_reply_message's internal-call
+    plumbing (same signing scheme, same settings), but fire-and-forget
+    instead of synchronous/failure-surfacing, since this is a UX nicety on
+    top of an already-persisted write, not the write itself.
+    """
+    import json
+    import logging
+    import urllib.error
+    import urllib.request
+
+    from django.conf import settings
+
+    from apps.chat.internal_signing import sign_internal_request
+
+    logger = logging.getLogger("apps.statuses")
+
+    base = str(getattr(settings, "NEST_INTERNAL_URL", "")).strip().rstrip("/")
+    token = str(getattr(settings, "DJANGO_INTERNAL_TOKEN", "")).strip()
+    if not base or not token:
+        return
+
+    url = f"{base}/internal/status-discussions/{status_id}/broadcast"
+    body = {"event": event, "payload": payload}
+    data = json.dumps(body).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        **sign_internal_request("POST", url, body, secret=token),
+    }
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            resp.read()
+    except (urllib.error.URLError, TimeoutError) as exc:
+        logger.info("status_discussion_broadcast_failed status_id=%s event=%s error=%s", status_id, event, exc)
 
 
 class StatusReplyDeliveryError(Exception):
