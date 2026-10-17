@@ -3,7 +3,7 @@ from django.db import transaction
 
 from apps.accounts.models import User
 from apps.partners.models import Partner
-from apps.communities.models import Community
+from apps.communities.models import Community, CommunityMembership, CommunityRole, CommunityMembershipStatus
 from apps.chat.models import (
     Conversation,
     ConversationType,
@@ -53,6 +53,17 @@ def create_community_with_main_conversation(
         avatar_url=avatar_url,
         owner=owner,
         main_conversation=main_conversation,
+    )
+
+    # CommunityCreateSerializer.create() (the actually-used create path)
+    # does this too - without it the owner has no CommunityMembership row
+    # at all, so GET .../members/ (which filters on
+    # CommunityMembership.objects.active()) would never list them.
+    CommunityMembership.objects.create(
+        community=community,
+        user=owner,
+        role=CommunityRole.OWNER,
+        status=CommunityMembershipStatus.ACTIVE,
     )
 
     return community

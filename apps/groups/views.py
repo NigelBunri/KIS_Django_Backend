@@ -35,7 +35,7 @@ from apps.groups.models import (
 )
 from apps.accounts.models import User
 from apps.partners.models import Partner as PartnerModel, PartnerMembership, PartnerMembershipStatus
-from apps.communities.models import CommunityMembership, CommunityRole
+from apps.communities.models import CommunityBan, CommunityMembership, CommunityRole
 from apps.chat.models import ConversationMember, BaseConversationRole
 from apps.groups.services import reactivate_group_membership
 
@@ -328,9 +328,28 @@ class GroupViewSet(viewsets.ModelViewSet):
 
         users = User.objects.filter(id__in=user_ids, is_active=True)
         added: list[str] = []
+        skipped_banned: list[str] = []
+
+        banned_user_ids: set[str] = set()
+        if group.community_id:
+            banned_user_ids = set(
+                str(uid) for uid in CommunityBan.objects.filter(
+                    community_id=group.community_id, user_id__in=user_ids,
+                ).values_list("user_id", flat=True)
+            )
 
         for target in users:
             if target.id == user.id:
+                continue
+            if str(target.id) in banned_user_ids:
+                # This group belongs to a community the target is banned
+                # from - adding them here used to silently un-ban them
+                # (update_or_create below would reactivate their
+                # CommunityMembership with no ban check at all), reachable
+                # by any admin of just this one sub-group, not a community
+                # admin. A community ban must block ALL access to the
+                # community, including every one of its sub-groups.
+                skipped_banned.append(str(target.id))
                 continue
             created = not GroupMembership.objects.filter(group=group, user=target).exists()
             self._reactivate_group_membership(group, target)
@@ -362,7 +381,10 @@ class GroupViewSet(viewsets.ModelViewSet):
             if created:
                 added.append(str(target.id))
 
-        return Response({"added": added, "count": len(added)}, status=status.HTTP_200_OK)
+        return Response(
+            {"added": added, "count": len(added), "skipped_banned": skipped_banned},
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["post", "delete"], url_path="leave")
     def leave(self, request, pk=None):
@@ -428,6 +450,91 @@ class GroupViewSet(viewsets.ModelViewSet):
         join_req.save(update_fields=["status", "reviewed_by", "reviewed_at"])
 
         return Response({"detail": "Rejected."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="members/set-role")
+    def set_member_role(self, request, pk=None):
+        """
+        Promote/demote a group member. Previously the only way to change
+        a group member's role at all was the unrelated chat-conversation
+        members/role endpoint (apps.chat.views.ConversationViewSet) acting
+        on the group's backing conversation - not reachable from
+        CommunityRoomPage's own Groups list, which has no member-
+        management UI of its own. Mirrors
+        CommunityViewSet._set_member_role_response's shape/guards.
+        """
+        group = self.get_object()
+        membership = self._get_membership(group, request.user)
+        if group.owner != request.user and not self._is_admin(membership):
+            raise PermissionDenied("Only group admins can change member roles.")
+
+        user_id = request.data.get("user_id")
+        role_value = request.data.get("role")
+        if not user_id or not role_value:
+            return Response({"detail": "user_id and role are required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            target_role = GroupRole(role_value)
+        except ValueError:
+            return Response({"detail": "Invalid role value."}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_membership = GroupMembership.objects.filter(
+            group=group, user_id=user_id, left_at__isnull=True,
+        ).first()
+        if not target_membership:
+            return Response({"detail": "Member not found."}, status=status.HTTP_404_NOT_FOUND)
+        if target_membership.role == GroupRole.OWNER:
+            return Response({"detail": "Owner role cannot be modified."}, status=status.HTTP_400_BAD_REQUEST)
+        if target_role == GroupRole.OWNER:
+            return Response({"detail": "Cannot assign owner role."}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_membership.role = target_role
+        target_membership.save(update_fields=["role"])
+
+        # Keep the backing conversation's base_role in step, same mapping
+        # ConversationViewSet.set_member_role uses for groups in reverse.
+        conv_role = (
+            BaseConversationRole.ADMIN
+            if target_role in (GroupRole.ADMIN, GroupRole.MOD)
+            else BaseConversationRole.MEMBER
+        )
+        ConversationMember.objects.filter(
+            conversation=group.conversation, user_id=user_id, left_at__isnull=True,
+        ).update(base_role=conv_role)
+
+        return Response(GroupMembershipSerializer(target_membership).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="members/remove")
+    def remove_member(self, request, pk=None):
+        """
+        Non-permanent removal - the member loses access immediately but
+        can rejoin later through the group's normal join_policy, distinct
+        from ban() below. Previously the only non-permanent way to lose
+        group membership was leaving voluntarily; an admin's only option
+        to remove someone else was the permanent ban() action.
+        """
+        group = self.get_object()
+        membership = self._get_membership(group, request.user)
+        if group.owner != request.user and not self._is_admin(membership):
+            raise PermissionDenied("Only group admins can remove members.")
+
+        user_id = request.data.get("user_id")
+        if not user_id:
+            return Response({"detail": "user_id required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_membership = GroupMembership.objects.filter(
+            group=group, user_id=user_id, left_at__isnull=True,
+        ).first()
+        if not target_membership:
+            return Response({"detail": "Member not found."}, status=status.HTTP_404_NOT_FOUND)
+        if target_membership.role == GroupRole.OWNER:
+            return Response({"detail": "The owner cannot be removed."}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_membership.left_at = timezone.now()
+        target_membership.save(update_fields=["left_at"])
+        ConversationMember.objects.filter(
+            conversation=group.conversation, user_id=user_id, left_at__isnull=True,
+        ).update(left_at=timezone.now())
+
+        return Response({"detail": "Member removed."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="ban")
     def ban(self, request, pk=None):

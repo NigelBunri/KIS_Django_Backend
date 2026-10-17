@@ -62,7 +62,7 @@ from apps.partners.services import dispatch_partner_webhooks
 from apps.groups.models import Group, GroupMembership, GroupRole
 from apps.groups.services import reactivate_group_membership
 from apps.channels.models import Channel
-from apps.communities.models import Community, CommunityMembership, CommunityRole
+from apps.communities.models import Community, CommunityMembership, CommunityMembershipStatus, CommunityRole
 
 
 def _extract_phone_participants(raw_data) -> list[str]:
@@ -552,6 +552,25 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
         return Response(ConversationMemberSerializer(member).data, status=201)
 
+    def _resolve_conversation_community(self, conversation):
+        """
+        Returns the Community this conversation backs as either its main
+        chat or its posts/feed conversation, or None. Used so
+        remove_member/set_member_role below - generic chat-conversation
+        actions - can keep apps.communities.CommunityMembership in sync
+        when they happen to be acting on a community's conversation,
+        exactly like they already do for apps.groups.Group below.
+        """
+        try:
+            return conversation.community_main
+        except Community.DoesNotExist:
+            pass
+        try:
+            return conversation.community_posts
+        except Community.DoesNotExist:
+            pass
+        return None
+
     @action(detail=True, methods=['post'], url_path='members/remove')
     def remove_member(self, request, pk=None):
         conversation = self.get_object()
@@ -606,6 +625,29 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 group=group, user_id=user_id, left_at__isnull=True,
             ).update(left_at=timezone.now())
 
+        # Mirror of the Group sync above, for apps.communities - without
+        # this, removing someone from a community's main/posts
+        # conversation via this generic endpoint left CommunityMembership
+        # looking ACTIVE (still counted as a member, still shown in the
+        # member list/feed) while they'd actually lost chat access - a
+        # split-brain state. Removes them from BOTH the community's
+        # conversations (main + posts), same as the community's own
+        # remove_member action, not just the one this call happened to
+        # target.
+        community = self._resolve_conversation_community(conversation)
+        if community:
+            cm = CommunityMembership.objects.filter(community=community, user_id=user_id).first()
+            if cm and cm.status == CommunityMembershipStatus.ACTIVE:
+                cm.mark_removed()
+            other_conversation_ids = [
+                cid for cid in (community.main_conversation_id, community.posts_conversation_id)
+                if cid and cid != conversation.id
+            ]
+            if other_conversation_ids:
+                ConversationMember.objects.filter(
+                    conversation_id__in=other_conversation_ids, user_id=user_id, left_at__isnull=True,
+                ).update(left_at=timezone.now())
+
         return Response(ConversationMemberSerializer(member).data, status=200)
 
     @action(detail=True, methods=['post'], url_path='members/role')
@@ -629,6 +671,20 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
         if base_role not in BaseConversationRole.values:
             return Response({"detail": "Invalid base_role."}, status=400)
+
+        community = self._resolve_conversation_community(conversation)
+        if community and base_role == BaseConversationRole.OWNER:
+            # The community's own members/set-role action refuses to ever
+            # assign or modify the owner role (ownership only ever changes
+            # through a dedicated transfer path, which doesn't exist yet).
+            # This generic endpoint had no equivalent protection, so anyone
+            # with base_role=ADMIN on a community's conversation could
+            # grant an arbitrary member base_role=OWNER here - a second
+            # "owner" the community layer never agreed to and has no
+            # record of.
+            return Response(
+                {"detail": "Owner role cannot be assigned through this endpoint."}, status=400,
+            )
 
         member = ConversationMember.objects.filter(
             conversation=conversation,
@@ -654,6 +710,22 @@ class ConversationViewSet(viewsets.ModelViewSet):
             GroupMembership.objects.filter(
                 group=group, user_id=user_id, left_at__isnull=True,
             ).update(role=group_role)
+
+        # Mirror into apps.communities, same reasoning as remove_member
+        # above - otherwise promoting/demoting someone via this generic
+        # endpoint changes their actual chat permissions while
+        # CommunityMembership.role (what the member list/role badge and
+        # the community's OWN role-change notifications are driven from)
+        # silently never updates.
+        if community:
+            cm = CommunityMembership.objects.filter(community=community, user_id=user_id).first()
+            if cm and cm.role != CommunityRole.OWNER:
+                community_role = (
+                    CommunityRole.ADMIN if base_role == BaseConversationRole.ADMIN else CommunityRole.MEMBER
+                )
+                if cm.role != community_role:
+                    cm.role = community_role
+                    cm.save(update_fields=["role"])
 
         return Response(ConversationMemberSerializer(member).data, status=200)
 

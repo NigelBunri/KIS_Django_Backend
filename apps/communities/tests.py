@@ -372,6 +372,41 @@ class CommunityMembershipLifecycleTests(TestCase):
             CommunityMembership.objects.active().filter(community=self.community, user=self.user).exists()
         )
 
+    def test_leave_revokes_chat_conversation_access(self):
+        # Regression test: leave() previously only ever updated
+        # CommunityMembership (mark_left()) and never touched the user's
+        # ConversationMember row on the community's main/posts
+        # conversations, unlike remove_member/ban which both correctly
+        # call _remove_conversation_membership. A user who left kept full
+        # real-time chat access to the community's group chat indefinitely.
+        main_conversation = Conversation.objects.create(
+            type=ConversationType.GROUP, title="Lifecycle Community", created_by=self.owner,
+        )
+        posts_conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Lifecycle Community Feed", created_by=self.owner,
+        )
+        self.community.main_conversation = main_conversation
+        self.community.posts_conversation = posts_conversation
+        self.community.save(update_fields=["main_conversation", "posts_conversation"])
+
+        self.client.force_authenticate(self.user)
+        # join() -> _activate_membership -> _ensure_conversation_membership
+        # already creates both ConversationMember rows.
+        join_res = self.client.post(f"/api/v1/communities/{self.community.id}/join/", {}, format="json")
+        self.assertEqual(join_res.status_code, status.HTTP_200_OK, join_res.data)
+        main_cm = ConversationMember.objects.get(conversation=main_conversation, user=self.user)
+        posts_cm = ConversationMember.objects.get(conversation=posts_conversation, user=self.user)
+        self.assertIsNone(main_cm.left_at)
+        self.assertIsNone(posts_cm.left_at)
+
+        leave_res = self.client.post(f"/api/v1/communities/{self.community.id}/leave/", {}, format="json")
+        self.assertEqual(leave_res.status_code, status.HTTP_200_OK, leave_res.data)
+
+        main_cm.refresh_from_db()
+        posts_cm.refresh_from_db()
+        self.assertIsNotNone(main_cm.left_at)
+        self.assertIsNotNone(posts_cm.left_at)
+
     def test_rejected_join_request_can_be_resubmitted(self):
         self.community.join_policy = CommunityJoinPolicy.REQUEST
         self.community.save(update_fields=["join_policy"])
@@ -400,6 +435,28 @@ class CommunityMembershipLifecycleTests(TestCase):
         )
         join_req.refresh_from_db()
         self.assertEqual(join_req.status, CommunityJoinRequestStatus.PENDING)
+
+    def test_join_requests_list_endpoint(self):
+        # Regression test: approve_request/reject_request both require a
+        # request_id, but there was no endpoint to discover one at all -
+        # the entire join-request flow was unreachable from any client.
+        self.community.join_policy = CommunityJoinPolicy.REQUEST
+        self.community.save(update_fields=["join_policy"])
+        self.client.force_authenticate(self.user)
+        self.client.post(f"/api/v1/communities/{self.community.id}/request-join/", {"message": "please add me"}, format="json")
+
+        # A plain outsider (not an admin) cannot see pending requests.
+        self.client.force_authenticate(self.user)
+        forbidden_res = self.client.get(f"/api/v1/communities/{self.community.id}/join-requests/")
+        self.assertEqual(forbidden_res.status_code, status.HTTP_403_FORBIDDEN, forbidden_res.data)
+
+        self.client.force_authenticate(self.owner)
+        res = self.client.get(f"/api/v1/communities/{self.community.id}/join-requests/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        results = res.data.get("results", res.data) if isinstance(res.data, dict) else res.data
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["message"], "please add me")
+        self.assertEqual(str(results[0]["user"]["id"]), str(self.user.id))
 
     def test_approve_request_activates_membership(self):
         self.community.join_policy = CommunityJoinPolicy.REQUEST
@@ -464,7 +521,11 @@ class CommunityMembershipLifecycleTests(TestCase):
         # Also excluded from the active members list while banned.
         self.client.force_authenticate(self.owner)
         members_res = self.client.get(f"/api/v1/communities/{self.community.id}/members/")
-        member_user_ids = {m["user"]["id"] for m in members_res.data}
+        # The members action paginates (DRF's default pagination wraps the
+        # list in {"results": [...], "count": ..., ...}), so .data is that
+        # envelope dict, not a bare list.
+        members_list = members_res.data.get("results", members_res.data)
+        member_user_ids = {m["user"]["id"] for m in members_list}
         self.assertNotIn(str(self.user.id), member_user_ids)
 
         # Unban lifts the ban and allows rejoining, but does not silently
@@ -483,6 +544,27 @@ class CommunityMembershipLifecycleTests(TestCase):
         self.assertEqual(rejoin_res.status_code, status.HTTP_200_OK, rejoin_res.data)
         membership.refresh_from_db()
         self.assertEqual(membership.status, CommunityMembershipStatus.ACTIVE)
+
+
+class CommunityListSerializerTests(TestCase):
+    def test_public_list_includes_join_policy(self):
+        # Regression test: the mobile discovery screen (CommunitiesTab.tsx)
+        # branches its "Join" action on join_policy, but the list
+        # serializer never included the field at all, so the client had no
+        # way to know a community needed a join request instead of a
+        # direct join.
+        owner = _make_user("+2348150000001", "list-ser-owner")
+        Community.objects.create(
+            owner=owner, name="Discoverable Community", slug="discoverable-community",
+            visibility="public", join_policy=CommunityJoinPolicy.REQUEST,
+        )
+        client = APIClient()
+        client.force_authenticate(owner)
+        res = client.get("/api/v1/communities/?public=true")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        results = res.data.get("results", res.data) if isinstance(res.data, dict) else res.data
+        match = next(r for r in results if r["slug"] == "discoverable-community")
+        self.assertEqual(match["join_policy"], "request")
 
 
 class CommunityRoleManagementTests(TestCase):
@@ -523,6 +605,39 @@ class CommunityRoleManagementTests(TestCase):
         self.assertEqual(demote_res.status_code, status.HTTP_200_OK, demote_res.data)
         membership.refresh_from_db()
         self.assertEqual(membership.role, CommunityRole.MEMBER)
+
+    def test_promote_grants_chat_admin_base_role_and_demote_revokes_it(self):
+        # Regression test: promoting someone to community Admin previously
+        # only updated the role badge (CommunityMembership.role) - it never
+        # touched ConversationMember.base_role, so the promoted member got
+        # none of the actual chat-layer admin powers (lock bypass,
+        # ADMINS_ONLY policy bypass) everything in apps/chat gates on that
+        # field.
+        main_conversation = Conversation.objects.create(
+            type=ConversationType.GROUP, title="Role Community", created_by=self.owner,
+        )
+        self.community.main_conversation = main_conversation
+        self.community.save(update_fields=["main_conversation"])
+        member_cm = ConversationMember.objects.create(
+            conversation=main_conversation, user=self.member, base_role="member",
+        )
+
+        self.client.force_authenticate(self.owner)
+        promote_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "admin"}, format="json",
+        )
+        self.assertEqual(promote_res.status_code, status.HTTP_200_OK, promote_res.data)
+        member_cm.refresh_from_db()
+        self.assertEqual(member_cm.base_role, "admin")
+
+        demote_res = self.client.post(
+            f"/api/v1/communities/{self.community.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "member"}, format="json",
+        )
+        self.assertEqual(demote_res.status_code, status.HTTP_200_OK, demote_res.data)
+        member_cm.refresh_from_db()
+        self.assertEqual(member_cm.base_role, "member")
 
     def test_plain_member_cannot_change_roles(self):
         self.client.force_authenticate(self.outsider_member)

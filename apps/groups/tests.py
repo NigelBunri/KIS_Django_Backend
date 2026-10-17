@@ -4,7 +4,8 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
-from apps.groups.models import Group, GroupJoinPolicy, GroupJoinRequest, GroupMembership
+from apps.groups.models import Group, GroupJoinPolicy, GroupJoinRequest, GroupMembership, GroupRole
+from apps.communities.models import Community, CommunityBan, CommunityMembership, CommunityRole
 from apps.partners.models import Partner, PartnerMembership, PartnerMembershipStatus, PartnerRole, PartnerRoleAssignment
 
 
@@ -344,6 +345,163 @@ class GroupMembershipReactivationTests(APITestCase):
         members_response = self.client.get(f"/api/v1/chat-groups/{self.group.id}/members/")
         member_ids = {m["user"]["id"] for m in members_response.data}
         self.assertIn(str(self.member.id), member_ids)
+
+
+class GroupCommunityBanSyncTests(APITestCase):
+    """
+    Regression coverage: a community-banned user could previously be
+    silently un-banned by any admin of just one of the community's
+    sub-groups calling add-members, which reactivated their
+    CommunityMembership (left_at=None, is_banned=False) with no ban check
+    at all - a real privilege-escalation/ban-bypass path.
+    """
+
+    def setUp(self):
+        self.community_owner = User.objects.create_user(
+            phone="+237670009920", password="TestPass12!", country="CM",
+        )
+        self.group_admin = User.objects.create_user(
+            phone="+237670009921", password="TestPass12!", country="CM",
+        )
+        self.banned_user = User.objects.create_user(
+            phone="+237670009922", password="TestPass12!", country="CM",
+        )
+        self.community = Community.objects.create(
+            owner=self.community_owner, name="Banned Sync Community", slug="banned-sync-community",
+        )
+        CommunityMembership.objects.create(
+            community=self.community, user=self.community_owner, role=CommunityRole.OWNER,
+        )
+        CommunityBan.objects.create(community=self.community, user=self.banned_user, reason="test ban")
+
+        conversation = Conversation.objects.create(
+            type=ConversationType.GROUP, title="Sub Group", created_by=self.group_admin,
+        )
+        self.group = Group.objects.create(
+            name="Sub Group", slug="banned-sync-sub-group",
+            owner=self.group_admin, conversation=conversation, community=self.community,
+        )
+        GroupMembership.objects.create(group=self.group, user=self.group_admin, role=GroupRole.OWNER)
+        ConversationMember.objects.create(
+            conversation=conversation, user=self.group_admin, base_role=BaseConversationRole.OWNER,
+        )
+
+    def test_group_admin_cannot_un_ban_a_community_banned_user_via_add_members(self):
+        self.client.force_authenticate(self.group_admin)
+        response = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/add-members/",
+            {"userIds": [str(self.banned_user.id)]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["added"], [])
+        self.assertEqual(response.data["skipped_banned"], [str(self.banned_user.id)])
+
+        self.assertFalse(
+            GroupMembership.objects.filter(group=self.group, user=self.banned_user).exists()
+        )
+        community_membership = CommunityMembership.objects.filter(
+            community=self.community, user=self.banned_user,
+        ).first()
+        self.assertIsNone(community_membership)
+
+
+class GroupMemberRoleManagementTests(APITestCase):
+    """
+    Covers the members/set-role and members/remove actions - previously
+    the only way to change a group member's role at all was the unrelated
+    chat-conversation endpoint, and there was no non-permanent removal
+    (only permanent ban()).
+    """
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            phone="+237670009930", password="TestPass12!", country="CM",
+        )
+        self.member = User.objects.create_user(
+            phone="+237670009931", password="TestPass12!", country="CM",
+        )
+        self.outsider = User.objects.create_user(
+            phone="+237670009932", password="TestPass12!", country="CM",
+        )
+        conversation = Conversation.objects.create(
+            type=ConversationType.GROUP, title="Role Group", created_by=self.owner,
+        )
+        self.group = Group.objects.create(
+            name="Role Group", slug="role-management-group", owner=self.owner, conversation=conversation,
+        )
+        GroupMembership.objects.create(group=self.group, user=self.owner, role=GroupRole.OWNER)
+        ConversationMember.objects.create(conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER)
+        GroupMembership.objects.create(group=self.group, user=self.member, role=GroupRole.MEMBER)
+        ConversationMember.objects.create(conversation=conversation, user=self.member, base_role=BaseConversationRole.MEMBER)
+        GroupMembership.objects.create(group=self.group, user=self.outsider, role=GroupRole.MEMBER)
+        ConversationMember.objects.create(conversation=conversation, user=self.outsider, base_role=BaseConversationRole.MEMBER)
+
+    def test_owner_can_promote_and_it_propagates_to_conversation_base_role(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "admin"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        membership = GroupMembership.objects.get(group=self.group, user=self.member)
+        self.assertEqual(membership.role, GroupRole.ADMIN)
+        cm = ConversationMember.objects.get(conversation=self.group.conversation, user=self.member)
+        self.assertEqual(cm.base_role, BaseConversationRole.ADMIN)
+
+    def test_plain_member_cannot_change_roles(self):
+        self.client.force_authenticate(self.outsider)
+        response = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "admin"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    def test_owner_role_cannot_be_modified_or_assigned(self):
+        self.client.force_authenticate(self.owner)
+        demote_owner = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/members/set-role/",
+            {"user_id": str(self.owner.id), "role": "member"}, format="json",
+        )
+        self.assertEqual(demote_owner.status_code, status.HTTP_400_BAD_REQUEST, demote_owner.data)
+
+        assign_owner = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/members/set-role/",
+            {"user_id": str(self.member.id), "role": "owner"}, format="json",
+        )
+        self.assertEqual(assign_owner.status_code, status.HTTP_400_BAD_REQUEST, assign_owner.data)
+
+    def test_remove_member_is_non_permanent(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/members/remove/",
+            {"user_id": str(self.member.id)}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        membership = GroupMembership.objects.get(group=self.group, user=self.member)
+        self.assertIsNotNone(membership.left_at)
+        cm = ConversationMember.objects.get(conversation=self.group.conversation, user=self.member)
+        self.assertIsNotNone(cm.left_at)
+
+        # Non-permanent - unlike ban(), an admin can bring them straight
+        # back in (no invite link / approval round-trip required).
+        self.client.force_authenticate(self.owner)
+        rejoin = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/add-members/",
+            {"userIds": [str(self.member.id)]}, format="json",
+        )
+        self.assertEqual(rejoin.status_code, status.HTTP_200_OK, rejoin.data)
+        membership.refresh_from_db()
+        self.assertIsNone(membership.left_at)
+
+    def test_owner_cannot_be_removed(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/members/remove/",
+            {"user_id": str(self.owner.id)}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
 
 
 class InviteLinkAndJoinPolicyTests(APITestCase):

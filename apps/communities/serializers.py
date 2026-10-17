@@ -121,6 +121,7 @@ class CommunityListSerializer(
             "avatar_url",
             "is_active",
             "allow_broadcasts",
+            "join_policy",
             "partner",
             "is_member",
             "is_owner",

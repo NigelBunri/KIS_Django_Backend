@@ -275,6 +275,28 @@ class CommunityViewSet(viewsets.ModelViewSet):
     def _update_membership_role(self, membership: CommunityMembership, role: str):
         membership.role = role
         membership.save(update_fields=["role"])
+        # Without this, promoting someone to community Admin/Mod never
+        # granted them any of the chat-layer admin powers everything in
+        # apps/chat gates on ConversationMember.base_role (lock bypass,
+        # ADMINS_ONLY send/react policy, etc) - it only showed an updated
+        # role badge. Same OWNER/ADMIN/MOD -> ADMIN, else -> MEMBER mapping
+        # ws_perms() already uses when auto-repairing a missing
+        # ConversationMember row, so a promoted member's chat permissions
+        # are correct whether that row already existed or had to be
+        # recreated.
+        base_role = (
+            BaseConversationRole.ADMIN
+            if role in (CommunityRole.OWNER, CommunityRole.ADMIN, CommunityRole.MOD)
+            else BaseConversationRole.MEMBER
+        )
+        conversation_ids = [
+            cid for cid in (membership.community.main_conversation_id, membership.community.posts_conversation_id) if cid
+        ]
+        if conversation_ids:
+            ConversationMember.objects.filter(
+                conversation_id__in=conversation_ids,
+                user_id=membership.user_id,
+            ).update(base_role=base_role)
         return membership
 
     def _check_not_banned(self, community: Community, user):
@@ -428,10 +450,44 @@ class CommunityViewSet(viewsets.ModelViewSet):
         if not membership:
             return Response({"detail": "Not a member."}, status=status.HTTP_400_BAD_REQUEST)
         membership.mark_left()
+        # Was missing entirely - mark_left() only ever touched
+        # CommunityMembership, so a user who left kept their
+        # ConversationMember row (left_at still null) on the community's
+        # main/posts conversations and retained full real-time chat access
+        # indefinitely. remove_member/_ban_user both already call this;
+        # leave() is the one other way out of a community and must too.
+        self._remove_conversation_membership(community, request.user.id)
         from apps.communities.realtime import notify_member_left
 
         notify_member_left(community, membership, reason="left")
         return Response({"detail": "Left community."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="join-requests")
+    def join_requests(self, request, pk=None):
+        """
+        Lists this community's join requests for admins to act on.
+        approve_request/reject_request both require a request_id with no
+        way to discover one - this was the missing other half of that:
+        without it, the fully-built and correctly-permission-checked
+        approve/reject actions were unreachable from any client, since
+        there was no way to even see what's pending.
+        """
+        community = self.get_object()
+        if not self._has_owner_privileges(community, request.user):
+            raise PermissionDenied("Only owners/admins can view join requests.")
+
+        status_filter = request.query_params.get("status", CommunityJoinRequestStatus.PENDING)
+        qs = CommunityJoinRequest.objects.filter(community=community).select_related("user", "reviewed_by")
+        if status_filter and status_filter != "all":
+            qs = qs.filter(status=status_filter)
+        qs = qs.order_by("-created_at")
+
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = CommunityJoinRequestSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = CommunityJoinRequestSerializer(qs, many=True)
+        return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path="request-join")
     def request_join(self, request, pk=None):
