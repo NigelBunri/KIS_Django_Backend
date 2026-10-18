@@ -18,6 +18,46 @@ from .badge_counts import get_main_tab_badge_counts
 from .permissions import IsOwnerOrReadOnly
 from .realtime import notify_main_tab_badges_updated
 
+
+def _mark_channel_content_seen(user_id, content_ids):
+    """Opening/reading a channel_content-targeted notification should also
+    count as having seen that content, so the broadcast badge's
+    channel_content_count (ChannelWatchHistory-based, see badge_counts.py's
+    _broadcast_unread_count) drops in step with its notification_count side -
+    otherwise a single "new content" notification keeps half the badge alive
+    after being read, since the two counters are independent.
+    """
+    content_ids = {cid for cid in content_ids if cid}
+    if not content_ids:
+        return
+    try:
+        from apps.broadcasts.models import ChannelContent, ChannelWatchHistory
+
+        valid_ids = set(
+            ChannelContent.objects.filter(id__in=content_ids).values_list("id", flat=True)
+        )
+        if not valid_ids:
+            return
+        existing = set(
+            ChannelWatchHistory.objects.filter(user_id=user_id, content_id__in=valid_ids)
+            .values_list("content_id", flat=True)
+        )
+        to_create = [
+            ChannelWatchHistory(
+                user_id=user_id,
+                content_id=cid,
+                progress_seconds=0,
+                completed=False,
+                last_viewed_at=timezone.now(),
+            )
+            for cid in valid_ids
+            if cid not in existing
+        ]
+        if to_create:
+            ChannelWatchHistory.objects.bulk_create(to_create, ignore_conflicts=True)
+    except Exception:
+        pass
+
 # -------------------------
 # Small request/response serializers for docs
 # -------------------------
@@ -166,6 +206,8 @@ class NotificationViewSet(viewsets.ModelViewSet):
         """
         notif = self.get_object()
         notif.mark_read()
+        if notif.target_type == "channel_content" and notif.target_id:
+            _mark_channel_content_seen(request.user.id, [notif.target_id])
         notify_main_tab_badges_updated(
             [str(request.user.id)],
             source="notifications",
@@ -195,8 +237,14 @@ class NotificationViewSet(viewsets.ModelViewSet):
         serializer = BulkMarkReadRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         ids = serializer.validated_data.get("ids", [])
+        content_ids = list(
+            models.Notification.objects.filter(
+                user_id=request.user.id, id__in=ids, target_type="channel_content"
+            ).values_list("target_id", flat=True)
+        )
         updated = models.Notification.objects.filter(user_id=request.user.id, id__in=ids).update(is_read=True, read_at=timezone.now())
         if updated:
+            _mark_channel_content_seen(request.user.id, content_ids)
             notify_main_tab_badges_updated(
                 [str(request.user.id)],
                 source="notifications",
@@ -215,11 +263,16 @@ class NotificationViewSet(viewsets.ModelViewSet):
     )
     @action(detail=False, methods=["post"], url_path="mark-all-read")
     def mark_all_read(self, request):
-        updated = models.Notification.objects.filter(user_id=request.user.id, is_deleted=False, is_read=False).update(
+        base_qs = models.Notification.objects.filter(user_id=request.user.id, is_deleted=False, is_read=False)
+        content_ids = list(
+            base_qs.filter(target_type="channel_content").values_list("target_id", flat=True)
+        )
+        updated = base_qs.update(
             is_read=True,
             read_at=timezone.now(),
         )
         if updated:
+            _mark_channel_content_seen(request.user.id, content_ids)
             notify_main_tab_badges_updated(
                 [str(request.user.id)],
                 source="notifications",
@@ -316,8 +369,13 @@ class NotificationViewSet(viewsets.ModelViewSet):
         for query in filters[1:]:
             combined &= query
 
-        updated = qs.filter(combined).update(is_read=True, read_at=timezone.now())
+        matched = qs.filter(combined)
+        content_ids = list(
+            matched.filter(target_type="channel_content").values_list("target_id", flat=True)
+        )
+        updated = matched.update(is_read=True, read_at=timezone.now())
         if updated:
+            _mark_channel_content_seen(request.user.id, content_ids)
             notify_main_tab_badges_updated(
                 [str(request.user.id)],
                 source=source or target_type or "notifications",
