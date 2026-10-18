@@ -29,7 +29,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-SUPPORTED_TYPES = {"call", "broadcast-call", "group", "community", "partner", "contact", "referral", "gift", "live-guest"}
+SUPPORTED_TYPES = {"call", "broadcast-call", "group", "community", "partner", "contact", "referral", "gift", "live-guest", "petition", "event"}
 
 
 def _not_found():
@@ -223,6 +223,56 @@ def _resolve_live_guest(token: str):
     })
 
 
+def _resolve_petition(token: str):
+    """Read-only preview for the website's /join/petition/[token] landing
+    page - token is the Petition's own UUID (petitions have no separate
+    share-token field; the id itself is already opaque and petitions are
+    public civic content by design, same trust level as a community's
+    name/description shown here). A draft petition hasn't been published
+    yet, so it's treated the same as "not found" rather than leaking its
+    existence/content to an unauthenticated visitor."""
+    import uuid as _uuid
+
+    from apps.government.models import Petition, PetitionStatus
+
+    try:
+        petition_id = _uuid.UUID(str(token))
+    except (ValueError, AttributeError, TypeError):
+        return _not_found()
+    petition = Petition.objects.filter(id=petition_id).first()
+    if not petition:
+        return _not_found()
+    if petition.status == PetitionStatus.DRAFT:
+        return _not_found()
+    return Response({
+        "status": "ok",
+        "type": "petition",
+        "name": petition.title,
+        "description": petition.description[:200] if petition.description else "",
+    })
+
+
+def _resolve_event(token: str):
+    """Read-only preview for the website's /join/event/[token] landing
+    page - token is the Event's own slug (already unique, already meant
+    to be a public-facing identifier). Gated on visibility == "public"
+    (an unlisted/private event's existence must not be confirmable via a
+    guessed/shared slug) and excludes draft events (not yet published) -
+    same "not found" treatment as a draft petition above, for the same
+    reason."""
+    from apps.events.models import Event
+
+    event = Event.objects.filter(slug=token).first()
+    if not event or event.visibility != "public" or event.status == "draft":
+        return _not_found()
+    return Response({
+        "status": "ok",
+        "type": "event",
+        "name": event.title,
+        "description": event.description[:200] if event.description else "",
+    })
+
+
 def _resolve_call(token: str, link_type: str):
     # No server-side validity check here on purpose (see module docstring)
     # - Django doesn't own call data and Nest's own join-by-token endpoint
@@ -246,6 +296,8 @@ _RESOLVERS = {
     "referral": _resolve_referral,
     "gift": _resolve_gift,
     "live-guest": _resolve_live_guest,
+    "petition": _resolve_petition,
+    "event": _resolve_event,
 }
 
 

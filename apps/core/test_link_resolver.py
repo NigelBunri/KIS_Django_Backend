@@ -387,3 +387,80 @@ class PublicLinkResolveViewTests(TestCase):
         body_text = str(resp.data)
         self.assertNotIn("+15550000101", body_text)
         self.assertNotIn("resolver_owner@example.com", body_text)
+
+    # --- petition ----------------------------------------------------------
+
+    def test_valid_active_petition_resolves(self):
+        from apps.government.models import Petition, PetitionStatus
+
+        petition = Petition.objects.create(
+            creator=self.owner, title="Fix the road", description="It is full of potholes.",
+            target="City Council", status=PetitionStatus.ACTIVE,
+        )
+        resp = self.client.get(self._url("petition", str(petition.id)))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "ok")
+        self.assertEqual(resp.data["name"], "Fix the road")
+
+    def test_draft_petition_is_404_not_leaked(self):
+        from apps.government.models import Petition, PetitionStatus
+
+        petition = Petition.objects.create(
+            creator=self.owner, title="Unpublished petition", description="x",
+            target="City Council", status=PetitionStatus.DRAFT,
+        )
+        resp = self.client.get(self._url("petition", str(petition.id)))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_malformed_petition_token_is_404_not_crash(self):
+        resp = self.client.get(self._url("petition", "not-a-uuid"))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_nonexistent_petition_token_is_404(self):
+        resp = self.client.get(self._url("petition", "00000000-0000-0000-0000-000000000000"))
+        self.assertEqual(resp.status_code, 404)
+
+    # --- event ---------------------------------------------------------------
+
+    def test_valid_public_published_event_resolves(self):
+        from django.utils import timezone
+        from apps.events.models import Event
+
+        event = Event.objects.create(
+            owner_id=self.owner.id, title="Youth Conference", slug="youth-conference-resolver",
+            description="A gathering for young leaders.",
+            start_at=timezone.now(), end_at=timezone.now(),
+            visibility="public", status="published",
+        )
+        resp = self.client.get(self._url("event", event.slug))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "ok")
+        self.assertEqual(resp.data["name"], "Youth Conference")
+
+    def test_unlisted_event_is_404_not_leaked(self):
+        from django.utils import timezone
+        from apps.events.models import Event
+
+        event = Event.objects.create(
+            owner_id=self.owner.id, title="Private meetup", slug="private-meetup-resolver",
+            start_at=timezone.now(), end_at=timezone.now(),
+            visibility="unlisted", status="published",
+        )
+        resp = self.client.get(self._url("event", event.slug))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_draft_event_is_404_not_leaked(self):
+        from django.utils import timezone
+        from apps.events.models import Event
+
+        event = Event.objects.create(
+            owner_id=self.owner.id, title="Draft event", slug="draft-event-resolver",
+            start_at=timezone.now(), end_at=timezone.now(),
+            visibility="public", status="draft",
+        )
+        resp = self.client.get(self._url("event", event.slug))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_nonexistent_event_slug_is_404(self):
+        resp = self.client.get(self._url("event", "does-not-exist-resolver"))
+        self.assertEqual(resp.status_code, 404)
