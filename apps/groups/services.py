@@ -12,6 +12,7 @@ from apps.chat.models import (
     ConversationMember,
     BaseConversationRole,
 )
+from apps.communities.models import CommunityBan, CommunityMembership, CommunityRole
 from apps.groups.models import Group, GroupMembership, GroupRole
 
 
@@ -96,3 +97,64 @@ def reactivate_group_membership(group: Group, user: User, *, role=None):
         cm.save(update_fields=["left_at", "joined_at"])
 
     return membership, cm
+
+
+class CommunityBanned(Exception):
+    """Raised by sync_community_membership_for_group when the target user
+    is banned from the group's owning community - the caller must treat
+    this as a hard denial, never silently skip the community sync (that
+    would leave the user able to chat/post in the group's own conversation
+    while still being nominally "banned" from the community one level up)."""
+
+
+@transaction.atomic
+def sync_community_membership_for_group(group: Group, user: User) -> None:
+    """
+    Mirror a group member into the group's owning community: a
+    CommunityMembership row plus ConversationMember on both the
+    community's main_conversation and posts_conversation. A no-op when
+    the group doesn't belong to a community.
+
+    Extracted from GroupViewSet.add_members (the only path that
+    originally did this) so GroupViewSet.join_by_invite and
+    ConversationViewSet.add_member's group branch can share it instead of
+    only ever syncing GroupMembership/ConversationMember on the group's
+    own conversation - which left a user who joined a community-scoped
+    group via invite link, or got added to one via the generic
+    "add from contacts/chats" action, fully able to use the group but
+    invisible in the community's own member list (CommunityViewSet.members
+    reads CommunityMembership only - see apps.communities.views) and able
+    to bypass a CommunityBan that only this group's own owner/admin would
+    ever see (add_members already guarded this; the other two paths did
+    not).
+    """
+    if not group.community_id:
+        return
+
+    if CommunityBan.objects.filter(community_id=group.community_id, user=user).exists():
+        raise CommunityBanned()
+
+    CommunityMembership.objects.update_or_create(
+        community_id=group.community_id,
+        user=user,
+        defaults={"role": CommunityRole.MEMBER, "left_at": None, "is_banned": False},
+    )
+    community = group.community
+    if community and community.main_conversation_id:
+        mcm, _ = ConversationMember.objects.get_or_create(
+            conversation=community.main_conversation,
+            user=user,
+            defaults={"base_role": BaseConversationRole.MEMBER},
+        )
+        if mcm.left_at is not None:
+            mcm.left_at = None
+            mcm.save(update_fields=["left_at"])
+    if community and community.posts_conversation_id:
+        pcm, _ = ConversationMember.objects.get_or_create(
+            conversation=community.posts_conversation,
+            user=user,
+            defaults={"base_role": BaseConversationRole.MEMBER},
+        )
+        if pcm.left_at is not None:
+            pcm.left_at = None
+            pcm.save(update_fields=["left_at"])

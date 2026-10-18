@@ -37,7 +37,11 @@ from apps.accounts.models import User
 from apps.partners.models import Partner as PartnerModel, PartnerMembership, PartnerMembershipStatus
 from apps.communities.models import CommunityBan, CommunityMembership, CommunityRole
 from apps.chat.models import ConversationMember, BaseConversationRole
-from apps.groups.services import reactivate_group_membership
+from apps.groups.services import (
+    reactivate_group_membership,
+    sync_community_membership_for_group,
+    CommunityBanned,
+)
 
 
 @extend_schema_view(
@@ -299,7 +303,16 @@ class GroupViewSet(viewsets.ModelViewSet):
         if group.join_policy != GroupJoinPolicy.OPEN:
             return Response({"detail": "Group is not open to direct join."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # A community-banned user self-joining an OPEN sub-group of that
+        # community previously bypassed the ban entirely - checked before
+        # the group membership is even created, same as add_members.
+        if group.community_id and CommunityBan.objects.filter(
+            community_id=group.community_id, user_id=user.id,
+        ).exists():
+            return Response({"detail": "You are banned from this community."}, status=status.HTTP_403_FORBIDDEN)
+
         membership, _cm = self._reactivate_group_membership(group, user)
+        sync_community_membership_for_group(group, user)
 
         return Response(GroupMembershipSerializer(membership).data, status=status.HTTP_200_OK)
 
@@ -344,40 +357,28 @@ class GroupViewSet(viewsets.ModelViewSet):
             if str(target.id) in banned_user_ids:
                 # This group belongs to a community the target is banned
                 # from - adding them here used to silently un-ban them
-                # (update_or_create below would reactivate their
-                # CommunityMembership with no ban check at all), reachable
-                # by any admin of just this one sub-group, not a community
-                # admin. A community ban must block ALL access to the
-                # community, including every one of its sub-groups.
+                # (the old inline update_or_create had no ban check at
+                # all), reachable by any admin of just this one sub-group,
+                # not a community admin. A community ban must block ALL
+                # access to the community, including every one of its
+                # sub-groups. Checked up front so a banned target's
+                # GroupMembership is never even created, not created then
+                # reverted.
                 skipped_banned.append(str(target.id))
                 continue
             created = not GroupMembership.objects.filter(group=group, user=target).exists()
             self._reactivate_group_membership(group, target)
-            if group.community_id:
-                CommunityMembership.objects.update_or_create(
-                    community_id=group.community_id,
-                    user=target,
-                    defaults={"role": CommunityRole.MEMBER, "left_at": None, "is_banned": False},
-                )
-                community = group.community
-                if community and community.main_conversation_id:
-                    mcm, _ = ConversationMember.objects.get_or_create(
-                        conversation=community.main_conversation,
-                        user=target,
-                        defaults={"base_role": BaseConversationRole.MEMBER},
-                    )
-                    if mcm.left_at is not None:
-                        mcm.left_at = None
-                        mcm.save(update_fields=["left_at"])
-                if community and community.posts_conversation_id:
-                    pcm, _ = ConversationMember.objects.get_or_create(
-                        conversation=community.posts_conversation,
-                        user=target,
-                        defaults={"base_role": BaseConversationRole.MEMBER},
-                    )
-                    if pcm.left_at is not None:
-                        pcm.left_at = None
-                        pcm.save(update_fields=["left_at"])
+            try:
+                sync_community_membership_for_group(group, target)
+            except CommunityBanned:
+                # Can't actually happen - banned_user_ids already excluded
+                # this target - but sync_community_membership_for_group
+                # re-checks on every caller's behalf (join_by_invite has no
+                # upfront filter of its own), so handle it defensively
+                # rather than assuming this call site's pre-filter is the
+                # only guard that will ever exist here.
+                skipped_banned.append(str(target.id))
+                continue
             if created:
                 added.append(str(target.id))
 
@@ -423,12 +424,24 @@ class GroupViewSet(viewsets.ModelViewSet):
         if not join_req:
             return Response({"detail": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Same community-ban guard as add_members/join - a sub-group's own
+        # admin approving a request must not be able to bypass a ban set
+        # one level up at the community.
+        if group.community_id and CommunityBan.objects.filter(
+            community_id=group.community_id, user_id=join_req.user_id,
+        ).exists():
+            return Response(
+                {"detail": "This user is banned from the community this group belongs to."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         join_req.status = GroupJoinRequestStatus.APPROVED
         join_req.reviewed_by = request.user
         join_req.reviewed_at = timezone.now()
         join_req.save(update_fields=["status", "reviewed_by", "reviewed_at"])
 
         self._reactivate_group_membership(group, join_req.user)
+        sync_community_membership_for_group(group, join_req.user)
 
         return Response({"detail": "Approved."}, status=status.HTTP_200_OK)
 
@@ -450,6 +463,36 @@ class GroupViewSet(viewsets.ModelViewSet):
         join_req.save(update_fields=["status", "reviewed_by", "reviewed_at"])
 
         return Response({"detail": "Rejected."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="join-requests")
+    def join_requests(self, request, pk=None):
+        """
+        Lists this group's join requests for admins to act on. Mirrors
+        CommunityViewSet.join_requests - approve_request/reject_request
+        above both require a request_id with no way to discover one.
+        Group.join_policy defaults to REQUEST, so an invite-link join (or
+        request_join()) silently becomes a pending GroupJoinRequest with
+        no membership of any kind created - without this action there was
+        no way for the owner to even see, let alone approve, those
+        requests.
+        """
+        group = self.get_object()
+        membership = self._get_membership(group, request.user)
+        if group.owner_id != request.user.id and not self._is_admin(membership):
+            raise PermissionDenied("Only owners/admins can view join requests.")
+
+        status_filter = request.query_params.get("status", GroupJoinRequestStatus.PENDING)
+        qs = GroupJoinRequest.objects.filter(group=group).select_related("user", "reviewed_by")
+        if status_filter and status_filter != "all":
+            qs = qs.filter(status=status_filter)
+        qs = qs.order_by("-created_at")
+
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = GroupJoinRequestSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = GroupJoinRequestSerializer(qs, many=True)
+        return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path="members/set-role")
     def set_member_role(self, request, pk=None):
@@ -645,6 +688,21 @@ class GroupViewSet(viewsets.ModelViewSet):
         if existing and existing.is_banned:
             return Response({"detail": "You are banned from this group."}, status=status.HTTP_403_FORBIDDEN)
 
+        # A community-banned user resolving a community-scoped group's
+        # invite link previously bypassed the ban entirely - this is the
+        # one path that used to have NEITHER a ban check NOR any community
+        # sync at all (see sync_community_membership_for_group's
+        # docstring), unlike add_members which already guarded it. Checked
+        # up front, before even the join_policy branch below, so a banned
+        # user can't land a pending GroupJoinRequest either.
+        if group.community_id and CommunityBan.objects.filter(
+            community_id=group.community_id, user_id=request.user.id,
+        ).exists():
+            return Response(
+                {"detail": "You are banned from the community this group belongs to."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         # Previously joined immediately regardless of join_policy - a group
         # with "Approval required to join" (GroupJoinPolicy.REQUEST) still
         # let anyone with the invite link join on the spot, the exact same
@@ -663,4 +721,15 @@ class GroupViewSet(viewsets.ModelViewSet):
             )
 
         self._reactivate_group_membership(group, request.user)
+        # CONFIRMED ROOT CAUSE of "invited user can see the community but
+        # isn't listed as a member of the community or the group they
+        # joined via invite link": this call previously only ever touched
+        # GroupMembership/ConversationMember on the group's OWN
+        # conversation - never CommunityMembership or the community's
+        # main/posts conversations, even though GroupViewSet.add_members
+        # (the admin-driven equivalent) already did. The community's own
+        # member-list endpoint reads CommunityMembership exclusively
+        # (CommunityViewSet.members), so the user was invisible there no
+        # matter how they joined the group.
+        sync_community_membership_for_group(group, request.user)
         return Response({"detail": "Joined successfully.", "group_id": str(group.id), "pending": False})

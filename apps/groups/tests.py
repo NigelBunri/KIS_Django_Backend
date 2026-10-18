@@ -4,7 +4,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.chat.models import BaseConversationRole, Conversation, ConversationMember, ConversationType
-from apps.groups.models import Group, GroupJoinPolicy, GroupJoinRequest, GroupMembership, GroupRole
+from apps.groups.models import Group, GroupJoinPolicy, GroupJoinRequest, GroupJoinRequestStatus, GroupMembership, GroupRole
 from apps.communities.models import Community, CommunityBan, CommunityMembership, CommunityRole
 from apps.partners.models import Partner, PartnerMembership, PartnerMembershipStatus, PartnerRole, PartnerRoleAssignment
 
@@ -366,8 +366,15 @@ class GroupCommunityBanSyncTests(APITestCase):
         self.banned_user = User.objects.create_user(
             phone="+237670009922", password="TestPass12!", country="CM",
         )
+        self.main_conversation = Conversation.objects.create(
+            type=ConversationType.GROUP, title="Community Main", created_by=self.community_owner,
+        )
+        self.posts_conversation = Conversation.objects.create(
+            type=ConversationType.POST, title="Community Posts", created_by=self.community_owner,
+        )
         self.community = Community.objects.create(
             owner=self.community_owner, name="Banned Sync Community", slug="banned-sync-community",
+            main_conversation=self.main_conversation, posts_conversation=self.posts_conversation,
         )
         CommunityMembership.objects.create(
             community=self.community, user=self.community_owner, role=CommunityRole.OWNER,
@@ -380,6 +387,7 @@ class GroupCommunityBanSyncTests(APITestCase):
         self.group = Group.objects.create(
             name="Sub Group", slug="banned-sync-sub-group",
             owner=self.group_admin, conversation=conversation, community=self.community,
+            join_policy=GroupJoinPolicy.OPEN, invite_token="banned-sync-sub-group-token",
         )
         GroupMembership.objects.create(group=self.group, user=self.group_admin, role=GroupRole.OWNER)
         ConversationMember.objects.create(
@@ -404,6 +412,196 @@ class GroupCommunityBanSyncTests(APITestCase):
             community=self.community, user=self.banned_user,
         ).first()
         self.assertIsNone(community_membership)
+
+    def test_joining_a_community_scoped_group_via_invite_link_syncs_community_membership(self):
+        # CONFIRMED ROOT CAUSE of "invited user can see the community but
+        # isn't listed as a member of the community or the group" - join_by
+        # _invite previously only ever touched GroupMembership/
+        # ConversationMember on the group's own conversation, never
+        # CommunityMembership or the community's main/posts conversations.
+        newcomer = User.objects.create_user(
+            phone="+237670009923", password="TestPass12!", country="CM",
+        )
+        self.client.force_authenticate(newcomer)
+        response = self.client.post(
+            "/api/v1/chat-groups/join-by-invite/",
+            {"invite_token": self.group.invite_token},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.assertTrue(
+            GroupMembership.objects.filter(group=self.group, user=newcomer, left_at__isnull=True).exists()
+        )
+        community_membership = CommunityMembership.objects.filter(
+            community=self.community, user=newcomer,
+        ).first()
+        self.assertIsNotNone(community_membership)
+        self.assertIsNone(community_membership.left_at)
+        self.assertFalse(community_membership.is_banned)
+        self.assertTrue(
+            ConversationMember.objects.filter(
+                conversation=self.main_conversation, user=newcomer, left_at__isnull=True,
+            ).exists()
+        )
+        self.assertTrue(
+            ConversationMember.objects.filter(
+                conversation=self.posts_conversation, user=newcomer, left_at__isnull=True,
+            ).exists()
+        )
+
+    def test_community_banned_user_cannot_join_community_scoped_group_via_invite_link(self):
+        self.client.force_authenticate(self.banned_user)
+        response = self.client.post(
+            "/api/v1/chat-groups/join-by-invite/",
+            {"invite_token": self.group.invite_token},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertFalse(GroupMembership.objects.filter(group=self.group, user=self.banned_user).exists())
+        self.assertFalse(
+            CommunityMembership.objects.filter(community=self.community, user=self.banned_user).exists()
+        )
+
+    def test_joining_a_community_scoped_open_group_directly_syncs_community_membership(self):
+        # GroupViewSet.get_queryset() only resolves a group the requester
+        # isn't yet a member of when they have broad community access
+        # (owner/admin/mod, or can_access_all_groups) - the realistic
+        # caller of a direct `join` on an OPEN sub-group they aren't in
+        # yet, as opposed to a true outsider, who joins via invite link
+        # (covered above) or a join request.
+        community_mod = User.objects.create_user(
+            phone="+237670009924", password="TestPass12!", country="CM",
+        )
+        CommunityMembership.objects.create(
+            community=self.community, user=community_mod, role=CommunityRole.MOD,
+        )
+        self.client.force_authenticate(community_mod)
+        response = self.client.post(f"/api/v1/chat-groups/{self.group.id}/join/?community={self.community.id}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.assertTrue(
+            CommunityMembership.objects.filter(
+                community=self.community, user=community_mod, left_at__isnull=True,
+            ).exists()
+        )
+        self.assertTrue(
+            ConversationMember.objects.filter(
+                conversation=self.main_conversation, user=community_mod, left_at__isnull=True,
+            ).exists()
+        )
+
+    def test_community_banned_user_cannot_join_community_scoped_open_group_directly(self):
+        # Give the banned user an existing GroupMembership so
+        # GroupViewSet.get_queryset() resolves the group via their own
+        # membership (reaching the join action's body at all) - the
+        # CommunityBan check being tested here applies regardless of
+        # whether the group-level membership is new or already active.
+        GroupMembership.objects.create(group=self.group, user=self.banned_user, role=GroupRole.MEMBER)
+        ConversationMember.objects.create(
+            conversation=self.group.conversation, user=self.banned_user, base_role=BaseConversationRole.MEMBER,
+        )
+        self.client.force_authenticate(self.banned_user)
+        response = self.client.post(f"/api/v1/chat-groups/{self.group.id}/join/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertFalse(
+            CommunityMembership.objects.filter(community=self.community, user=self.banned_user).exists()
+        )
+
+    def test_approving_a_join_request_for_a_community_scoped_group_syncs_community_membership(self):
+        requester = User.objects.create_user(
+            phone="+237670009925", password="TestPass12!", country="CM",
+        )
+        join_req = GroupJoinRequest.objects.create(group=self.group, user=requester, message="hi")
+        self.client.force_authenticate(self.group_admin)
+        response = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/approve-request/",
+            {"request_id": str(join_req.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(
+            CommunityMembership.objects.filter(community=self.community, user=requester, left_at__isnull=True).exists()
+        )
+
+    def test_group_admin_cannot_approve_a_community_banned_users_join_request(self):
+        join_req = GroupJoinRequest.objects.create(group=self.group, user=self.banned_user, message="hi")
+        self.client.force_authenticate(self.group_admin)
+        response = self.client.post(
+            f"/api/v1/chat-groups/{self.group.id}/approve-request/",
+            {"request_id": str(join_req.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertFalse(GroupMembership.objects.filter(group=self.group, user=self.banned_user).exists())
+
+
+class GroupJoinRequestsListActionTests(APITestCase):
+    """
+    Regression coverage for the missing discovery endpoint: approve-
+    request/reject-request both require a request_id with no way to
+    discover one. Group.join_policy defaults to REQUEST, so an invite-
+    link join silently becomes a pending GroupJoinRequest the owner had
+    no way to even see. Mirrors
+    CommunityViewSet.join_requests/CommunityJoinRequestsListActionTests.
+    """
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            phone="+237670009940", password="TestPass12!", country="CM",
+        )
+        self.plain_member = User.objects.create_user(
+            phone="+237670009941", password="TestPass12!", country="CM",
+        )
+        self.requester = User.objects.create_user(
+            phone="+237670009942", password="TestPass12!", country="CM",
+        )
+        conversation = Conversation.objects.create(
+            type=ConversationType.GROUP, title="Request Group", created_by=self.owner,
+        )
+        self.group = Group.objects.create(
+            name="Request Group", slug="join-requests-list-group",
+            owner=self.owner, conversation=conversation, join_policy=GroupJoinPolicy.REQUEST,
+        )
+        GroupMembership.objects.create(group=self.group, user=self.owner, role=GroupRole.OWNER)
+        ConversationMember.objects.create(
+            conversation=conversation, user=self.owner, base_role=BaseConversationRole.OWNER,
+        )
+        GroupMembership.objects.create(group=self.group, user=self.plain_member, role=GroupRole.MEMBER)
+        ConversationMember.objects.create(
+            conversation=conversation, user=self.plain_member, base_role=BaseConversationRole.MEMBER,
+        )
+        self.join_req = GroupJoinRequest.objects.create(
+            group=self.group, user=self.requester, message="Please let me in",
+        )
+
+    def test_owner_can_list_pending_join_requests(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.get(f"/api/v1/chat-groups/{self.group.id}/join-requests/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        payload = response.data.get("results", response.data)
+        request_ids = {item["id"] for item in payload}
+        self.assertIn(self.join_req.id, request_ids)
+
+    def test_plain_member_cannot_list_join_requests(self):
+        self.client.force_authenticate(self.plain_member)
+        response = self.client.get(f"/api/v1/chat-groups/{self.group.id}/join-requests/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    def test_approved_requests_are_excluded_by_default(self):
+        self.join_req.status = GroupJoinRequestStatus.APPROVED
+        self.join_req.save(update_fields=["status"])
+
+        self.client.force_authenticate(self.owner)
+        response = self.client.get(f"/api/v1/chat-groups/{self.group.id}/join-requests/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        payload = response.data.get("results", response.data)
+        request_ids = {item["id"] for item in payload}
+        self.assertNotIn(self.join_req.id, request_ids)
+
+        response_all = self.client.get(f"/api/v1/chat-groups/{self.group.id}/join-requests/?status=all")
+        payload_all = response_all.data.get("results", response_all.data)
+        self.assertIn(self.join_req.id, {item["id"] for item in payload_all})
 
 
 class GroupMemberRoleManagementTests(APITestCase):

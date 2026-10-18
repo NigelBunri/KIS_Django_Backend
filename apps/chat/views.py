@@ -60,7 +60,7 @@ from apps.partners.services import (
 )
 from apps.partners.services import dispatch_partner_webhooks
 from apps.groups.models import Group, GroupMembership, GroupRole
-from apps.groups.services import reactivate_group_membership
+from apps.groups.services import reactivate_group_membership, sync_community_membership_for_group, CommunityBanned
 from apps.channels.models import Channel
 from apps.communities.models import Community, CommunityMembership, CommunityMembershipStatus, CommunityRole
 
@@ -549,6 +549,31 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if group:
             group_role = base_role if base_role in GroupRole.values else GroupRole.MEMBER
             reactivate_group_membership(group, user, role=group_role)
+            # CONFIRMED gap: this generic "add from contacts/chats" action
+            # kept GroupMembership in sync (above) but never touched the
+            # group's owning Community at all when group.community_id is
+            # set - unlike GroupViewSet.add_members, which already does
+            # (and already checks CommunityBan first). A member added here
+            # showed up correctly in the group's own member list but was
+            # permanently invisible in the community's (CommunityViewSet.
+            # members reads CommunityMembership exclusively), and a
+            # community-banned user could be silently added back in via
+            # this path with no ban check at all.
+            try:
+                sync_community_membership_for_group(group, user)
+            except CommunityBanned:
+                # Undo the ConversationMember/GroupMembership reactivation
+                # above rather than leaving the target able to chat in
+                # this group while banned from the community it belongs to.
+                member.left_at = timezone.now()
+                member.save(update_fields=["left_at"])
+                GroupMembership.objects.filter(group=group, user=user).update(
+                    left_at=timezone.now(), is_banned=True,
+                )
+                return Response(
+                    {"detail": "This user is banned from the community this group belongs to."},
+                    status=403,
+                )
 
         return Response(ConversationMemberSerializer(member).data, status=201)
 
