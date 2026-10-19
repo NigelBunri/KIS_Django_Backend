@@ -668,6 +668,55 @@ class CommunityListPartnerScopeTests(TestCase):
         self.assertTrue(any(r["id"] == str(self.partner_community.id) for r in results))
 
 
+class CommunityInviteLinkOwnerTests(TestCase):
+    """Regression test: invite_link previously checked membership.role
+    directly instead of using _has_owner_privileges like every other
+    admin-gated action in this viewset - confirmed in production that a
+    community's real owner (owner_id matches) can have a
+    CommunityMembership.role of 'member' (likely stale/legacy data, since
+    CommunityCreateSerializer.create() does set role=OWNER today), which
+    403'd the owner out of generating their own community's invite link."""
+
+    def setUp(self):
+        self.owner = _make_user("+2348150000301", "invite-link-owner")
+        self.plain_member = _make_user("+2348150000302", "invite-link-plain")
+        self.stranger = _make_user("+2348150000303", "invite-link-stranger")
+        self.community = Community.objects.create(
+            owner=self.owner, name="Invite Link Community", slug="invite-link-community",
+            visibility="public", allow_join_link=True,
+        )
+        # Simulates the real production anomaly: owner_id matches, but the
+        # owner's own membership row says 'member', not 'owner'.
+        CommunityMembership.objects.create(
+            community=self.community, user=self.owner, role="member",
+        )
+        CommunityMembership.objects.create(
+            community=self.community, user=self.plain_member, role="member",
+        )
+        self.client = APIClient()
+
+    def test_owner_can_generate_invite_link_even_with_stale_member_role(self):
+        self.client.force_authenticate(self.owner)
+        res = self.client.get(f"/api/v1/chat-communities/{self.community.id}/invite-link/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertTrue(res.data["invite_link"].endswith(f"/join/community/{res.data['invite_token']}"))
+
+    def test_owner_can_regenerate_invite_link_even_with_stale_member_role(self):
+        self.client.force_authenticate(self.owner)
+        res = self.client.post(f"/api/v1/chat-communities/{self.community.id}/invite-link/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+    def test_plain_member_still_cannot_manage_invite_link(self):
+        self.client.force_authenticate(self.plain_member)
+        res = self.client.get(f"/api/v1/chat-communities/{self.community.id}/invite-link/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_non_member_cannot_manage_invite_link(self):
+        self.client.force_authenticate(self.stranger)
+        res = self.client.get(f"/api/v1/chat-communities/{self.community.id}/invite-link/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
 class CommunityRoleManagementTests(TestCase):
     """
     Covers promote/demote via the canonical members/set-role endpoint

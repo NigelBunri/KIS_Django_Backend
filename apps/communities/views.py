@@ -880,11 +880,24 @@ class CommunityViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get", "post"], url_path="invite-link")
     def invite_link(self, request, pk=None):
-        """GET returns current link; POST regenerates it. Admins only."""
+        """GET returns current link; POST regenerates it. Admins only.
+
+        BUG FIX: previously checked membership.role directly, which missed
+        the real owner whenever their CommunityMembership row's role
+        wasn't (or no longer was) 'owner' - confirmed in production: a
+        community's owner_id matched the requesting user, but their own
+        membership.role was 'member', 403ing them out of their own
+        community's invite link ("could not retrieve an invite link").
+        Every other admin-gated action in this viewset (ban,
+        approve/reject-request, remove-member, members/set-role, settings
+        update, etc.) already guards against exactly this by checking
+        _has_owner_privileges (community.owner_id == user.id FIRST, before
+        ever consulting the membership row) - this was the one action that
+        didn't.
+        """
         community = self.get_object()
         membership = self._get_membership(community, request.user)
-        role = membership.role if membership else None
-        if role not in ("owner", "admin", "mod"):
+        if not (self._has_owner_privileges(community, request.user) or (membership and membership.role == CommunityRole.MOD)):
             raise PermissionDenied("Only admins can manage the invite link.")
         if not community.allow_join_link:
             return Response({"detail": "Invite links are disabled for this community."}, status=400)
