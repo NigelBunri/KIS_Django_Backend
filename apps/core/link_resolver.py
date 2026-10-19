@@ -29,7 +29,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-SUPPORTED_TYPES = {"call", "broadcast-call", "group", "community", "partner", "contact", "referral", "gift", "live-guest", "petition", "event"}
+SUPPORTED_TYPES = {"call", "broadcast-call", "group", "channel", "community", "partner", "contact", "referral", "gift", "live-guest", "petition", "event"}
 
 
 def _not_found():
@@ -48,6 +48,23 @@ def _resolve_group(token: str):
         "status": "ok",
         "type": "group",
         "name": group.name,
+    })
+
+
+def _resolve_channel(token: str):
+    from apps.channels.models import Channel
+
+    channel = Channel.objects.filter(invite_token=token).first()
+    if not channel:
+        return _not_found()
+    if channel.is_archived:
+        return Response({"status": "revoked", "detail": "This channel invite is no longer active."}, status=410)
+    return Response({
+        "status": "ok",
+        "type": "channel",
+        "name": channel.name,
+        "description": channel.description[:200] if channel.description else "",
+        "avatar_url": channel.avatar_url or None,
     })
 
 
@@ -290,6 +307,7 @@ def _resolve_call(token: str, link_type: str):
 
 _RESOLVERS = {
     "group": _resolve_group,
+    "channel": _resolve_channel,
     "community": _resolve_community,
     "partner": _resolve_partner,
     "contact": _resolve_contact,

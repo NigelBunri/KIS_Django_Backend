@@ -71,6 +71,12 @@ class Channel(models.Model):
         blank=True,
         help_text="Optional invite-only messages shown before subscription.",
     )
+    invite_token = models.CharField(
+        max_length=64,
+        blank=True,
+        db_index=True,
+        help_text="Short random token used to build a shareable invite link.",
+    )
 
     owner = models.ForeignKey(
         User,

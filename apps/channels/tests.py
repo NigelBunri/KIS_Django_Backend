@@ -643,3 +643,89 @@ class ChannelDiscoveryOrderingTests(_PersonalChannelTestBase):
         second_ids = [row["id"] for row in second.data["results"]]
         self.assertEqual(first_ids, second_ids)
         self.assertGreaterEqual(len(first_ids), 5)
+
+
+class ChannelInviteLinkTests(_PersonalChannelTestBase):
+    """Channels had no invite-link endpoint at all (ROUTES.channels on the
+    mobile side had no inviteLink route, and ChatInfoPage.tsx's generate-
+    invite-link UI was gated to isGroup only) - "could not generate channel
+    invite link" bug report. Mirrors apps.groups.views.GroupViewSet's own
+    invite_link/join_by_invite test coverage."""
+
+    def setUp(self):
+        super().setUp()
+        self.channel = self._create_personal_channel(
+            owner=self.owner, name="Owner Channel", slug="owner-channel",
+            channel_type=Channel.ChannelType.PRIVATE,
+        )
+        ConversationMember.objects.create(
+            conversation=self.channel.conversation, user=self.member, base_role=BaseConversationRole.MEMBER,
+        )
+
+    def test_member_can_fetch_invite_link_and_it_generates_a_token(self):
+        self.client.force_authenticate(self.member)
+        res = self.client.get(f"/api/v1/partner-channels/channels/{self.channel.id}/invite-link/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertTrue(res.data["invite_link"].endswith(f"/join/channel/{res.data['invite_token']}"))
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.invite_token, res.data["invite_token"])
+
+    def test_non_member_cannot_fetch_invite_link(self):
+        """404, not 403 — get_object() itself hides a PRIVATE personal
+        channel's existence from a non-member stranger (same treatment as
+        retrieve/subscribe/members for this channel type), before this
+        action's own membership check ever runs."""
+        self.client.force_authenticate(self.stranger)
+        res = self.client.get(f"/api/v1/partner-channels/channels/{self.channel.id}/invite-link/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_plain_member_cannot_regenerate_but_owner_can(self):
+        self.client.force_authenticate(self.member)
+        first = self.client.get(f"/api/v1/partner-channels/channels/{self.channel.id}/invite-link/")
+        regen_attempt = self.client.post(f"/api/v1/partner-channels/channels/{self.channel.id}/invite-link/")
+        self.assertEqual(regen_attempt.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.owner)
+        regen = self.client.post(f"/api/v1/partner-channels/channels/{self.channel.id}/invite-link/")
+        self.assertEqual(regen.status_code, status.HTTP_200_OK, regen.data)
+        self.assertNotEqual(regen.data["invite_token"], first.data["invite_token"])
+
+    def test_stranger_can_join_private_channel_via_invite_link(self):
+        """The whole point of an invite link is to bypass the personal
+        PRIVATE channel's normal hidden-from-non-members visibility (see
+        _personal_channel_hidden_from) - a stranger who'd 404 on a direct
+        retrieve/subscribe must still be able to join via a real token."""
+        self.client.force_authenticate(self.owner)
+        link_res = self.client.get(f"/api/v1/partner-channels/channels/{self.channel.id}/invite-link/")
+        token = link_res.data["invite_token"]
+
+        self.client.force_authenticate(self.stranger)
+        join_res = self.client.post(
+            "/api/v1/partner-channels/channels/join-by-invite/", {"invite_token": token}, format="json",
+        )
+        self.assertEqual(join_res.status_code, status.HTTP_200_OK, join_res.data)
+        self.assertEqual(join_res.data["channel_id"], str(self.channel.id))
+        self.assertTrue(
+            ConversationMember.objects.filter(
+                conversation=self.channel.conversation, user=self.stranger, left_at__isnull=True,
+            ).exists()
+        )
+
+    def test_already_member_join_by_invite_is_idempotent(self):
+        self.client.force_authenticate(self.owner)
+        link_res = self.client.get(f"/api/v1/partner-channels/channels/{self.channel.id}/invite-link/")
+        token = link_res.data["invite_token"]
+
+        self.client.force_authenticate(self.member)
+        res = self.client.post(
+            "/api/v1/partner-channels/channels/join-by-invite/", {"invite_token": token}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("Already a member", res.data["detail"])
+
+    def test_invalid_token_returns_404(self):
+        self.client.force_authenticate(self.stranger)
+        res = self.client.post(
+            "/api/v1/partner-channels/channels/join-by-invite/", {"invite_token": "not-a-real-token"}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)

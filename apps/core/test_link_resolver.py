@@ -12,6 +12,7 @@ from apps.broadcasts.models import (
     BroadcastChannel, ChannelLiveStream, ChannelLiveStreamGuest,
     ChannelMembershipGift, ChannelMembershipTier,
 )
+from apps.channels.models import Channel
 from apps.chat.models import Conversation, ConversationType
 from apps.chat.models import ContactShareLink
 from apps.communities.models import Community
@@ -48,6 +49,9 @@ class PublicLinkResolveViewTests(TestCase):
     def _make_group_conversation(self):
         return Conversation.objects.create(type=ConversationType.GROUP, title="x", created_by=self.owner)
 
+    def _make_channel_conversation(self):
+        return Conversation.objects.create(type=ConversationType.CHANNEL, title="x", created_by=self.owner)
+
     # --- unsupported / malformed --------------------------------------
 
     def test_unsupported_type_is_404_not_crash(self):
@@ -80,6 +84,29 @@ class PublicLinkResolveViewTests(TestCase):
             conversation=self._make_group_conversation(),
         )
         resp = self.client.get(self._url("group", token))
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.data["status"], "revoked")
+
+    # --- channel -----------------------------------------------------
+
+    def test_valid_channel_token_resolves_unauthenticated(self):
+        token = secrets.token_urlsafe(24)
+        Channel.objects.create(
+            name="Announcements", slug="announcements", invite_token=token, owner=self.owner,
+            conversation=self._make_channel_conversation(),
+        )
+        resp = self.client.get(self._url("channel", token))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "ok")
+        self.assertEqual(resp.data["name"], "Announcements")
+
+    def test_archived_channel_token_is_revoked_not_ok(self):
+        token = secrets.token_urlsafe(24)
+        Channel.objects.create(
+            name="Old Channel", slug="old-channel", invite_token=token, is_archived=True, owner=self.owner,
+            conversation=self._make_channel_conversation(),
+        )
+        resp = self.client.get(self._url("channel", token))
         self.assertEqual(resp.status_code, 410)
         self.assertEqual(resp.data["status"], "revoked")
 

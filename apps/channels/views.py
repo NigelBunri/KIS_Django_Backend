@@ -1,4 +1,7 @@
 # apps/channels/views.py
+import secrets
+
+from django.conf import settings
 from django.db import models
 from django.db.models import Count, Q
 from rest_framework import viewsets, status
@@ -15,6 +18,7 @@ from apps.channels.serializers import (
     SubchannelSerializer,
 )
 from apps.chat.models import BaseConversationRole, ConversationMember
+from apps.communities.models import CommunityBan
 from apps.partners.serializers import PartnerChannelPermissionOverwriteSerializer
 from apps.partners.services import (
     active_partner_member_ids,
@@ -293,6 +297,96 @@ class ChannelViewSet(viewsets.ModelViewSet):
         member.left_at = timezone.now()
         member.save(update_fields=["left_at"])
         return Response({"subscribed": False}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get", "post"], url_path="invite-link")
+    def invite_link(self, request, pk=None):
+        """
+        GET  — return the current invite link (generates one if absent).
+              Any existing member (or the owner/manager) may call this -
+              mirrors apps.groups.views.GroupViewSet.invite_link, including
+              its GET-is-not-a-mutation reasoning: sharing the existing
+              link is a normal everyday action, not an admin privilege.
+        POST — regenerate the invite token (invalidates the old link).
+              Requires manage permission (owner, or admin/manager via the
+              partner permission system for partner channels) - same
+              consequence/ gating as the group equivalent.
+        """
+        channel = self.get_object()
+        can_manage = self._user_can_manage_channel(channel, request.user)
+        if not (_is_member(channel, request.user) or can_manage):
+            raise PermissionDenied("You are not a member of this channel.")
+
+        if request.method == "POST":
+            if not can_manage:
+                raise PermissionDenied("Only managers can regenerate the invite link.")
+            channel.invite_token = secrets.token_urlsafe(24)
+            channel.save(update_fields=["invite_token"])
+        elif not channel.invite_token:
+            channel.invite_token = secrets.token_urlsafe(24)
+            channel.save(update_fields=["invite_token"])
+
+        # KIS_WEBSITE_PUBLIC_BASE_URL is the real, deployed website that
+        # serves /join/... (see PublicLinkResolveView) - same base every
+        # other invite-link type (group/community) builds from.
+        base = getattr(settings, "KIS_WEBSITE_PUBLIC_BASE_URL", "").rstrip("/")
+        invite_link = f"{base}/join/channel/{channel.invite_token}"
+        return Response({"invite_link": invite_link, "invite_token": channel.invite_token})
+
+    @action(detail=False, methods=["post"], url_path="join-by-invite")
+    def join_by_invite(self, request):
+        """
+        POST { "invite_token": "..." } — join the channel identified by the
+        token. Mirrors apps.groups.views.GroupViewSet.join_by_invite: this
+        is the one path that must bypass a personal PRIVATE channel's
+        normal discovery/subscribe visibility (see
+        _personal_channel_hidden_from's docstring) - that's the entire
+        point of holding a real invite link.
+        """
+        token = (request.data.get("invite_token") or "").strip()
+        if not token:
+            return Response({"detail": "invite_token is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        channel = Channel.objects.filter(invite_token=token, is_archived=False).first()
+        if not channel:
+            return Response({"detail": "Invalid or expired invite link."}, status=status.HTTP_404_NOT_FOUND)
+
+        if channel.community_id and CommunityBan.objects.filter(
+            community_id=channel.community_id, user_id=request.user.id,
+        ).exists():
+            return Response(
+                {"detail": "You are banned from the community this channel belongs to."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        from django.utils import timezone
+
+        member = ConversationMember.objects.filter(
+            conversation=channel.conversation, user=request.user,
+        ).first()
+        if member and member.left_at is None:
+            return Response(
+                {"detail": "Already a member.", "channel_id": str(channel.id)},
+                status=status.HTTP_200_OK,
+            )
+
+        role = (
+            BaseConversationRole.MEMBER
+            if partner_user_can_send_channel(channel, request.user)
+            else BaseConversationRole.READONLY
+        )
+        if member:
+            member.left_at = None
+            member.base_role = role
+            member.save(update_fields=["left_at", "base_role"])
+        else:
+            ConversationMember.objects.create(
+                conversation=channel.conversation, user=request.user, base_role=role,
+            )
+
+        return Response(
+            {"detail": "Joined channel.", "channel_id": str(channel.id)},
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["get", "post"], url_path="members")
     def members(self, request, pk=None):

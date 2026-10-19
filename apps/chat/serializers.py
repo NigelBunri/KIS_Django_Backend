@@ -226,6 +226,14 @@ class ConversationDetailSerializer(ConversationImageUrlSerializerMixin, serializ
 
     request_initiator = UserSerializer(read_only=True)
     request_recipient = UserSerializer(read_only=True)
+    # Lets a client that only has a conversationId (not the group/channel's
+    # own id) resolve it via this detail endpoint - e.g. ChatInfoPage.tsx's
+    # invite-link flow, which needs the group/channel id to call
+    # ROUTES.groups.inviteLink/ROUTES.channels.inviteLink. Mirrors
+    # ConversationListSerializer.get_group_id below, which this detail
+    # serializer previously had no equivalent of at all.
+    group_id = serializers.SerializerMethodField()
+    channel_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
@@ -244,6 +252,8 @@ class ConversationDetailSerializer(ConversationImageUrlSerializerMixin, serializ
             "updated_at",
             "settings",
             "members",
+            "group_id",
+            "channel_id",
             # DM request state
             "request_state",
             "request_initiator",
@@ -265,6 +275,14 @@ class ConversationDetailSerializer(ConversationImageUrlSerializerMixin, serializ
             "request_accepted_at",
             "request_rejected_at",
         ]
+
+    def get_group_id(self, obj):
+        group = getattr(obj, "group", None)
+        return str(group.id) if group else None
+
+    def get_channel_id(self, obj):
+        channel = getattr(obj, "channel", None)
+        return str(channel.id) if channel else None
 
 
 # ---------------------------------------------------------------------------
