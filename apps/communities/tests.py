@@ -717,6 +717,84 @@ class CommunityInviteLinkOwnerTests(TestCase):
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
 
+class CommunityPromoteToGroupAdminTests(TestCase):
+    """
+    "Promote to admin" on a community member is always admin OF ONE OF
+    THE COMMUNITY'S OWN GROUPS (the owner picks which), never a bare
+    community-wide toggle - see
+    CommunityViewSet.promote_member_to_group_admin. Covers: the dual
+    group+community role write, a group that belongs to a DIFFERENT
+    community being rejected, and the owner-role guard.
+    """
+
+    def setUp(self):
+        from apps.groups.services import create_group_with_conversation
+
+        self.client = APIClient()
+        self.owner = _make_user("+2348140000101", "promote-owner")
+        self.member = _make_user("+2348140000102", "promote-member")
+        self.community = Community.objects.create(
+            owner=self.owner, name="Promote Community", slug="promote-community",
+        )
+        self.other_community = Community.objects.create(
+            owner=self.owner, name="Other Community", slug="other-community",
+        )
+        CommunityMembership.objects.create(community=self.community, user=self.owner, role=CommunityRole.OWNER)
+        CommunityMembership.objects.create(community=self.community, user=self.member, role=CommunityRole.MEMBER)
+        self.group = create_group_with_conversation(
+            owner=self.owner, name="Inner Circle", slug="inner-circle", community=self.community,
+        )
+        self.other_group = create_group_with_conversation(
+            owner=self.owner, name="Unrelated Group", slug="unrelated-group", community=self.other_community,
+        )
+
+    def test_promote_sets_both_group_admin_and_community_admin(self):
+        from apps.groups.models import GroupMembership, GroupRole
+
+        self.client.force_authenticate(self.owner)
+        res = self.client.post(
+            f"/api/v1/chat-communities/{self.community.id}/members/promote-admin/",
+            {"user_id": str(self.member.id), "group_id": str(self.group.id)}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        community_membership = CommunityMembership.objects.get(community=self.community, user=self.member)
+        self.assertEqual(community_membership.role, CommunityRole.ADMIN)
+
+        group_membership = GroupMembership.objects.get(group=self.group, user=self.member)
+        self.assertEqual(group_membership.role, GroupRole.ADMIN)
+        self.assertIsNone(group_membership.left_at)
+
+        group_cm = ConversationMember.objects.get(conversation=self.group.conversation, user=self.member)
+        self.assertEqual(group_cm.base_role, "admin")
+
+    def test_promote_with_group_from_a_different_community_404s(self):
+        self.client.force_authenticate(self.owner)
+        res = self.client.post(
+            f"/api/v1/chat-communities/{self.community.id}/members/promote-admin/",
+            {"user_id": str(self.member.id), "group_id": str(self.other_group.id)}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        community_membership = CommunityMembership.objects.get(community=self.community, user=self.member)
+        self.assertEqual(community_membership.role, CommunityRole.MEMBER)
+
+    def test_plain_member_cannot_promote(self):
+        self.client.force_authenticate(self.member)
+        res = self.client.post(
+            f"/api/v1/chat-communities/{self.community.id}/members/promote-admin/",
+            {"user_id": str(self.member.id), "group_id": str(self.group.id)}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_owner_role_cannot_be_promoted(self):
+        self.client.force_authenticate(self.owner)
+        res = self.client.post(
+            f"/api/v1/chat-communities/{self.community.id}/members/promote-admin/",
+            {"user_id": str(self.owner.id), "group_id": str(self.group.id)}, format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+
 class CommunityRoleManagementTests(TestCase):
     """
     Covers promote/demote via the canonical members/set-role endpoint

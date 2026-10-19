@@ -686,6 +686,83 @@ class CommunityViewSet(viewsets.ModelViewSet):
         serializer = CommunityMembershipSerializer(membership)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["post"], url_path="members/promote-admin")
+    def promote_member_to_group_admin(self, request, pk=None):
+        """
+        POST { user_id, group_id } — promote a community member to admin.
+
+        "Admin" in this system is never a bare community-wide toggle with
+        nothing backing it - it's always admin OF ONE OF THE COMMUNITY'S
+        OWN GROUPS, which the owner picks here. This:
+          - Promotes the member within that group (GroupMembership.role
+            and the matching ConversationMember.base_role on the group's
+            own conversation) - the exact dual-write
+            GroupViewSet.set_member_role already does, so they get real
+            moderation powers in that group's chat.
+          - Also sets CommunityMembership.role=ADMIN, so every existing
+            community-wide admin-gated action (invite link, member/role
+            management, ban, settings) keeps working for them exactly as
+            it did for a plain "Promote to admin" before - just reached
+            through "admin of a group" rather than a standalone toggle.
+        A community with zero groups has nothing to scope an admin to;
+        the frontend already hides this action in that case, and the
+        group lookup below 404s if group_id doesn't resolve to one of
+        this community's own groups, so that requirement holds
+        server-side too, not just in the UI.
+        """
+        community = self.get_object()
+        if not self._has_owner_privileges(community, request.user):
+            raise PermissionDenied("Only owners/admins can promote members.")
+
+        user_id = request.data.get("user_id")
+        group_id = request.data.get("group_id")
+        if not user_id or not group_id:
+            return Response({"detail": "user_id and group_id are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from apps.groups.models import Group, GroupRole
+        from apps.groups.services import reactivate_group_membership
+
+        group = Group.objects.filter(id=group_id, community=community).first()
+        if not group:
+            return Response({"detail": "Group not found in this community."}, status=status.HTTP_404_NOT_FOUND)
+
+        membership = CommunityMembership.objects.active().filter(
+            community=community, user_id=user_id,
+        ).first()
+        if not membership:
+            return Response({"detail": "Member not found."}, status=status.HTTP_404_NOT_FOUND)
+        if membership.role == CommunityRole.OWNER:
+            return Response({"detail": "Owner role cannot be modified."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # reactivate_group_membership only applies `role` on first creation
+        # (get_or_create's `defaults`) - an existing membership needs an
+        # explicit role write too, same as GroupViewSet.set_member_role.
+        group_membership, _cm = reactivate_group_membership(group, target_user, role=GroupRole.ADMIN)
+        if group_membership.role != GroupRole.ADMIN:
+            group_membership.role = GroupRole.ADMIN
+            group_membership.save(update_fields=["role"])
+        ConversationMember.objects.filter(
+            conversation=group.conversation, user=target_user, left_at__isnull=True,
+        ).update(base_role=BaseConversationRole.ADMIN)
+
+        previous_role = membership.role
+        membership = self._update_membership_role(membership, CommunityRole.ADMIN)
+
+        if previous_role != membership.role:
+            from apps.communities.realtime import notify_role_changed
+            from apps.communities.notifications import notify_role_changed as notify_role_changed_persistent
+
+            notify_role_changed(community, membership, previous_role=previous_role, changed_by=request.user)
+            notify_role_changed_persistent(community, membership, previous_role=previous_role)
+
+        serializer = CommunityMembershipSerializer(membership)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["post"], url_path="members/block")
     def block_member(self, request, pk=None):
         # Historically a second, divergent ban implementation (it set
