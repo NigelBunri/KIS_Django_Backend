@@ -19,6 +19,7 @@ from apps.communities.models import (
 )
 from apps.communities.serializers import CommunityPostSerializer
 from apps.notifications.models import Notification
+from apps.partners.models import Partner, PartnerMembership, PartnerMembershipStatus
 
 
 def _make_user(phone, username):
@@ -565,6 +566,106 @@ class CommunityListSerializerTests(TestCase):
         results = res.data.get("results", res.data) if isinstance(res.data, dict) else res.data
         match = next(r for r in results if r["slug"] == "discoverable-community")
         self.assertEqual(match["join_policy"], "request")
+
+
+class CommunityListMembershipScopeTests(TestCase):
+    """
+    Regression test: the default (non-discovery) list endpoint - what both
+    CommunitiesTab.tsx's top-level list and MessagesScreen.tsx's community
+    sidebar map call - previously OR'd in every publicly-visible community
+    regardless of membership, so a user saw communities they'd never
+    joined mixed into "their" communities list. Discovery (?public=true)
+    is the only place that OR-clause should still apply; retrieve/join/etc.
+    on a public community the user hasn't joined yet must keep working too.
+    """
+
+    def setUp(self):
+        self.owner = _make_user("+2348150000101", "scope-owner")
+        self.outsider = _make_user("+2348150000102", "scope-outsider")
+        self.public_community = Community.objects.create(
+            owner=self.owner, name="Open Public Community", slug="open-public-community",
+            visibility="public", join_policy=CommunityJoinPolicy.OPEN,
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.outsider)
+
+    def test_default_list_excludes_public_community_user_has_not_joined(self):
+        res = self.client.get("/api/v1/chat-communities/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        results = res.data.get("results", res.data) if isinstance(res.data, dict) else res.data
+        self.assertFalse(any(r["id"] == str(self.public_community.id) for r in results))
+
+    def test_discovery_list_still_includes_it(self):
+        res = self.client.get("/api/v1/chat-communities/?public=true")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        results = res.data.get("results", res.data) if isinstance(res.data, dict) else res.data
+        self.assertTrue(any(r["id"] == str(self.public_community.id) for r in results))
+
+    def test_retrieve_and_join_still_work_before_membership(self):
+        res = self.client.get(f"/api/v1/chat-communities/{self.public_community.id}/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        join_res = self.client.post(f"/api/v1/chat-communities/{self.public_community.id}/join/", {}, format="json")
+        self.assertEqual(join_res.status_code, status.HTTP_200_OK, join_res.data)
+
+        listed = self.client.get("/api/v1/chat-communities/")
+        results = listed.data.get("results", listed.data) if isinstance(listed.data, dict) else listed.data
+        self.assertTrue(any(r["id"] == str(self.public_community.id) for r in results))
+
+
+class CommunityListPartnerScopeTests(TestCase):
+    """
+    Regression test: ?partner=<id> list requests (usePartnersData.ts's
+    Communities section and PartnerMessagingView.tsx's conversation list)
+    previously gave ANY active PartnerMembership member blanket visibility
+    into every community under that partner, regardless of whether they'd
+    personally joined each one - a plain partner member saw communities in
+    their org's Communities/Messaging sections they weren't a member of
+    per that community's own member list. Org-wide visibility (for
+    admin tooling like the recruitment panel's space picker) stays
+    reserved for the true partner owner.
+    """
+
+    def setUp(self):
+        self.partner_owner = _make_user("+2348150000201", "partner-scope-owner")
+        self.plain_member = _make_user("+2348150000202", "partner-scope-member")
+        self.community_owner = _make_user("+2348150000203", "partner-scope-comm-owner")
+        self.partner = Partner.objects.create(
+            name="Scope Partner", slug="scope-partner", owner=self.partner_owner,
+        )
+        PartnerMembership.objects.create(
+            partner=self.partner, user=self.plain_member,
+            status=PartnerMembershipStatus.MEMBER,
+        )
+        self.partner_community = Community.objects.create(
+            owner=self.community_owner, name="Partner Community", slug="partner-community",
+            visibility="private", partner=self.partner,
+        )
+        self.client = APIClient()
+
+    def test_plain_partner_member_does_not_see_community_they_have_not_joined(self):
+        self.client.force_authenticate(self.plain_member)
+        res = self.client.get(f"/api/v1/chat-communities/?partner={self.partner.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        results = res.data.get("results", res.data) if isinstance(res.data, dict) else res.data
+        self.assertFalse(any(r["id"] == str(self.partner_community.id) for r in results))
+
+    def test_partner_owner_still_sees_all_communities_under_partner(self):
+        self.client.force_authenticate(self.partner_owner)
+        res = self.client.get(f"/api/v1/chat-communities/?partner={self.partner.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        results = res.data.get("results", res.data) if isinstance(res.data, dict) else res.data
+        self.assertTrue(any(r["id"] == str(self.partner_community.id) for r in results))
+
+    def test_plain_partner_member_sees_it_once_they_join_the_community(self):
+        CommunityMembership.objects.create(
+            community=self.partner_community, user=self.plain_member,
+            status=CommunityMembershipStatus.ACTIVE,
+        )
+        self.client.force_authenticate(self.plain_member)
+        res = self.client.get(f"/api/v1/chat-communities/?partner={self.partner.id}")
+        results = res.data.get("results", res.data) if isinstance(res.data, dict) else res.data
+        self.assertTrue(any(r["id"] == str(self.partner_community.id) for r in results))
 
 
 class CommunityRoleManagementTests(TestCase):

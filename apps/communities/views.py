@@ -81,24 +81,34 @@ class CommunityViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """
         - Return public communities when ?public=true is passed (for discovery).
-        - Otherwise return communities where the user is the owner, an active
-          member, or which are publicly visible (so a genuine first-time
-          user can retrieve/join/request-join a public community they're
-          not a member of yet - get_object() for every detail action,
-          including join/request-join/members/invite-link, goes through
-          this same queryset; without the public OR-clause here, those
-          actions 404'd before ever reaching their own join_policy/
-          permission checks, so a real outsider could never successfully
-          join any community via the standard join route. Caught by the
-          Phase 5 regression tests, not previously covered by anything).
-          PRIVATE/HIDDEN communities remain invisible to non-members here,
-          as intended - they're only reachable via join_by_invite (which
-          looks up by invite_token, not by this queryset).
+        - For the `list` action (what the Communities tab and the Messages
+          screen's community sidebar both render), return ONLY communities
+          where the user is the owner or an active member - a public
+          community the user hasn't joined must never appear there just
+          because it's publicly visible; that's what ?public=true discovery
+          is for.
+        - For every other action (retrieve/join/request-join/members/
+          invite-link/etc.), also include publicly visible communities, so a
+          genuine first-time user can retrieve/join/request-join a public
+          community they're not a member of yet - get_object() for every
+          detail action goes through this same queryset; without the public
+          OR-clause here, those actions 404'd before ever reaching their own
+          join_policy/permission checks, so a real outsider could never
+          successfully join any community via the standard join route.
+          Caught by the Phase 5 regression tests, not previously covered by
+          anything). PRIVATE/HIDDEN communities remain invisible to
+          non-members here, as intended - they're only reachable via
+          join_by_invite (which looks up by invite_token, not by this
+          queryset).
         - Supports ?search=, ?ordering=-member_count.
         """
         user = self.request.user
         qs = Community.objects.select_related("partner", "owner", "main_conversation")
         partner_id = self.request.query_params.get("partner")
+        membership_filter = models.Q(owner=user) | models.Q(
+            memberships__user=user,
+            memberships__status=CommunityMembershipStatus.ACTIVE,
+        )
 
         # Public discovery mode
         is_public_filter = self.request.query_params.get("public", "").lower() in ("true", "1")
@@ -125,29 +135,41 @@ class CommunityViewSet(viewsets.ModelViewSet):
             return qs.distinct()
 
         if partner_id:
-            is_privileged = False
+            is_partner_owner = False
             try:
                 partner_obj = PartnerModel.objects.only("owner_id").get(pk=partner_id)
-                is_privileged = str(partner_obj.owner_id) == str(user.pk)
+                is_partner_owner = str(partner_obj.owner_id) == str(user.pk)
             except PartnerModel.DoesNotExist:
                 pass
-            if not is_privileged:
-                is_privileged = PartnerMembership.objects.filter(
-                    partner_id=partner_id,
-                    user=user,
-                    status=PartnerMembershipStatus.MEMBER,
-                ).exists()
-            if is_privileged:
-                return qs.filter(partner_id=partner_id).distinct()
+            is_partner_member = is_partner_owner or PartnerMembership.objects.filter(
+                partner_id=partner_id,
+                user=user,
+                status=PartnerMembershipStatus.MEMBER,
+            ).exists()
+            if is_partner_member:
+                partner_qs = qs.filter(partner_id=partner_id)
+                if self.action == "list" and not is_partner_owner:
+                    # A regular partner member browsing their org's
+                    # Communities tab or partner-scoped Messaging view
+                    # (usePartnersData.ts / PartnerMessagingView.tsx) must
+                    # only see communities they've personally joined - not
+                    # every community run under the partner, which is what
+                    # this branch returned before (any active
+                    # PartnerMembership, not just the owner, got blanket
+                    # partner-wide visibility regardless of per-community
+                    # membership). Org-wide visibility for picking/managing
+                    # ANY community under the partner (e.g. the recruitment
+                    # panel's space picker) stays reserved for the true
+                    # partner owner.
+                    return partner_qs.filter(membership_filter).distinct()
+                return partner_qs.distinct()
 
-        qs = qs.filter(
-            models.Q(owner=user)
-            | models.Q(
-                memberships__user=user,
-                memberships__status=CommunityMembershipStatus.ACTIVE,
+        if self.action == "list":
+            qs = qs.filter(membership_filter)
+        else:
+            qs = qs.filter(
+                membership_filter | models.Q(is_active=True, visibility=CommunityVisibility.PUBLIC)
             )
-            | models.Q(is_active=True, visibility=CommunityVisibility.PUBLIC)
-        )
         if partner_id:
             qs = qs.filter(partner_id=partner_id)
         return qs.distinct()
