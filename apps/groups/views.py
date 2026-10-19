@@ -135,6 +135,14 @@ class GroupViewSet(viewsets.ModelViewSet):
                 or user_has_partner_permission(partner, user, "partner.groups.manage")
             ):
                 raise PermissionDenied("Not allowed to create groups for this organization.")
+        community = serializer.validated_data.get("community")
+        if community and community.owner_id != user.id:
+            # Previously unchecked entirely - any authenticated user who
+            # passed a community id in the create payload could create a
+            # group under it, regardless of whether they were even a
+            # member. Only the community's owner may create a new group
+            # within it.
+            raise PermissionDenied("Only the community owner can create a group here.")
         features = get_user_tier_features(user)
         raw_limit = features.get("groups_per_community", features.get("groups"))
         limit = normalize_limit_value(raw_limit, default=None)

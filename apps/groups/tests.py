@@ -115,6 +115,50 @@ class PartnerGroupCreationPermissionTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
 
+class CommunityGroupCreationPermissionTests(APITestCase):
+    """GroupViewSet.perform_create checked a partner-manage permission when
+    `partner` was set, but had no check at all when `community` was set -
+    any authenticated member (or even a non-member who knew the community
+    id) could create a group attributed to any community. Only the
+    community's owner may create a group within it."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            phone="+237670009950", password="TestPass12!", country="CM",
+        )
+        self.member = User.objects.create_user(
+            phone="+237670009951", password="TestPass12!", country="CM",
+        )
+        self.community = Community.objects.create(
+            owner=self.owner, name="Community Co", slug="community-co",
+        )
+        CommunityMembership.objects.create(
+            community=self.community, user=self.owner, role=CommunityRole.OWNER,
+        )
+        CommunityMembership.objects.create(
+            community=self.community, user=self.member, role=CommunityRole.MEMBER,
+        )
+
+    def test_plain_member_cannot_create_community_group(self):
+        self.client.force_authenticate(self.member)
+        response = self.client.post(
+            "/api/v1/chat-groups/",
+            {"name": "Community Group", "slug": "community-group", "community": str(self.community.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(Group.objects.filter(community=self.community, slug="community-group").exists())
+
+    def test_owner_can_create_community_group(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            "/api/v1/chat-groups/",
+            {"name": "Community Group", "slug": "community-group", "community": str(self.community.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+
 class GroupMembershipReactivationTests(APITestCase):
     """
     Email/E2EE-history audit fix: GroupMembership.joined_at and
