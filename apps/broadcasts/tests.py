@@ -256,6 +256,18 @@ class BroadcastChannelModelTests(APITestCase):
         self.assertNotIn('private_email', detail.get('settings') or {})
         self.assertTrue(summary['is_subscribed'])
         self.assertEqual(summary['viewer_role'], '')
+        # Regression test: this field was missing entirely - the mobile
+        # app's SubscribeBellButton had no real saved preference to
+        # initialize from, so the bell always reset to a hardcoded
+        # client-side default on every reopen, regardless of what the
+        # viewer had actually chosen last.
+        self.assertEqual(summary['notification_level'], BroadcastChannelSubscription.NotificationLevel.PERSONALIZED)
+
+    def test_notification_level_is_none_for_a_non_subscriber(self):
+        channel = self._create_channel()
+        summary = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+        self.assertFalse(summary['is_subscribed'])
+        self.assertIsNone(summary['notification_level'])
 
     def test_staff_admin_can_inspect_channel_records(self):
         channel = self._create_channel()

@@ -219,6 +219,7 @@ def _resolve_channel_avatar(obj: "BroadcastChannel") -> tuple[str, str, str]:
 
 class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
     is_subscribed = serializers.SerializerMethodField()
+    notification_level = serializers.SerializerMethodField()
     viewer_role = serializers.SerializerMethodField()
     is_broadcast = serializers.SerializerMethodField()
     broadcast_id = serializers.SerializerMethodField()
@@ -258,6 +259,7 @@ class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
             "subscriber_count",
             "content_count",
             "is_subscribed",
+            "notification_level",
             "viewer_role",
             "owner_type",
             "owner_id",
@@ -340,6 +342,20 @@ class BroadcastChannelSummarySerializer(serializers.ModelSerializer):
         if not getattr(user, "is_authenticated", False):
             return False
         return BroadcastChannelSubscription.objects.filter(channel=obj, user=user).exists()
+
+    def get_notification_level(self, obj: BroadcastChannel) -> str | None:
+        # CONFIRMED ROOT CAUSE of the bell always resetting to a hardcoded
+        # client-side default after reopening a channel: this response had
+        # no field at all carrying the viewer's own saved
+        # BroadcastChannelSubscription.notifications value, so
+        # SubscribeBellButton had nothing real to initialize from. None
+        # (not a NotificationLevel value) when the viewer isn't subscribed
+        # at all - the bell itself is hidden client-side in that case.
+        user = self.context.get("user") or getattr(self.context.get("request"), "user", None)
+        if not getattr(user, "is_authenticated", False):
+            return None
+        subscription = BroadcastChannelSubscription.objects.filter(channel=obj, user=user).only("notifications").first()
+        return subscription.notifications if subscription else None
 
     def get_viewer_role(self, obj: BroadcastChannel) -> str:
         user = self.context.get("user") or getattr(self.context.get("request"), "user", None)
