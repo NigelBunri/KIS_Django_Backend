@@ -18,11 +18,15 @@ gaps found and fixed during the P0.4 live-streaming closure pass:
     ingest credential) to a non-manager viewer.
   - ChannelLiveStreamWhipView must require edit permission (stream_id is
     a public, non-secret value - previously anyone could hijack ingest).
-  - ChannelLiveStreamArchiveView must require the shared webhook secret
-    when one is configured (previously accepted unauthenticated calls
-    despite its own comment claiming otherwise).
+  - ChannelLiveStreamArchiveView and ChannelLiveStreamWebhookView's
+    generic fallback must fail CLOSED (reject) when
+    LIVE_STREAM_WEBHOOK_SECRET is unset, not skip verification entirely -
+    an unset secret previously meant *no* signature check at all.
   - Chat message display_name must come from the account, not the
     request body, for authenticated posters.
+  - Chat send/history must use stable "message"/"display_name"/
+    "created_at" field names on the wire - a prior mobile/backend
+    mismatch on these exact keys silently broke every live chat send.
 
 Run:
   python3 manage.py test apps.broadcasts.test_channel_live_stream --keepdb -v 2
@@ -323,6 +327,62 @@ class LiveStreamArchiveWebhookAuthTests(LiveStreamTestBase):
 
         self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
 
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="")
+    def test_archive_webhook_fails_closed_when_no_secret_is_configured(self):
+        """An unset LIVE_STREAM_WEBHOOK_SECRET must reject every call, not
+        skip verification - `if configured_secret and supplied != ...`
+        used to short-circuit to False whenever the secret was empty,
+        silently accepting any unauthenticated POST. See
+        _live_stream_shared_secret_valid in views.py."""
+        res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"recording_url": "https://cdn.example.com/r.mp4"}, format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.live.refresh_from_db()
+        self.assertEqual((self.live.metadata or {}).get("recording_url"), None)
+
+
+class ChannelLiveStreamWebhookAuthTests(LiveStreamTestBase):
+    """ChannelLiveStreamWebhookView's generic shared-secret fallback - the
+    only check KisVideoLiveProvider's webhooks ever get, since that
+    provider implements no verify_webhook_signature of its own (see
+    live_stream_providers.py) and so always falls into this branch."""
+
+    def setUp(self):
+        super().setUp()
+        self.live_data = self._schedule_stream()
+        self.live = ChannelLiveStream.objects.get(id=self.live_data["id"])
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="")
+    def test_fails_closed_when_no_secret_is_configured(self):
+        res = self.client.post(
+            "/api/v1/broadcasts/live-streams/webhook/kisvideo/",
+            {"provider_stream_id": "abc", "status": "live"}, format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_rejects_missing_secret_when_one_is_configured(self):
+        res = self.client.post(
+            "/api/v1/broadcasts/live-streams/webhook/kisvideo/",
+            {"provider_stream_id": "abc", "status": "live"}, format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_accepts_correct_secret(self):
+        res = self.client.post(
+            "/api/v1/broadcasts/live-streams/webhook/kisvideo/",
+            {"provider_stream_id": "abc", "status": "live"}, format="json",
+            HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertNotEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
 
 class LiveChatMessageIdentityTests(LiveStreamTestBase):
     def setUp(self):
@@ -357,3 +417,33 @@ class LiveChatMessageIdentityTests(LiveStreamTestBase):
         msg = LiveChatMessage.objects.get(id=res.data["id"])
         self.assertIsNone(msg.user_id)
         self.assertEqual(msg.display_name, "Guest123")
+
+    def test_send_and_history_round_trip_the_same_field_names(self):
+        """Regression test for a mobile/backend field-name mismatch: the
+        app was POSTing {"text": ...} and reading back .text/.user_display
+        from both the send response and the chat-history list, while this
+        view only ever accepted/returned "message"/"display_name"/
+        "created_at" - every real-world send silently 400'd, and any
+        history that did load rendered blank text under "Viewer" for
+        every message. This locks the actual wire contract so a future
+        change to these key names fails a test instead of only failing
+        silently on-device."""
+        self.client.force_authenticate(self.viewer)
+
+        send_res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/chat/",
+            {"message": "hello from the viewer"},
+            format="json",
+        )
+        self.assertEqual(send_res.status_code, 201, send_res.data)
+        for key in ("id", "display_name", "message", "created_at"):
+            self.assertIn(key, send_res.data)
+        self.assertEqual(send_res.data["message"], "hello from the viewer")
+
+        history_res = self.client.get(f"/api/v1/broadcasts/live-streams/{self.live.id}/chat/")
+        self.assertEqual(history_res.status_code, 200, history_res.data)
+        rows = history_res.data["results"]
+        self.assertEqual(len(rows), 1)
+        for key in ("id", "display_name", "avatar_url", "message", "created_at", "user_id"):
+            self.assertIn(key, rows[0])
+        self.assertEqual(rows[0]["message"], "hello from the viewer")

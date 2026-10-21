@@ -572,6 +572,7 @@ class ChannelContentListSerializer(serializers.ModelSerializer):
 class ChannelContentDetailSerializer(ChannelContentListSerializer):
     assets = ChannelContentAssetSerializer(many=True, read_only=True)
     geo_restricted = serializers.SerializerMethodField()
+    my_reaction = serializers.SerializerMethodField()
 
     class Meta(ChannelContentListSerializer.Meta):
         fields = ChannelContentListSerializer.Meta.fields + [
@@ -584,10 +585,27 @@ class ChannelContentDetailSerializer(ChannelContentListSerializer):
             "scheduled_at",
             "age_restriction",
             "geo_restricted",
+            "my_reaction",
         ]
 
     def get_geo_restricted(self, obj: ChannelContent) -> bool:
         return hasattr(obj, "geo_restriction") and obj.geo_restriction is not None
+
+    def get_my_reaction(self, obj: ChannelContent):
+        # Without this, the mobile Like/Dislike buttons had no way to know
+        # the viewer's existing reaction on load, so they could never
+        # render an "already liked" state or decide whether a tap should
+        # toggle it off (DELETE) vs switch it (POST) - every tap just blindly
+        # POSTed another "like"/"dislike", which ChannelContentReactView's
+        # update_or_create silently no-ops into (one row per user, see
+        # ChannelContentReaction.unique_together), while the UI kept
+        # incrementing its own optimistic counter regardless.
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not getattr(user, "is_authenticated", False):
+            return None
+        reaction = obj.reactions.filter(user=user).values_list("reaction", flat=True).first()
+        return reaction
 
 
 class ChannelContentCommentSerializer(serializers.ModelSerializer):
@@ -595,6 +613,7 @@ class ChannelContentCommentSerializer(serializers.ModelSerializer):
     like_count = serializers.SerializerMethodField()
     is_liked = serializers.SerializerMethodField()
     reply_count = serializers.SerializerMethodField()
+    is_member = serializers.SerializerMethodField()
 
     class Meta:
         model = ChannelContentComment
@@ -609,10 +628,11 @@ class ChannelContentCommentSerializer(serializers.ModelSerializer):
             "like_count",
             "is_liked",
             "reply_count",
+            "is_member",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "content", "user", "user_display", "is_pinned", "like_count", "is_liked", "reply_count", "created_at", "updated_at"]
+        read_only_fields = ["id", "content", "user", "user_display", "is_pinned", "like_count", "is_liked", "reply_count", "is_member", "created_at", "updated_at"]
 
     def get_user_display(self, obj: ChannelContentComment) -> str:
         user = obj.user
@@ -643,6 +663,23 @@ class ChannelContentCommentSerializer(serializers.ModelSerializer):
         if annotated is not None:
             return annotated
         return obj.replies.filter(is_deleted=False).count()
+
+    def get_is_member(self, obj: ChannelContentComment) -> bool:
+        # Paid-membership badge next to a commenter's name - the perk
+        # gating this join system otherwise had none of. Views that list
+        # many comments should bulk-annotate `_is_member` the same way
+        # `_like_count`/`_is_liked`/`_reply_count` already do above to
+        # avoid a per-row query; this is the correctness fallback.
+        annotated = getattr(obj, "_is_member", None)
+        if annotated is not None:
+            return bool(annotated)
+        if not obj.user_id:
+            return False
+        from .models import ChannelMembership
+
+        return ChannelMembership.objects.filter(
+            user_id=obj.user_id, tier__channel_id=obj.content.channel_id, status=ChannelMembership.Status.ACTIVE,
+        ).exists()
 
 
 class ChannelContentChapterSerializer(serializers.ModelSerializer):
@@ -2856,22 +2893,75 @@ class ChannelLiveQAQuestionSerializer(serializers.ModelSerializer):
 
 
 class BroadcastChannelSubscriptionDetailSerializer(serializers.ModelSerializer):
-    user_display = serializers.SerializerMethodField()
+    # `id`/`display_name`/`username`/`avatar_url`/`subscribed_at` mirror the
+    # exact field names ChannelMembersScreen.tsx (mobile) reads off each row
+    # - the old `user_id`/`user_display`-only shape never actually matched
+    # what that screen expected, so every subscriber there rendered with no
+    # username, no avatar, and no "subscriber since" date regardless of what
+    # was actually on file (user_display's own `full_name` branch was dead
+    # too: User has no `full_name` attribute, so it always fell through to
+    # username/phone/"KIS user"). Kept user_id/user_display alongside the
+    # new fields for any other existing caller of this serializer.
+    id = serializers.UUIDField(source="user.id", read_only=True)
     user_id = serializers.UUIDField(source="user.id", read_only=True)
+    display_name = serializers.SerializerMethodField()
+    user_display = serializers.SerializerMethodField()
+    username = serializers.CharField(source="user.username", read_only=True)
+    avatar_url = serializers.SerializerMethodField()
+    work_status = serializers.SerializerMethodField()
+    hiring_job_listing_id = serializers.SerializerMethodField()
+    subscribed_at = serializers.DateTimeField(source="created_at", read_only=True)
 
     class Meta:
         model = BroadcastChannelSubscription
-        fields = ["id", "user_id", "user_display", "notifications", "created_at", "updated_at"]
+        fields = [
+            "id",
+            "user_id",
+            "display_name",
+            "user_display",
+            "username",
+            "avatar_url",
+            "work_status",
+            "hiring_job_listing_id",
+            "subscribed_at",
+            "notifications",
+            "created_at",
+            "updated_at",
+        ]
         read_only_fields = fields
 
-    def get_user_display(self, obj: BroadcastChannelSubscription) -> str:
-        user = obj.user
+    def _display_name(self, user) -> str:
         return (
-            getattr(user, "full_name", "")
+            getattr(user, "display_name", "")
             or getattr(user, "username", "")
             or getattr(user, "phone", "")
             or "KIS user"
         )
+
+    def get_display_name(self, obj: BroadcastChannelSubscription) -> str:
+        return self._display_name(obj.user)
+
+    def get_user_display(self, obj: BroadcastChannelSubscription) -> str:
+        return self._display_name(obj.user)
+
+    def get_avatar_url(self, obj: BroadcastChannelSubscription):
+        profile = getattr(obj.user, "profile", None)
+        return absolutize_backend_media(
+            getattr(profile, "avatar_url", None) if profile else None,
+            request=self.context.get("request"),
+        )
+
+    def get_work_status(self, obj: BroadcastChannelSubscription):
+        from apps.accounts.visibility import get_visible_work_status
+
+        viewer = getattr(self.context.get("request"), "user", None)
+        return get_visible_work_status(obj.user, viewer)
+
+    def get_hiring_job_listing_id(self, obj: BroadcastChannelSubscription):
+        from apps.accounts.visibility import get_visible_hiring_job_listing_id
+
+        viewer = getattr(self.context.get("request"), "user", None)
+        return get_visible_hiring_job_listing_id(obj.user, viewer)
 
 
 class ChannelContentTipSerializer(serializers.ModelSerializer):
@@ -2981,12 +3071,16 @@ class ChannelContentPremiereSerializer(serializers.ModelSerializer):
 
 class ChannelLiveStreamGuestSerializer(serializers.ModelSerializer):
     user_display_name = serializers.SerializerMethodField()
+    user_avatar_url = serializers.SerializerMethodField()
+    user_work_status = serializers.SerializerMethodField()
+    user_hiring_job_listing_id = serializers.SerializerMethodField()
     invite_url = serializers.SerializerMethodField()
 
     class Meta:
         model = ChannelLiveStreamGuest
-        fields = ["id", "live_stream", "user", "user_display_name", "email", "role",
-                  "status", "invite_url", "accepted_at", "created_at"]
+        fields = ["id", "live_stream", "user", "user_display_name", "user_avatar_url",
+                  "user_work_status", "user_hiring_job_listing_id", "email", "role", "status", "invite_url",
+                  "accepted_at", "created_at"]
         read_only_fields = ["id", "invite_token", "accepted_at", "created_at"]
 
     def get_user_display_name(self, obj):
@@ -2994,6 +3088,31 @@ class ChannelLiveStreamGuestSerializer(serializers.ModelSerializer):
             return obj.email or "Guest"
         return (getattr(getattr(obj.user, "profile", None), "display_name", None)
                 or getattr(obj.user, "display_name", str(obj.user_id)))
+
+    def get_user_avatar_url(self, obj):
+        if not obj.user:
+            return None
+        profile = getattr(obj.user, "profile", None)
+        return absolutize_backend_media(
+            getattr(profile, "avatar_url", None) if profile else None,
+            request=self.context.get("request"),
+        )
+
+    def get_user_work_status(self, obj):
+        if not obj.user:
+            return None
+        from apps.accounts.visibility import get_visible_work_status
+
+        viewer = getattr(self.context.get("request"), "user", None)
+        return get_visible_work_status(obj.user, viewer)
+
+    def get_user_hiring_job_listing_id(self, obj):
+        if not obj.user:
+            return None
+        from apps.accounts.visibility import get_visible_hiring_job_listing_id
+
+        viewer = getattr(self.context.get("request"), "user", None)
+        return get_visible_hiring_job_listing_id(obj.user, viewer)
 
     def get_invite_url(self, obj):
         # Previously built /broadcasts/live/join/{token}/ - not a

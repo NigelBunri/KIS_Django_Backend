@@ -809,6 +809,18 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.billing.tasks.expire_subscriptions",
         "schedule": 60 * 60,
     },
+    # Paid channel membership expiry (apps/broadcasts/tasks.py
+    # sweep_expired_channel_memberships_task) - the ChannelMembership
+    # equivalent of expire-subscriptions above. A directly-purchased
+    # membership's webhook activation never set expires_at at all, so it
+    # stayed ACTIVE forever despite MembershipScreen.tsx labeling every
+    # paid tier "/mo" - gifted memberships already expired correctly after
+    # 30 days, direct purchases never did. Same hourly cadence as the
+    # other expiry sweeps.
+    "expire-channel-memberships": {
+        "task": "apps.broadcasts.tasks.sweep_expired_channel_memberships_task",
+        "schedule": 60 * 60,
+    },
     # Stale pending WalletTransaction sweep (apps/billing/tasks.py,
     # apps/billing/services.py sweep_stale_pending_wallet_transactions). A
     # tier-upgrade checkout creates the transaction row as "pending" before

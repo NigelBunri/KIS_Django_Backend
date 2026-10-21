@@ -15414,13 +15414,24 @@ def _viewer_satisfies_age_restriction(user, content: ChannelContent) -> bool:
     return True
 
 
+def _user_is_active_channel_member(user, channel) -> bool:
+    if not getattr(user, "is_authenticated", False):
+        return False
+    return ChannelMembership.objects.filter(
+        user=user, tier__channel=channel, status=ChannelMembership.Status.ACTIVE,
+    ).exists()
+
+
 def _user_can_view_content(user, content: ChannelContent) -> bool:
     from .moderation_gate import is_channel_content_broadcast_eligible
 
     if content.is_deleted:
         return False
     can_manage = _user_can_edit_content(user, content)
-    if content.visibility == ChannelContent.Visibility.PUBLIC and content.status == ChannelContent.Status.PUBLISHED:
+    if (
+        content.visibility in (ChannelContent.Visibility.PUBLIC, ChannelContent.Visibility.MEMBERS_ONLY)
+        and content.status == ChannelContent.Status.PUBLISHED
+    ):
         # A channel manager can always see their own published content
         # regardless of its age rating or moderation state - same as
         # YouTube Studio letting a creator preview their own
@@ -15430,7 +15441,11 @@ def _user_can_view_content(user, content: ChannelContent) -> bool:
             return False
         if not can_manage and not is_channel_content_broadcast_eligible(content):
             return False
-        return content.channel.is_public and not content.channel.is_deleted
+        if not (content.channel.is_public and not content.channel.is_deleted):
+            return False
+        if content.visibility == ChannelContent.Visibility.MEMBERS_ONLY and not can_manage:
+            return _user_is_active_channel_member(user, content.channel)
+        return True
     return can_manage
 
 
@@ -16095,6 +16110,22 @@ def _notify_channel_subscribers(channel: BroadcastChannel, *, notification_type:
         .exclude(notifications=BroadcastChannelSubscription.NotificationLevel.NONE)
         .values_list("user_id", "notifications")
     )
+    context = {
+        "channel_id": str(channel.id),
+        "channel_handle": channel.handle,
+        "channel_name": channel.display_name,
+    }
+    # The mobile push router (src/push/notificationRouter.ts) deep-links off
+    # specific flat keys (channel_content_id, live_id) rather than the generic
+    # target_type/target_id pair, so each notification type must mirror its
+    # target_id under the exact key the router checks for it - otherwise a
+    # tap falls through to the less-specific channel_id branch and opens the
+    # channel home instead of the actual new post/live stream.
+    if target_type == "channel_content":
+        context["channel_content_id"] = str(target_id)
+    elif target_type == "channel_live_stream":
+        context["live_id"] = str(target_id)
+
     count = 0
     for user_id, level in subscriptions[:500]:
         try:
@@ -16107,11 +16138,7 @@ def _notify_channel_subscribers(channel: BroadcastChannel, *, notification_type:
                 target_id=target_id,
                 priority="MEDIUM" if level == BroadcastChannelSubscription.NotificationLevel.PERSONALIZED else "HIGH",
                 dedup_key=f"{notification_type}:{target_id}:{user_id}",
-                context={
-                    "channel_id": str(channel.id),
-                    "channel_handle": channel.handle,
-                    "channel_name": channel.display_name,
-                },
+                context=context,
             )
             count += 1
         except Exception:
@@ -16440,6 +16467,8 @@ class BroadcastChannelSubscribeView(APIView):
             reason="channel_subscription_updated",
             extra={"channel_id": str(channel.id), "subscribed": True},
         )
+        from apps.broadcasts.realtime import notify_channel_subscribed
+        notify_channel_subscribed(channel, request.user.id, subscribed=True)
         return Response(BroadcastChannelSubscriptionSerializer(subscription, context={"request": request}).data)
 
     def delete(self, request, channel_id):
@@ -16453,6 +16482,8 @@ class BroadcastChannelSubscribeView(APIView):
                 reason="channel_subscription_updated",
                 extra={"channel_id": str(channel.id), "subscribed": False},
             )
+            from apps.broadcasts.realtime import notify_channel_subscribed
+            notify_channel_subscribed(channel, request.user.id, subscribed=False)
         return Response({"subscribed": False}, status=status.HTTP_200_OK)
 
 
@@ -16518,8 +16549,11 @@ class BroadcastChannelContentListCreateView(APIView):
         if not can_manage:
             from .moderation_gate import filter_channel_content_broadcast_eligible
 
+            visible_visibilities = [ChannelContent.Visibility.PUBLIC]
+            if _user_is_active_channel_member(request.user, channel):
+                visible_visibilities.append(ChannelContent.Visibility.MEMBERS_ONLY)
             query = filter_channel_content_broadcast_eligible(
-                query.filter(visibility=ChannelContent.Visibility.PUBLIC, status=ChannelContent.Status.PUBLISHED)
+                query.filter(visibility__in=visible_visibilities, status=ChannelContent.Status.PUBLISHED)
             )
         status_filter = str(request.query_params.get("status") or "").strip()
         if status_filter and can_manage:
@@ -16721,6 +16755,8 @@ class ChannelContentPublishView(APIView):
             target_id=str(content.id),
             metadata={'title': content.title, 'content_type': content.content_type},
         )
+        from apps.broadcasts.realtime import notify_channel_content_published
+        notify_channel_content_published(content)
         return Response(ChannelContentDetailSerializer(content, context={"request": request}).data)
 
 
@@ -17043,9 +17079,14 @@ def _derive_stream_key(live) -> str:
 
 
 class ChannelLiveStreamStreamKeyView(APIView):
+    # Read-only: derives/returns the existing ingest key, never generates or
+    # rotates one, so GET is the correct verb (mobile's LiveControlRoom.tsx
+    # was calling this with GET while only .post() existed, a 405 on every
+    # call). POST is kept too since it's effectively the same safe retrieval
+    # under a different verb, in case anything else already relies on it.
     permission_classes = [IsAuthenticated]
 
-    def post(self, request, stream_id):
+    def _handle(self, request, stream_id):
         live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
         if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
             raise PermissionDenied("You cannot view ingest details for this live stream.")
@@ -17070,6 +17111,12 @@ class ChannelLiveStreamStreamKeyView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+    def get(self, request, stream_id):
+        return self._handle(request, stream_id)
+
+    def post(self, request, stream_id):
+        return self._handle(request, stream_id)
 
 
 class ChannelLiveStreamStartView(APIView):
@@ -17097,6 +17144,8 @@ class ChannelLiveStreamStartView(APIView):
             target_type="channel_live_stream",
             target_id=live.id,
         )
+        from apps.broadcasts.realtime import notify_channel_live_started
+        notify_channel_live_started(live.channel, live)
         return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
 
 
@@ -17134,7 +17183,30 @@ class ChannelLiveStreamEndView(APIView):
             except Exception as _vod_err:
                 logger.warning("[DVR] Failed to auto-create VOD for stream %s: %s", live.id, _vod_err)
 
+        from apps.broadcasts.realtime import notify_channel_live_ended
+        notify_channel_live_ended(live.channel, live)
         return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
+
+
+def _live_stream_shared_secret_valid(request) -> bool:
+    """Shared-secret check for the generic (non-Mux) live-stream webhook
+    fallback, used both here and by ChannelLiveStreamArchiveView below.
+
+    Fails CLOSED: an unset/empty LIVE_STREAM_WEBHOOK_SECRET now rejects
+    every request instead of silently skipping verification. Previously
+    `if configured_secret and supplied != configured_secret` short-
+    circuited to False whenever the secret wasn't configured, which meant
+    an unset secret made this endpoint accept any unauthenticated POST -
+    the opposite of what an unset secret should do. KisVideoLiveProvider
+    (the only provider since Mux's retirement) never implements
+    verify_webhook_signature itself, so this fallback is the only check
+    these webhooks ever get in production.
+    """
+    configured_secret = str(getattr(settings, "LIVE_STREAM_WEBHOOK_SECRET", os.getenv("LIVE_STREAM_WEBHOOK_SECRET", "")) or "")
+    if not configured_secret:
+        return False
+    supplied = request.headers.get("X-Live-Webhook-Secret") or request.headers.get("X-KIS-Live-Secret") or ""
+    return supplied == configured_secret
 
 
 class ChannelLiveStreamWebhookView(APIView):
@@ -17158,9 +17230,7 @@ class ChannelLiveStreamWebhookView(APIView):
                 return Response({"detail": "Invalid webhook signature."}, status=status.HTTP_403_FORBIDDEN)
         else:
             # Generic shared-secret fallback
-            configured_secret = str(getattr(settings, "LIVE_STREAM_WEBHOOK_SECRET", os.getenv("LIVE_STREAM_WEBHOOK_SECRET", "")) or "")
-            supplied = request.headers.get("X-Live-Webhook-Secret") or request.headers.get("X-KIS-Live-Secret") or ""
-            if configured_secret and supplied != configured_secret:
+            if not _live_stream_shared_secret_valid(request):
                 return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
 
         payload = request.data if isinstance(request.data, dict) else {}
@@ -17507,6 +17577,13 @@ class ChannelContentCommentsView(APIView):
         qs = qs.annotate(
             _like_count=Count("reactions", distinct=True),
             _reply_count=Count("replies", filter=Q(replies__is_deleted=False), distinct=True),
+            _is_member=Exists(
+                ChannelMembership.objects.filter(
+                    user_id=OuterRef("user_id"),
+                    tier__channel_id=content.channel_id,
+                    status=ChannelMembership.Status.ACTIVE,
+                )
+            ),
         )
         if getattr(request.user, "is_authenticated", False):
             qs = qs.annotate(
@@ -20073,10 +20150,12 @@ class ChannelSubscriberListView(APIView):
             raise PermissionDenied("You cannot view subscribers for this channel.")
         offset = int(request.query_params.get("offset") or 0)
         limit = 50
-        qs = BroadcastChannelSubscription.objects.filter(channel=channel).select_related("user").order_by("-created_at")[offset:offset + limit]
+        qs = BroadcastChannelSubscription.objects.filter(channel=channel).select_related("user", "user__profile").order_by("-created_at")[offset:offset + limit]
         from apps.broadcasts.serializers import BroadcastChannelSubscriptionDetailSerializer
         return Response({
-            "results": BroadcastChannelSubscriptionDetailSerializer(qs, many=True).data,
+            "results": BroadcastChannelSubscriptionDetailSerializer(
+                qs, many=True, context={"request": request},
+            ).data,
             "offset": offset,
             "limit": limit,
         })
@@ -20876,7 +20955,7 @@ class ChannelLiveStreamChatHistoryView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, stream_id):
-        stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel"), id=stream_id)
         limit = min(int(request.query_params.get("limit", 100) or 100), 500)
         before_id = request.query_params.get("before")
         qs = LiveChatMessage.objects.filter(stream=stream, is_deleted=False)
@@ -20887,15 +20966,28 @@ class ChannelLiveStreamChatHistoryView(APIView):
                 pass
         messages = list(qs.order_by("-created_at")[:limit])
         messages.reverse()
+        # Member badge - bulk-fetched once for the whole page instead of a
+        # per-message query, same N+1-avoidance pattern as the comment
+        # list's _is_member annotation above.
+        member_user_ids = set(
+            ChannelMembership.objects.filter(
+                user_id__in={m.user_id for m in messages if m.user_id},
+                tier__channel_id=stream.channel_id,
+                status=ChannelMembership.Status.ACTIVE,
+            ).values_list("user_id", flat=True)
+        )
         return Response({
             "results": [
                 {
                     "id": str(m.id),
-                    "display_name": m.display_name or (m.user.get_full_name() if m.user else "Anonymous"),
+                    "display_name": m.display_name or (
+                        (m.user.display_name or m.user.username or m.user.phone or "Anonymous") if m.user else "Anonymous"
+                    ),
                     "avatar_url": m.avatar_url,
                     "message": m.message,
                     "created_at": m.created_at.isoformat(),
                     "user_id": str(m.user_id) if m.user_id else None,
+                    "is_member": m.user_id in member_user_ids,
                 }
                 for m in messages
             ]
@@ -20924,11 +21016,17 @@ class ChannelLiveStreamChatHistoryView(APIView):
             avatar_url=str(request.data.get("avatar_url") or "")[:1024],
             message=message_text,
         )
+        is_member = bool(user) and ChannelMembership.objects.filter(
+            user_id=user.id, tier__channel_id=stream.channel_id, status=ChannelMembership.Status.ACTIVE,
+        ).exists()
+        from apps.broadcasts.realtime import notify_live_chat_message
+        notify_live_chat_message(stream_id, message=msg, is_member=is_member)
         return Response({
             "id": str(msg.id),
             "display_name": msg.display_name,
             "message": msg.message,
             "created_at": msg.created_at.isoformat(),
+            "is_member": is_member,
         }, status=201)
 
 
@@ -21016,9 +21114,7 @@ class ChannelLiveStreamArchiveView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request, stream_id):
-        configured_secret = str(getattr(settings, "LIVE_STREAM_WEBHOOK_SECRET", os.getenv("LIVE_STREAM_WEBHOOK_SECRET", "")) or "")
-        supplied = request.headers.get("X-Live-Webhook-Secret") or request.headers.get("X-KIS-Live-Secret") or ""
-        if configured_secret and supplied != configured_secret:
+        if not _live_stream_shared_secret_valid(request):
             return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
         stream = get_object_or_404(ChannelLiveStream, id=stream_id)
         recording_url = str(request.data.get("recording_url") or "").strip()

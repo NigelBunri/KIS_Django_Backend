@@ -349,6 +349,7 @@ class ChannelContent(models.Model):
         PUBLIC = "public", "Public"
         UNLISTED = "unlisted", "Unlisted"
         PRIVATE = "private", "Private"
+        MEMBERS_ONLY = "members_only", "Members only"
 
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"

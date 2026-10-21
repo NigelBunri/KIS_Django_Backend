@@ -897,6 +897,30 @@ class BroadcastChannelApiTests(APITestCase):
         self.assertEqual(playlist.status_code, status.HTTP_201_CREATED, playlist.data)
         self.assertTrue(BroadcastPlaylist.objects.filter(channel=self.channel, title='Featured').exists())
 
+    def test_publish_notifies_subscribers_with_deep_linkable_content_id(self):
+        # Regression for a push/in-app routing bug: _notify_channel_subscribers
+        # used to only put channel-level fields in context, so the mobile
+        # router (src/push/notificationRouter.ts) had no channel_content_id
+        # to deep-link on and fell through to just opening the channel home.
+        from apps.notifications.models import Notification
+
+        BroadcastChannelSubscription.objects.create(channel=self.channel, user=self.viewer)
+
+        self.client.force_authenticate(user=self.owner)
+        create = self.client.post(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/contents/',
+            {'content_type': 'text', 'title': 'Subscriber Notice', 'text_plain': 'Body'},
+            format='json',
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.data)
+        content_id = create.data.get('id')
+
+        publish = self.client.post(f'/api/v1/broadcasts/channel-contents/{content_id}/publish/', {}, format='json')
+        self.assertEqual(publish.status_code, status.HTTP_200_OK, publish.data)
+
+        notification = Notification.objects.get(user_id=self.viewer.id, type='CHANNEL_CONTENT_PUBLISHED')
+        self.assertEqual(notification.context_data.get('channel_content_id'), str(content_id))
+
     def test_channel_content_rejects_review_held_attachments(self):
         self.client.force_authenticate(user=self.owner)
         response = self.client.post(
@@ -2901,6 +2925,20 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         self.user.save(update_fields=["tier"])
         self.client.force_authenticate(user=self.user)
 
+    def _make_payment_eligible(self, institution_id):
+        # apps.billing.eligibility.can_receive_payments gates creating a
+        # published, priced broadcast (_require_payment_setup_for_paid_item,
+        # apps/broadcasts/views.py) the same way it already gates Product/
+        # ShopService - these pricing/booking tests predate that gate
+        # (same "predates a later-added gate" situation as the tier-paywall
+        # comment on setUp above) and need a connected payout account
+        # before they can exercise what they're actually testing (price
+        # parsing/booking flow), same pattern apps/commerce's own tests use.
+        institution = EducationInstitution.objects.get(id=institution_id)
+        institution.payout_account_status = EducationInstitutionPayoutAccountStatus.ACTIVE
+        institution.flutterwave_subaccount_id = "RS_TEST_EDU_PRICING"
+        institution.save(update_fields=["payout_account_status", "flutterwave_subaccount_id"])
+
     def test_direct_owner_without_membership_can_manage_education_institution(self):
         institution = EducationInstitution.objects.create(
             owner=self.user,
@@ -3051,6 +3089,7 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         )
         self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
         institution_id = create_response.data["institution"]["id"]
+        self._make_payment_eligible(institution_id)
 
         with override_settings(API_BASE_URL="http://10.112.162.99:8000", SITE_URL="http://10.112.162.99:8000"):
             response = self.client.post(
@@ -3083,6 +3122,7 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         )
         self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
         institution_id = create_response.data["institution"]["id"]
+        self._make_payment_eligible(institution_id)
         broadcast_response = self.client.post(
             f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
             {
@@ -3108,16 +3148,14 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         self.assertEqual(booking["currency"], "USD")
         self.assertTrue(booking["payment_required"])
 
-        # resolve_payout_entity now correctly resolves the institution for
+        # resolve_payout_entity correctly resolves the institution for
         # non-course bookings too (previously it only did so when
         # booking.course_id was set, which let bookings like this one skip
         # the payment-eligibility check entirely) — so paying out requires
-        # an active payout account, same as any other seller.
-        institution = EducationInstitution.objects.get(id=institution_id)
-        institution.payout_account_status = EducationInstitutionPayoutAccountStatus.ACTIVE
-        institution.flutterwave_subaccount_id = "test-subaccount-usd"
-        institution.save(update_fields=["payout_account_status", "flutterwave_subaccount_id"])
-
+        # an active payout account, same as any other seller. Already set
+        # up by _make_payment_eligible above (needed earlier too, just to
+        # get past broadcast creation's own gate) - this step of the flow
+        # just relies on it still being there.
         payment_response = self.client.post(
             f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/{broadcast_id}/bookings/{booking['id']}/pay/",
             {},
@@ -3158,6 +3196,7 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         )
         self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
         institution_id = create_response.data["institution"]["id"]
+        self._make_payment_eligible(institution_id)
         broadcast_response = self.client.post(
             f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
             {
@@ -3195,6 +3234,7 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         )
         self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
         institution_id = create_response.data["institution"]["id"]
+        self._make_payment_eligible(institution_id)
 
         response = self.client.post(
             f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
@@ -3243,6 +3283,7 @@ class EducationInstitutionFormNormalizationTests(APITestCase):
         )
         self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
         institution_id = create_response.data["institution"]["id"]
+        self._make_payment_eligible(institution_id)
         broadcast_response = self.client.post(
             f"/api/v1/broadcasts/education/institutions/{institution_id}/broadcasts/",
             {

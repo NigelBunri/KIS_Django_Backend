@@ -1657,7 +1657,20 @@ def reconcile_wallet_flutterwave_event(*, payload: dict) -> Response:
                     from apps.broadcasts.models import ChannelMembership
                     ChannelMembership.objects.filter(
                         id=_mem_id, user_id=_user_id, status="pending_payment"
-                    ).update(status=ChannelMembership.Status.ACTIVE, payment_reference=str(tx_ref or ""))
+                    ).update(
+                        status=ChannelMembership.Status.ACTIVE,
+                        payment_reference=str(tx_ref or ""),
+                        # Mirrors ChannelMembershipGiftRedeemView's 30-day
+                        # grant - MembershipScreen.tsx has always labeled
+                        # paid tiers "/mo", but nothing here ever set an
+                        # expiry, so a directly-purchased membership never
+                        # lapsed while an identically-priced gift did.
+                        # This is expiry only, not auto-renewal -
+                        # sweep_expired_channel_memberships (Celery Beat)
+                        # flips status to EXPIRED once this passes; there is
+                        # no recurring re-charge of the original payment yet.
+                        expires_at=timezone.now() + timedelta(days=30),
+                    )
                 except Exception as _exc:
                     logger.warning("[FLW webhook] membership activation failed: %s", _exc)
                 else:
@@ -2209,6 +2222,7 @@ class StripeWebhookView(APIView):
                     ).update(
                         status=ChannelMembership.Status.ACTIVE,
                         payment_reference=intent_id,
+                        expires_at=timezone.now() + timedelta(days=30),
                     )
                     # In-app/push confirmation — email removed (comms
                     # architecture migration, Sep 2026), same reasoning as

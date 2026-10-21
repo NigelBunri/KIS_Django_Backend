@@ -134,6 +134,37 @@ def sweep_stuck_education_bookings(limit: int = 500):
 
 
 @shared_task
+def sweep_expired_channel_memberships_task(limit: int = 500):
+    """Periodic sweep for paid ChannelMembership rows past their
+    expires_at that are still ACTIVE. MembershipScreen.tsx labels every
+    paid tier "/mo", and gift memberships already got a real 30-day
+    expires_at (ChannelMembershipGiftRedeemView), but a directly-purchased
+    membership's activation (apps.billing.views's Flutterwave/Stripe
+    webhook handlers) never set one at all, so it stayed ACTIVE forever
+    regardless of renewal. This is expiry only, not auto-renewal - there is
+    no recurring re-charge of the original payment method yet, so a
+    member must re-purchase after lapsing. See CELERY_BEAT_SCHEDULE in
+    config/settings/base.py for the schedule, and sweep_expired_subscriptions
+    in apps.billing.services for the equivalent AccountTier sweep this
+    mirrors."""
+    from django.utils import timezone as _timezone
+
+    from .models import ChannelMembership
+
+    expired_ids = list(
+        ChannelMembership.objects.filter(
+            status=ChannelMembership.Status.ACTIVE,
+            expires_at__isnull=False,
+            expires_at__lte=_timezone.now(),
+        ).order_by("expires_at").values_list("id", flat=True)[:limit]
+    )
+    updated = ChannelMembership.objects.filter(id__in=expired_ids).update(
+        status=ChannelMembership.Status.EXPIRED,
+    )
+    return {"candidates": len(expired_ids), "expired": updated}
+
+
+@shared_task
 def purge_expired_broadcasts_task():
     """Thin wrapper so cleanup_expired_broadcast_items - a real, working
     function with its own management command - is actually scheduled
