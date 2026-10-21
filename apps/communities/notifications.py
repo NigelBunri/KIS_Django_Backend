@@ -19,12 +19,13 @@ logger = logging.getLogger(__name__)
 NOTIFIABLE_SETTINGS_FIELDS = {"visibility", "join_policy"}
 
 
-def _create(*, user_id, notification_type, title, body, target_id, dedup_key, context=None):
+def _create(*, user_id, notification_type, title, body, target_id, dedup_key, context=None, actor_user_id=None):
     from apps.notifications.services import create_notification
 
     try:
         create_notification(
             user_id=user_id,
+            actor_user_id=actor_user_id,
             type=notification_type,
             title=title[:400],
             body=body[:1000],
@@ -61,6 +62,7 @@ def notify_join_request_created(community, join_request) -> None:
             target_id=community.id,
             dedup_key=f"community.join_request.created:{join_request.id}:{admin_id}",
             context={"community_id": str(community.id), "join_request_id": str(join_request.id)},
+            actor_user_id=join_request.user_id,
         )
 
 
@@ -133,4 +135,5 @@ def notify_settings_changed(community, *, changed_by, changed_fields) -> None:
             # is a "something changed, go look" nudge, not an audit log.
             dedup_key=f"community.settings_changed:{community.id}:{user_id}:{'-'.join(sorted(notifiable))}",
             context={"community_id": str(community.id), "changed_fields": sorted(notifiable)},
+            actor_user_id=changed_by.id,
         )

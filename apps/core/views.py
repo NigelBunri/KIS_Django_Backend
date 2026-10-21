@@ -395,13 +395,15 @@ class UnifiedSearchView(APIView):
         return {aliases.get(item.strip(), item.strip()) for item in raw.split(",") if item.strip()}
 
     def _search_contacts(self, request, query: str, limit: int):
+        from apps.accounts.visibility import get_visible_hiring_job_listing_id, get_visible_work_status
+
         blocked_user_ids = _blocked_user_ids_for_search(request.user)
         qs = UserModel.objects.filter(is_active=True).filter(
             Q(display_name__icontains=query)
             | Q(username__icontains=query)
             | Q(phone__icontains=query)
             | Q(email__icontains=query)
-        ).exclude(id=request.user.id)
+        ).exclude(id=request.user.id).select_related("profile")
         if blocked_user_ids:
             qs = qs.exclude(id__in=blocked_user_ids)
         qs = qs.order_by("display_name", "username", "phone")[:limit]
@@ -414,7 +416,12 @@ class UnifiedSearchView(APIView):
                 target_id=user.id,
                 route="Messages/AddContactOrDirectChat",
                 score=100,
-                metadata={"username": _search_text(getattr(user, "username", ""))},
+                metadata={
+                    "username": _search_text(getattr(user, "username", "")),
+                    "avatar_url": getattr(getattr(user, "profile", None), "avatar_url", None),
+                    "work_status": get_visible_work_status(user, request.user),
+                    "hiring_job_listing_id": get_visible_hiring_job_listing_id(user, request.user),
+                },
             )
             for user in qs
         ]

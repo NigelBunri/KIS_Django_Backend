@@ -512,7 +512,10 @@ class NotificationViewSet(viewsets.ModelViewSet):
         )
 
         # Use the NotificationSerializer for full output
-        return Response(srl.NotificationSerializer(notif).data, status=status.HTTP_201_CREATED)
+        return Response(
+            srl.NotificationSerializer(notif, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 # -------------------------
@@ -558,6 +561,7 @@ class MentionNotificationView(APIView):
             dedup_key = f"mention:{conversation_id}:{message_id}:{user.id}" if message_id else None
             services.create_notification(
                 user_id=user.id,
+                actor_user_id=request.user.id,
                 type="mention",
                 title=f"{sender_name} mentioned you",
                 body=preview or f"{sender_name} mentioned you in a conversation.",

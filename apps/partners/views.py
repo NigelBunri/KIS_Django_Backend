@@ -5206,7 +5206,10 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
             user_ids=[uid for uid in active_partner_member_ids(post.partner) if uid != str(request.user.id)],
             data={"postId": str(post.id), "commentId": str(comment.id), "authorId": str(request.user.id)},
         )
-        return Response(PartnerPostCommentSerializer(comment).data, status=status.HTTP_201_CREATED)
+        return Response(
+            PartnerPostCommentSerializer(comment, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=["post"], url_path="comment-room")
     def comment_room(self, request, pk=None):
@@ -5235,7 +5238,10 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
         if not self._user_can_access_partner(post.partner, request.user):
             raise PermissionDenied("Not allowed to view comments.")
         comments = post.comments.filter(is_deleted=False).select_related("author").order_by("created_at")
-        return Response(PartnerPostCommentSerializer(comments, many=True).data, status=status.HTTP_200_OK)
+        return Response(
+            PartnerPostCommentSerializer(comments, many=True, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["post"], url_path="react")
     def react(self, request, pk=None):

@@ -176,7 +176,12 @@ def ensure_notification_deliveries(notification: models.Notification, channels=N
 
 @transaction.atomic
 def create_notification(user_id, type, template_key=None, context=None, channel=None, priority="MEDIUM", dedup_key=None, **kwargs):
-    """Create a notification and schedule deliveries. Deduplication key avoids duplicates."""
+    """Create a notification and schedule deliveries. Deduplication key avoids duplicates.
+
+    kwargs['actor_user_id'], if passed, is whoever performed the action this
+    notification is about (reacted/commented/mentioned/requested), not the
+    recipient - see Notification.actor_user_id's own docstring. Omit it for
+    notification types with no human actor (billing, shipping, system)."""
     context_data = normalize_notification_context(
         notification_type=type,
         target_type=kwargs.get("target_type"),
@@ -209,6 +214,7 @@ def create_notification(user_id, type, template_key=None, context=None, channel=
         with transaction.atomic():
             notif = models.Notification.objects.create(
                 user_id=user_id,
+                actor_user_id=kwargs.get("actor_user_id"),
                 template=template,
                 type=type,
                 title=title or "",

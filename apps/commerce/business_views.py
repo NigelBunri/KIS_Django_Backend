@@ -218,7 +218,11 @@ class JobListingViewSet(viewsets.ModelViewSet):
     serializer_class = JobListingSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["job_type", "country", "industry", "remote_allowed", "is_active", "is_kingdom_certified"]
+    # "poster" added so a user's own "my postings" picker (e.g. linking an
+    # active listing to their Hiring status ring - see
+    # Profile.hiring_job_listing) can query ?poster=<their own id> instead
+    # of paging through every listing on the board client-side.
+    filterset_fields = ["job_type", "country", "industry", "remote_allowed", "is_active", "is_kingdom_certified", "poster"]
     search_fields = ["title", "description", "required_skills"]
     ordering_fields = ["created_at", "deadline", "salary_min", "salary_max"]
 

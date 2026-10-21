@@ -401,9 +401,9 @@ class CommunityViewSet(viewsets.ModelViewSet):
         qs = CommunityMembership.objects.active().filter(community=community).select_related("user").order_by("-joined_at")
         page = self.paginate_queryset(qs)
         if page is not None:
-            serializer = CommunityMembershipSerializer(page, many=True)
+            serializer = CommunityMembershipSerializer(page, many=True, context={"request": request})
             return self.get_paginated_response(serializer.data)
-        serializer = CommunityMembershipSerializer(qs, many=True)
+        serializer = CommunityMembershipSerializer(qs, many=True, context={"request": request})
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path="join")
@@ -424,7 +424,7 @@ class CommunityViewSet(viewsets.ModelViewSet):
         from apps.communities.realtime import notify_member_joined
 
         notify_member_joined(community, membership)
-        return Response(CommunityMembershipSerializer(membership).data, status=status.HTTP_200_OK)
+        return Response(CommunityMembershipSerializer(membership, context={"request": request}).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="add-members")
     def add_members(self, request, pk=None):
@@ -683,7 +683,7 @@ class CommunityViewSet(viewsets.ModelViewSet):
             notify_role_changed(community, membership, previous_role=previous_role, changed_by=request.user)
             notify_role_changed_persistent(community, membership, previous_role=previous_role)
 
-        serializer = CommunityMembershipSerializer(membership)
+        serializer = CommunityMembershipSerializer(membership, context={"request": request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="members/promote-admin")
@@ -760,7 +760,7 @@ class CommunityViewSet(viewsets.ModelViewSet):
             notify_role_changed(community, membership, previous_role=previous_role, changed_by=request.user)
             notify_role_changed_persistent(community, membership, previous_role=previous_role)
 
-        serializer = CommunityMembershipSerializer(membership)
+        serializer = CommunityMembershipSerializer(membership, context={"request": request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="members/block")
@@ -1191,7 +1191,10 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
         from apps.communities.realtime import notify_comment_created
 
         notify_comment_created(comment)
-        return Response(CommunityPostCommentSerializer(comment).data, status=status.HTTP_201_CREATED)
+        return Response(
+            CommunityPostCommentSerializer(comment, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=["post"], url_path="comment-room")
     def comment_room(self, request, pk=None):
@@ -1218,7 +1221,10 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
     def comments(self, request, pk=None):
         post = self.get_object()
         comments = post.comments.filter(is_deleted=False).select_related("author").order_by("created_at")
-        return Response(CommunityPostCommentSerializer(comments, many=True).data, status=status.HTTP_200_OK)
+        return Response(
+            CommunityPostCommentSerializer(comments, many=True, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["post"], url_path="react")
     def react(self, request, pk=None):

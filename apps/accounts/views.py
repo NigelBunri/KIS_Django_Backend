@@ -76,9 +76,7 @@ from .models import (
     Project,
     Recommendation,
     ProfileFieldVisibility,
-    ProfileFieldVisibilityAllowTarget,
     ProfileArticle,
-    ProfileArticleAllowTarget,
     ProfilePreferences,
     ProfileLanguage,
     ProfileShowcase,
@@ -147,6 +145,7 @@ PROFILE_FIELD_ORDER = [
     "testimonial",
     "certification",
     "intro_video",
+    "work_status",
 ]
 PROFILE_FIELD_KEYS = set(PROFILE_FIELD_ORDER)
 POPULAR_PROFILE_LANGUAGES = (
@@ -223,111 +222,24 @@ def _normalize_kis_handle_key(value: object | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", visible)
 
 
-def _digits_only(value: str | None) -> str:
-    return "".join(ch for ch in str(value or "") if ch.isdigit())
-
-
-def _phone_variants(value: str | None, country_hint: str = "CM") -> set[str]:
-    raw = str(value or "").strip()
-    if not raw:
-        return set()
-    variants = {raw}
-    digits = _digits_only(raw)
-    if digits:
-        variants.add(digits)
-        variants.add(f"+{digits}")
-        if digits.startswith("00") and len(digits) > 2:
-            variants.add(digits[2:])
-            variants.add(f"+{digits[2:]}")
-    try:
-        e164 = to_e164(raw, country_hint or "CM")
-        variants.add(e164)
-        if e164.startswith("+"):
-            variants.add(e164[1:])
-    except Exception:
-        pass
-    return {item for item in variants if item}
-
-
-def _user_phone_variants(user: Optional[User]) -> set[str]:
-    if not user:
-        return set()
-    country_hint = str(getattr(user, "country", "") or "CM").upper() or "CM"
-    variants = set()
-    variants.update(_phone_variants(getattr(user, "phone", None), country_hint))
-    local_number = str(getattr(user, "phone_number", "") or "").strip()
-    if local_number:
-        variants.update(_phone_variants(local_number, country_hint))
-        code = str(getattr(user, "phone_country_code", "") or "").strip()
-        if code:
-            variants.update(_phone_variants(f"{code}{local_number}", country_hint))
-    return variants
-
-
-def _allow_targets_match_viewer(viewer: Optional[User], allow_targets: Iterable[ProfileFieldVisibilityAllowTarget | ProfileArticleAllowTarget]) -> bool:
-    if not viewer:
-        return False
-    viewer_id = str(viewer.id)
-    viewer_phone_variants = _user_phone_variants(viewer)
-    viewer_phone_digits = {_digits_only(item) for item in viewer_phone_variants if _digits_only(item)}
-    for target in allow_targets:
-        target_user_id = str(getattr(target, "target_user_id", "") or "")
-        if target_user_id and target_user_id == viewer_id:
-            return True
-        target_phone = str(getattr(target, "target_phone", "") or "").strip()
-        if target_phone and target_phone in viewer_phone_variants:
-            return True
-        target_phone_digits = _digits_only(getattr(target, "target_phone_number", "") or target_phone)
-        if target_phone_digits and target_phone_digits in viewer_phone_digits:
-            return True
-    return False
-
-
-def _has_contact_link(owner: User, target: User) -> bool:
-    owner_phone_variants = _user_phone_variants(target)
-    owner_digits = {_digits_only(item) for item in owner_phone_variants if _digits_only(item)}
-    qs = UserContact.objects.filter(user=owner).filter(
-        Q(contact_user=target)
-        | Q(contact_phone__in=owner_phone_variants)
-        | Q(contact_phone_number__in=owner_digits)
-    )
-    return qs.exists()
-
-
-def _is_mutual_contact(owner: User, viewer: Optional[User]) -> bool:
-    if not viewer:
-        return False
-    if owner.id == viewer.id:
-        return True
-    return _has_contact_link(owner, viewer) and _has_contact_link(viewer, owner)
-
-
-def _can_view_visibility(
-    owner: User,
-    viewer: Optional[User],
-    visibility: str,
-    allow_targets: Iterable[ProfileFieldVisibilityAllowTarget | ProfileArticleAllowTarget],
-) -> bool:
-    viewer_id = str(getattr(viewer, "id", ""))
-    owner_id = str(owner.id)
-    if viewer_id and viewer_id == owner_id:
-        return True
-    normalized = str(visibility or "public").strip().lower()
-    if normalized == "public":
-        return True
-    if normalized == "private":
-        return False
-    if normalized == "contacts":
-        return _is_mutual_contact(owner, viewer)
-    if normalized == "custom":
-        return _allow_targets_match_viewer(viewer, allow_targets)
-    return False
-
-
-def _can_view_field(owner: User, viewer: Optional[User], rule: Optional[ProfileFieldVisibility]) -> bool:
-    if not rule:
-        return True
-    return _can_view_visibility(owner, viewer, rule.visibility, rule.allow_targets.all())
+# Visibility-check helpers (_digits_only, _is_mutual_contact,
+# _can_view_field, etc.) moved to apps/accounts/visibility.py so apps other
+# than accounts (communities, groups, statuses - anywhere a user's profile
+# fields get surfaced to someone else) can enforce the exact same
+# ProfileFieldVisibility rules without importing this views module (which
+# itself imports from serializers.py, so the reverse import would be
+# circular). Re-imported under their original names here so every existing
+# call site in this file keeps working unchanged.
+from .visibility import (  # noqa: E402
+    _can_view_field,
+    _can_view_visibility,
+    _digits_only,
+    _is_mutual_contact,
+    _phone_variants,
+    _user_phone_variants,
+    get_visible_hiring_job_listing_id,
+    get_visible_work_status,
+)
 
 
 def _resolve_media_url(request, file_field, fallback_url):
@@ -546,6 +458,33 @@ def _build_profile_payload(profile: Profile, viewer: Optional[User], request=Non
             "completion_score": profile.completion_score,
             "visibility": profile.visibility,
             "branding_prefs": profile.branding_prefs,
+            # Gated behind the owner's own ProfileFieldVisibility rule for
+            # "work_status" (public/contacts/custom/private), same
+            # per-field privacy model as avatar/headline/bio above - this
+            # used to be unconditional ("public by definition"), which
+            # meant a user who set this to contacts-only or private still
+            # had their Open to Work/Hiring status handed to literally any
+            # viewer who could load their profile at all.
+            "work_status": maybe(profile.work_status, "work_status"),
+            # Gated the same way as work_status itself (same
+            # ProfileFieldVisibility rule, not a separate one) - see
+            # apps.accounts.serializers.ProfileSerializer.to_representation
+            # for the identical rule applied to the ProfileViewSet's own
+            # default retrieve/update payload.
+            "work_preferences": profile.work_preferences if can_view("work_status") else {},
+            # get_visible_hiring_job_listing_id does its own full
+            # work_status-visibility + listing-is_active check - see its
+            # docstring in apps.accounts.visibility for the stale-vs-active
+            # rule (a deactivated/deleted listing reads back as None here,
+            # same as everywhere else this is exposed).
+            "hiring_job_listing_id": get_visible_hiring_job_listing_id(owner, viewer),
+            # Was never in this payload at all - UserProfileScreen.tsx
+            # (mobile) has rendered an "Open to Work" banner off
+            # `profile.open_to_work` since that screen was first built, but
+            # this view/me action never actually returned the field, so
+            # the banner never once showed for a real viewer regardless of
+            # the flag's actual value.
+            "open_to_work": profile.open_to_work,
             "created_at": profile.created_at,
             "updated_at": profile.updated_at,
             "verification_summary": owner_verification_summary,
@@ -2942,11 +2881,14 @@ class ConnectionSerializer(serializers.ModelSerializer):
 
     def _user_payload(self, user):
         profile = getattr(user, "profile", None)
+        viewer = getattr(self.context.get("request"), "user", None)
         return {
             "id": str(user.id),
             "display_name": user.display_name or user.username,
             "avatar_url": getattr(profile, "avatar_url", "") or "",
             "headline": getattr(profile, "headline", "") or "",
+            "work_status": get_visible_work_status(user, viewer),
+            "hiring_job_listing_id": get_visible_hiring_job_listing_id(user, viewer),
         }
 
     def get_from_user(self, obj):
@@ -3008,7 +2950,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             Q(from_user=target, to_user=request.user)
         ).first()
         if existing:
-            return Response(ConnectionSerializer(existing).data, status=200)
+            return Response(ConnectionSerializer(existing, context={"request": request}).data, status=200)
         conn = UserConnection.objects.create(
             from_user=request.user, to_user=target,
             note=request.data.get("note", ""),
@@ -3032,6 +2974,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             # test coverage catching it until the regression tests below.
             create_notification(
                 user_id=target.id,
+                actor_user_id=request.user.id,
                 type="connection_request",
                 title="New connection request",
                 body=f"{request.user.display_name or request.user.username} wants to connect with you.",
@@ -3041,7 +2984,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             )
         except Exception as exc:
             logger.warning("Connection-request notification failed for conn_id=%s: %s", conn.id, exc.__class__.__name__)
-        return Response(ConnectionSerializer(conn).data, status=201)
+        return Response(ConnectionSerializer(conn, context={"request": request}).data, status=201)
 
     def partial_update(self, request, pk=None, **kwargs):
         conn = get_object_or_404(UserConnection, pk=pk, to_user=request.user)
@@ -3068,6 +3011,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
                 create_notification(
                     user_id=conn.from_user_id,
+                    actor_user_id=request.user.id,
                     type="connection_accepted",
                     title="Connection accepted",
                     body=f"{request.user.display_name or request.user.username} accepted your connection request.",
@@ -3077,7 +3021,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 )
             except Exception as exc:
                 logger.warning("Connection-accepted notification failed for conn_id=%s: %s", conn.id, exc.__class__.__name__)
-        return Response(ConnectionSerializer(conn).data)
+        return Response(ConnectionSerializer(conn, context={"request": request}).data)
 
     @action(detail=False, methods=["get"], url_path="search")
     def search(self, request):
@@ -3126,6 +3070,8 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 "avatar_url": getattr(p, "avatar_url", "") or "",
                 "industry": getattr(p, "industry", "") or "",
                 "connection_status": connection_map.get(str(u.id), "none"),
+                "work_status": get_visible_work_status(u, user),
+                "hiring_job_listing_id": get_visible_hiring_job_listing_id(u, user),
             })
         return Response(data)
 
@@ -3180,6 +3126,8 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 "avatar_url": getattr(p, "avatar_url", ""),
                 "industry": getattr(p, "industry", ""),
                 "connection_status": connection_map.get(str(u.id), "none"),
+                "work_status": get_visible_work_status(u, user),
+                "hiring_job_listing_id": get_visible_hiring_job_listing_id(u, user),
             })
         return Response(data)
 

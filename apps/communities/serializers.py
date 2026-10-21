@@ -80,10 +80,12 @@ class CommunityMembershipStateSerializerMixin:
 
 class CommunityUserSerializer(serializers.ModelSerializer):
     avatar_url = serializers.SerializerMethodField()
+    work_status = serializers.SerializerMethodField()
+    hiring_job_listing_id = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ["id", "display_name", "phone", "avatar_url"]
+        fields = ["id", "display_name", "phone", "avatar_url", "work_status", "hiring_job_listing_id"]
 
     def get_avatar_url(self, obj):
         profile = getattr(obj, "profile", None)
@@ -91,6 +93,18 @@ class CommunityUserSerializer(serializers.ModelSerializer):
             getattr(profile, "avatar_url", None) if profile else None,
             request=self.context.get("request"),
         )
+
+    def get_work_status(self, obj):
+        from apps.accounts.visibility import get_visible_work_status
+
+        viewer = getattr(self.context.get("request"), "user", None)
+        return get_visible_work_status(obj, viewer)
+
+    def get_hiring_job_listing_id(self, obj):
+        from apps.accounts.visibility import get_visible_hiring_job_listing_id
+
+        viewer = getattr(self.context.get("request"), "user", None)
+        return get_visible_hiring_job_listing_id(obj, viewer)
 
 
 class CommunityListSerializer(

@@ -14,6 +14,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import NotFound, ValidationError
 
 from apps.accounts.models import User, UserContact
+from apps.accounts.visibility import get_visible_work_status, get_visible_hiring_job_listing_id
 from apps.moderation.models import AuditLog, Flag, UserBlock
 from apps.statuses.models import (
     StatusComment,
@@ -310,6 +311,8 @@ class StatusViewSet(viewsets.ModelViewSet):
                     "id": str(user.id),
                     "display_name": user.display_name or user.phone or f"User {user.id}",
                     "avatar_url": getattr(user.profile, "avatar_url", None),
+                    "work_status": get_visible_work_status(user, request.user),
+                    "hiring_job_listing_id": get_visible_hiring_job_listing_id(user, request.user),
                 },
                 "items": self._serialize_status_items(
                     request,
@@ -620,6 +623,8 @@ class StatusViewSet(viewsets.ModelViewSet):
             "id": str(user.id),
             "display_name": user.display_name or user.phone or f"User {user.id}",
             "avatar_url": getattr(getattr(user, "profile", None), "avatar_url", None),
+            "work_status": get_visible_work_status(user, self.request.user),
+            "hiring_job_listing_id": get_visible_hiring_job_listing_id(user, self.request.user),
         }
 
     @action(detail=True, methods=["post"], url_path="reply")

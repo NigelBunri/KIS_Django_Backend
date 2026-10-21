@@ -66,6 +66,16 @@ class Notification(BaseEntity):
     ]
 
     user_id = models.UUIDField(db_index=True)  # recipient user id from account app
+    # Open to Work / Hiring spec, "notifications/activity items" avatar
+    # context: who performed the action this notification is about (the
+    # person who reacted/commented/mentioned/sent a request), as opposed to
+    # user_id above (who RECEIVES it). Nullable/optional - most
+    # notification types (billing, shipping, system/moderation ones) have
+    # no human actor at all, and this is populated only by the call sites
+    # that do; a notification with no actor just never shows an avatar.
+    # Plain UUIDField (not a FK) matching user_id's own pattern just above
+    # - this app intentionally never FKs into apps.accounts.User.
+    actor_user_id = models.UUIDField(null=True, blank=True, db_index=True)
     template = models.ForeignKey(NotificationTemplate, null=True, blank=True, on_delete=models.SET_NULL)
     type = models.CharField(max_length=128, db_index=True)  # e.g. FRIEND_REQUEST, EVENT_ALERT
     title = models.CharField(max_length=400)

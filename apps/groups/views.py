@@ -300,7 +300,7 @@ class GroupViewSet(viewsets.ModelViewSet):
     def members(self, request, pk=None):
         group = self.get_object()
         qs = GroupMembership.objects.filter(group=group, left_at__isnull=True)
-        serializer = GroupMembershipSerializer(qs, many=True)
+        serializer = GroupMembershipSerializer(qs, many=True, context={"request": request})
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path="join")
@@ -322,7 +322,7 @@ class GroupViewSet(viewsets.ModelViewSet):
         membership, _cm = self._reactivate_group_membership(group, user)
         sync_community_membership_for_group(group, user)
 
-        return Response(GroupMembershipSerializer(membership).data, status=status.HTTP_200_OK)
+        return Response(GroupMembershipSerializer(membership, context={"request": request}).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="add-members")
     def add_members(self, request, pk=None):
@@ -551,7 +551,7 @@ class GroupViewSet(viewsets.ModelViewSet):
             conversation=group.conversation, user_id=user_id, left_at__isnull=True,
         ).update(base_role=conv_role)
 
-        return Response(GroupMembershipSerializer(target_membership).data, status=status.HTTP_200_OK)
+        return Response(GroupMembershipSerializer(target_membership, context={"request": request}).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="members/remove")
     def remove_member(self, request, pk=None):

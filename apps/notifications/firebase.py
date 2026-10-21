@@ -22,6 +22,39 @@ def _notification_data(notification: models.Notification) -> dict[str, str]:
     for key, value in (notification.context_data or {}).items():
         if value is not None:
             data[str(key)] = str(value)
+    # Mirrors NotificationSerializer.get_actor's gated shape (same
+    # visibility.py entry points, same recipient-as-viewer rule) so the
+    # foreground push toast (InAppNotificationToast.tsx) can show the same
+    # actor avatar+ring the in-app notifications list does, not just once
+    # the user opens the list. FCM/APNs data payloads are string-only, so
+    # unlike the REST serializer this is a flat set of actor_* keys rather
+    # than a nested object - omitted entirely when there's no actor, or
+    # when the recipient isn't allowed to see this actor's status.
+    if notification.actor_user_id:
+        from apps.accounts.models import User
+        from apps.accounts.visibility import get_visible_hiring_job_listing_id, get_visible_work_status
+
+        try:
+            actor = User.objects.select_related("profile").get(id=notification.actor_user_id)
+        except User.DoesNotExist:
+            actor = None
+        if actor:
+            try:
+                recipient = User.objects.get(id=notification.user_id)
+            except User.DoesNotExist:
+                recipient = None
+            profile = getattr(actor, "profile", None)
+            data["actor_id"] = str(actor.id)
+            data["actor_display_name"] = actor.display_name or actor.username or ""
+            avatar_url = getattr(profile, "avatar_url", None)
+            if avatar_url:
+                data["actor_avatar_url"] = str(avatar_url)
+            work_status = get_visible_work_status(actor, recipient)
+            if work_status:
+                data["actor_work_status"] = work_status
+            listing_id = get_visible_hiring_job_listing_id(actor, recipient)
+            if listing_id:
+                data["actor_hiring_job_listing_id"] = listing_id
     return data
 
 

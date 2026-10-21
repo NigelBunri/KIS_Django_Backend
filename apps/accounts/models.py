@@ -412,6 +412,22 @@ def profile_showcase_upload_path(instance, filename: str) -> str:
     return f"profiles/{instance.user_id}/showcase/{instance.type}/{filename}"
 
 
+class WorkStatus(models.TextChoices):
+    """LinkedIn-style "Open to work" / "Hiring" photo-ring status.
+
+    Deliberately a single tri-state field, not two independent booleans -
+    a user is either showing no badge, open to work, or hiring, never both
+    at once. Distinct from the pre-existing `Profile.open_to_work` boolean
+    below, which backs the unrelated partners/recruitment "talent
+    discovery" search filter (apps.partners, TalentDiscoverScreen) - that
+    field is left untouched; this one only drives the visual ring shown
+    around a user's avatar everywhere it's rendered in the app.
+    """
+    NONE = "none", "None"
+    OPEN_FOR_WORK = "open_for_work", "Open for work"
+    HIRING = "hiring", "Hiring"
+
+
 class Profile(BaseEntity):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile")
     avatar_url = models.URLField(blank=True, null=True)
@@ -425,6 +441,55 @@ class Profile(BaseEntity):
     visibility = models.CharField(max_length=50, default="public")
     branding_prefs = models.JSONField(default=dict, blank=True)
     open_to_work = models.BooleanField(default=False)
+    work_status = models.CharField(
+        max_length=20, choices=WorkStatus.choices, default=WorkStatus.NONE, db_index=True,
+    )
+    # Section A of the "Open to Work" spec: job titles/roles sought,
+    # employment type, workplace arrangement, preferred location,
+    # availability/start date. Free-form JSON (same pattern as
+    # branding_prefs above) rather than a related model since this is a
+    # single small user-editable blob with no independent query/reporting
+    # need of its own - matching how this app already stores comparable
+    # flexible preference data. Only meaningful (and only persisted - see
+    # apps.accounts.serializers.ProfileSerializer.validate) while
+    # work_status == OPEN_FOR_WORK; not required for HIRING or NONE.
+    # Shape (all keys optional): {
+    #   "roles": [str, ...], "employment_types": [str, ...]
+    #       (subset of "full_time"/"part_time"/"contract"/"internship"),
+    #   "workplace": "on_site" | "hybrid" | "remote",
+    #   "location": str, "availability": str (freeform, e.g. an ISO date
+    #       or "Immediately"),
+    # }
+    work_preferences = models.JSONField(default=dict, blank=True)
+    # Section 7 of the spec: "Hiring may lead to an associated active job
+    # listing". Nullable, optional link from this profile's Hiring status
+    # to a real listing in apps.commerce's existing job board - a user can
+    # activate Hiring with or without linking one (mobile defaults to
+    # "activate without linking"; see ProfileScreen.tsx's hiring sheet).
+    # String app-label reference avoids apps.accounts importing
+    # apps.commerce at module load time.
+    #
+    # STALE-STATUS RULE (explicit spec requirement - "distinguish active
+    # hiring status from stale status with no active opportunity"): the
+    # Hiring ring itself (driven by work_status alone, via
+    # get_visible_work_status) always keeps rendering so long as
+    # work_status == HIRING, regardless of this field - a user can
+    # legitimately be "hiring" in a general sense with no single posting
+    # live yet, and hiding their ring on every listing expiry would be a
+    # confusing, surprising status flip they didn't make. What DOES change
+    # is the ring's *tap-through*: apps.accounts.visibility.
+    # get_visible_hiring_job_listing_id only returns an id (enabling
+    # "tap ring -> open listing") when this FK is set AND the listing is
+    # still is_active=True; on_delete=SET_NULL means a deleted listing
+    # degrades to the same "no active opportunity" state as an explicitly
+    # deactivated or never-linked one, handled identically on read.
+    hiring_job_listing = models.ForeignKey(
+        "commerce.JobListing",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="hiring_profiles",
+    )
 
     class Meta:
         verbose_name = "Profile"

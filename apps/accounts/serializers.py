@@ -142,6 +142,19 @@ class ProfileSerializer(serializers.ModelSerializer):
     verification_summary = serializers.SerializerMethodField()
     avatar_file = serializers.ImageField(write_only=True, required=False, allow_null=True)
     cover_file = serializers.ImageField(write_only=True, required=False, allow_null=True)
+    # Write-only UUID input rather than a PrimaryKeyRelatedField(queryset=...)
+    # so this module doesn't need a module-level import of apps.commerce
+    # (which itself imports apps.accounts.models.User, so that would be
+    # circular) - resolved to a real JobListing instance (or None) in
+    # validate_hiring_job_listing below, which also enforces "can only link
+    # a listing you posted yourself".
+    hiring_job_listing = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    # Gated, stale-aware read view of the same field - see
+    # apps.accounts.visibility.get_visible_hiring_job_listing_id for the
+    # full active-vs-stale rule. Deliberately NOT exposing the raw FK value
+    # on read (it would leak which listing is linked to viewers who can't
+    # even see work_status at all).
+    hiring_job_listing_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Profile
@@ -159,6 +172,10 @@ class ProfileSerializer(serializers.ModelSerializer):
             "completion_score",
             "visibility",
             "branding_prefs",
+            "work_status",
+            "work_preferences",
+            "hiring_job_listing",
+            "hiring_job_listing_id",
             "created_at",
             "updated_at",
         ]
@@ -183,6 +200,73 @@ class ProfileSerializer(serializers.ModelSerializer):
         from apps.verification.services import verification_summary
 
         return verification_summary(VerificationSubjectType.USER, obj.user_id)
+
+    def get_hiring_job_listing_id(self, obj: Profile) -> str | None:
+        from .visibility import get_visible_hiring_job_listing_id
+
+        viewer = getattr(self.context.get("request"), "user", None)
+        return get_visible_hiring_job_listing_id(obj.user, viewer)
+
+    def validate_hiring_job_listing(self, value):
+        if value is None:
+            return None
+        from apps.commerce.business_models import JobListing
+
+        request = self.context.get("request")
+        requester = getattr(request, "user", None)
+        try:
+            listing = JobListing.objects.get(id=value)
+        except JobListing.DoesNotExist:
+            raise serializers.ValidationError("Job listing not found.")
+        if not requester or listing.poster_id != requester.id:
+            # Mirrors the "link an existing listing YOU posted" product
+            # decision in the mobile Hiring picker - you cannot point your
+            # own Hiring ring at someone else's job posting.
+            raise serializers.ValidationError("You can only link a job listing you posted.")
+        return listing
+
+    def validate(self, attrs: dict) -> dict:
+        attrs = super().validate(attrs)
+        # work_preferences is only meaningful (and only ever persisted)
+        # while the resulting work_status is OPEN_FOR_WORK - see
+        # Profile.work_preferences's own docstring. A client that submits
+        # it alongside (or while already at) a different status has that
+        # part of the payload silently dropped rather than rejected, so a
+        # single PATCH that flips status away from open_for_work doesn't
+        # need to also remember to omit/clear preferences itself.
+        if "work_preferences" in attrs:
+            from .models import WorkStatus
+
+            resulting_status = attrs.get(
+                "work_status", getattr(self.instance, "work_status", WorkStatus.NONE)
+            )
+            if resulting_status != WorkStatus.OPEN_FOR_WORK:
+                attrs.pop("work_preferences")
+        return attrs
+
+    def to_representation(self, instance: Profile) -> dict:
+        # work_status stays a real, writable model field (so the owner's
+        # own PATCH - ROUTES.profiles.update, used by ProfileScreen.tsx's
+        # Open to Work/Hiring picker - keeps working) but its *output* is
+        # gated by the owner's own ProfileFieldVisibility rule, same as
+        # every other per-field-visibility-controlled value in
+        # apps.accounts.views._build_profile_payload. This serializer is
+        # also what PublicUserSerializer nests to represent someone ELSE's
+        # profile, so without this override a private/contacts-only status
+        # was handed to any viewer who could load the profile at all.
+        data = super().to_representation(instance)
+        from .visibility import get_visible_work_status
+
+        viewer = getattr(self.context.get("request"), "user", None)
+        visible_status = get_visible_work_status(instance.user, viewer)
+        data["work_status"] = visible_status
+        # work_preferences gated the same way as work_status itself (same
+        # ProfileFieldVisibility rule, not a separate one) - a viewer who
+        # can't see the status at all shouldn't see the preferences blob
+        # either.
+        if visible_status is None:
+            data["work_preferences"] = {}
+        return data
 
     def validate_avatar_url(self, value):
         return normalize_image_payload(value)

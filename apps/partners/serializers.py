@@ -507,13 +507,18 @@ class PartnerPostSerializer(serializers.ModelSerializer):
         ]
 
     def get_author(self, obj):
+        from apps.accounts.visibility import get_visible_hiring_job_listing_id, get_visible_work_status
+
         author = obj.author
         profile = getattr(author, "profile", None)
+        viewer = getattr(self.context.get("request"), "user", None)
         return {
             "id": str(author.id),
             "display_name": getattr(author, "display_name", None),
             "phone": getattr(author, "phone", None),
             "avatar_url": getattr(profile, "avatar_url", None) if profile else None,
+            "work_status": get_visible_work_status(author, viewer),
+            "hiring_job_listing_id": get_visible_hiring_job_listing_id(author, viewer),
         }
 
     def get_reactions(self, obj):
@@ -592,13 +597,18 @@ class PartnerPostCommentSerializer(serializers.ModelSerializer):
         read_only_fields = ["author", "is_deleted", "created_at", "updated_at"]
 
     def get_author(self, obj):
+        from apps.accounts.visibility import get_visible_hiring_job_listing_id, get_visible_work_status
+
         author = obj.author
         profile = getattr(author, "profile", None)
+        viewer = getattr(self.context.get("request"), "user", None)
         return {
             "id": str(author.id),
             "display_name": getattr(author, "display_name", None),
             "phone": getattr(author, "phone", None),
             "avatar_url": getattr(profile, "avatar_url", None) if profile else None,
+            "work_status": get_visible_work_status(author, viewer),
+            "hiring_job_listing_id": get_visible_hiring_job_listing_id(author, viewer),
         }
 
 
