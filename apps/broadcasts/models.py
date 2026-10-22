@@ -512,8 +512,17 @@ class ChannelLiveStream(models.Model):
     playback_url = models.URLField(blank=True, default="")
     replay_url = models.URLField(blank=True, default="")
     thumbnail_url = models.URLField(blank=True, default="")
+    thumbnail_media_type = models.CharField(
+        max_length=8,
+        choices=[("image", "Image"), ("video", "Video")],
+        blank=True,
+        default="",
+    )
     viewer_count = models.PositiveIntegerField(default=0)
     peak_viewer_count = models.PositiveIntegerField(default=0)
+    total_view_count = models.PositiveIntegerField(default=0)
+    total_watch_seconds = models.PositiveIntegerField(default=0)
+    playback_error_count = models.PositiveIntegerField(default=0)
     metadata = models.JSONField(default=dict, blank=True)
     created_by = models.ForeignKey(
         User,
@@ -926,6 +935,7 @@ class ChannelModerationRecord(models.Model):
         CHANNEL = "channel", "Channel"
         CONTENT = "content", "Content"
         COMMENT = "comment", "Comment"
+        LIVE_CHAT_MESSAGE = "live_chat_message", "Live chat message"
 
     class Status(models.TextChoices):
         OPEN = "open", "Open"
@@ -944,7 +954,7 @@ class ChannelModerationRecord(models.Model):
     channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="moderation_records")
     content = models.ForeignKey(ChannelContent, null=True, blank=True, on_delete=models.CASCADE, related_name="moderation_records")
     comment = models.ForeignKey(ChannelContentComment, null=True, blank=True, on_delete=models.CASCADE, related_name="moderation_records")
-    target_type = models.CharField(max_length=16, choices=TargetType.choices, db_index=True)
+    target_type = models.CharField(max_length=24, choices=TargetType.choices, db_index=True)
     target_id = models.UUIDField(db_index=True)
     reporter = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="channel_moderation_reports")
     actor = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="channel_moderation_actions")
@@ -3606,6 +3616,31 @@ class LiveChatMessage(models.Model):
         indexes = [
             models.Index(fields=["stream", "created_at"], name="live_chat_stream_time_idx"),
         ]
+
+
+class ChannelChatBan(models.Model):
+    """A channel-level live-chat restriction - deliberately separate from
+    UserBlock (which is a per-user, reciprocal personal block used for DMs/
+    feeds) since this is a one-way moderation action a channel owner/manager
+    takes against a chatter in their own room, not a mutual personal block.
+    expires_at=None means a permanent ban; a non-null past expires_at means
+    the ban has lapsed (checked via is_active(), never deleted so the
+    moderation history is preserved)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="chat_bans")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="channel_chat_bans")
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "channel_chat_ban"
+        unique_together = [("channel", "user")]
+        indexes = [models.Index(fields=["channel", "user"])]
+
+    def is_active(self) -> bool:
+        return self.expires_at is None or self.expires_at > timezone.now()
 
 
 # ── Channel Membership Tiers ──────────────────────────────────────────────────

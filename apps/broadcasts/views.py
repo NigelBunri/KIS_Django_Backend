@@ -209,6 +209,7 @@ from apps.broadcasts.models import (
     ServiceMediumMap,
     _default_expires_at,
     LiveChatMessage,
+    ChannelChatBan,
     ChannelMembershipTier,
     ChannelMembership,
     ChannelContentTip,
@@ -8016,6 +8017,10 @@ class BroadcastFeedView(APIView):
                 payload["avatar_url"] = avatar_url
             if bio:
                 payload["bio"] = bio
+            from apps.accounts.visibility import get_visible_hiring_job_listing_id, get_visible_work_status
+
+            payload["work_status"] = get_visible_work_status(user, request.user)
+            payload["hiring_job_listing_id"] = get_visible_hiring_job_listing_id(user, request.user)
             return payload
 
         author_user_cache: dict[str, User | None] = {}
@@ -15478,6 +15483,17 @@ def _content_datetime_from_request(value: object):
         raise ValidationError({"scheduled_at": "Invalid date/time."})
 
 
+def _reject_past_scheduled_at(scheduled_at, *, field_name: str = "scheduled_start_at") -> None:
+    """Shared by schedule-create and schedule-edit: a clearly-past datetime
+    is almost always a client bug (bad timezone math, a date-picker
+    defaulting to today in the wrong year), not an intentional backdated
+    schedule. The 5-minute grace window avoids rejecting "start now"
+    requests that land a few seconds after `scheduled_at` was computed on
+    the client."""
+    if scheduled_at is not None and scheduled_at < timezone.now() - timedelta(minutes=5):
+        raise ValidationError({field_name: "Scheduled time cannot be in the past."})
+
+
 def _live_stream_provider() -> str:
     return str(getattr(settings, "LIVE_STREAM_PROVIDER", os.getenv("LIVE_STREAM_PROVIDER", "disabled")) or "disabled").strip().lower()
 
@@ -15502,6 +15518,16 @@ def _safe_live_dev_payload(channel_id, stream_id) -> dict[str, str]:
 
 def _hash_stream_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _bump_peak_viewer_count(stream_id, count: int) -> None:
+    """Single place peak_viewer_count ever gets bumped from, so the three
+    independent viewer-count writers (provider webhook, LiveStreamViewerPingView,
+    Nest's socket-room-based LiveStreamViewerCountReportView) can't disagree
+    about what the recorded peak is. Atomic conditional UPDATE - safe under
+    concurrent callers, no read-then-write race."""
+    if count and count > 0:
+        ChannelLiveStream.objects.filter(id=stream_id, peak_viewer_count__lt=count).update(peak_viewer_count=count)
 
 
 def _embeds_enabled() -> bool:
@@ -15858,6 +15884,7 @@ def _channel_content_counts(content: ChannelContent) -> dict:
         "shares": int(stats.get("shares") or 0),
         "comments": int(stats.get("comments") or 0),
         "reactions": int(stats.get("reactions") or 0),
+        "dislikes": int(stats.get("dislikes") or 0),
         "saves": int(stats.get("saves") or 0),
     }
 
@@ -15876,7 +15903,8 @@ def _sync_channel_content_counts(content: ChannelContent) -> dict:
     stats = content.stats if isinstance(content.stats, dict) else {}
     stats.update(
         {
-            "reactions": ChannelContentReaction.objects.filter(content=content).count(),
+            "reactions": ChannelContentReaction.objects.filter(content=content, reaction="like").count(),
+            "dislikes": ChannelContentReaction.objects.filter(content=content, reaction="dislike").count(),
             "comments": ChannelContentComment.objects.filter(content=content, is_deleted=False).count(),
             "saves": ChannelContentSave.objects.filter(content=content).count(),
         }
@@ -16978,6 +17006,9 @@ class ChannelLiveStreamListCreateView(APIView):
         scheduled_at = _content_datetime_from_request(
             request.data.get("scheduled_start_at") or request.data.get("scheduledStartAt") or request.data.get("scheduled_at")
         )
+        # scheduled_start_at is optional (an unscheduled/"go live now" stream
+        # omits it entirely - see LiveStreamSchedulingTests._schedule_stream).
+        _reject_past_scheduled_at(scheduled_at)
         stream_uuid = uuid.uuid4()
         dev_payload = _safe_live_dev_payload(channel.id, stream_uuid)
 
@@ -17011,6 +17042,18 @@ class ChannelLiveStreamListCreateView(APIView):
         _safe_user_metadata = {
             k: v for k, v in _user_metadata.items() if k not in _reserved_live_stream_metadata_keys
         }
+        thumbnail_url = str(request.data.get("thumbnail_url") or request.data.get("thumbnailUrl") or "").strip()
+        thumbnail_media_type = str(
+            request.data.get("thumbnail_media_type") or request.data.get("thumbnailMediaType") or ""
+        ).strip().lower()
+        if not thumbnail_url:
+            # No asset means nothing to type - the mobile pre-live screen falls
+            # back to its default loading state whenever thumbnail_url is blank,
+            # so a stray type here would be meaningless and only risk confusing
+            # that fallback check.
+            thumbnail_media_type = ""
+        elif thumbnail_media_type not in ("image", "video"):
+            raise ValidationError({"thumbnail_media_type": "Must be 'image' or 'video' when a thumbnail_url is set."})
         live = ChannelLiveStream.objects.create(
             channel=channel,
             title=title[:220],
@@ -17021,7 +17064,8 @@ class ChannelLiveStreamListCreateView(APIView):
             ingest_url=merged.get("ingest_url", ""),
             stream_key_hash=_hash_stream_key(stream_key),
             playback_url=merged.get("playback_url", ""),
-            thumbnail_url=str(request.data.get("thumbnail_url") or request.data.get("thumbnailUrl") or "").strip(),
+            thumbnail_url=thumbnail_url,
+            thumbnail_media_type=thumbnail_media_type,
             metadata={
                 "provider_calls_enabled": _live_provider_sandbox_enabled(),
                 "raw_stream_key_returned": False,
@@ -17041,7 +17085,14 @@ class ChannelLiveStreamListCreateView(APIView):
             content_type=ChannelContentType.LIVE_STREAM,
             title=live.title,
             description=live.description,
-            thumbnail_url=live.thumbnail_url,
+            # Only ever a static image here: ChannelContent.thumbnail_url is
+            # rendered as a plain <Image> wherever content cards/feeds show it
+            # (unrelated to this live stream's own pre-live wait screen, which
+            # reads ChannelLiveStream.thumbnail_url/thumbnail_media_type
+            # directly) - a video wait-asset URL would render as a broken
+            # image there, so it's deliberately left blank in that case rather
+            # than copied.
+            thumbnail_url=live.thumbnail_url if live.thumbnail_media_type != "video" else "",
             visibility=ChannelContent.Visibility.PUBLIC,
             status=ChannelContent.Status.SCHEDULED,
             scheduled_at=live.scheduled_start_at,
@@ -17053,6 +17104,29 @@ class ChannelLiveStreamListCreateView(APIView):
         return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
+class LiveNowView(APIView):
+    """Cross-channel 'Live Now' discovery (C1 of the YouTube-parity batch) -
+    no existing endpoint aggregates live streams across channels; the
+    per-channel ChannelLiveStreamListCreateView.get right below is scoped
+    to one channel_id, and BroadcastChannelSummarySerializer carries no
+    is_live/live_stream_id field to piggyback on. Public channels only -
+    same reasoning as ChannelLiveStreamDetailView.get just below: a
+    private channel's live stream must not surface to non-managers, and a
+    discovery rail is exactly the kind of surface that would otherwise
+    leak one."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        limit = min(max(int(request.query_params.get("limit") or 20), 1), 50)
+        rows = (
+            ChannelLiveStream.objects.select_related("channel", "content")
+            .filter(status=ChannelLiveStream.Status.LIVE, channel__is_public=True, channel__is_deleted=False)
+            .order_by("-viewer_count", "-started_at")[:limit]
+        )
+        return Response({"results": ChannelLiveStreamSerializer(rows, many=True, context={"request": request}).data})
+
+
 class ChannelLiveStreamDetailView(APIView):
     permission_classes = [AllowAny]
 
@@ -17061,6 +17135,150 @@ class ChannelLiveStreamDetailView(APIView):
         if not live.channel.is_public and not _user_can_manage_channel(request.user, live.channel):
             raise Http404
         return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
+
+    def patch(self, request, stream_id):
+        live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
+            raise PermissionDenied("You cannot edit this live stream.")
+        if live.status != ChannelLiveStream.Status.SCHEDULED:
+            raise ValidationError({"status": "Only a scheduled stream can be edited."})
+
+        update_fields = ["updated_at"]
+        content_update_fields = []
+
+        if "title" in request.data:
+            title = str(request.data.get("title") or "").strip()
+            if not title:
+                raise ValidationError({"title": "A live stream title is required."})
+            live.title = title[:220]
+            update_fields.append("title")
+            if live.content_id:
+                live.content.title = live.title
+                content_update_fields.append("title")
+
+        if "description" in request.data:
+            live.description = str(request.data.get("description") or "").strip()
+            update_fields.append("description")
+            if live.content_id:
+                live.content.description = live.description
+                content_update_fields.append("description")
+
+        if any(k in request.data for k in ("scheduled_start_at", "scheduledStartAt", "scheduled_at")):
+            scheduled_at = _content_datetime_from_request(
+                request.data.get("scheduled_start_at") or request.data.get("scheduledStartAt") or request.data.get("scheduled_at")
+            )
+            _reject_past_scheduled_at(scheduled_at)
+            live.scheduled_start_at = scheduled_at
+            update_fields.append("scheduled_start_at")
+            if live.content_id:
+                live.content.scheduled_at = scheduled_at
+                content_update_fields.append("scheduled_at")
+
+        if "thumbnail_url" in request.data or "thumbnailUrl" in request.data:
+            live.thumbnail_url = str(request.data.get("thumbnail_url") or request.data.get("thumbnailUrl") or "").strip()
+            update_fields.append("thumbnail_url")
+            if live.content_id:
+                live.content.thumbnail_url = live.thumbnail_url
+                content_update_fields.append("thumbnail_url")
+
+        if "thumbnail_media_type" in request.data:
+            media_type = str(request.data.get("thumbnail_media_type") or "").strip().lower()
+            if media_type not in ("", "image", "video"):
+                raise ValidationError({"thumbnail_media_type": "Must be 'image' or 'video'."})
+            if not live.thumbnail_url:
+                media_type = ""
+            live.thumbnail_media_type = media_type
+            update_fields.append("thumbnail_media_type")
+
+        live.save(update_fields=update_fields)
+        if live.content_id and content_update_fields:
+            live.content.save(update_fields=content_update_fields)
+        _channel_audit(request, action="channel_live.edit", target_type="channel", target_id=live.channel_id, metadata={"stream_id": str(live.id)})
+        return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
+
+
+class ChannelLiveStreamCancelView(APIView):
+    """Cancels a scheduled stream before it ever goes live - distinct from
+    End (which closes out a stream that was actually live at some point).
+    Only reachable while status=SCHEDULED; nothing was ever live so there is
+    no "it's live" notification to undo and no subscriber notification to
+    send here."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, stream_id):
+        from .live_stream_providers import get_live_stream_provider
+
+        live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
+            raise PermissionDenied("You cannot cancel this live stream.")
+        if live.status != ChannelLiveStream.Status.SCHEDULED:
+            raise ValidationError({"status": "Only a scheduled stream can be cancelled."})
+
+        # Scheduling eagerly calls create_live_stream() on a real provider
+        # (see ChannelLiveStreamListCreateView.post), so a cancelled stream
+        # may already hold an unused upstream reservation - clean it up the
+        # same way End does, best-effort (a provider outage shouldn't block
+        # the creator from cancelling).
+        if live.provider and live.provider != "disabled" and live.provider_stream_id:
+            lsp = get_live_stream_provider(live.provider)
+            if lsp:
+                try:
+                    lsp.delete_live_stream(live.provider_stream_id)
+                except Exception:
+                    pass
+
+        live.status = ChannelLiveStream.Status.CANCELLED
+        live.save(update_fields=["status", "updated_at"])
+        if live.content_id:
+            live.content.status = ChannelContent.Status.ARCHIVED
+            live.content.save(update_fields=["status"])
+        _channel_audit(request, action="channel_live.cancel", target_type="channel", target_id=live.channel_id, metadata={"stream_id": str(live.id)})
+        return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
+
+
+class ChannelLiveStreamCanViewView(APIView):
+    """Internal-only: lets Nest's channel.live.join socket handler
+    (src/realtime/handlers/live.ts, DjangoConversationClient.canViewLiveStream)
+    re-verify that a user may view this channel's live stream before letting
+    them subscribe to its viewer-count/live-chat-broadcast room - the exact
+    same visibility rule ChannelLiveStreamDetailView.get already enforces for
+    REST reads (public channel, or a manager of a private one), mirroring
+    apps.statuses's can-view pattern for status.join. Without this, a user
+    excluded from a private channel could still eavesdrop on its live
+    viewer count / chat broadcast via a raw socket subscription even though
+    the REST endpoint 404s them. No request.user here - the query param is
+    the user Nest is checking on behalf of, not the (service) caller."""
+
+    permission_classes = []
+    authentication_classes = []
+
+    def get(self, request, stream_id):
+        from apps.chat.internal_auth import require_internal_auth
+
+        require_internal_auth(request)
+
+        user_id = str(request.query_params.get("user_id") or "").strip()
+        if not user_id:
+            return Response({"can_view": False}, status=400)
+
+        try:
+            live = ChannelLiveStream.objects.select_related("channel").get(id=stream_id)
+        except ChannelLiveStream.DoesNotExist:
+            return Response({"can_view": False}, status=404)
+
+        if live.channel.is_public:
+            return Response({"can_view": True}, status=200)
+
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        try:
+            user = User.objects.get(id=user_id)
+        except (User.DoesNotExist, ValueError, TypeError):
+            return Response({"can_view": False}, status=200)
+
+        return Response({"can_view": _user_can_manage_channel(user, live.channel)}, status=200)
 
 
 def _derive_stream_key(live) -> str:
@@ -17119,6 +17337,83 @@ class ChannelLiveStreamStreamKeyView(APIView):
         return self._handle(request, stream_id)
 
 
+class ChannelLiveStreamStreamKeyRotateView(APIView):
+    """Issues a new stream key, invalidating the old one - there is no
+    standalone "revoke" action separate from this: once rotation exists,
+    revoking-without-reissuing has no real use case for this product (the
+    broadcast would just be left keyless; a creator done broadcasting
+    already has End, which calls the provider's delete_live_stream). Only
+    allowed while not live - no supported publisher client can swap a key
+    mid-broadcast, so rotating under an active stream would just orphan the
+    running publish with no way to recover it.
+
+    For a real provider (kisvideo): delete+recreate upstream, since
+    kisvideo-live has no dedicated rotate endpoint (confirmed against its
+    app/main.py - only POST /streams, DELETE /streams/{id}, PUT .../targets
+    exist) - delete+create is the documented way to get a fresh
+    provider_stream_id/ingest_url/stream_key there.
+
+    For the disabled/dev-payload path (today's only working path in
+    production): _safe_live_dev_payload's ingest_url is channel-scoped, not
+    stream-scoped, so it doesn't need to change; _derive_stream_key's
+    disabled-mode branch reads provider_stream_id as the key material, so
+    regenerating that is what actually rotates the derived key."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, stream_id):
+        from .live_stream_providers import LiveStreamProviderError, get_live_stream_provider
+
+        live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
+            raise PermissionDenied("You cannot rotate the stream key for this live stream.")
+        if live.status == ChannelLiveStream.Status.LIVE:
+            raise ValidationError({"status": "Cannot rotate the stream key while the broadcast is live. End it first."})
+
+        old_provider_stream_id = str(live.provider_stream_id or "")
+        if live.provider and live.provider != "disabled":
+            lsp = get_live_stream_provider(live.provider)
+            if lsp is None:
+                raise ValidationError({"provider": f"No active provider adapter for '{live.provider}'."})
+            if old_provider_stream_id:
+                lsp.delete_live_stream(old_provider_stream_id)
+            try:
+                provider_payload = lsp.create_live_stream()
+            except LiveStreamProviderError as exc:
+                raise ValidationError({"provider": str(exc)})
+            live.provider_stream_id = provider_payload.get("provider_stream_id") or str(uuid.uuid4())
+            live.ingest_url = provider_payload.get("ingest_url", "")
+            live.playback_url = provider_payload.get("playback_url", "") or live.playback_url
+            if provider_payload.get("whip_url"):
+                live.metadata = {**(live.metadata or {}), "whip_url": provider_payload.get("whip_url")}
+        else:
+            live.provider_stream_id = str(uuid.uuid4())
+
+        new_stream_key = f"{live.channel_id}:{live.id}:{uuid.uuid4()}"
+        live.stream_key_hash = _hash_stream_key(new_stream_key)
+        live.metadata = {**(live.metadata or {}), "raw_stream_key_returned": False}
+        live.save(update_fields=["provider_stream_id", "ingest_url", "playback_url", "stream_key_hash", "metadata", "updated_at"])
+
+        stream_key = _derive_stream_key(live)
+        _channel_audit(
+            request,
+            action="channel_live.stream_key.rotate",
+            target_type="channel",
+            target_id=live.channel_id,
+            metadata={"stream_id": str(live.id), "provider": live.provider},
+        )
+        return Response(
+            {
+                "stream_id": str(live.id),
+                "provider": live.provider,
+                "ingest_url": str(live.ingest_url or "").strip(),
+                "stream_key": stream_key,
+                "stream_key_available": bool(stream_key),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class ChannelLiveStreamStartView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -17136,17 +17431,32 @@ class ChannelLiveStreamStartView(APIView):
         if live.content_id:
             _activate_live_stream_content(live.content_id)
         _channel_audit(request, action="channel_live.start", target_type="channel", target_id=live.channel_id, metadata={"stream_id": str(live.id), "content_id": str(live.content_id or "")})
-        _notify_channel_subscribers(
-            live.channel,
-            notification_type="CHANNEL_LIVE_STARTED",
-            title=f"{live.channel.display_name} is live",
-            body=live.title,
-            target_type="channel_live_stream",
-            target_id=live.id,
-        )
-        from apps.broadcasts.realtime import notify_channel_live_started
-        notify_channel_live_started(live.channel, live)
+        # Only tell subscribers "it's live" immediately when nothing will ever
+        # confirm real ingest for us: disabled/dev-payload streams always store
+        # provider="disabled" (see _safe_live_dev_payload), and no webhook will
+        # ever arrive for them. A real provider-backed stream (provider_stream_id
+        # + a real webhook integration) defers this notification to
+        # ChannelLiveStreamWebhookView's first confirmed "live" event instead -
+        # tapping Start only opens the session for the creator to begin
+        # publishing, it is not proof an encoder/camera has actually connected,
+        # and subscribers should not be told a channel is live before that's true.
+        if (live.provider or "disabled") == "disabled":
+            _notify_live_started(live)
         return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
+
+
+def _notify_live_started(live) -> None:
+    _notify_channel_subscribers(
+        live.channel,
+        notification_type="CHANNEL_LIVE_STARTED",
+        title=f"{live.channel.display_name} is live",
+        body=live.title,
+        target_type="channel_live_stream",
+        target_id=live.id,
+    )
+    from apps.broadcasts.realtime import notify_channel_live_started, notify_live_stream_status_changed
+    notify_channel_live_started(live.channel, live)
+    notify_live_stream_status_changed(live)
 
 
 class ChannelLiveStreamEndView(APIView):
@@ -17183,8 +17493,9 @@ class ChannelLiveStreamEndView(APIView):
             except Exception as _vod_err:
                 logger.warning("[DVR] Failed to auto-create VOD for stream %s: %s", live.id, _vod_err)
 
-        from apps.broadcasts.realtime import notify_channel_live_ended
+        from apps.broadcasts.realtime import notify_channel_live_ended, notify_live_stream_status_changed
         notify_channel_live_ended(live.channel, live)
+        notify_live_stream_status_changed(live)
         return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
 
 
@@ -17255,14 +17566,49 @@ class ChannelLiveStreamWebhookView(APIView):
         if not live:
             return Response({"matched": False}, status=status.HTTP_202_ACCEPTED)
 
+        # Duplicate-delivery guard: kisvideo-live's MediaMTX hooks are
+        # "best-effort" (app/main.py's _notify_django swallows delivery
+        # failures rather than retrying), which in practice means the
+        # realistic failure mode is the opposite of lost delivery - a flaky
+        # hook firing twice for the same publish/unpublish event, not a
+        # malicious replay (this is a shared-secret-authenticated internal
+        # endpoint, not a public attack surface, so a full nonce/timestamp
+        # envelope would be solving a threat model this integration doesn't
+        # have). cache.add() is the same atomic SET-if-not-exists primitive
+        # already used for view-count and viewer-ping dedup elsewhere in
+        # this file (_record_unique_view, LiveStreamViewerPingView) - a
+        # short window is enough to absorb a near-simultaneous double-fire
+        # without suppressing a later, genuinely new event of the same type
+        # (e.g. the stream going live again after a real reconnect).
+        dedup_key = f"broadcast:live_webhook_dedup:{provider_name}:{provider_stream_id}:{mapped_status or 'nostatus'}"
+        if not cache.add(dedup_key, 1, timeout=10):
+            return Response({"matched": True, "deduped": True}, status=status.HTTP_200_OK)
+
         if mapped_status and mapped_status in ChannelLiveStream.Status.values:
             live.status = mapped_status
-            if mapped_status == "live" and not live.started_at:
-                live.started_at = timezone.now()
-                if live.content_id:
-                    _activate_live_stream_content(live.content_id)
+            if mapped_status == "live":
+                if not live.started_at:
+                    live.started_at = timezone.now()
+                    if live.content_id:
+                        _activate_live_stream_content(live.content_id)
+                # Real ingest confirmed by the provider itself - this is the
+                # authoritative "actually live" signal for provider-backed
+                # streams (see ChannelLiveStreamStartView, which deliberately
+                # does not notify subscribers for these). started_at may
+                # already be set from the creator tapping Start before the
+                # encoder connected, so gate on a dedicated metadata flag
+                # rather than started_at's nullity - otherwise this branch
+                # would silently never fire for that (normal) ordering.
+                # _notify_channel_subscribers dedupes on (type, target, user)
+                # regardless, but the flag avoids redundant work on repeat
+                # "live" webhook deliveries (e.g. reconnects).
+                if not (live.metadata or {}).get("subscribers_notified"):
+                    _notify_live_started(live)
+                    live.metadata = {**(live.metadata or {}), "subscribers_notified": True}
             elif mapped_status in ("ended", "cancelled") and not live.ended_at:
                 live.ended_at = timezone.now()
+                from apps.broadcasts.realtime import notify_live_stream_status_changed
+                notify_live_stream_status_changed(live)
 
         # Update viewer count
         viewer_count = live.viewer_count or 0
@@ -17273,13 +17619,13 @@ class ChannelLiveStreamWebhookView(APIView):
         else:
             viewer_count = int(payload.get("viewer_count") or viewer_count)
         live.viewer_count = viewer_count
-        live.peak_viewer_count = max(live.peak_viewer_count or 0, viewer_count)
 
         live.metadata = {
             **(live.metadata or {}),
             "last_webhook": {"provider": provider_name, "event_type": event_type, "status": mapped_status},
         }
-        live.save(update_fields=["status", "viewer_count", "peak_viewer_count", "metadata", "started_at", "ended_at", "updated_at"])
+        live.save(update_fields=["status", "viewer_count", "metadata", "started_at", "ended_at", "updated_at"])
+        _bump_peak_viewer_count(live.id, viewer_count)
         return Response({"matched": True, "id": str(live.id), "status": live.status})
 
 
@@ -18100,6 +18446,31 @@ class BroadcastChannelAnalyticsView(APIView):
             "saves": ChannelContentSave.objects.filter(content__channel=channel).count(),
             "shares": sum(int((content.stats or {}).get("shares") or 0) for content in content_query.only("stats")[:10000]),
         }
+        # Live-stream engagement (chat volume, tip count) has never been
+        # rolled into this channel's daily analytics - live_peak_viewers
+        # existed as a model field and a serializer entry but nothing ever
+        # wrote it, and chat/tip counts had no home here at all. Scoped to
+        # today's streams only, same "generated on read, for today" shape
+        # as the rest of this view - live reactions (Batch 6) are
+        # deliberately not aggregated here, since they were never persisted
+        # (ephemeral socket bursts, no DB rows to count).
+        todays_live_streams = ChannelLiveStream.objects.filter(
+            channel=channel,
+            created_at__date=today,
+        )
+        live_stream_ids = list(todays_live_streams.values_list("id", flat=True))
+        live_peak_viewers = todays_live_streams.aggregate(
+            peak=models.Max("peak_viewer_count")
+        )["peak"] or 0
+        live_chat_messages = LiveChatMessage.objects.filter(
+            stream_id__in=live_stream_ids, is_deleted=False
+        ).count()
+        live_tips = ChannelLiveStreamTip.objects.filter(
+            live_stream_id__in=live_stream_ids, status=ChannelLiveStreamTip.Status.COMPLETED
+        )
+        live_tips_count = live_tips.count()
+        live_tips_amount_cents = sum(t.amount_cents for t in live_tips.only("amount_cents"))
+
         rollup, _ = ChannelAnalyticsDailyRollup.objects.update_or_create(
             channel=channel,
             content=None,
@@ -18112,7 +18483,13 @@ class BroadcastChannelAnalyticsView(APIView):
                 "saves": summary["saves"],
                 "comments": summary["comments"],
                 "reactions": summary["reactions"],
-                "metadata": {"generated": "on_read"},
+                "live_peak_viewers": live_peak_viewers,
+                "metadata": {
+                    "generated": "on_read",
+                    "live_chat_messages": live_chat_messages,
+                    "live_tips_count": live_tips_count,
+                    "live_tips_amount_cents": live_tips_amount_cents,
+                },
             },
         )
         top_content = content_query.order_by("-updated_at")[:10]
@@ -20815,26 +21192,59 @@ class LiveStreamSwitchCameraView(APIView):
 # ── Live Stream Viewer Ping (REST fallback for viewer count) ──────────────────
 
 class LiveStreamViewerPingView(APIView):
+    """The authoritative source for ChannelLiveStream.viewer_count/
+    peak_viewer_count/total_view_count/total_watch_seconds. Every other
+    writer (provider webhook, Nest's socket-room report) feeds peak through
+    the shared _bump_peak_viewer_count helper so there's one definition of
+    "peak", not three disagreeing ones.
+
+    "A view" (total_view_count) = a distinct viewer/IP that pinged at least
+    once while the stream was live - proof of a sustained connection having
+    been established, not merely a page/screen load, matching this app's
+    existing honesty bar elsewhere (see test_impressions_analytics_honesty.py:
+    don't count something as "confirmed" unless real evidence backs it).
+    total_watch_seconds accumulates real elapsed time between a viewer's own
+    consecutive pings (capped per-gap so a lapsed-then-resumed ping can't
+    inflate it with dead air), not an estimate from viewer_count alone."""
+
     permission_classes = [AllowAny]
+
+    _PING_INTERVAL_CAP_SECONDS = 60  # cap a single inter-ping gap's contribution
 
     def post(self, request, stream_id):
         stream = get_object_or_404(ChannelLiveStream, id=stream_id)
         if stream.status != "live":
             return Response({"viewer_count": stream.viewer_count or 0})
-        # Increment viewer count using cache-based deduplication
+        from django.core.cache import cache
+        from django.db.models import F
+
+        ident = str(request.user.id) if request.user.is_authenticated else request.META.get("REMOTE_ADDR", "anon")
+        user_key = f"live_viewer:{stream_id}:{ident}"
+        last_seen_key = f"live_viewer_last_seen:{stream_id}:{ident}"
         try:
-            from django.core.cache import cache
-            user_key = f"live_viewer:{stream_id}:{request.user.id if request.user.is_authenticated else request.META.get('REMOTE_ADDR', 'anon')}"
             is_new = cache.add(user_key, 1, timeout=35)
+            now_ts = timezone.now().timestamp()
+            last_seen = cache.get(last_seen_key)
+            cache.set(last_seen_key, now_ts, timeout=120)
+
             if is_new:
-                # New viewer ping — increment persisted count
                 count = int(cache.get(f"live_viewers:{stream_id}") or 0) + 1
                 cache.set(f"live_viewers:{stream_id}", count, timeout=300)
-                # Sync to DB every 10 new pings or so (cheap batching)
                 if count % 10 == 1 or count <= 5:
                     ChannelLiveStream.objects.filter(id=stream_id).update(viewer_count=count)
+                # First ping ever for this viewer on this stream = one confirmed view.
+                ChannelLiveStream.objects.filter(id=stream_id).update(total_view_count=F("total_view_count") + 1)
             else:
                 count = int(cache.get(f"live_viewers:{stream_id}") or stream.viewer_count or 0)
+
+            if last_seen:
+                gap = max(0.0, min(now_ts - float(last_seen), self._PING_INTERVAL_CAP_SECONDS))
+                if gap > 0:
+                    ChannelLiveStream.objects.filter(id=stream_id).update(
+                        total_watch_seconds=F("total_watch_seconds") + int(gap)
+                    )
+
+            _bump_peak_viewer_count(stream_id, count)
         except Exception:
             count = stream.viewer_count or 0
         return Response({"viewer_count": count, "stream_id": str(stream_id)})
@@ -20847,6 +21257,97 @@ class LiveStreamViewerPingView(APIView):
         except Exception:
             count = stream.viewer_count or 0
         return Response({"viewer_count": count, "stream_id": str(stream_id)})
+
+
+class LiveStreamViewerCountReportView(APIView):
+    """Internal-only: Nest's live.ts calls this on every channel.viewer.count
+    broadcast (join/leave/disconnect) so the exact socket-room count - a real
+    count of connected viewer sockets, not an approximation - becomes part of
+    the same single peak-tracking path LiveStreamViewerPingView feeds,
+    instead of being a fourth number only Nest ever sees. Overwrites the
+    shared cache-based current count, since the socket room size is more
+    precise than the ping-based approximation for clients that hold a
+    socket open. Same internal-auth posture as ChannelLiveStreamCanViewView."""
+
+    permission_classes = []
+    authentication_classes = []
+
+    def post(self, request, stream_id):
+        from apps.chat.internal_auth import require_internal_auth
+        from django.core.cache import cache
+
+        require_internal_auth(request)
+        try:
+            count = int(request.data.get("count") or 0)
+        except (TypeError, ValueError):
+            return Response({"detail": "count must be an integer"}, status=400)
+        if count < 0:
+            return Response({"detail": "count must not be negative"}, status=400)
+
+        get_object_or_404(ChannelLiveStream, id=stream_id)
+        cache.set(f"live_viewers:{stream_id}", count, timeout=300)
+        ChannelLiveStream.objects.filter(id=stream_id).update(viewer_count=count)
+        _bump_peak_viewer_count(stream_id, count)
+        return Response({"ok": True})
+
+
+class LiveStreamHealthReportView(APIView):
+    """Publisher-only: the broadcasting client reports its own connection
+    health (bitrate drops, encoder reconnects) periodically or on notable
+    events. Proportionate for weight-2: bounded recent-samples list on the
+    stream row, not a time-series store this codebase has no infrastructure
+    for. Surfaced back via ChannelLiveStreamSerializer.health_status for a
+    "last known health" read, not a full chart - that's beyond this pass's
+    scope."""
+
+    permission_classes = [IsAuthenticated]
+    _MAX_SAMPLES = 20
+
+    def post(self, request, stream_id):
+        live = get_object_or_404(ChannelLiveStream, id=stream_id)
+        if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
+            raise PermissionDenied("You cannot report health for this live stream.")
+        health_status = str(request.data.get("status") or "").strip().lower()
+        if health_status not in {"good", "degraded", "error"}:
+            return Response({"detail": "status must be one of: good, degraded, error"}, status=400)
+        detail = str(request.data.get("detail") or "").strip()[:300]
+
+        samples = list((live.metadata or {}).get("health_samples") or [])
+        samples.append({"status": health_status, "detail": detail, "at": timezone.now().isoformat()})
+        samples = samples[-self._MAX_SAMPLES:]
+        live.metadata = {**(live.metadata or {}), "health_samples": samples}
+        live.save(update_fields=["metadata", "updated_at"])
+        return Response({"ok": True})
+
+
+class LiveStreamPlaybackEventView(APIView):
+    """Viewer-side: reports a playback failure/stall so these show up
+    somewhere instead of only ever existing as a client-local retry (see
+    LiveWatchPage.tsx's onError/retry path, added earlier this session).
+    Minimal counters, no per-event row store - proportionate for weight-2."""
+
+    permission_classes = [AllowAny]
+    _VALID_EVENTS = {"startup_failure", "buffering_stall", "playback_error"}
+
+    def post(self, request, stream_id):
+        get_object_or_404(ChannelLiveStream, id=stream_id)
+        event = str(request.data.get("event") or "").strip().lower()
+        if event not in self._VALID_EVENTS:
+            return Response({"detail": f"event must be one of: {', '.join(sorted(self._VALID_EVENTS))}"}, status=400)
+        reason = str(request.data.get("reason") or "").strip()[:300]
+
+        from django.db.models import F
+        ChannelLiveStream.objects.filter(id=stream_id).update(
+            playback_error_count=F("playback_error_count") + 1,
+        )
+        live = ChannelLiveStream.objects.filter(id=stream_id).only("id", "metadata").first()
+        if live is not None:
+            live.metadata = {
+                **(live.metadata or {}),
+                "last_playback_event": {"event": event, "reason": reason, "at": timezone.now().isoformat()},
+            }
+            live.save(update_fields=["metadata", "updated_at"])
+        return Response({"ok": True})
 
 
 # ── Task 1a: My Reactions ─────────────────────────────────────────────────────
@@ -20953,9 +21454,29 @@ class ChannelLiveStreamWhipView(APIView):
 
 class ChannelLiveStreamChatHistoryView(APIView):
     permission_classes = [AllowAny]
+    throttle_scope = "broadcast_live_chat"
+
+    def get_throttles(self):
+        # Only sends are rate-limited (spam/flood risk) - history reads
+        # (GET, e.g. a panel's initial load or scrollback) aren't a spam
+        # vector and viewers may legitimately re-fetch more often than the
+        # send limit would tolerate.
+        if self.request and self.request.method == "POST":
+            return [ScopedRateThrottle()]
+        return []
 
     def get(self, request, stream_id):
         stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel"), id=stream_id)
+        # SECURITY: this REST path (history reads, and posts below) bypasses
+        # the socket-join visibility check entirely - without this, anyone,
+        # including an unauthenticated client, could read a private/
+        # members-only channel's live chat straight off this endpoint even
+        # though channel.live.join (live.ts) and ChannelLiveStreamCanViewView
+        # already enforce the same "public, or a manager of a private
+        # channel" rule for the socket path. Same 404-not-403 hide-not-reveal
+        # posture as ChannelLiveStreamDetailView.get for consistency.
+        if not stream.channel.is_public and not _user_can_manage_channel(request.user, stream.channel):
+            raise Http404
         limit = min(int(request.query_params.get("limit", 100) or 100), 500)
         before_id = request.query_params.get("before")
         qs = LiveChatMessage.objects.filter(stream=stream, is_deleted=False)
@@ -20964,6 +21485,24 @@ class ChannelLiveStreamChatHistoryView(APIView):
                 qs = qs.filter(id__lt=int(before_id))
             except (ValueError, TypeError):
                 pass
+        # Per-viewer block filter: this is deliberately NOT the same check as
+        # _channel_blocks_user above (that's channel-owner-vs-poster, applied
+        # globally to who may even see/post in this room at all). This is a
+        # personal, per-reader filter - two ordinary viewers who've blocked
+        # each other shouldn't see each other's messages, but that has no
+        # bearing on whether either of them can see the stream itself.
+        if request.user.is_authenticated:
+            blocked_pair_ids = set(
+                UserBlock.objects.filter(
+                    Q(blocker_id=request.user.id) | Q(blocked_id=request.user.id)
+                ).values_list("blocker_id", "blocked_id")
+            )
+            blocked_other_ids = {
+                (b if a == request.user.id else a)
+                for a, b in blocked_pair_ids
+            }
+            if blocked_other_ids:
+                qs = qs.exclude(user_id__in=blocked_other_ids)
         messages = list(qs.order_by("-created_at")[:limit])
         messages.reverse()
         # Member badge - bulk-fetched once for the whole page instead of a
@@ -20995,11 +21534,19 @@ class ChannelLiveStreamChatHistoryView(APIView):
 
     def post(self, request, stream_id):
         """Persist a chat message (called by the NestJS gateway or directly)."""
-        stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel"), id=stream_id)
+        if not stream.channel.is_public and not _user_can_manage_channel(request.user, stream.channel):
+            raise Http404
         message_text = str(request.data.get("message") or "").strip()[:1000]
         if not message_text:
             return Response({"error": "message required"}, status=400)
         user = request.user if request.user.is_authenticated else None
+        if user:
+            ban = ChannelChatBan.objects.filter(channel=stream.channel, user=user).first()
+            if ban and ban.is_active():
+                return Response({"error": "You are banned from chatting in this channel."}, status=403)
+            if _channel_blocks_user(stream.channel, user):
+                return Response({"error": "You cannot post in this channel's chat."}, status=403)
         # SECURITY: an authenticated user's display_name always comes from
         # their own account, never the request body - otherwise a logged-in
         # attacker could impersonate any other user/creator's name in a
@@ -21028,6 +21575,115 @@ class ChannelLiveStreamChatHistoryView(APIView):
             "created_at": msg.created_at.isoformat(),
             "is_member": is_member,
         }, status=201)
+
+
+class ChannelLiveChatMessageModerationView(APIView):
+    """Mirrors ChannelContentCommentModerationView's delete(manager-or-own)/
+    post(report) split exactly, for live chat messages instead of VOD
+    comments - same ChannelModerationRecord/ModerationFlag trail, just a
+    different target_type."""
+
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, stream_id, message_id):
+        msg = get_object_or_404(
+            LiveChatMessage.objects.select_related("stream__channel"),
+            id=message_id, stream_id=stream_id, is_deleted=False,
+        )
+        if not (_user_can_manage_channel(request.user, msg.stream.channel) or msg.user_id == getattr(request.user, "id", None)):
+            raise PermissionDenied("You cannot remove this message.")
+        msg.is_deleted = True
+        msg.save(update_fields=["is_deleted"])
+        ChannelModerationRecord.objects.create(
+            channel=msg.stream.channel,
+            target_type=ChannelModerationRecord.TargetType.LIVE_CHAT_MESSAGE,
+            target_id=msg.id,
+            actor=request.user,
+            status=ChannelModerationRecord.Status.ACTIONED,
+            action=ChannelModerationRecord.Action.REMOVE,
+            reason="Live chat message removed",
+            resolved_at=timezone.now(),
+        )
+        _channel_audit(request, action="channel_live_chat.remove", target_type="live_chat_message", target_id=msg.id, metadata={"stream_id": str(stream_id)})
+        from apps.broadcasts.realtime import notify_live_chat_message_deleted
+        notify_live_chat_message_deleted(stream_id, message_id=msg.id)
+        return Response({"removed": True})
+
+    def post(self, request, stream_id, message_id):
+        msg = get_object_or_404(LiveChatMessage, id=message_id, stream_id=stream_id, is_deleted=False)
+        reason = str(request.data.get("reason") or "Reported by viewer").strip()[:1000]
+        record = ChannelModerationRecord.objects.create(
+            channel_id=msg.stream.channel_id,
+            target_type=ChannelModerationRecord.TargetType.LIVE_CHAT_MESSAGE,
+            target_id=msg.id,
+            reporter=request.user,
+            reason=reason,
+        )
+        try:
+            ModerationFlag.objects.create(
+                source="USER",
+                target_type="LIVE_CHAT_MESSAGE",
+                target_id=msg.id,
+                reporter_id=request.user.id,
+                reason=reason,
+                severity="MEDIUM",
+                tags={"channel_moderation_record_id": str(record.id), "stream_id": str(stream_id)},
+            )
+        except Exception:
+            logger.exception("Unable to mirror live chat message report into moderation flags")
+        _channel_audit(request, action="channel_live_chat.report", target_type="live_chat_message", target_id=msg.id, metadata={"record_id": str(record.id)})
+        return Response({"reported": True, "id": str(record.id)}, status=status.HTTP_201_CREATED)
+
+
+class ChannelLiveChatBansView(APIView):
+    """Manager-only: ban/list banned chatters for a channel's live chat.
+    Separate from UserBlock - see ChannelChatBan's docstring (models.py) for
+    why this is a one-way channel-moderation action, not a mutual personal
+    block."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot view this channel's chat bans.")
+        bans = ChannelChatBan.objects.filter(channel=channel).select_related("user")
+        return Response({
+            "results": [
+                {
+                    "id": str(b.id),
+                    "user_id": str(b.user_id),
+                    "display_name": b.user.display_name or b.user.username or "",
+                    "expires_at": b.expires_at.isoformat() if b.expires_at else None,
+                    "is_active": b.is_active(),
+                }
+                for b in bans
+            ]
+        })
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot ban users from this channel's chat.")
+        target_user_id = str(request.data.get("user_id") or "").strip()
+        if not target_user_id:
+            raise ValidationError({"user_id": "user_id is required."})
+        expires_at = _content_datetime_from_request(request.data.get("expires_at")) if request.data.get("expires_at") else None
+        ban, _ = ChannelChatBan.objects.update_or_create(
+            channel=channel, user_id=target_user_id,
+            defaults={"expires_at": expires_at, "created_by": request.user},
+        )
+        _channel_audit(request, action="channel_live_chat.ban", target_type="user", target_id=target_user_id, metadata={"channel_id": str(channel_id), "expires_at": request.data.get("expires_at")})
+        return Response({"id": str(ban.id), "user_id": str(ban.user_id), "expires_at": ban.expires_at.isoformat() if ban.expires_at else None}, status=status.HTTP_201_CREATED)
+
+    def delete(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot unban users from this channel's chat.")
+        target_user_id = str(request.query_params.get("user_id") or "").strip()
+        deleted, _ = ChannelChatBan.objects.filter(channel=channel, user_id=target_user_id).delete()
+        _channel_audit(request, action="channel_live_chat.unban", target_type="user", target_id=target_user_id, metadata={"channel_id": str(channel_id)})
+        return Response({"removed": bool(deleted)})
 
 
 # ── Task 2b: Trending endpoint ────────────────────────────────────────────────

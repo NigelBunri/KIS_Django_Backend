@@ -500,7 +500,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
             # This indicates corrupted state; better to fail loudly than create ghost conversations.
             raise PermissionDenied("You are not a member of this conversation.")
 
-        data = ConversationDetailSerializer(conversation).data
+        data = ConversationDetailSerializer(conversation, context={'request': request}).data
         return Response(
             data,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
@@ -575,7 +575,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                     status=403,
                 )
 
-        return Response(ConversationMemberSerializer(member).data, status=201)
+        return Response(ConversationMemberSerializer(member, context={'request': request}).data, status=201)
 
     def _resolve_conversation_community(self, conversation):
         """
@@ -673,7 +673,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                     conversation_id__in=other_conversation_ids, user_id=user_id, left_at__isnull=True,
                 ).update(left_at=timezone.now())
 
-        return Response(ConversationMemberSerializer(member).data, status=200)
+        return Response(ConversationMemberSerializer(member, context={'request': request}).data, status=200)
 
     @action(detail=True, methods=['post'], url_path='members/role')
     def set_member_role(self, request, pk=None):
@@ -752,7 +752,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                     cm.role = community_role
                     cm.save(update_fields=["role"])
 
-        return Response(ConversationMemberSerializer(member).data, status=200)
+        return Response(ConversationMemberSerializer(member, context={'request': request}).data, status=200)
 
     # ------------------------------------------------------------------
     # Settings
@@ -787,7 +787,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.request_accepted_at = timezone.now()
         conversation.save(update_fields=['request_state', 'request_accepted_at'])
 
-        return Response(ConversationDetailSerializer(conversation).data, status=200)
+        return Response(ConversationDetailSerializer(conversation, context={'request': request}).data, status=200)
 
     @action(detail=True, methods=['post'], url_path='block_chat')
     def block_chat(self, request, pk=None):
@@ -805,7 +805,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.is_locked = True
         conversation.locked_by = request.user
         conversation.save(update_fields=['is_locked', 'locked_by'])
-        response = ConversationDetailSerializer(conversation).data
+        response = ConversationDetailSerializer(conversation, context={'request': request}).data
         return Response(response, status=200)
 
     @action(detail=True, methods=['post'], url_path='archive')
@@ -818,7 +818,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.is_archived = bool(archived)
         conversation.archived_by = request.user if archived else None
         conversation.save(update_fields=['is_archived', 'archived_by'])
-        return Response(ConversationDetailSerializer(conversation).data, status=200)
+        return Response(ConversationDetailSerializer(conversation, context={'request': request}).data, status=200)
 
     def _current_member_for_action(self, request, conversation):
         member = ConversationMember.objects.filter(
@@ -904,7 +904,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.is_locked = bool(locked)
         conversation.locked_by = request.user if locked else None
         conversation.save(update_fields=['is_locked', 'locked_by'])
-        return Response(ConversationDetailSerializer(conversation).data, status=200)
+        return Response(ConversationDetailSerializer(conversation, context={'request': request}).data, status=200)
 
     # ------------------------------------------------------------------
     # 🔐 INTERNAL: last-message update (called by NestJS)

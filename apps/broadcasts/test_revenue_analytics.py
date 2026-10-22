@@ -31,6 +31,8 @@ from .models import (
     ChannelAdSlot,
     ChannelContent,
     ChannelContentTip,
+    ChannelLiveStream,
+    ChannelLiveStreamTip,
     ChannelMembership,
     ChannelMembershipTier,
 )
@@ -108,3 +110,85 @@ class ChannelRevenueAnalyticsTests(TestCase):
         res = self.client.get(f"/api/v1/broadcasts/channels/{self.channel.id}/revenue/")
 
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class ChannelRevenueAnalyticsLiveTipsTests(TestCase):
+    """F4: super_chat_amount/count (live-stream tips) were already
+    aggregated separately from super_thanks_amount/count (VOD content
+    tips) in the view itself, but no test ever exercised that - this
+    file's existing coverage only ever created ChannelContentTip rows, so
+    a regression in the live-tip branch (e.g. the wrong FK, the wrong
+    status filter) could ship unnoticed. These prove both sources are
+    kept distinct AND correctly summed into total_estimated_cents
+    together, plus the zero-revenue honesty case (0, not missing/null)."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(phone="+2349170000010", password="pw123456", country="NG")
+        self.tipper = User.objects.create_user(phone="+2349170000011", password="pw123456", country="NG")
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=self.owner.id, owner_user=self.owner,
+            handle="live-revenue-channel", display_name="Live Revenue Channel", is_public=True,
+        )
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.owner, role=BroadcastChannelRole.Role.OWNER)
+        self.live = ChannelLiveStream.objects.create(channel=self.channel, title="Revenue stream")
+        self.client = APIClient()
+
+    def test_super_chat_is_counted_separately_from_super_thanks_and_both_sum_into_total(self):
+        content = ChannelContent.objects.create(
+            channel=self.channel, content_type="video", title="VOD", created_by=self.owner,
+        )
+        ChannelContentTip.objects.create(
+            content=content, user=self.tipper, amount_cents=500,
+            status=ChannelContentTip.Status.COMPLETED,
+        )
+        ChannelLiveStreamTip.objects.create(
+            live_stream=self.live, user=self.tipper, amount_cents=1200,
+            status=ChannelLiveStreamTip.Status.COMPLETED,
+        )
+        # A pending live tip must not count as revenue yet.
+        ChannelLiveStreamTip.objects.create(
+            live_stream=self.live, user=self.tipper, amount_cents=9999,
+            status=ChannelLiveStreamTip.Status.PENDING,
+        )
+        self.client.force_authenticate(self.owner)
+
+        res = self.client.get(f"/api/v1/broadcasts/channels/{self.channel.id}/revenue/")
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["super_thanks_amount"], 500)
+        self.assertEqual(res.data["super_chat_amount"], 1200)
+        self.assertEqual(res.data["super_chat_count"], 1)
+        self.assertEqual(res.data["total_estimated_cents"], 500 + 1200)
+
+    def test_live_tip_outside_the_period_window_is_excluded(self):
+        old_tip = ChannelLiveStreamTip.objects.create(
+            live_stream=self.live, user=self.tipper, amount_cents=777,
+            status=ChannelLiveStreamTip.Status.COMPLETED,
+        )
+        old_tip.created_at = timezone.now() - timezone.timedelta(days=60)
+        old_tip.save(update_fields=["created_at"])
+        self.client.force_authenticate(self.owner)
+
+        res_7d = self.client.get(f"/api/v1/broadcasts/channels/{self.channel.id}/revenue/?period=7d")
+        res_90d = self.client.get(f"/api/v1/broadcasts/channels/{self.channel.id}/revenue/?period=90d")
+
+        self.assertEqual(res_7d.data["super_chat_amount"], 0)
+        self.assertEqual(res_90d.data["super_chat_amount"], 777)
+
+    def test_zero_revenue_channel_reports_real_zeros_not_missing_fields(self):
+        """Honesty bar mirrors test_impressions_analytics_honesty.py's
+        standard elsewhere in this app: a channel that has genuinely never
+        earned anything must see explicit 0s it can trust, not an absent
+        key or a null that could be confused with "not yet computed"."""
+        self.client.force_authenticate(self.owner)
+
+        res = self.client.get(f"/api/v1/broadcasts/channels/{self.channel.id}/revenue/")
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        for field in (
+            "super_thanks_amount", "super_thanks_count", "super_chat_amount", "super_chat_count",
+            "memberships_active", "memberships_est_monthly", "ad_impressions", "ad_revenue_cents",
+            "total_estimated_cents",
+        ):
+            self.assertIn(field, res.data)
+            self.assertEqual(res.data[field], 0)

@@ -132,6 +132,31 @@ def notify_channel_subscribed(channel, user_id, *, subscribed: bool) -> None:
     )
 
 
+def notify_live_stream_status_changed(live) -> None:
+    """Pushes a status transition (live/ended) into the stream's own
+    `stream:<streamId>` room (C6 of the YouTube-parity batch) - distinct
+    from notify_channel_live_started/_ended above, which notify
+    *subscribers* (a per-user audience, for push notifications to people
+    not currently watching). This reaches people ALREADY on LiveWatchPage,
+    already joined via channel.live.join, who were previously only finding
+    out about a status change on their next REST poll tick. Callers are
+    responsible for the same go-live honesty gating _notify_live_started
+    already enforces - this function itself does not re-derive that."""
+    notify_nest_of_live_stream_broadcast(
+        stream_id=live.id,
+        event="channel.live.status_changed",
+        payload={"streamId": str(live.id), "status": live.status},
+    )
+
+
+def notify_live_chat_message_deleted(stream_id, *, message_id) -> None:
+    notify_nest_of_live_stream_broadcast(
+        stream_id=stream_id,
+        event="channel.chat.message_deleted",
+        payload={"streamId": str(stream_id), "id": str(message_id)},
+    )
+
+
 def notify_live_chat_message(stream_id, *, message, is_member: bool = False) -> None:
     notify_nest_of_live_stream_broadcast(
         stream_id=stream_id,

@@ -550,6 +550,7 @@ class ChannelContentListSerializer(serializers.ModelSerializer):
             "shares": int(stats.get("shares") or 0),
             "comments": int(stats.get("comments") or 0),
             "reactions": int(stats.get("reactions") or 0),
+            "dislikes": int(stats.get("dislikes") or 0),
         }
 
     def _active_broadcast(self, obj: ChannelContent):
@@ -801,7 +802,14 @@ class ChannelLiveStreamSerializer(serializers.ModelSerializer):
     # let anyone who can view a public live stream also hijack its ingest.
     _INTERNAL_METADATA_KEYS = frozenset({
         "whip_url", "provider_raw", "stream_key", "raw_stream_key_returned",
+        # Exposed instead via dedicated health_status/health_updated_at
+        # fields below (a clean "last known status" summary) rather than
+        # leaking the full raw sample history to every public viewer.
+        "health_samples", "last_playback_event",
     })
+
+    health_status = serializers.SerializerMethodField()
+    health_updated_at = serializers.SerializerMethodField()
 
     class Meta:
         model = ChannelLiveStream
@@ -822,13 +830,27 @@ class ChannelLiveStreamSerializer(serializers.ModelSerializer):
             "playback_url",
             "replay_url",
             "thumbnail_url",
+            "thumbnail_media_type",
             "viewer_count",
             "peak_viewer_count",
+            "total_view_count",
+            "total_watch_seconds",
+            "playback_error_count",
+            "health_status",
+            "health_updated_at",
             "metadata",
             "created_at",
             "updated_at",
         ]
         read_only_fields = fields
+
+    def get_health_status(self, obj: ChannelLiveStream) -> str:
+        samples = (obj.metadata or {}).get("health_samples") or []
+        return samples[-1]["status"] if samples else ""
+
+    def get_health_updated_at(self, obj: ChannelLiveStream) -> str:
+        samples = (obj.metadata or {}).get("health_samples") or []
+        return samples[-1]["at"] if samples else ""
 
     def _can_view_ingest_details(self, obj: ChannelLiveStream) -> bool:
         request = self.context.get("request")

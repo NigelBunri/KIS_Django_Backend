@@ -640,6 +640,11 @@ REST_FRAMEWORK = {
         # per-viewer dedup window in the view itself which stops the more
         # common single-script-hammering-one-endpoint abuse.
         "broadcast_view_event": _env_throttle_rate("THROTTLE_BROADCAST_VIEW_EVENT", dev_default="6000/min", prod_default="120/min"),
+        # Live chat is a single shared, high-visibility room per stream, so
+        # spam is more damaging there than in 1:1 "messaging" (1200/min) -
+        # narrower than that general scope, same order of magnitude as
+        # broadcast_view_event's conservative-but-not-brute-force-level posture.
+        "broadcast_live_chat": _env_throttle_rate("THROTTLE_BROADCAST_LIVE_CHAT", dev_default="6000/min", prod_default="30/min"),
         "messaging": _env_throttle_rate("THROTTLE_MESSAGING", dev_default="6000/min", prod_default="1200/min"),
         # Trusted-internal Nest->Django chat-voice URL signing. Keyed by IP
         # (AllowAny + internal-token auth means there's no request.user) -
@@ -964,6 +969,26 @@ CELERY_BEAT_SCHEDULE = {
     "purge-expired-broadcasts": {
         "task": "apps.broadcasts.tasks.purge_expired_broadcasts_task",
         "schedule": 24 * 60 * 60,
+    },
+    # Scheduled live-stream reminders (apps/broadcasts/tasks.py
+    # send_live_stream_reminders_task) - there was previously no reminder at
+    # all before a scheduled stream went live, only the go-live notification
+    # itself. 5-minute cadence against a 15-minute window gives every
+    # stream 2-3 chances to be caught before the window closes, without
+    # needing per-stream one-off scheduling the way the Education
+    # satisfaction-deadline task does.
+    "send-live-stream-reminders": {
+        "task": "apps.broadcasts.tasks.send_live_stream_reminders_task",
+        "schedule": 5 * 60,
+    },
+    # Fails stale provider-backed live streams (apps/broadcasts/tasks.py
+    # fail_stale_live_streams_task) - without this, a stream whose encoder
+    # never actually connected after Start was tapped stayed LIVE forever
+    # (Status.FAILED existed on the model but nothing ever set it). Same
+    # 5-minute cadence as the reminder task against a 10-minute timeout.
+    "fail-stale-live-streams": {
+        "task": "apps.broadcasts.tasks.fail_stale_live_streams_task",
+        "schedule": 5 * 60,
     },
     # purge_expired_statuses existed as a real, working function and
     # management command (apps/statuses/management/commands/

@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
@@ -173,6 +175,103 @@ def purge_expired_broadcasts_task():
     from .services import cleanup_expired_broadcast_items
 
     return {"deleted": cleanup_expired_broadcast_items()}
+
+
+@shared_task
+def send_live_stream_reminders_task(window_minutes: int = 15, limit: int = 500):
+    """Finds scheduled live streams starting within the next
+    `window_minutes` and sends a one-time "starting soon" reminder to
+    subscribers. Mirrors the exact dedup pattern ChannelLiveStreamWebhookView
+    already uses for the live-started notification (a metadata flag, not a
+    separate tracking model) so a stream is never reminded twice across
+    repeated beat ticks. Deliberately a single fixed window rather than
+    multiple reminder tiers (e.g. 1h + 15m) - this is the first reminder
+    this app has ever sent for live streams; a single well-chosen window is
+    enough to start, more tiers can follow if creators ask for them."""
+    from .models import BroadcastChannel, ChannelLiveStream
+    from .views import _notify_channel_subscribers
+
+    cutoff = timezone.now() + timedelta(minutes=window_minutes)
+    candidates = list(
+        ChannelLiveStream.objects.select_related("channel")
+        .filter(
+            status=ChannelLiveStream.Status.SCHEDULED,
+            scheduled_start_at__isnull=False,
+            scheduled_start_at__lte=cutoff,
+            scheduled_start_at__gte=timezone.now(),
+        )
+        .order_by("scheduled_start_at")[:limit]
+    )
+    reminded = 0
+    for live in candidates:
+        if (live.metadata or {}).get("reminder_sent"):
+            continue
+        _notify_channel_subscribers(
+            live.channel,
+            notification_type="CHANNEL_LIVE_REMINDER",
+            title=f"{live.channel.display_name} goes live soon",
+            body=live.title,
+            target_type="channel_live_stream",
+            target_id=live.id,
+        )
+        live.metadata = {**(live.metadata or {}), "reminder_sent": True}
+        live.save(update_fields=["metadata", "updated_at"])
+        reminded += 1
+    return {"candidates": len(candidates), "reminded": reminded}
+
+
+@shared_task
+def fail_stale_live_streams_task(timeout_minutes: int = 10, limit: int = 500):
+    """Finds provider-backed live streams where the creator tapped Start
+    (status=LIVE, started_at set) more than `timeout_minutes` ago but no
+    webhook ever confirmed real ingest (metadata["subscribers_notified"] -
+    the same flag ChannelLiveStreamWebhookView sets on its first confirmed
+    "live" event - is still falsy). Marks these FAILED rather than leaving
+    them stuck LIVE forever with a dead encoder. Deliberately excludes
+    provider="disabled" streams: that path notifies subscribers immediately
+    on Start (see ChannelLiveStreamStartView) because no webhook will ever
+    arrive for it by design, so "no webhook yet" is never a failure signal
+    there. Only notifies the creator, not subscribers - nothing was ever
+    actually live, so there's nothing to tell the audience."""
+    from .models import ChannelLiveStream
+
+    cutoff = timezone.now() - timedelta(minutes=timeout_minutes)
+    candidates = list(
+        ChannelLiveStream.objects.select_related("channel")
+        .exclude(provider="disabled")
+        .exclude(provider="")
+        .filter(
+            status=ChannelLiveStream.Status.LIVE,
+            started_at__isnull=False,
+            started_at__lte=cutoff,
+        )
+        .order_by("started_at")[:limit]
+    )
+    failed = 0
+    for live in candidates:
+        if (live.metadata or {}).get("subscribers_notified"):
+            continue
+        live.status = ChannelLiveStream.Status.FAILED
+        live.ended_at = live.ended_at or timezone.now()
+        live.save(update_fields=["status", "ended_at", "updated_at"])
+        if live.created_by_id:
+            try:
+                from apps.notifications import services as notification_services
+                notification_services.create_notification(
+                    user_id=live.created_by_id,
+                    type="CHANNEL_LIVE_FAILED",
+                    title="Your live stream couldn't start",
+                    body=f"\"{live.title}\" never connected to the streaming server. Please try again.",
+                    target_type="channel_live_stream",
+                    target_id=live.id,
+                    priority="HIGH",
+                    dedup_key=f"CHANNEL_LIVE_FAILED:{live.id}",
+                    context={"channel_id": str(live.channel_id), "live_id": str(live.id)},
+                )
+            except Exception:
+                pass
+        failed += 1
+    return {"candidates": len(candidates), "failed": failed}
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=30)
