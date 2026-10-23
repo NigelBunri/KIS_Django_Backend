@@ -173,9 +173,19 @@ def _resolve_channel_avatar(obj: "BroadcastChannel") -> tuple[str, str, str]:
     if owner_type == BroadcastChannel.OwnerType.USER and obj.owner_user and is_platform_go(obj.owner_user):
         return "logo", _kis_official_logo_url(), ""
 
+    # CONFIRMED ROOT CAUSE of "logo/cover uploaded fine but only ever shows
+    # the download placeholder, never the actual image": avatar_url stores
+    # the exact presigned GET URL _attach_channel_image generated at
+    # confirm time (see apps/media/upload_intent.py), which expires after
+    # _presign_expiry_seconds() (600s default) - returning it raw here
+    # meant every client that fetched this channel's data more than ~10
+    # minutes after the upload got a 403'ing, dead URL with no way to
+    # know it had gone stale. resolve_stale_media_url re-signs a fresh one
+    # from the embedded object key on every single call, exactly like
+    # get_banner_url already does for banner_url two methods below.
     custom_avatar = str(obj.avatar_url or "").strip()
     if custom_avatar:
-        return "photo", custom_avatar, ""
+        return "photo", resolve_stale_media_url(custom_avatar), ""
 
     if owner_type == BroadcastChannel.OwnerType.USER:
         user = obj.owner_user

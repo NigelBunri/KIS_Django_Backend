@@ -308,6 +308,27 @@ class BroadcastChannelModelTests(APITestCase):
         self.assertEqual(data['avatar_kind'], 'photo')
         self.assertEqual(data['avatar_display_url'], 'https://example.com/me.jpg')
 
+    def test_channels_own_custom_avatar_url_is_re_signed_not_returned_stale(self):
+        # CONFIRMED ROOT CAUSE of "logo uploaded fine, only ever shows the
+        # download placeholder, never the image": channel.avatar_url stores
+        # a presigned S3 URL that expires after ~10 minutes (see
+        # apps/media/upload_intent.py's _attach_channel_image). Returning
+        # that raw stored value here meant avatar_display_url was already
+        # dead by the time any client fetched the channel more than a few
+        # minutes after upload. Must go through resolve_stale_media_url,
+        # exactly like get_banner_url already does for banner_url.
+        channel = self._create_channel()
+        channel.avatar_url = 'https://kis-media.s3.eu-west-2.amazonaws.com/private/channel/avatar/x/y.jpg?X-Amz-Expires=600&X-Amz-Signature=stale'
+        channel.save(update_fields=['avatar_url'])
+
+        with patch('apps.broadcasts.serializers.resolve_stale_media_url') as mock_resolve:
+            mock_resolve.return_value = 'https://kis-media.s3.eu-west-2.amazonaws.com/private/channel/avatar/x/y.jpg?X-Amz-Expires=600&X-Amz-Signature=fresh'
+            data = BroadcastChannelSummarySerializer(channel, context={'user': self.viewer}).data
+
+        mock_resolve.assert_any_call(channel.avatar_url)
+        self.assertEqual(data['avatar_kind'], 'photo')
+        self.assertEqual(data['avatar_display_url'], mock_resolve.return_value)
+
     def test_regular_user_channel_falls_back_to_initials_without_a_photo(self):
         profile, _ = Profile.objects.get_or_create(user=self.user)
         profile.avatar_url = ''
