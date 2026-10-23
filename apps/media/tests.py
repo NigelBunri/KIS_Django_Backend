@@ -688,6 +688,40 @@ class ChannelBrandingImageUploadTests(APITestCase):
         self.channel.refresh_from_db()
         self.assertEqual(self.channel.banner_url, _MOCK_PRESIGNED_URL)
 
+    def test_avatar_url_survives_a_realistically_long_presigned_url(self, mock_client):
+        # CONFIRMED ROOT CAUSE of every real channel logo/cover upload
+        # failing in production (reproduced end-to-end against the real
+        # server, not just mocks): BroadcastChannel.avatar_url/banner_url
+        # used Django's default URLField max_length=200, but a real AWS
+        # SigV4 presigned GET URL (X-Amz-Credential/Date/Expires/
+        # SignedHeaders/Signature query string) routinely runs 250-400+
+        # characters - every confirm() call hit a Postgres "value too long
+        # for type character varying(200)". The shared _mock_s3_client()'s
+        # fixed ~85-char URL never exercised this path, which is exactly
+        # why the original test suite never caught it - this test uses a
+        # realistic-length URL specifically so the regression can't come
+        # back silently.
+        realistic_presigned_url = (
+            "https://kis-production-media.s3.eu-west-2.amazonaws.com/"
+            "private/channel/avatar/6494dc6b-a4b0-4a62-85fc-285ddb84b057/"
+            "1e643f60da0841dfa6483fbe02ec641c.jpg"
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            "&X-Amz-Credential=AKIAABCDEFGHIJKLMNOP%2F20261023%2Feu-west-2%2Fs3%2Faws4_request"
+            "&X-Amz-Date=20261023T130000Z&X-Amz-Expires=600"
+            "&X-Amz-SignedHeaders=host"
+            "&X-Amz-Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        self.assertGreater(len(realistic_presigned_url), 200)
+        mock_client.return_value = _mock_s3_client(generate_presigned_url=MagicMock(return_value=realistic_presigned_url))
+        response = self._initiate(context="channel_avatar", target_id=str(self.channel.id))
+        upload_id = response.data["upload_id"]
+
+        confirm_response = self.client.post(self._confirm_url(upload_id), {}, format="json")
+
+        self.assertEqual(confirm_response.status_code, 200, confirm_response.data)
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.avatar_url, realistic_presigned_url)
+
     def test_non_manager_cannot_attach_even_if_they_know_the_channel_id(self, mock_client):
         mock_client.return_value = _mock_s3_client()
         response = self._initiate(user=self.other, context="channel_avatar", target_id=str(self.channel.id))
