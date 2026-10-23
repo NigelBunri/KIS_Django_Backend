@@ -26,7 +26,7 @@ from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import serializers, status
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import SAFE_METHODS, AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
@@ -18375,6 +18375,68 @@ class ChannelContentChapterDetailView(APIView):
         return Response(ChannelContentChapterSerializer(chapter).data)
 
 
+def _serialize_channel_manager(role: "BroadcastChannelRole") -> dict:
+    user = role.user
+    return {
+        "user_id": str(user.id),
+        "display_name": getattr(user, "display_name", "") or getattr(user, "username", "") or "",
+        "phone": getattr(user, "phone", "") or "",
+        "role": role.role,
+    }
+
+
+class BroadcastChannelManagersView(APIView):
+    """List/invite channel managers. Only the channel's OWNER (not just any
+    manager) may invite or remove another manager - mirrors the model this
+    feature is benchmarked against, where only the channel owner controls
+    who else has access, preventing a chain of managers granting each other
+    access the original owner never approved. Any current manager may view
+    the list (GET) - that alone can't change who has access."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if not _user_can_manage_channel(request.user, channel):
+            raise PermissionDenied("You cannot view this channel's managers.")
+        roles = BroadcastChannelRole.objects.filter(channel=channel).select_related("user").order_by("role", "created_at")
+        return Response({"results": [_serialize_channel_manager(role) for role in roles]})
+
+    def post(self, request, channel_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if _user_channel_role(request.user, channel) not in {"staff", BroadcastChannelRole.Role.OWNER}:
+            raise PermissionDenied("Only this channel's owner can add a manager.")
+        phone = str(request.data.get("phone") or "").strip()
+        if not phone:
+            raise ValidationError({"phone": "A phone number is required."})
+        candidate = User.objects.filter(phone=phone).first()
+        if not candidate:
+            raise NotFound("No KIS account was found with that phone number.")
+        if candidate.id == channel.owner_user_id:
+            raise ValidationError({"detail": "This person already owns the channel."})
+        role, created = BroadcastChannelRole.objects.get_or_create(
+            channel=channel, user=candidate, role=BroadcastChannelRole.Role.MANAGER,
+        )
+        if not created:
+            raise ValidationError({"detail": "This person is already a manager of this channel."})
+        return Response(_serialize_channel_manager(role), status=status.HTTP_201_CREATED)
+
+
+class BroadcastChannelManagerDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, channel_id, user_id):
+        channel = get_object_or_404(BroadcastChannel, id=channel_id, is_deleted=False)
+        if _user_channel_role(request.user, channel) not in {"staff", BroadcastChannelRole.Role.OWNER}:
+            raise PermissionDenied("Only this channel's owner can remove a manager.")
+        if str(channel.owner_user_id or "") == str(user_id):
+            raise ValidationError({"detail": "The channel owner cannot be removed."})
+        deleted, _ = BroadcastChannelRole.objects.filter(channel=channel, user_id=user_id).exclude(role=BroadcastChannelRole.Role.OWNER).delete()
+        if not deleted:
+            raise NotFound("This person does not manage this channel.")
+        return Response({"removed": True})
+
+
 class BroadcastChannelModerationQueueView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -18563,6 +18625,59 @@ class BroadcastPlaylistItemDetailView(APIView):
             raise PermissionDenied("You cannot manage this playlist.")
         deleted, _ = BroadcastPlaylistItem.objects.filter(playlist=playlist, content_id=content_id).delete()
         return Response({"removed": bool(deleted)})
+
+
+class BroadcastPlaylistDetailView(APIView):
+    """GET/PATCH/DELETE a single playlist - the piece BroadcastPlaylistItemView
+    (reorder + shuffle_enabled only) and BroadcastPlaylistListCreateView
+    (list + create only) never covered: there was no way to rename a
+    playlist, edit its description, change its visibility, or delete it
+    once created. Mirrors those two views' exact permission shape (AllowAny
+    read gated by visibility/manage-rights, manage-rights required to
+    write) rather than introducing a new convention."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, playlist_id):
+        playlist = get_object_or_404(BroadcastPlaylist.objects.select_related("channel"), id=playlist_id)
+        can_manage = _user_can_manage_channel(request.user, playlist.channel)
+        if playlist.visibility != BroadcastPlaylist.Visibility.PUBLIC and not can_manage:
+            raise Http404
+        return Response(BroadcastPlaylistSerializer(playlist, context={"request": request}).data)
+
+    def patch(self, request, playlist_id):
+        playlist = get_object_or_404(BroadcastPlaylist.objects.select_related("channel"), id=playlist_id)
+        if not _user_can_manage_channel(request.user, playlist.channel):
+            raise PermissionDenied("You cannot manage this playlist.")
+        update_fields = []
+        if "title" in request.data:
+            title = str(request.data.get("title") or "").strip()[:160]
+            if not title:
+                raise ValidationError({"title": "Playlist title is required."})
+            playlist.title = title
+            update_fields.append("title")
+        if "description" in request.data:
+            playlist.description = str(request.data.get("description") or "").strip()
+            update_fields.append("description")
+        if "visibility" in request.data:
+            visibility = str(request.data.get("visibility") or "").strip().lower()
+            if visibility not in BroadcastPlaylist.Visibility.values:
+                raise ValidationError({"visibility": "Invalid visibility value."})
+            playlist.visibility = visibility
+            update_fields.append("visibility")
+        if "shuffle_enabled" in request.data:
+            playlist.shuffle_enabled = bool(request.data.get("shuffle_enabled"))
+            update_fields.append("shuffle_enabled")
+        if update_fields:
+            playlist.save(update_fields=[*update_fields, "updated_at"])
+        return Response(BroadcastPlaylistSerializer(playlist, context={"request": request}).data)
+
+    def delete(self, request, playlist_id):
+        playlist = get_object_or_404(BroadcastPlaylist.objects.select_related("channel"), id=playlist_id)
+        if not _user_can_manage_channel(request.user, playlist.channel):
+            raise PermissionDenied("You cannot manage this playlist.")
+        playlist.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class BroadcastPlaylistListCreateView(APIView):
@@ -24086,6 +24201,39 @@ class ChannelCategoryBrowseView(APIView):
 PERCEPTUAL_MATCH_THRESHOLD = 0.85
 
 
+def _file_automated_copyright_claim(source_fingerprint, matched_fingerprint, match_row) -> None:
+    """Content ID's missing last step: a ChannelFingerprintMatch was already
+    being detected and scored for real (see _record_fingerprint_and_scan_matches'
+    own history) but nothing ever turned that detection into something a
+    channel owner could see or act on - ChannelFingerprintMatch.claim sat
+    permanently NULL, and ChannelContentCopyrightClaimsView only ever
+    listed manually-filed claims. This closes that gap: the first time a
+    match is recorded between two DIFFERENT channels' content, file a real
+    ChannelContentCopyrightClaim against the newer (source) content,
+    claimed by the channel that owns the earlier (matched) content - same
+    model/serializer/list endpoint a manual claim already uses, so the
+    existing CopyrightClaimsPanel UI shows these with zero changes needed
+    there. Never re-files on a repeat scan (match_row.claim_id already set
+    is the guard) and never fires for a channel's own re-upload of its own
+    earlier content (same channel on both sides is not an infringement)."""
+    if match_row.claim_id is not None:
+        return
+    source_channel_id = source_fingerprint.content.channel_id
+    matched_channel_id = matched_fingerprint.content.channel_id
+    if source_channel_id == matched_channel_id:
+        return
+    claim = ChannelContentCopyrightClaim.objects.create(
+        content=source_fingerprint.content,
+        claimant_channel_id=matched_channel_id,
+        claimant_name=getattr(matched_fingerprint.content.channel, "display_name", "") or "",
+        claim_type=ChannelContentCopyrightClaim.ClaimType.VIDEO,
+        asset_fingerprint=matched_fingerprint.fingerprint_hash,
+        status=ChannelContentCopyrightClaim.Status.MATCHED,
+    )
+    match_row.claim = claim
+    match_row.save(update_fields=["claim"])
+
+
 def _record_fingerprint_and_scan_matches(content, algorithm: str, fingerprint_hash: str):
     """Stores/updates one content's fingerprint and scans every other
     existing fingerprint of the same algorithm for a real match - returns
@@ -24094,7 +24242,8 @@ def _record_fingerprint_and_scan_matches(content, algorithm: str, fingerprint_ha
     matches use real Hamming-distance similarity scoring (see
     perceptual_fingerprint_similarity) instead of the hardcoded 1.0 this
     endpoint used to record for every "match" regardless of how similar
-    the videos actually were.
+    the videos actually were. Every recorded match now also runs through
+    _file_automated_copyright_claim - see that function for why.
     """
     from apps.broadcasts.models import ChannelContentFingerprint, ChannelFingerprintMatch
 
@@ -24104,19 +24253,21 @@ def _record_fingerprint_and_scan_matches(content, algorithm: str, fingerprint_ha
         defaults={"fingerprint_hash": fingerprint_hash, "status": ChannelContentFingerprint.Status.INDEXED},
     )
 
-    candidates = ChannelContentFingerprint.objects.filter(algorithm=algorithm).exclude(content_id=content.id)
+    candidates = ChannelContentFingerprint.objects.filter(algorithm=algorithm).exclude(content_id=content.id).select_related("content", "content__channel")
     if algorithm == ChannelContentFingerprint.Algorithm.PERCEPTUAL:
         for match in candidates:
             score = perceptual_fingerprint_similarity(fingerprint_hash, match.fingerprint_hash)
             if score >= PERCEPTUAL_MATCH_THRESHOLD:
-                ChannelFingerprintMatch.objects.update_or_create(
+                match_row, _ = ChannelFingerprintMatch.objects.update_or_create(
                     source_fingerprint=fp, matched_fingerprint=match, defaults={"similarity_score": score},
                 )
+                _file_automated_copyright_claim(fp, match, match_row)
     else:
         for match in candidates.filter(fingerprint_hash=fingerprint_hash):
-            ChannelFingerprintMatch.objects.update_or_create(
+            match_row, _ = ChannelFingerprintMatch.objects.update_or_create(
                 source_fingerprint=fp, matched_fingerprint=match, defaults={"similarity_score": 1.0},
             )
+            _file_automated_copyright_claim(fp, match, match_row)
     return fp, created
 
 

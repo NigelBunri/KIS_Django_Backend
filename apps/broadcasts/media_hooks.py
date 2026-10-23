@@ -1,18 +1,19 @@
 # apps/broadcasts/media_hooks.py
 """
-Registers apps.broadcasts' Education domain rules, plus the channel-content-
-video purpose, onto the apps.media purpose registry — Education is Phase 3
-of the Education System cleanup project, following the same pattern as
-apps/statuses/media_hooks.py and apps/commerce/media_hooks.py. Called once
-from apps/broadcasts/apps.py's AppConfig.ready().
+Registers apps.broadcasts' Education domain rules, the channel-content-
+video purpose, and the channel logo/cover (avatar/banner) purposes onto the
+apps.media purpose registry — Education is Phase 3 of the Education System
+cleanup project, following the same pattern as apps/statuses/media_hooks.py
+and apps/commerce/media_hooks.py. Called once from apps/broadcasts/apps.py's
+AppConfig.ready().
 
-All four purposes here are create/update-with-media (allow_attach=False,
-see apps/media/purposes.py) — media is bound to its owning row at save
-time, not attached to a pre-existing target via the generic attach
-endpoint — so only access_authorizer is registered here, matching status's
-pattern exactly (no target_authorizer/attach_handler for allow_attach=
-False purposes). channel_content_video goes further than the education
-purposes: it never resolves a target at ALL through this system (see
+Every purpose here is create/update-with-media or auto-attach-at-confirm
+(allow_attach=False, see apps/media/purposes.py) — media is bound to its
+owning row at save/confirm time, not attached to a pre-existing target via
+the generic attach endpoint — so only access_authorizer is registered here,
+matching status's pattern exactly (no target_authorizer/attach_handler for
+allow_attach=False purposes). channel_content_video goes further than the
+rest: it never resolves a target at ALL through this system (see
 can_view_channel_content_video's own docstring below).
 """
 
@@ -83,6 +84,27 @@ def can_view_education_material(user, asset) -> AccessDecision:
     return AccessDecision.deny("not_authorized")
 
 
+def can_view_channel_branding_media(user, asset) -> AccessDecision:
+    """Channel logo / cover images — public for any public channel (matches
+    BroadcastChannelDetailView.get's AllowAny + is_public check), otherwise
+    restricted to users who can manage the channel. Anonymous viewers are
+    allowed through for a public channel, same as the channel detail
+    endpoint itself allows."""
+    from .models import BroadcastChannel
+    from .views import _user_can_manage_channel
+
+    channel = None
+    if asset.target_type == "broadcasts.BroadcastChannel" and asset.target_id:
+        channel = BroadcastChannel.objects.filter(id=asset.target_id, is_deleted=False).first()
+    if channel is None:
+        return AccessDecision.deny("not_found")
+    if channel.is_public:
+        return AccessDecision.allow()
+    if user is not None and getattr(user, "is_authenticated", False) and _user_can_manage_channel(user, channel):
+        return AccessDecision.allow()
+    return AccessDecision.deny("not_authorized")
+
+
 def can_view_channel_content_video(user, asset: MediaAsset) -> AccessDecision:
     """channel_content_video never goes through the generic attach flow at
     all - ChannelContentAssetUploadView binds a client-supplied storage_path
@@ -110,3 +132,5 @@ def register() -> None:
     purposes.register_access_authorizer("education_module_cover_image", can_view_education_branding_media)
     purposes.register_access_authorizer("education_material", can_view_education_material)
     purposes.register_access_authorizer("channel_content_video", can_view_channel_content_video)
+    purposes.register_access_authorizer("channel_avatar", can_view_channel_branding_media)
+    purposes.register_access_authorizer("channel_banner", can_view_channel_branding_media)

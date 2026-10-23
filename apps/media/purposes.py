@@ -250,6 +250,34 @@ register_purpose("profile_cover", _PurposeSpec(
     visibility_class="restricted",
 ))
 
+# Broadcast channel logo/cover image — auto-attaches at CONFIRM time like
+# profile_avatar/profile_cover above (see _attach_channel_avatar/_banner in
+# upload_intent.py), not via the generic attach endpoint, so allow_attach=
+# False here too. Unlike profile's single implicit target (the caller's own
+# Profile row), a user can own several channels, so target_id (which
+# channel) is required at initiate time and re-checked at attach time.
+# visibility_class="public_catalog": a channel's logo/cover is shown to
+# every public viewer of that channel, same spirit as a commerce shop/
+# product image.
+register_purpose("channel_avatar", _PurposeSpec(
+    context="broadcast",
+    moderation_context="broadcast",
+    retention_days=None,
+    attach_target="broadcasts.BroadcastChannel.avatar_url",
+    target_types=("broadcasts.BroadcastChannel",),
+    allow_attach=False,
+    visibility_class="public_catalog",
+))
+register_purpose("channel_banner", _PurposeSpec(
+    context="broadcast",
+    moderation_context="broadcast",
+    retention_days=None,
+    attach_target="broadcasts.BroadcastChannel.banner_url",
+    target_types=("broadcasts.BroadcastChannel",),
+    allow_attach=False,
+    visibility_class="public_catalog",
+))
+
 # Commerce attach targets are dynamic (which shop/product/service instance
 # is chosen at attach time, per apps.commerce.media_uploads) rather than a
 # single fixed model field — attach_target is left None to reflect that

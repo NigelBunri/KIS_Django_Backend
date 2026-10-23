@@ -343,6 +343,9 @@ def _synthetic_test_jpeg_bytes() -> bytes:
     return buf.getvalue()
 
 
+_MOCK_PRESIGNED_URL = "https://mock-bucket.s3.mock-region.amazonaws.com/mock-signed?X-Amz-Signature=redacted"
+
+
 def _mock_s3_client(**overrides):
     """A MagicMock standing in for S3MediaStorage._client()'s boto3 client.
     All tests in MediaUploadIntentTests patch S3MediaStorage._client with
@@ -350,7 +353,7 @@ def _mock_s3_client(**overrides):
     import io
 
     client = MagicMock()
-    client.generate_presigned_url.return_value = "https://mock-bucket.s3.mock-region.amazonaws.com/mock-signed?X-Amz-Signature=redacted"
+    client.generate_presigned_url.return_value = _MOCK_PRESIGNED_URL
     # Matches _initiate()'s default size_bytes=1_000_000 so tests that don't
     # care about size stay within the confirm flow's declared/actual size
     # tolerance instead of accidentally tripping size_mismatch.
@@ -614,6 +617,109 @@ class MediaUploadIntentTests(APITestCase):
         self.assertEqual(result["expired_count"], 1)
         intent = MediaUploadIntent.objects.get(id=upload_id)
         self.assertEqual(intent.status, MediaUploadIntent.STATUS_EXPIRED)
+
+
+@patch("apps.media.storage_backends.S3MediaStorage._client")
+class ChannelBrandingImageUploadTests(APITestCase):
+    """channel_avatar/channel_banner (apps/media/upload_intent.py's
+    _attach_channel_image) — auto-attach-at-confirm onto
+    BroadcastChannel.avatar_url/banner_url, gated by target_id + a manage-
+    role check re-verified at confirm time (not just at initiate, which the
+    generic MediaUploadInitiateView never authorizes for any context)."""
+
+    INITIATE_URL = "/api/v1/media/uploads/initiate/"
+
+    def _confirm_url(self, upload_id):
+        return f"/api/v1/media/uploads/{upload_id}/confirm/"
+
+    def setUp(self):
+        from apps.broadcasts.models import BroadcastChannel
+
+        User = get_user_model()
+        self.owner = User.objects.create_user(phone="+237670005001", password="TestPass123!", country="CM")
+        self.other = User.objects.create_user(phone="+237670005002", password="TestPass123!", country="CM")
+        self.channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER,
+            owner_id=self.owner.id,
+            owner_user=self.owner,
+            handle="branding-upload-channel",
+            display_name="Branding Upload Channel",
+        )
+
+    def _initiate(self, *, user=None, context="channel_avatar", target_id=None, size_bytes=1_000_000, content_type="image/jpeg", filename="logo.jpg"):
+        self.client.force_authenticate(user or self.owner)
+        body = {"context": context, "filename": filename, "content_type": content_type, "size_bytes": size_bytes}
+        if target_id is not None:
+            body["target_id"] = target_id
+        return self.client.post(self.INITIATE_URL, body, format="json")
+
+    def test_owner_can_upload_avatar(self, mock_client):
+        mock_client.return_value = _mock_s3_client()
+        response = self._initiate(context="channel_avatar", target_id=str(self.channel.id))
+        self.assertEqual(response.status_code, 201)
+        upload_id = response.data["upload_id"]
+        new_key = response.data["object_key"]
+        self.assertTrue(new_key.startswith("private/channel/avatar/"))
+
+        confirm_response = self.client.post(self._confirm_url(upload_id), {}, format="json")
+
+        self.assertEqual(confirm_response.status_code, 200)
+        self.channel.refresh_from_db()
+        # The shared _mock_s3_client() stubs generate_presigned_url() to a
+        # single fixed string regardless of Params, so the real assertion
+        # here is "the field got a URL from storage.url() at all" — the key
+        # genuinely reaching that call is already covered by it not being
+        # blank/unset AND the attach_handler integration test below
+        # (test_non_manager_cannot_attach...) proving the same code path
+        # left it untouched when attach is rejected.
+        self.assertEqual(self.channel.avatar_url, _MOCK_PRESIGNED_URL)
+        self.assertEqual(confirm_response.data["channel"]["avatar_kind"], "photo")
+
+    def test_owner_can_upload_banner(self, mock_client):
+        mock_client.return_value = _mock_s3_client()
+        response = self._initiate(context="channel_banner", target_id=str(self.channel.id), filename="cover.jpg")
+        upload_id = response.data["upload_id"]
+        new_key = response.data["object_key"]
+        self.assertTrue(new_key.startswith("private/channel/banner/"))
+
+        confirm_response = self.client.post(self._confirm_url(upload_id), {}, format="json")
+
+        self.assertEqual(confirm_response.status_code, 200)
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.banner_url, _MOCK_PRESIGNED_URL)
+
+    def test_non_manager_cannot_attach_even_if_they_know_the_channel_id(self, mock_client):
+        mock_client.return_value = _mock_s3_client()
+        response = self._initiate(user=self.other, context="channel_avatar", target_id=str(self.channel.id))
+        upload_id = response.data["upload_id"]
+
+        confirm_response = self.client.post(self._confirm_url(upload_id), {}, format="json")
+
+        self.assertEqual(confirm_response.status_code, 400)
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.avatar_url, "")
+
+    def test_confirm_rejects_missing_target_channel(self, mock_client):
+        mock_client.return_value = _mock_s3_client()
+        response = self._initiate(context="channel_avatar", target_id="")
+        upload_id = response.data["upload_id"]
+
+        confirm_response = self.client.post(self._confirm_url(upload_id), {}, format="json")
+
+        self.assertEqual(confirm_response.status_code, 400)
+
+    def test_repeated_confirm_is_idempotent(self, mock_client):
+        mock_client.return_value = _mock_s3_client()
+        response = self._initiate(context="channel_avatar", target_id=str(self.channel.id))
+        upload_id = response.data["upload_id"]
+
+        first = self.client.post(self._confirm_url(upload_id), {}, format="json")
+        second = self.client.post(self._confirm_url(upload_id), {}, format="json")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.channel.refresh_from_db()
+        self.assertTrue(self.channel.avatar_url)
 
 
 @patch("apps.media.storage_backends.S3MediaStorage._client")

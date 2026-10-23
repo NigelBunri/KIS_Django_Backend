@@ -98,6 +98,16 @@ def _commerce_image_max_bytes() -> int:
     return int(getattr(settings, "COMMERCE_IMAGE_MAX_UPLOAD_BYTES", 8 * 1024 * 1024))
 
 
+def _channel_image_allowed_content_types() -> set[str]:
+    configured = getattr(settings, "CHANNEL_IMAGE_ALLOWED_CONTENT_TYPES", "")
+    values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
+    return values or {"image/jpeg", "image/png", "image/webp"}
+
+
+def _channel_image_max_bytes() -> int:
+    return int(getattr(settings, "CHANNEL_IMAGE_MAX_UPLOAD_BYTES", 8 * 1024 * 1024))
+
+
 def _commerce_complaint_allowed_content_types() -> set[str]:
     configured = getattr(settings, "COMMERCE_COMPLAINT_ALLOWED_CONTENT_TYPES", "")
     values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
@@ -311,6 +321,26 @@ UPLOAD_CONTEXTS: dict[str, UploadContextConfig] = {
         allowed_content_types=_commerce_complaint_allowed_content_types,
         max_bytes=_commerce_complaint_max_bytes,
         key_prefix="commerce/cmpl",
+    ),
+    # Broadcast channel logo/cover image. Auto-attaches at confirm time like
+    # profile_avatar/profile_cover (see _attach_channel_avatar/_banner below)
+    # rather than commerce's confirm-only + separate-attach shape, because
+    # — unlike a shop/product, which doesn't exist yet when its first image
+    # is picked — the channel a logo/cover belongs to always already exists
+    # by the time Channel Studio's branding editor shows the picker. The one
+    # thing profile_avatar/profile_cover don't need that this does: a
+    # `target_id` (which of the user's possibly-several channels) passed at
+    # initiate time and re-validated (manage-role check) again at attach
+    # time — see _attach_channel_image.
+    "channel_avatar": UploadContextConfig(
+        allowed_content_types=_channel_image_allowed_content_types,
+        max_bytes=_channel_image_max_bytes,
+        key_prefix="channel/avatar",
+    ),
+    "channel_banner": UploadContextConfig(
+        allowed_content_types=_channel_image_allowed_content_types,
+        max_bytes=_channel_image_max_bytes,
+        key_prefix="channel/banner",
     ),
     # Status/story media. Like the commerce contexts, these are
     # confirm-only (see _confirm_only_media_descriptor) — there is no
@@ -937,6 +967,80 @@ def _attach_profile_cover(intent: MediaUploadIntent, *, already_confirmed: bool)
     return _attach_profile_image(intent, "cover_file", already_confirmed=already_confirmed)
 
 
+def _attach_channel_image(intent: MediaUploadIntent, field_name: str, *, already_confirmed: bool) -> dict:
+    """field_name is 'avatar_url' or 'banner_url' — unlike profile's
+    avatar_file/cover_file (ImageField, resolved to a URL lazily by the
+    storage backend at read time), BroadcastChannel.avatar_url/banner_url
+    are plain URLField strings (see apps/broadcasts/models.py), so the URL
+    has to be generated here, at attach time, rather than left to the
+    serializer. default_storage.url() returns the same kind of
+    private-bucket presigned GET that every other channel image field
+    already stores — BroadcastChannelSummarySerializer re-signs a fresh one
+    from the embedded key on every read via resolve_stale_media_url, so
+    this one going stale after its TTL is a non-issue, exactly like
+    ChannelContent.thumbnail_url already handles.
+
+    intent.target_id carries which channel this upload is for (set at
+    initiate time — see MediaUploadInitiateView.post) since, unlike a
+    user's own single profile, a user may own several channels. Both the
+    initiate-time and this attach-time manage-role check exist because
+    minutes can pass between them (the client could lose manage access to
+    the channel in between)."""
+    from apps.broadcasts.models import BroadcastChannel
+    from apps.broadcasts.serializers import BroadcastChannelDetailSerializer
+    from apps.broadcasts.views import _user_can_manage_channel
+
+    from .services import lifecycle
+
+    if not intent.target_id:
+        raise ValidationError({"detail": "This upload is missing its target channel."})
+    channel = BroadcastChannel.objects.select_for_update().filter(
+        id=intent.target_id, is_deleted=False,
+    ).first()
+    if not channel:
+        raise ValidationError({"detail": "Channel not found."})
+    if not _user_can_manage_channel(intent.owner, channel):
+        raise ValidationError({"detail": "You do not have permission to manage this channel."})
+
+    previous_url = getattr(channel, field_name) or ""
+    # A presigned GET URL for the same key still differs byte-for-byte on
+    # every call (signature/expiry in the query string), so comparing full
+    # URLs would always report "new" — the object key itself is the only
+    # part stable enough to compare, and it's unique (uuid4 hex) and
+    # embedded verbatim in the URL's path component either way.
+    is_new_upload = not already_confirmed or intent.object_key not in previous_url
+
+    if is_new_upload:
+        decision = run_and_record_explicit_content_scan(intent, upload_context="broadcast")
+        if decision.status == "blocked":
+            logger.warning(
+                "media_upload_intent.channel_image_blocked",
+                extra={"upload_id": str(intent.id), "user_id": str(intent.owner_id), "field": field_name},
+            )
+            raise ValidationError({"detail": decision.user_message})
+
+        new_url = default_storage.url(intent.object_key)
+        setattr(channel, field_name, new_url)
+        channel.save(update_fields=[field_name, "updated_at"])
+        lifecycle.sync_attachment(intent=intent, target_type="broadcasts.BroadcastChannel", target_id=str(channel.id))
+
+    serialized = BroadcastChannelDetailSerializer(channel, context={"request": None}).data
+    return {
+        "upload_id": str(intent.id),
+        "status": intent.status,
+        "channel": serialized,
+        "assetId": str(intent.canonical_asset_id) if intent.canonical_asset_id else None,
+    }
+
+
+def _attach_channel_avatar(intent: MediaUploadIntent, *, already_confirmed: bool) -> dict:
+    return _attach_channel_image(intent, "avatar_url", already_confirmed=already_confirmed)
+
+
+def _attach_channel_banner(intent: MediaUploadIntent, *, already_confirmed: bool) -> dict:
+    return _attach_channel_image(intent, "banner_url", already_confirmed=already_confirmed)
+
+
 def _confirm_only_media_descriptor(intent: MediaUploadIntent, *, already_confirmed: bool) -> dict:
     """Attach handler for contexts where confirmation and attachment are
     deliberately separate steps: confirm() proves the S3 object is real and
@@ -967,6 +1071,8 @@ def _confirm_only_media_descriptor(intent: MediaUploadIntent, *, already_confirm
 ATTACH_HANDLERS: dict[str, Callable[[MediaUploadIntent], dict]] = {
     "profile_avatar": _attach_profile_avatar,
     "profile_cover": _attach_profile_cover,
+    "channel_avatar": _attach_channel_avatar,
+    "channel_banner": _attach_channel_banner,
     "commerce_shop_image": _confirm_only_media_descriptor,
     "commerce_product_main_image": _confirm_only_media_descriptor,
     "commerce_product_gallery_image": _confirm_only_media_descriptor,

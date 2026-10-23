@@ -1680,6 +1680,93 @@ class ContentFingerprintTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(ChannelContentFingerprint.objects.filter(content=self.content_a, algorithm='perceptual').exists())
 
+    # ── Automated copyright claim filing (the missing last step: a match
+    # was already detected and scored for real, but ChannelFingerprintMatch
+    # .claim stayed permanently NULL - nothing ever turned a detected match
+    # into something a channel owner could see in CopyrightClaimsPanel) ──
+    def _other_channel_content(self, title='Someone else\'s original'):
+        other_owner = get_user_model().objects.create_user(
+            phone='5557400399', username='fp_other_owner', password='secret', country='NG',
+        )
+        other_channel = BroadcastChannel.objects.create(
+            owner_type=BroadcastChannel.OwnerType.USER, owner_id=other_owner.id, owner_user=other_owner,
+            handle='fp-other-channel', display_name='Other Creator', is_public=True,
+        )
+        content = ChannelContent.objects.create(
+            channel=other_channel, content_type='video', title=title,
+            status=ChannelContent.Status.PUBLISHED, visibility=ChannelContent.Visibility.PUBLIC,
+            published_at=timezone.now(),
+        )
+        return other_channel, content
+
+    def test_cross_channel_perceptual_match_files_a_real_claim(self):
+        from apps.broadcasts.models import ChannelContentCopyrightClaim
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+
+        other_channel, original = self._other_channel_content()
+        _record_fingerprint_and_scan_matches(original, ChannelContentFingerprint.Algorithm.PERCEPTUAL, 'a' * 16)
+        fp_b, _ = _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.PERCEPTUAL, 'a' * 16)
+
+        match = ChannelFingerprintMatch.objects.get(source_fingerprint=fp_b)
+        self.assertIsNotNone(match.claim_id)
+        claim = ChannelContentCopyrightClaim.objects.get(id=match.claim_id)
+        self.assertEqual(claim.content_id, self.content_a.id)
+        self.assertEqual(claim.claimant_channel_id, other_channel.id)
+        self.assertEqual(claim.claim_type, ChannelContentCopyrightClaim.ClaimType.VIDEO)
+        self.assertEqual(claim.status, ChannelContentCopyrightClaim.Status.MATCHED)
+
+    def test_cross_channel_sha256_match_files_a_real_claim(self):
+        from apps.broadcasts.models import ChannelContentCopyrightClaim
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+
+        other_channel, original = self._other_channel_content()
+        _record_fingerprint_and_scan_matches(original, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+        fp_b, _ = _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+
+        match = ChannelFingerprintMatch.objects.get(source_fingerprint=fp_b)
+        self.assertIsNotNone(match.claim_id)
+        claim = ChannelContentCopyrightClaim.objects.get(id=match.claim_id)
+        self.assertEqual(claim.claimant_channel_id, other_channel.id)
+
+    def test_same_channel_match_never_files_a_claim_against_itself(self):
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+        fp_b, _ = _record_fingerprint_and_scan_matches(self.content_b, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+
+        match = ChannelFingerprintMatch.objects.get(source_fingerprint=fp_b)
+        self.assertIsNone(match.claim_id)
+
+    def test_repeat_scan_does_not_file_a_duplicate_claim(self):
+        from apps.broadcasts.models import ChannelContentCopyrightClaim
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+
+        other_channel, original = self._other_channel_content()
+        _record_fingerprint_and_scan_matches(original, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+        # Re-submitting the exact same fingerprint for content_a again (e.g.
+        # a client retry) must not file a second claim for the same match.
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+
+        self.assertEqual(
+            ChannelContentCopyrightClaim.objects.filter(content=self.content_a, claimant_channel=other_channel).count(), 1,
+        )
+
+    def test_claimed_against_channel_sees_the_claim_via_copyright_claims_endpoint(self):
+        from apps.broadcasts.views import _record_fingerprint_and_scan_matches
+
+        _other_channel, original = self._other_channel_content()
+        _record_fingerprint_and_scan_matches(original, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+        _record_fingerprint_and_scan_matches(self.content_a, ChannelContentFingerprint.Algorithm.SHA256, 'deadbeef' * 8)
+
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.get(f'/api/v1/broadcasts/channels/{self.channel.id}/copyright-claims/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['claim_type'], 'video')
+        self.assertEqual(response.data[0]['status'], 'matched')
+
 
 class UserContentPlaylistApiTests(APITestCase):
     def setUp(self):
@@ -1779,6 +1866,215 @@ class KISTubePlatformScaleApiTests(APITestCase):
         row = next(r for r in response.data['results'] if r['id'] == str(playlist.id))
         self.assertTrue(row['shuffle_enabled'])
 
+    # ── Playlist detail: rename/edit/visibility/delete (previously
+    # missing entirely - only create+list and item add/remove/reorder
+    # existed, with no way to rename a playlist, edit its description,
+    # change its visibility, or delete it once created) ─────────────────
+    def test_playlist_owner_can_rename_and_edit_description(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='Old title', description='Old desc')
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.patch(
+            f'/api/v1/broadcasts/playlists/{playlist.id}/',
+            {'title': 'New title', 'description': 'New desc'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        playlist.refresh_from_db()
+        self.assertEqual(playlist.title, 'New title')
+        self.assertEqual(playlist.description, 'New desc')
+
+    def test_playlist_owner_can_change_visibility(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='List', visibility=BroadcastPlaylist.Visibility.PUBLIC)
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.patch(
+            f'/api/v1/broadcasts/playlists/{playlist.id}/',
+            {'visibility': 'private'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        playlist.refresh_from_db()
+        self.assertEqual(playlist.visibility, BroadcastPlaylist.Visibility.PRIVATE)
+
+    def test_playlist_rejects_invalid_visibility(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='List')
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.patch(
+            f'/api/v1/broadcasts/playlists/{playlist.id}/',
+            {'visibility': 'nonsense'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_playlist_rejects_blank_title(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='List')
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.patch(
+            f'/api/v1/broadcasts/playlists/{playlist.id}/',
+            {'title': '   '},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_non_manager_cannot_edit_playlist(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='List')
+        self.client.force_authenticate(user=self.other)
+
+        response = self.client.patch(
+            f'/api/v1/broadcasts/playlists/{playlist.id}/',
+            {'title': 'Hijacked'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        playlist.refresh_from_db()
+        self.assertEqual(playlist.title, 'List')
+
+    def test_playlist_owner_can_delete_playlist(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='To delete')
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.delete(f'/api/v1/broadcasts/playlists/{playlist.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(BroadcastPlaylist.objects.filter(id=playlist.id).exists())
+
+    def test_non_manager_cannot_delete_playlist(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='Keep me')
+        self.client.force_authenticate(user=self.other)
+
+        response = self.client.delete(f'/api/v1/broadcasts/playlists/{playlist.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(BroadcastPlaylist.objects.filter(id=playlist.id).exists())
+
+    def test_playlist_detail_get_404s_for_private_non_manager(self):
+        playlist = BroadcastPlaylist.objects.create(channel=self.channel, title='Private', visibility=BroadcastPlaylist.Visibility.PRIVATE)
+        self.client.force_authenticate(user=self.other)
+
+        response = self.client.get(f'/api/v1/broadcasts/playlists/{playlist.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # ── Channel managers (previously no endpoint at all - the role model
+    # existed, invite/remove did not) ───────────────────────────────────
+    def test_owner_can_list_managers(self):
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.get(f'/api/v1/broadcasts/channels/{self.channel.id}/managers/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['results'][0]['role'], 'owner')
+
+    def test_owner_can_add_manager_by_phone(self):
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/managers/',
+            {'phone': self.viewer.phone},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data['role'], 'manager')
+        self.assertTrue(
+            BroadcastChannelRole.objects.filter(channel=self.channel, user=self.viewer, role=BroadcastChannelRole.Role.MANAGER).exists()
+        )
+
+    def test_adding_manager_with_unknown_phone_404s(self):
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/managers/',
+            {'phone': '0000000000'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_adding_the_same_manager_twice_is_rejected(self):
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.viewer, role=BroadcastChannelRole.Role.MANAGER)
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/managers/',
+            {'phone': self.viewer.phone},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_non_owner_manager_cannot_add_another_manager(self):
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.viewer, role=BroadcastChannelRole.Role.MANAGER)
+        self.client.force_authenticate(user=self.viewer)
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/managers/',
+            {'phone': self.other.phone},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_outsider_cannot_add_manager(self):
+        self.client.force_authenticate(user=self.other)
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/channels/{self.channel.id}/managers/',
+            {'phone': self.viewer.phone},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_owner_can_remove_a_manager(self):
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.viewer, role=BroadcastChannelRole.Role.MANAGER)
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.delete(f'/api/v1/broadcasts/channels/{self.channel.id}/managers/{self.viewer.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(
+            BroadcastChannelRole.objects.filter(channel=self.channel, user=self.viewer).exists()
+        )
+
+    def test_owner_cannot_be_removed(self):
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.delete(f'/api/v1/broadcasts/channels/{self.channel.id}/managers/{self.owner.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(
+            BroadcastChannelRole.objects.filter(channel=self.channel, user=self.owner, role=BroadcastChannelRole.Role.OWNER).exists()
+        )
+
+    def test_non_owner_cannot_remove_a_manager(self):
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.viewer, role=BroadcastChannelRole.Role.MANAGER)
+        self.client.force_authenticate(user=self.other)
+
+        response = self.client.delete(f'/api/v1/broadcasts/channels/{self.channel.id}/managers/{self.viewer.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(
+            BroadcastChannelRole.objects.filter(channel=self.channel, user=self.viewer).exists()
+        )
+
+    def test_newly_added_manager_can_manage_the_channel(self):
+        BroadcastChannelRole.objects.create(channel=self.channel, user=self.viewer, role=BroadcastChannelRole.Role.MANAGER)
+        self.client.force_authenticate(user=self.viewer)
+
+        response = self.client.get(f'/api/v1/broadcasts/channels/{self.channel.id}/managers/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
     # ── User playlist item reorder + hydration ──────────────────────────
     def test_user_playlist_item_reorder(self):
         self.client.force_authenticate(user=self.viewer)
@@ -1836,6 +2132,46 @@ class KISTubePlatformScaleApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(len(response.data['results']), 1)
         self.assertEqual(response.data['results'][0]['body'], 'A reply')
+
+    # ── Channel settings: comments_restricted (newly surfaced in Channel
+    # Studio's Settings tab — ChannelSettingsPanel.tsx — this policy was
+    # already enforced server-side with no test and no UI control before) ──
+    def test_comments_restricted_blocks_non_manager(self):
+        self.channel.settings = {'comments_restricted': True}
+        self.channel.save(update_fields=['settings'])
+        self.client.force_authenticate(user=self.viewer)
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/comments/',
+            {'body': 'Hello'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    def test_comments_restricted_still_allows_manager(self):
+        self.channel.settings = {'comments_restricted': True}
+        self.channel.save(update_fields=['settings'])
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/comments/',
+            {'body': 'Hello from the owner'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_comments_unrestricted_by_default_allows_anyone(self):
+        self.client.force_authenticate(user=self.viewer)
+
+        response = self.client.post(
+            f'/api/v1/broadcasts/channel-contents/{self.content_a.id}/comments/',
+            {'body': 'Hello'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
     # ── Search sort + suggest ───────────────────────────────────────────
     def test_search_sort_by_views(self):

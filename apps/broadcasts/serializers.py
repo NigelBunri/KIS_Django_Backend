@@ -154,21 +154,31 @@ def _kis_official_logo_url() -> str:
 def _resolve_channel_avatar(obj: "BroadcastChannel") -> tuple[str, str, str]:
     """Returns (kind, url, initials); kind is one of 'logo'/'photo'/'initials'.
 
-    Display rule (deliberately ignores the freely-editable `avatar_url`
-    field for this computed trio): a channel owned by GO always shows the
-    official KIS logo; a user-owned channel shows that user's own profile
-    photo, or their initials if they have none; an org-owned channel (shop/
-    health institution/education institution/partner) shows that org's own
-    image, or its initials if it has none. HealthInstitution has no image
-    field on the model at all today, so it's always initials.
+    Display rule: GO's own official channel always shows the official KIS
+    logo, full stop — the one case a channel-level override must never win,
+    to keep the platform's own brand mark from being user-editable. For
+    every other channel, its own `avatar_url` (set via Channel Studio's
+    branding editor — see apps/media/upload_intent.py's channel_avatar
+    attach handler) wins once set, letting a creator give their channel a
+    distinct identity rather than always inheriting their personal profile
+    photo or org image. Absent that, a user-owned channel falls back to
+    that user's own profile photo (or initials); an org-owned channel (shop/
+    health institution/education institution/partner) falls back to that
+    org's own image (or its initials). HealthInstitution has no image field
+    on the model at all today, so it's always initials there.
     """
     owner_type = obj.owner_type
     owner_id = obj.owner_id
 
+    if owner_type == BroadcastChannel.OwnerType.USER and obj.owner_user and is_platform_go(obj.owner_user):
+        return "logo", _kis_official_logo_url(), ""
+
+    custom_avatar = str(obj.avatar_url or "").strip()
+    if custom_avatar:
+        return "photo", custom_avatar, ""
+
     if owner_type == BroadcastChannel.OwnerType.USER:
         user = obj.owner_user
-        if user and is_platform_go(user):
-            return "logo", _kis_official_logo_url(), ""
         if user:
             profile = getattr(user, "profile", None)
             avatar = str(getattr(profile, "avatar_url", "") or "").strip()
