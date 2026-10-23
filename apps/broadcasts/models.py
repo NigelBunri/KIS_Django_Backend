@@ -157,8 +157,17 @@ class BroadcastChannel(models.Model):
     handle = models.SlugField(max_length=80, unique=True)
     display_name = models.CharField(max_length=140)
     description = models.TextField(blank=True, default="")
-    avatar_url = models.URLField(blank=True, default="")
-    banner_url = models.URLField(blank=True, default="")
+    # CONFIRMED ROOT CAUSE of every channel logo/cover upload failing (real
+    # end-to-end test against production, not just local mocks): Django's
+    # URLField defaults to max_length=200, but a presigned S3 GET URL
+    # (X-Amz-Credential/Date/Expires/SignedHeaders/Signature query string)
+    # routinely runs 250-400+ characters - _attach_channel_image's own
+    # channel.save() blew up with a Postgres "value too long for type
+    # character varying(200)" on every single attempt, regardless of image
+    # size or device. 1024 matches the precedent already set for exactly
+    # this kind of URL elsewhere in this file (see line ~3609).
+    avatar_url = models.URLField(max_length=1024, blank=True, default="")
+    banner_url = models.URLField(max_length=1024, blank=True, default="")
     country = models.CharField(max_length=8, blank=True, default="")
     language = models.CharField(max_length=16, blank=True, default="")
     category = models.CharField(max_length=64, blank=True, default="")
