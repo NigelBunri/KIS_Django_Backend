@@ -722,6 +722,121 @@ class LiveStreamRecordingStatusTests(LiveStreamTestBase):
             1,
         )
 
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_successful_archive_creates_a_playable_asset_not_just_a_status(self):
+        # THE actual bug this whole lifecycle exists to prevent: a
+        # recording_status of "ready" with no ChannelContentAsset behind
+        # it is a replay that LOOKS done but has nothing for any existing
+        # player surface (ChannelContentDetailPage's MediaStage reads
+        # content.assets/content.first_asset - nothing else) to actually
+        # play. This is the test that would have caught the original gap.
+        res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"recording_url": "https://cdn.example.com/r.mp4", "duration_seconds": 1800, "thumbnail_url": "https://cdn.example.com/t.jpg"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        content_id = res.data["content_id"]
+        content = ChannelContent.objects.get(id=content_id)
+        self.assertEqual(content.status, ChannelContent.Status.DRAFT)
+        asset = content.assets.first()
+        self.assertIsNotNone(asset, "archive must create a real ChannelContentAsset, not just a status flag")
+        self.assertEqual(asset.asset_type, "video")
+        self.assertEqual(asset.url, "https://cdn.example.com/r.mp4")
+        self.assertEqual(asset.duration_seconds, 1800)
+        self.assertEqual(asset.processing_status, "ready")
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_replay_inherits_original_broadcast_visibility(self):
+        self.live.content.visibility = ChannelContent.Visibility.MEMBERS_ONLY
+        self.live.content.save(update_fields=["visibility"])
+
+        res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"recording_url": "https://cdn.example.com/r.mp4"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        content = ChannelContent.objects.get(id=res.data["content_id"])
+        self.assertEqual(content.visibility, ChannelContent.Visibility.MEMBERS_ONLY)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_stale_failure_after_ready_does_not_regress_a_working_replay(self):
+        # Realistic ordering risk: two independent webhook calls
+        # (success, then a late/duplicate failure retry) can arrive out
+        # of order. A working replay must never flip back to failed.
+        self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"recording_url": "https://cdn.example.com/r.mp4"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"status": "failed", "error": "stale retry"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["recording_status"], ChannelLiveStream.RecordingStatus.READY)
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.READY)
+
+
+class LiveStreamRecordingUploadUrlTests(LiveStreamTestBase):
+    """ChannelLiveStreamRecordingUploadUrlView - issues the presigned S3
+    PUT kisvideo-live-api's app/recording.py uploads a finalized
+    recording to."""
+
+    def setUp(self):
+        super().setUp()
+        self.live_data = self._schedule_stream()
+        self.live = ChannelLiveStream.objects.get(id=self.live_data["id"])
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_rejects_missing_secret(self):
+        res = self.client.post(f"/api/v1/broadcasts/live-streams/{self.live.id}/recording-upload-url/")
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_issues_an_upload_url_scoped_under_the_correct_namespace(self):
+        # The sandbox test settings run against local FileSystemStorage
+        # (no real S3 - see config/settings/creator_sandbox.py), which has
+        # no generate_presigned_put/url(key) of its own - mocking
+        # default_storage here tests the VIEW's own logic (key
+        # construction/scoping, response shape) in isolation from the
+        # real S3MediaStorage implementation, which apps/media/tests.py
+        # already covers separately.
+        with patch("apps.broadcasts.views.default_storage") as mock_storage:
+            mock_storage.generate_presigned_put.return_value = "https://s3.example.com/presigned-put"
+            mock_storage.url.return_value = "https://s3.example.com/object-url"
+
+            res = self.client.post(
+                f"/api/v1/broadcasts/live-streams/{self.live.id}/recording-upload-url/",
+                HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+            )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["upload_url"], "https://s3.example.com/presigned-put")
+        self.assertEqual(res.data["object_url"], "https://s3.example.com/object-url")
+        # Server-generated key, scoped to this exact channel+stream - never
+        # something a caller could redirect to an arbitrary location.
+        self.assertIn(f"broadcast_videos/live_recordings/{self.channel.id}/{self.live.id}/", res.data["object_key"])
+        mock_storage.generate_presigned_put.assert_called_once()
+        called_key = mock_storage.generate_presigned_put.call_args[0][0]
+        self.assertIn(f"broadcast_videos/live_recordings/{self.channel.id}/{self.live.id}/", called_key)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_invalid_stream_id_returns_404(self):
+        res = self.client.post(
+            "/api/v1/broadcasts/live-streams/00000000-0000-0000-0000-000000000000/recording-upload-url/",
+            HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
 
 class ChannelLiveStreamWebhookAuthTests(LiveStreamTestBase):
     """ChannelLiveStreamWebhookView's generic shared-secret fallback - the
@@ -761,6 +876,62 @@ class ChannelLiveStreamWebhookAuthTests(LiveStreamTestBase):
         )
 
         self.assertNotEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class ChannelLiveStreamWebhookRecordingStatusTests(LiveStreamTestBase):
+    """ChannelLiveStreamWebhookView's optional recording_status piggyback -
+    kisvideo-live-api's hook_ready/hook_not_ready send this alongside the
+    ordinary live/ended status (see that service's app/main.py)."""
+
+    def setUp(self):
+        super().setUp()
+        self.live_data = self._schedule_stream()
+        self.live = ChannelLiveStream.objects.get(id=self.live_data["id"])
+        self.live.provider = "kisvideo"
+        self.live.provider_stream_id = "rec-status-test-stream"
+        self.live.save(update_fields=["provider", "provider_stream_id"])
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_live_event_can_set_recording_status_to_recording(self):
+        res = self.client.post(
+            "/api/v1/broadcasts/live-streams/webhook/kisvideo/",
+            {"provider_stream_id": "rec-status-test-stream", "status": "live", "recording_status": "recording"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.RECORDING)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_cannot_regress_a_terminal_ready_status(self):
+        self.live.recording_status = ChannelLiveStream.RecordingStatus.READY
+        self.live.save(update_fields=["recording_status"])
+
+        res = self.client.post(
+            "/api/v1/broadcasts/live-streams/webhook/kisvideo/",
+            {"provider_stream_id": "rec-status-test-stream", "status": "ended", "recording_status": "finalizing"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.live.refresh_from_db()
+        self.assertEqual(
+            self.live.recording_status, ChannelLiveStream.RecordingStatus.READY,
+            "a terminal recording_status must never be regressed by a later live/ended status webhook",
+        )
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_invalid_recording_status_value_is_ignored(self):
+        res = self.client.post(
+            "/api/v1/broadcasts/live-streams/webhook/kisvideo/",
+            {"provider_stream_id": "rec-status-test-stream", "status": "live", "recording_status": "not_a_real_value"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.NOT_STARTED)
 
 
 class ChannelLiveStreamWebhookDedupTests(LiveStreamTestBase):

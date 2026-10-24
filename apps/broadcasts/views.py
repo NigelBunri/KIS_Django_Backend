@@ -17762,6 +17762,31 @@ class ChannelLiveStreamWebhookView(APIView):
                 from apps.broadcasts.realtime import notify_live_stream_status_changed
                 notify_live_stream_status_changed(live)
 
+        # Optional recording-lifecycle update, piggybacked on this same
+        # generic webhook - kisvideo-live-api's hook_ready/hook_not_ready
+        # send this alongside the ordinary live/ended status (see that
+        # service's app/main.py::_notify_django). Only ever a forward
+        # transition: a late or duplicate "recording"/"finalizing" event
+        # (this webhook's own dedup window is 10s - real network/retry
+        # delays can exceed that) must never regress a row that has
+        # already reached a TERMINAL state via the separate archive
+        # webhook (ChannelLiveStreamArchiveView, which runs after this
+        # one, potentially out of order under retry) - a finished replay
+        # silently reverting to "finalizing" would be exactly the kind of
+        # inconsistent state this field exists to prevent, not cause.
+        requested_recording_status = str(payload.get("recording_status") or "").strip().lower()
+        _RECORDING_TERMINAL = {
+            ChannelLiveStream.RecordingStatus.READY,
+            ChannelLiveStream.RecordingStatus.FAILED,
+            ChannelLiveStream.RecordingStatus.DELETED,
+        }
+        if (
+            requested_recording_status
+            and requested_recording_status in ChannelLiveStream.RecordingStatus.values
+            and live.recording_status not in _RECORDING_TERMINAL
+        ):
+            live.recording_status = requested_recording_status
+
         # Update viewer count
         viewer_count = live.viewer_count or 0
         if lsp and hasattr(lsp, "extract_viewer_count"):
@@ -17776,7 +17801,7 @@ class ChannelLiveStreamWebhookView(APIView):
             **(live.metadata or {}),
             "last_webhook": {"provider": provider_name, "event_type": event_type, "status": mapped_status},
         }
-        live.save(update_fields=["status", "viewer_count", "metadata", "started_at", "ended_at", "updated_at"])
+        live.save(update_fields=["status", "recording_status", "viewer_count", "metadata", "started_at", "ended_at", "updated_at"])
         _bump_peak_viewer_count(live.id, viewer_count)
         logger.info(
             "[LiveStream] webhook applied stream=%s new_status=%s viewer_count=%s",
@@ -22043,34 +22068,85 @@ class BroadcastTrendingView(APIView):
 
 # ── Task 3b: DVR Archive webhook ──────────────────────────────────────────────
 
-class ChannelLiveStreamArchiveView(APIView):
-    # SECURITY: this is meant to be a provider/recording-pipeline webhook
-    # (same trust level as ChannelLiveStreamWebhookView), but unlike that
-    # view it was never actually checking a signature despite the comment
-    # claiming so - stream_id is a public, non-secret UUID, so without this
-    # check anyone could plant an arbitrary recording_url + title/thumbnail
-    # as a channel's "archived" stream content. Uses the same shared-secret
-    # header convention as ChannelLiveStreamWebhookView's generic fallback.
-    #
-    # HONESTY NOTE for whoever builds the real recording pipeline: nothing
-    # in this codebase calls this endpoint today. kisvideo-live's
-    # mediamtx.yml has no `record:` block, and no job/worker anywhere
-    # uploads a recording and POSTs here - confirmed by grepping both
-    # repos, not assumed. ChannelLiveStream.recording_status therefore
-    # only ever reaches NOT_STARTED (default) or, via this view, READY/
-    # FAILED - RECORDING/FINALIZING/PROCESSING are real states the full
-    # lifecycle models for when a real pipeline exists, but nothing sets
-    # them yet. Do not surface "processing" to creators until something
-    # actually transitions a stream into that state.
+RECORDING_UPLOAD_KEY_PREFIX = "broadcast_videos/live_recordings"
+
+
+class ChannelLiveStreamRecordingUploadUrlView(APIView):
+    """Issues a presigned S3 PUT for kisvideo-live-api's app/recording.py
+    to upload a finalized recording to - called once per broadcast, right
+    before the actual upload (see that module's _request_upload_url).
+
+    Reuses the exact same presigned-PUT mechanism
+    apps.media.upload_intent already uses for direct-to-S3 client uploads
+    (default_storage.generate_presigned_put, implemented on
+    S3MediaStorage - apps/media/storage_backends.py) rather than this
+    service needing its own AWS credentials at all. The object key is
+    placed under the SAME "broadcast_videos" prefix ordinary feed-video
+    uploads already use (MEDIA_SUBDIRECTORY above) and that
+    AWS_S3_PUBLIC_PREFIXES already covers in production (confirmed via
+    direct inspection of .env.django, not assumed) - this does not make
+    any new part of the bucket public; it reuses a policy and access
+    model every other piece of broadcast video content already relies
+    on. Authorization for VIEWING the resulting replay is still enforced
+    entirely at the ChannelContent/_user_can_view_content layer, exactly
+    as for any other broadcast_videos asset - this endpoint only ever
+    grants WRITE access to one freshly-minted, unguessable key, never
+    read access to anything.
+    """
+
     permission_classes = [AllowAny]
 
     def post(self, request, stream_id):
         if not _live_stream_shared_secret_valid(request):
             return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
-        stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+        stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel"), id=stream_id)
+
+        # The key is generated server-side from the validated stream_id,
+        # NEVER accepted from the caller - app/recording.py never gets to
+        # choose where its upload lands, closing exactly the "trust a
+        # client-supplied S3 key" gap the task called out explicitly.
+        key = f"{RECORDING_UPLOAD_KEY_PREFIX}/{stream.channel_id}/{stream.id}/{uuid.uuid4().hex}.mp4"
+        try:
+            upload_url = default_storage.generate_presigned_put(key, "video/mp4", 600)
+        except Exception:
+            logger.exception("[LiveStream] recording upload-url generation failed stream=%s", stream_id)
+            return Response({"error": "Could not generate upload URL."}, status=500)
+
+        object_url = default_storage.url(key)
+        logger.info("[LiveStream] recording upload-url issued stream=%s", stream_id)
+        return Response({"upload_url": upload_url, "object_url": object_url, "object_key": key})
+
+
+class ChannelLiveStreamArchiveView(APIView):
+    # SECURITY: this is meant to be a provider/recording-pipeline webhook
+    # (same trust level as ChannelLiveStreamWebhookView). Uses the same
+    # shared-secret header convention as that view's generic fallback.
+    #
+    # Called by kisvideo-live-api's app/recording.py after it has
+    # concatenated, ffprobe-validated, and uploaded a finalized recording
+    # via ChannelLiveStreamRecordingUploadUrlView above - see that
+    # module's _report_success/_report_failure. recording_status only
+    # ever reaches READY once the actual media asset has been confirmed
+    # uploaded (never before) - see the ChannelContentAsset creation
+    # below, which is what makes the replay genuinely playable, not just
+    # "a row that claims to be ready."
+    permission_classes = [AllowAny]
+
+    def post(self, request, stream_id):
+        if not _live_stream_shared_secret_valid(request):
+            return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
+        stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
 
         reported_status = str(request.data.get("status") or "").strip().lower()
         if reported_status == "failed":
+            # A failure reported AFTER this stream already has a ready
+            # replay (a stale/duplicate retry arriving out of order) must
+            # never regress a working replay back to "failed" - the
+            # archive succeeded once, that fact doesn't become false
+            # because of a late duplicate event.
+            if stream.recording_status == ChannelLiveStream.RecordingStatus.READY:
+                logger.info("[LiveStream] ignoring stale failure report for already-ready stream=%s", stream_id)
+                return Response({"archived": True, "stream_id": str(stream.id), "recording_status": stream.recording_status})
             stream.recording_status = ChannelLiveStream.RecordingStatus.FAILED
             error_detail = str(request.data.get("error") or "").strip()
             if error_detail:
@@ -22088,6 +22164,22 @@ class ChannelLiveStreamArchiveView(APIView):
         if not recording_url:
             return Response({"error": "recording_url required"}, status=400)
 
+        # Idempotency: a duplicate SUCCESS delivery for a stream that
+        # already has a ready replay must be a no-op, not a second
+        # content/asset pair - checked up front (not just the
+        # ChannelContent.objects.filter(...).exists() guard further
+        # down) so a retry can't even re-run the metadata/status writes
+        # below, let alone create a duplicate asset.
+        existing_replay = ChannelContent.objects.filter(
+            channel=stream.channel, metadata__archived_from_stream=str(stream.id)
+        ).first()
+        if existing_replay is not None:
+            logger.info("[LiveStream] archive webhook deduped - replay already exists for stream=%s", stream_id)
+            return Response({
+                "archived": True, "stream_id": str(stream.id),
+                "recording_status": stream.recording_status, "content_id": str(existing_replay.id),
+            })
+
         # Persist to stream metadata
         metadata = dict(stream.metadata or {})
         metadata["recording_url"] = recording_url
@@ -22099,27 +22191,50 @@ class ChannelLiveStreamArchiveView(APIView):
         stream.recording_status = ChannelLiveStream.RecordingStatus.READY
         stream.save(update_fields=["metadata", "recording_status", "updated_at"])
 
-        # Create VOD content entry - idempotent against retries/duplicate
-        # provider callbacks (the one documented failure mode of this
-        # webhook contract - see ChannelLiveStreamWebhookView's own
-        # dedup-guard comment for why "fires twice" is the realistic case
-        # to guard, not a malicious replay).
-        if not ChannelContent.objects.filter(
-            channel=stream.channel, metadata__archived_from_stream=str(stream.id)
-        ).exists():
-            ChannelContent.objects.create(
-                channel=stream.channel,
-                title=stream.title or "Live Stream Archive",
-                description=stream.description or "",
-                content_type=ChannelContentType.VIDEO,
-                thumbnail_url=thumbnail_url or stream.thumbnail_url or "",
-                status=ChannelContent.Status.DRAFT,
-                visibility=ChannelContent.Visibility.PUBLIC,
-                duration_seconds=int(duration_seconds) if duration_seconds else None,
-                metadata={"archived_from_stream": str(stream.id), "recording_url": recording_url},
-            )
+        # Preserve the broadcast's own chosen visibility rather than
+        # hardcoding PUBLIC - a members-only or unlisted live stream's
+        # replay should inherit the same restriction, not silently
+        # become more exposed than the original broadcast was.
+        source_content = stream.content
+        replay_visibility = source_content.visibility if source_content else ChannelContent.Visibility.PUBLIC
 
-        return Response({"archived": True, "stream_id": str(stream.id), "recording_status": stream.recording_status})
+        replay_content = ChannelContent.objects.create(
+            channel=stream.channel,
+            title=stream.title or "Live Stream Archive",
+            description=stream.description or "",
+            content_type=ChannelContentType.VIDEO,
+            thumbnail_url=thumbnail_url or stream.thumbnail_url or "",
+            # DRAFT/unpublished until the creator explicitly publishes it
+            # through the existing ChannelContentPublishView - matches
+            # the product requirement that a replay must never become
+            # automatically public just because recording finished.
+            status=ChannelContent.Status.DRAFT,
+            visibility=replay_visibility,
+            duration_seconds=int(duration_seconds) if duration_seconds else None,
+            metadata={"archived_from_stream": str(stream.id), "recording_url": recording_url},
+        )
+        # THE critical piece a "ready" recording_status alone does not
+        # provide: without a real ChannelContentAsset row, every existing
+        # playback surface (ChannelContentDetailPage's MediaStage reads
+        # content.assets/content.first_asset, nothing else) has no video
+        # to actually play - the replay would report "ready" while being
+        # completely unplayable. This is what makes recording_status=
+        # ready mean "genuinely watchable," not just "a webhook fired."
+        ChannelContentAsset.objects.create(
+            content=replay_content,
+            asset_type="video",
+            url=recording_url,
+            mime_type="video/mp4",
+            duration_seconds=int(duration_seconds) if duration_seconds else None,
+            thumbnail_url=thumbnail_url or stream.thumbnail_url or "",
+            processing_status="ready",
+        )
+
+        logger.info("[LiveStream] replay created stream=%s content=%s", stream_id, replay_content.id)
+        return Response({
+            "archived": True, "stream_id": str(stream.id),
+            "recording_status": stream.recording_status, "content_id": str(replay_content.id),
+        })
 
 
 # ── Task 4: Content Download ──────────────────────────────────────────────────

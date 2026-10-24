@@ -209,6 +209,7 @@ from .views import (
     ChannelLiveChatBansView,
     BroadcastTrendingView,
     ChannelLiveStreamArchiveView,
+    ChannelLiveStreamRecordingUploadUrlView,
     ChannelContentDownloadView,
     ChannelMembershipTierListView,
     ChannelMembershipTierDetailView,
@@ -886,6 +887,7 @@ urlpatterns = [
     path("broadcasts/trending/", BroadcastTrendingView.as_view(), name="broadcast-trending"),
     # Task 3b: DVR archive webhook
     path("broadcasts/live-streams/<uuid:stream_id>/archive/", ChannelLiveStreamArchiveView.as_view(), name="broadcast-live-stream-archive"),
+    path("broadcasts/live-streams/<uuid:stream_id>/recording-upload-url/", ChannelLiveStreamRecordingUploadUrlView.as_view(), name="broadcast-live-stream-recording-upload-url"),
     # Task 4: content download
     path("broadcasts/channel-contents/<uuid:content_id>/download/", ChannelContentDownloadView.as_view(), name="broadcast-channel-content-download"),
     # Task 5: channel membership tiers and membership
