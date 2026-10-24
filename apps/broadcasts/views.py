@@ -22,6 +22,7 @@ from django.core.files.storage import FileSystemStorage, default_storage
 from django.db import IntegrityError, models, transaction
 from django.db.models import Q
 from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect, StreamingHttpResponse
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
@@ -22087,7 +22088,13 @@ def _resolve_live_stream_for_recording_pipeline(stream_id: str):
     (also what this session's own test suite already exercises)."""
     try:
         return ChannelLiveStream.objects.select_related("channel", "content").get(id=stream_id)
-    except (ValueError, ChannelLiveStream.DoesNotExist):
+    except (ValueError, DjangoValidationError, ChannelLiveStream.DoesNotExist):
+        # DjangoValidationError (NOT the already-imported DRF
+        # rest_framework.exceptions.ValidationError) is what a UUIDField
+        # lookup actually raises for a malformed value like
+        # "live/<key>" - confirmed via a real production 500 on the
+        # first genuine end-to-end test, not assumed; a plain
+        # `except ValueError` alone let this slip through uncaught.
         return ChannelLiveStream.objects.select_related("channel", "content").filter(
             provider="kisvideo", provider_stream_id=stream_id,
         ).first()

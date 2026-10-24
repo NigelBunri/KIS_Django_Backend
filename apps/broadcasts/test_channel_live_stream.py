@@ -685,6 +685,30 @@ class LiveStreamRecordingStatusTests(LiveStreamTestBase):
         self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.READY)
 
     @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_archive_resolves_by_provider_stream_id_not_just_uuid(self):
+        # Same real bug as recording-upload-url's own
+        # test_provider_stream_id_shaped_value_resolves_correctly -
+        # kisvideo-live-api's real _report_success/_report_failure calls
+        # use the "live/<key>" path, never the ChannelLiveStream.id UUID.
+        # _schedule_stream() leaves provider="disabled" (dev-payload mode -
+        # confirmed via this same sandbox's own logs) unless explicitly
+        # overridden; the provider_stream_id fallback lookup filters on
+        # provider="kisvideo" specifically, matching the real
+        # kisvideo-live-api caller this is actually testing against.
+        self.live.provider = "kisvideo"
+        self.live.provider_stream_id = "live/archive-realistic-key"
+        self.live.save(update_fields=["provider", "provider_stream_id"])
+
+        res = self.client.post(
+            "/api/v1/broadcasts/live-streams/live/archive-realistic-key/archive/",
+            {"recording_url": "https://cdn.example.com/r.mp4", "duration_seconds": 1800},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["recording_status"], ChannelLiveStream.RecordingStatus.READY)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
     def test_failed_status_does_not_create_a_replay_content_row(self):
         # The hard requirement this guards: never show a replay as ready
         # when no playable asset actually exists.
@@ -829,9 +853,48 @@ class LiveStreamRecordingUploadUrlTests(LiveStreamTestBase):
         self.assertIn(f"broadcast_videos/live_recordings/{self.channel.id}/{self.live.id}/", called_key)
 
     @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
-    def test_invalid_stream_id_returns_404(self):
+    def test_well_formed_but_nonexistent_uuid_returns_404(self):
         res = self.client.post(
             "/api/v1/broadcasts/live-streams/00000000-0000-0000-0000-000000000000/recording-upload-url/",
+            HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_provider_stream_id_shaped_value_resolves_correctly(self):
+        # THE actual bug a real end-to-end test caught (not something a
+        # UUID-only test suite would surface): kisvideo-live-api's real
+        # caller never knows ChannelLiveStream.id at all - only MediaMTX's
+        # own "live/<key>" path (stored as provider_stream_id). That
+        # value is malformed-as-a-UUID (contains a literal "/"), and
+        # Django's UUIDField lookup raises ValidationError (NOT
+        # ValueError) for a malformed value - a resolver that only
+        # caught ValueError let this crash with a 500 in production on
+        # the very first real call. self.live.provider_stream_id is set
+        # in LiveStreamTestBase in exactly this "live/<key>"-like shape.
+        # _schedule_stream() leaves provider="disabled" (dev-payload mode)
+        # unless explicitly overridden; the provider_stream_id fallback
+        # lookup filters on provider="kisvideo" specifically.
+        self.live.provider = "kisvideo"
+        self.live.provider_stream_id = "live/realistic-key-abc123"
+        self.live.save(update_fields=["provider", "provider_stream_id"])
+
+        with patch("apps.broadcasts.views.default_storage") as mock_storage:
+            mock_storage.generate_presigned_put.return_value = "https://s3.example.com/presigned-put"
+            mock_storage.url.return_value = "https://s3.example.com/object-url"
+
+            res = self.client.post(
+                "/api/v1/broadcasts/live-streams/live/realistic-key-abc123/recording-upload-url/",
+                HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+            )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_unknown_provider_stream_id_shaped_value_returns_404_not_500(self):
+        res = self.client.post(
+            "/api/v1/broadcasts/live-streams/live/no-such-key-at-all/recording-upload-url/",
             HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
         )
 
