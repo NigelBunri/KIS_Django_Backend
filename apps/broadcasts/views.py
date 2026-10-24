@@ -14847,6 +14847,14 @@ def _build_composer_fields(data) -> dict[str, Any]:
     embed_allowed_raw = str(data.get("embed_allowed") or data.get("embedAllowed") or "").strip().lower()
     text_plain = str(data.get("text_plain") or data.get("textPlain") or "").strip()
     text_preview = str(data.get("text_preview") or data.get("textPreview") or "").strip()
+    link_preview_title = str(data.get("link_preview_title") or data.get("linkPreviewTitle") or "").strip()
+    link_preview_description = str(
+        data.get("link_preview_description") or data.get("linkPreviewDescription") or ""
+    ).strip()
+    link_preview_image = str(data.get("link_preview_image") or data.get("linkPreviewImage") or "").strip()
+    link_open_externally_raw = str(
+        data.get("link_open_externally") if data.get("link_open_externally") is not None else data.get("linkOpenExternally") or ""
+    ).strip().lower()
     fields: dict[str, Any] = {}
     if text_doc is not None:
         fields["text"] = text_doc
@@ -14881,16 +14889,40 @@ def _build_composer_fields(data) -> dict[str, Any]:
         fields["embed_allowed"] = True
     elif embed_allowed_raw in {"0", "false", "no", "off"}:
         fields["embed_allowed"] = False
+    if link_preview_title:
+        fields["link_preview_title"] = link_preview_title
+    if link_preview_description:
+        fields["link_preview_description"] = link_preview_description
+    if link_preview_image:
+        fields["link_preview_image"] = link_preview_image
+    if link_open_externally_raw in {"1", "true", "yes", "on"}:
+        fields["link_open_externally"] = True
+    elif link_open_externally_raw in {"0", "false", "no", "off"}:
+        fields["link_open_externally"] = False
     return fields
 
 
-def _build_feed_attachments(request, file_objects):
+def _build_feed_attachments(request, file_objects, captions=None):
+    # captions is index-aligned with file_objects (not with the returned
+    # list) — see appendBroadcastAttachments on the client, which sends one
+    # caption string per uploaded file in upload order. Zipping against
+    # file_objects keeps that alignment even if a later file in the batch
+    # fails validation and _build_feed_attachment returns None for it.
     attachments = []
-    for file_obj in file_objects:
+    for index, file_obj in enumerate(file_objects):
         attachment = _build_feed_attachment(request, file_obj)
         if attachment:
+            if captions and index < len(captions) and captions[index]:
+                attachment["caption"] = str(captions[index]).strip()
             attachments.append(attachment)
     return attachments
+
+
+def _parse_attachment_captions(value: object | None) -> list[str] | None:
+    parsed = _parse_json_payload(value, None)
+    if isinstance(parsed, list):
+        return [str(item or "") for item in parsed]
+    return None
 
 
 def _normalize_feed_attachment(request, attachment: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -15790,6 +15822,15 @@ def _check_embed_access(request, content: ChannelContent):
     policy, _ = ChannelEmbedPolicy.objects.get_or_create(channel=content.channel)
     if not policy.allow_embeds:
         raise PermissionDenied("Embeds are disabled for this channel.")
+    # Per-post override from the composer's "Allow embedding elsewhere"
+    # toggle (metadata['embed_allowed'], set in
+    # channel_content_payload_from_feed_entry) - the channel-wide policy
+    # above is a separate, coarser setting a creator doesn't control per
+    # post. Absent on older content created before this field existed, so
+    # default True to match prior (unconditionally-allowed) behavior.
+    content_metadata = content.metadata if isinstance(content.metadata, dict) else {}
+    if content_metadata.get("embed_allowed") is False:
+        raise PermissionDenied("Embedding is disabled for this post.")
     domain = _request_domain(request)
     if domain and _domain_matches(domain, policy.blocked_domains):
         raise PermissionDenied("This domain is not allowed to embed this content.")
@@ -18738,8 +18779,9 @@ class BroadcastFeedEntriesView(APIView):
         summary = (request.data.get('summary') or '').strip()
         media_type_input = (request.data.get('media_type') or '').strip().lower()
         files = _collect_feed_files(request)
+        attachment_captions = _parse_attachment_captions(request.data.get("attachment_captions"))
         attachments = _merge_client_attachments(
-            _build_feed_attachments(request, files),
+            _build_feed_attachments(request, files, captions=attachment_captions),
             request.data.get("attachment_payloads") or request.data.get("attachments_payload"),
         )
         media_options = _parse_media_options(request.data.get('media_options'))
@@ -18837,8 +18879,9 @@ class BroadcastFeedEntryDetailView(APIView):
         media_type_input = (data.get('media_type') or '').strip().lower()
 
         files = _collect_feed_files(request)
+        attachment_captions = _parse_attachment_captions(data.get("attachment_captions"))
         new_attachments = _merge_client_attachments(
-            _build_feed_attachments(request, files),
+            _build_feed_attachments(request, files, captions=attachment_captions),
             data.get("attachment_payloads") or data.get("attachments_payload"),
         )
         media_options_input = data.get('media_options')

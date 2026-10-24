@@ -287,6 +287,32 @@ def _resolve_channel_for_feed_entry(user, profile: dict[str, Any] | None, entry:
     return _get_or_create_personal_channel(user, profile)
 
 
+def _safe_entry_datetime(value: object):
+    """Best-effort parse — unlike views._content_datetime_from_request this
+    never raises: scheduled_at is one field in a larger post/update, and a
+    malformed value here shouldn't fail content creation outright, just
+    fall back to unscheduled."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if timezone.is_naive(parsed):
+        return timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed
+
+
+def _channel_content_status_from_entry(entry: dict[str, Any], is_broadcast: bool, scheduled_at) -> str:
+    if is_broadcast:
+        return "published"
+    if scheduled_at and scheduled_at > timezone.now():
+        return "scheduled"
+    return "draft"
+
+
 def channel_content_payload_from_feed_entry(channel, entry: dict[str, Any], broadcast_item=None) -> dict[str, Any]:
     attachments = _entry_attachments(entry)
     first_attachment = attachments[0] if attachments else {}
@@ -294,6 +320,7 @@ def channel_content_payload_from_feed_entry(channel, entry: dict[str, Any], broa
     content_type = _content_type_from_entry(entry)
     text_doc = _entry_text_doc(entry)
     text_plain = _entry_text_plain(entry)
+    scheduled_at = _safe_entry_datetime(entry.get("scheduled_at") or entry.get("scheduledAt"))
     published_at = timezone.now() if is_broadcast else None
     if entry.get("broadcasted_at"):
         try:
@@ -319,9 +346,9 @@ def channel_content_payload_from_feed_entry(channel, entry: dict[str, Any], broa
             or ""
         ).strip(),
         "visibility": str(entry.get("visibility") or "public").strip().lower()[:16] or "public",
-        "status": "published" if is_broadcast else "draft",
+        "status": _channel_content_status_from_entry(entry, is_broadcast, scheduled_at),
         "published_at": published_at,
-        "scheduled_at": None,
+        "scheduled_at": scheduled_at,
         "duration_seconds": _safe_int(entry.get("duration_seconds") or first_attachment.get("duration_seconds")),
         "metadata": {
             "legacy_feed_entry": deepcopy(entry),
@@ -330,6 +357,24 @@ def channel_content_payload_from_feed_entry(channel, entry: dict[str, Any], broa
             "captions": deepcopy(entry.get("captions") or None),
             "embed_allowed": bool(entry.get("embed_allowed") or entry.get("embedAllowed")),
             "composer_type": str(entry.get("composer_type") or entry.get("composerType") or "").strip(),
+            # content_type already routes 'poll'/'event'/'link' entries
+            # here (see _content_type_from_entry) but nothing previously
+            # carried the actual poll/event/link payload onto the real
+            # ChannelContent row - ChannelContentPollView reads poll
+            # config from exactly this metadata['poll'] key (see its own
+            # docstring), so without this a channel-scoped poll/event/link
+            # composed here was inert: stored only inside the opaque
+            # legacy_feed_entry blob above, unreachable by the dedicated
+            # poll vote/result endpoint or any event/link-aware client code.
+            "poll": deepcopy(entry.get("poll")) if isinstance(entry.get("poll"), dict) else None,
+            "event": deepcopy(entry.get("event")) if isinstance(entry.get("event"), dict) else None,
+            "link": str(entry.get("link") or "").strip() or None,
+            "link_preview_title": str(entry.get("link_preview_title") or entry.get("linkPreviewTitle") or "").strip() or None,
+            "link_preview_description": str(
+                entry.get("link_preview_description") or entry.get("linkPreviewDescription") or ""
+            ).strip() or None,
+            "link_preview_image": str(entry.get("link_preview_image") or entry.get("linkPreviewImage") or "").strip() or None,
+            "link_open_externally": bool(entry.get("link_open_externally", entry.get("linkOpenExternally", True))),
         },
         "stats": {
             "views": int(entry.get("views") or entry.get("view_count") or 0),
@@ -348,7 +393,7 @@ def sync_channel_content_from_feed_entry(user, profile: dict[str, Any] | None, e
     if not entry_uuid:
         return None
 
-    from apps.broadcasts.models import ChannelContent, ChannelContentAsset
+    from apps.broadcasts.models import BroadcastPlaylist, BroadcastPlaylistItem, ChannelContent, ChannelContentAsset
 
     channel = _resolve_channel_for_feed_entry(user, profile, entry)
     payload = channel_content_payload_from_feed_entry(channel, entry, broadcast_item=broadcast_item)
@@ -366,6 +411,23 @@ def sync_channel_content_from_feed_entry(user, profile: dict[str, Any] | None, e
     for index, attachment in enumerate(_entry_attachments(entry)):
         asset_payload = _asset_payload_from_attachment(attachment, index)
         ChannelContentAsset.objects.create(content=content, **asset_payload)
+
+    # The composer's "Add to playlist" picker only offers this channel's
+    # own playlists (fetchChannelPlaylists(channelId)), and storing
+    # playlist_ids in metadata alone (above) never actually added the
+    # content anywhere - BroadcastPlaylistItem is the real join table
+    # every playlist-items endpoint reads from. Scoped to channel=channel
+    # so a playlist id from a different channel can't be targeted.
+    requested_playlist_ids = entry.get("playlist_ids") or entry.get("playlistIds") or []
+    if isinstance(requested_playlist_ids, list):
+        playlist_uuids = [pid for pid in (_as_uuid(raw) for raw in requested_playlist_ids) if pid]
+        BroadcastPlaylistItem.objects.filter(content=content).exclude(playlist_id__in=playlist_uuids).delete()
+        if playlist_uuids:
+            owned_playlist_ids = set(
+                BroadcastPlaylist.objects.filter(id__in=playlist_uuids, channel=channel).values_list("id", flat=True)
+            )
+            for playlist_id in owned_playlist_ids:
+                BroadcastPlaylistItem.objects.get_or_create(playlist_id=playlist_id, content=content)
 
     if broadcast_item:
         metadata = dict(getattr(broadcast_item, "metadata", None) or {})
