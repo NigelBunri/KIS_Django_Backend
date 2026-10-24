@@ -475,19 +475,14 @@ class ChannelLiveStream(models.Model):
         FAILED = "failed", "Failed"
 
     class RecordingStatus(models.TextChoices):
-        # Full intended lifecycle (matches the YouTube-style automatic-
-        # recording product spec), not all of which this platform can
-        # reach today - see ChannelLiveStreamArchiveView's own docstring.
-        # No MediaMTX record config, no upload step, and nothing calls
-        # that webhook in production yet, so RECORDING/FINALIZING/
-        # PROCESSING are real states a future server-side recording
-        # pipeline would transition through, but nothing in this codebase
-        # sets them today - only NOT_STARTED (default) -> READY or FAILED
-        # actually happen right now, driven by whether a real
-        # recording_url ever arrives. Modeling the full lifecycle now,
-        # even the unreachable states, means the real pipeline (when
-        # built) only has to start emitting the right transitions, not
-        # invent the enum/contract too.
+        # Full lifecycle, all states reachable: kisvideo-live's MediaMTX
+        # native-recording pipeline (app/recording.py) drives
+        # NOT_STARTED -> RECORDING -> FINALIZING -> PROCESSING ->
+        # READY/FAILED via ChannelLiveStreamWebhookView (recording_status
+        # piggybacked on the live-status webhook) and
+        # ChannelLiveStreamArchiveView (processing/ready/failed). DELETED
+        # is set by delete_channel_content when a replay's content is
+        # removed. See ChannelLiveStreamArchiveView's own docstring.
         NOT_STARTED = "not_started", "Not started"
         RECORDING = "recording", "Recording"
         FINALIZING = "finalizing", "Finalizing"

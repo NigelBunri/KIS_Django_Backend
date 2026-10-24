@@ -807,6 +807,105 @@ class LiveStreamRecordingStatusTests(LiveStreamTestBase):
         self.live.refresh_from_db()
         self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.READY)
 
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_processing_status_report_sets_processing(self):
+        # Reported by kisvideo-live-api's app/recording.py right as
+        # concat/validate succeeds and upload is about to begin - a real
+        # sub-state between "finalizing" (just disconnected) and
+        # "ready"/"failed" (pipeline done).
+        res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"status": "processing"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["recording_status"], ChannelLiveStream.RecordingStatus.PROCESSING)
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.PROCESSING)
+        # Reporting "processing" must never itself create a replay - it
+        # has no recording_url, nothing to archive yet.
+        self.assertFalse(
+            ChannelContent.objects.filter(channel=self.channel, metadata__archived_from_stream=str(self.live.id)).exists()
+        )
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_stale_processing_report_does_not_regress_an_already_ready_replay(self):
+        self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"recording_url": "https://cdn.example.com/r.mp4"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"status": "processing"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["recording_status"], ChannelLiveStream.RecordingStatus.READY)
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.READY)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_successful_archive_stores_object_key_as_storage_path(self):
+        # Without this, purge_channel_content_assets (fired on delete)
+        # has no S3 key to actually delete - a "deleted" replay would
+        # leave its video object in S3 forever. object_key is the same
+        # value ChannelLiveStreamRecordingUploadUrlView handed back
+        # alongside the presigned URL this recording was uploaded to.
+        res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {
+                "recording_url": "https://cdn.example.com/r.mp4",
+                "duration_seconds": 1800,
+                "object_key": f"broadcast_videos/live_recordings/{self.channel.id}/{self.live.id}/abc123.mp4",
+            },
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        content = ChannelContent.objects.get(id=res.data["content_id"])
+        asset = content.assets.first()
+        self.assertEqual(asset.storage_path, f"broadcast_videos/live_recordings/{self.channel.id}/{self.live.id}/abc123.mp4")
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_deleting_the_replay_content_sets_recording_status_deleted_and_purges_storage(self):
+        from apps.broadcasts.moderation_gate import delete_channel_content
+
+        archive_res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {
+                "recording_url": "https://cdn.example.com/r.mp4",
+                "object_key": "broadcast_videos/live_recordings/x/y/z.mp4",
+            },
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+        replay_content = ChannelContent.objects.get(id=archive_res.data["content_id"])
+
+        with patch("django.core.files.storage.default_storage") as mock_storage:
+            delete_channel_content(replay_content, actor=self.owner)
+
+        mock_storage.delete.assert_called_once_with("broadcast_videos/live_recordings/x/y/z.mp4")
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.DELETED)
+
+    def test_delete_is_a_noop_for_content_with_no_backing_live_stream(self):
+        # Ordinary (non-replay) content must not blow up just because it
+        # has no live_stream reverse relation at all.
+        from apps.broadcasts.moderation_gate import delete_channel_content
+        from apps.broadcasts.models import ChannelContentType
+
+        plain_content = ChannelContent.objects.create(
+            channel=self.channel, title="Just a post", content_type=ChannelContentType.VIDEO,
+        )
+
+        delete_channel_content(plain_content, actor=self.owner)  # must not raise
+
+        plain_content.refresh_from_db()
+        self.assertTrue(plain_content.is_deleted)
+
 
 class LiveStreamRecordingUploadUrlTests(LiveStreamTestBase):
     """ChannelLiveStreamRecordingUploadUrlView - issues the presigned S3

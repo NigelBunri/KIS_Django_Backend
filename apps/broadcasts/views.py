@@ -22171,6 +22171,24 @@ class ChannelLiveStreamArchiveView(APIView):
             raise Http404
 
         reported_status = str(request.data.get("status") or "").strip().lower()
+        if reported_status == "processing":
+            # Reported once concat/validate/upload actually begins (see
+            # app/recording.py's _finalize_segments on the kisvideo-live
+            # side) - a real sub-state of "the pipeline is doing work",
+            # distinct from "finalizing" (publisher just disconnected,
+            # grace period/segment collection not necessarily done yet).
+            # Same terminal-state protection as the failed/ready paths:
+            # a late or duplicate processing report must never regress a
+            # stream that has already reached a terminal outcome.
+            _RECORDING_TERMINAL = {
+                ChannelLiveStream.RecordingStatus.READY,
+                ChannelLiveStream.RecordingStatus.FAILED,
+                ChannelLiveStream.RecordingStatus.DELETED,
+            }
+            if stream.recording_status not in _RECORDING_TERMINAL:
+                stream.recording_status = ChannelLiveStream.RecordingStatus.PROCESSING
+                stream.save(update_fields=["recording_status", "updated_at"])
+            return Response({"archived": False, "stream_id": str(stream.id), "recording_status": stream.recording_status})
         if reported_status == "failed":
             # A failure reported AFTER this stream already has a ready
             # replay (a stale/duplicate retry arriving out of order) must
@@ -22193,6 +22211,7 @@ class ChannelLiveStreamArchiveView(APIView):
         recording_url = str(request.data.get("recording_url") or "").strip()
         duration_seconds = request.data.get("duration_seconds")
         thumbnail_url = str(request.data.get("thumbnail_url") or "").strip()
+        object_key = str(request.data.get("object_key") or "").strip()
 
         if not recording_url:
             return Response({"error": "recording_url required"}, status=400)
@@ -22257,6 +22276,13 @@ class ChannelLiveStreamArchiveView(APIView):
             content=replay_content,
             asset_type="video",
             url=recording_url,
+            # Without this, purge_channel_content_assets (fired on
+            # delete) has no S3 key to delete - storage_path is what it
+            # keys off of, not url - so a "deleted" replay would leave
+            # its video object in S3 forever. object_key is the same
+            # value ChannelLiveStreamRecordingUploadUrlView handed back
+            # alongside the presigned URL this recording was uploaded to.
+            storage_path=object_key,
             mime_type="video/mp4",
             duration_seconds=int(duration_seconds) if duration_seconds else None,
             thumbnail_url=thumbnail_url or stream.thumbnail_url or "",

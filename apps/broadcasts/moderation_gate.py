@@ -228,13 +228,42 @@ def delete_channel_content(content, *, actor, notes: str = "") -> None:
     for a self-service delete, reused here for an admin-initiated one via
     resolve_and_apply_moderation_decision, plus the real storage purge
     neither path had before."""
-    from .models import ChannelContent
+    from .models import ChannelContent, ChannelLiveStream
 
     content.status = ChannelContent.Status.ARCHIVED
     content.visibility = ChannelContent.Visibility.PRIVATE
     content.is_deleted = True
     content.save(update_fields=["status", "visibility", "is_deleted", "updated_at"])
     purge_channel_content_assets(content)
+
+    # Two distinct ways a ChannelContent can relate to a ChannelLiveStream,
+    # both needing this cleanup:
+    #   1. content IS the original broadcast's own post - ChannelLiveStream.
+    #      content points AT it, so the reverse accessor (related_name=
+    #      "live_stream") resolves directly.
+    #   2. content IS a replay - ChannelLiveStreamArchiveView creates it as
+    #      a brand new standalone row (never wired through the content FK),
+    #      linked back to its source stream only via
+    #      metadata["archived_from_stream"]. Deleting a replay (the
+    #      realistic creator action this exists for) only ever hits this
+    #      path, never the reverse accessor above.
+    # Either way, deleting it must be reflected in recording_status too,
+    # both so the creator's recording/replay management UI stops showing
+    # it as "ready" and so the terminal-state guard on
+    # ChannelLiveStreamWebhookView/ChannelLiveStreamArchiveView rejects
+    # any further stale pipeline report for this stream. This is an
+    # explicit, single user/moderator action, not a race between
+    # duplicate webhook deliveries - it overrides any prior recording
+    # status unconditionally, unlike those two views' own regression
+    # guards.
+    live_stream = getattr(content, "live_stream", None)
+    if live_stream is None:
+        archived_from_stream_id = (content.metadata or {}).get("archived_from_stream")
+        if archived_from_stream_id:
+            live_stream = ChannelLiveStream.objects.filter(id=archived_from_stream_id).first()
+    if live_stream is not None and live_stream.recording_status != ChannelLiveStream.RecordingStatus.DELETED:
+        live_stream.recording_status = ChannelLiveStream.RecordingStatus.DELETED
+        live_stream.save(update_fields=["recording_status", "updated_at"])
 
 
 def resolve_and_apply_moderation_decision(target_type: str, target_id, *, action: str, actor, notes: str = "") -> bool:
