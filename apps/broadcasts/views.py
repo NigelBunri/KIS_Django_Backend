@@ -17350,14 +17350,28 @@ def _derive_stream_key(live) -> str:
         return ingest_url.rsplit("/", 1)[-1]
     if ingest_url.startswith(("rtmp://", "rtmps://")) and live.provider == "disabled":
         return str(live.provider_stream_id or live.id)
-    if ingest_url.startswith(("rtmp://", "rtmps://")) and live.provider == "kisvideo":
-        # kisvideo-live has no "/app/" segment like Mux - its path IS the key
-        # (app/main.py::create_stream: path = f"live/{key}", ingest_url =
-        # rtmp://host:port/live/{key}). Without this branch every kisvideo-
-        # backed stream fell through to the empty-string return below, so
-        # ChannelLiveStreamStreamKeyView always reported "not available yet"
-        # for the one provider actually wired up in production.
-        return ingest_url.rsplit("/", 1)[-1]
+    if live.provider == "kisvideo":
+        # kisvideo-live's ingest_url used to embed the key as its own last
+        # path segment (rtmp://host:1935/live/{key}), which this branch
+        # used to parse directly - but it now points broadcasters at a
+        # per-stream ingest-proxy port instead (app/ingest_proxy.py in
+        # that repo, added so a broadcaster's encoder is re-encoded to a
+        # predictable zero-B-frame shape before MediaMTX ever parses it),
+        # e.g. rtmp://host:19350/live, with no key in it at all - parsing
+        # ingest_url here started silently returning "live" (the RTMP app
+        # name) instead of the real key, breaking "Load stream key for
+        # OBS" with no error, just a wrong value, for every kisvideo
+        # stream created after that change shipped.
+        #
+        # provider_stream_id ("live/{key}", set once at creation time -
+        # see app/main.py::create_stream - and never touched by ingest-
+        # contract changes since) is the stable source of truth for this
+        # provider's key instead, matching the precedent the disabled-
+        # provider branch above already sets (it reads provider_stream_id
+        # as its own key material for the same reason).
+        provider_stream_id = str(live.provider_stream_id or "").strip()
+        if provider_stream_id:
+            return provider_stream_id.rsplit("/", 1)[-1]
     return ""
 
 
