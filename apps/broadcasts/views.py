@@ -17570,6 +17570,32 @@ class ChannelLiveStreamEndView(APIView):
         live.save(update_fields=["status", "ended_at", "replay_url", "updated_at"])
         logger.info("[LiveStream] end tapped stream=%s channel=%s provider=%s", stream_id, live.channel_id, live.provider)
 
+        # Releases kisvideo-live's per-stream ingest-proxy port (see that
+        # repo's app/ingest_proxy.py) back to the pool - deliberately only
+        # here, on the creator's own explicit "End stream" tap, never from
+        # the webhook path above that also sets status=ended. A publisher
+        # disconnect (OBS dropping, a brief network blip) ALSO reaches
+        # "ended" through that webhook, and the ingest proxy's whole
+        # purpose is staying up through exactly that so a reconnect has
+        # somewhere to land (see ingest_proxy.py's own docstring) - tearing
+        # the port down there would defeat that. Only a deliberate tap
+        # here means "this creator is actually done," so only here is it
+        # safe to free the slot. The pool is small (sized for this box's
+        # CPU budget, see kisvideo-live's docker-compose.prod.yml) - skip
+        # this and every past stream permanently holds its port, and the
+        # very next "Go Live" anyone attempts 503s with "No ingest
+        # capacity available" even though nothing is actually broadcasting.
+        if live.provider and live.provider != "disabled" and live.provider_stream_id:
+            from .live_stream_providers import get_live_stream_provider
+            lsp = get_live_stream_provider(live.provider)
+            if lsp:
+                try:
+                    lsp.delete_live_stream(live.provider_stream_id)
+                except Exception:
+                    logger.warning(
+                        "[LiveStream] failed to release provider ingest slot for stream=%s", stream_id, exc_info=True,
+                    )
+
         # Auto-archive live stream as VOD if recording URL is present
         recording_url = (live.metadata or {}).get("recording_url") or ""
         if recording_url and not ChannelContent.objects.filter(

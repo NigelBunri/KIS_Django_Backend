@@ -413,6 +413,41 @@ class LiveStreamStartEndLifecycleTests(LiveStreamTestBase):
         self.assertIsNotNone(self.live.ended_at)
         self.assertEqual(self.live.replay_url, "https://cdn.example.com/replay.m3u8")
 
+    def test_end_releases_provider_ingest_slot_for_real_providers(self):
+        # kisvideo-live's ingest proxy has a small, fixed port pool (one
+        # real-time x264 re-encode per port, sized to this box's CPU
+        # budget - see that repo's docker-compose.prod.yml) and only ever
+        # frees a port via DELETE /streams/{id}. Before this test's fix,
+        # nothing called that on a normal "End stream" tap, so every past
+        # broadcast permanently held its port and the very next "Go Live"
+        # anyone attempted 503'd with "No ingest capacity available" even
+        # though nothing was actually broadcasting - confirmed live
+        # against production, not a hypothetical.
+        self.live.provider = "kisvideo"
+        self.live.provider_stream_id = "live/testkey123"
+        self.live.save(update_fields=["provider", "provider_stream_id"])
+        self.client.force_authenticate(self.owner)
+
+        with patch("apps.broadcasts.live_stream_providers.get_live_stream_provider") as mock_get_provider:
+            mock_lsp = mock_get_provider.return_value
+            res = self.client.post(f"/api/v1/broadcasts/live-streams/{self.live.id}/end/")
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        mock_get_provider.assert_called_once_with("kisvideo")
+        mock_lsp.delete_live_stream.assert_called_once_with("live/testkey123")
+
+    def test_end_does_not_touch_provider_when_disabled(self):
+        # The disabled/dev-payload provider has no real ingest slot to
+        # release - calling delete_live_stream for it would be a no-op at
+        # best, so the view must not even try.
+        self.client.force_authenticate(self.owner)
+
+        with patch("apps.broadcasts.live_stream_providers.get_live_stream_provider") as mock_get_provider:
+            res = self.client.post(f"/api/v1/broadcasts/live-streams/{self.live.id}/end/")
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        mock_get_provider.assert_not_called()
+
     def test_end_auto_archives_vod_when_recording_url_present_exactly_once(self):
         self.live.metadata = {**self.live.metadata, "recording_url": "https://cdn.example.com/recording.mp4"}
         self.live.save(update_fields=["metadata"])
