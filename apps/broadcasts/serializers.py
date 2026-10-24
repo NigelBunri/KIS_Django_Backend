@@ -519,6 +519,17 @@ class ChannelContentListSerializer(serializers.ModelSerializer):
     engagement_counts = serializers.SerializerMethodField()
     is_broadcast = serializers.SerializerMethodField()
     broadcast_id = serializers.SerializerMethodField()
+    # ChannelLiveStream.content is a OneToOneField(..., related_name=
+    # "live_stream") - the actual canonical id a client must navigate with
+    # to watch this content when it's a live stream, distinct from this
+    # ChannelContent row's own id. Without this, every content-list-driven
+    # entry point (channel pages, search, playlists - anywhere rendering
+    # from this serializer) had no correct id to pass to the live-watch
+    # screen at all and silently fell back to the wrong one, which
+    # LiveWatchPage.tsx's useLiveStream() then 404s on, defaulting the UI
+    # to "scheduled" for a stream that was actually live.
+    live_stream_id = serializers.SerializerMethodField()
+    live_stream_status = serializers.SerializerMethodField()
     # Was a plain passthrough model field - see ChannelContentAssetSerializer's
     # url/thumbnail_url comment just above for why that silently 403s once
     # the stored presigned URL's TTL elapses. This is the serializer behind
@@ -541,6 +552,8 @@ class ChannelContentListSerializer(serializers.ModelSerializer):
             "status",
             "is_broadcast",
             "broadcast_id",
+            "live_stream_id",
+            "live_stream_status",
             "published_at",
             "duration_seconds",
             "stats",
@@ -588,6 +601,25 @@ class ChannelContentListSerializer(serializers.ModelSerializer):
     def get_broadcast_id(self, obj: ChannelContent) -> str:
         item = self._active_broadcast(obj)
         return str(item.id) if item else ""
+
+    def _live_stream(self, obj: ChannelContent):
+        # Reverse OneToOneField access raises DoesNotExist rather than
+        # returning None for a content row with no associated stream
+        # (the overwhelming majority of rows - only live-stream content
+        # has one) - that's the normal, expected case here, not a bug to
+        # surface.
+        try:
+            return obj.live_stream
+        except ChannelLiveStream.DoesNotExist:
+            return None
+
+    def get_live_stream_id(self, obj: ChannelContent) -> str:
+        live = self._live_stream(obj)
+        return str(live.id) if live else ""
+
+    def get_live_stream_status(self, obj: ChannelContent) -> str:
+        live = self._live_stream(obj)
+        return live.status if live else ""
 
 
 class ChannelContentDetailSerializer(ChannelContentListSerializer):
@@ -851,6 +883,7 @@ class ChannelLiveStreamSerializer(serializers.ModelSerializer):
             "replay_url",
             "thumbnail_url",
             "thumbnail_media_type",
+            "recording_status",
             "viewer_count",
             "peak_viewer_count",
             "total_view_count",

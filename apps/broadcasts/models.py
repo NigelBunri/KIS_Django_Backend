@@ -474,6 +474,28 @@ class ChannelLiveStream(models.Model):
         CANCELLED = "cancelled", "Cancelled"
         FAILED = "failed", "Failed"
 
+    class RecordingStatus(models.TextChoices):
+        # Full intended lifecycle (matches the YouTube-style automatic-
+        # recording product spec), not all of which this platform can
+        # reach today - see ChannelLiveStreamArchiveView's own docstring.
+        # No MediaMTX record config, no upload step, and nothing calls
+        # that webhook in production yet, so RECORDING/FINALIZING/
+        # PROCESSING are real states a future server-side recording
+        # pipeline would transition through, but nothing in this codebase
+        # sets them today - only NOT_STARTED (default) -> READY or FAILED
+        # actually happen right now, driven by whether a real
+        # recording_url ever arrives. Modeling the full lifecycle now,
+        # even the unreachable states, means the real pipeline (when
+        # built) only has to start emitting the right transitions, not
+        # invent the enum/contract too.
+        NOT_STARTED = "not_started", "Not started"
+        RECORDING = "recording", "Recording"
+        FINALIZING = "finalizing", "Finalizing"
+        PROCESSING = "processing", "Processing"
+        READY = "ready", "Ready"
+        FAILED = "failed", "Failed"
+        DELETED = "deleted", "Deleted"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     channel = models.ForeignKey(BroadcastChannel, on_delete=models.CASCADE, related_name="live_streams")
     content = models.OneToOneField(
@@ -506,6 +528,9 @@ class ChannelLiveStream(models.Model):
     playback_url = models.URLField(max_length=1024, blank=True, default="")
     replay_url = models.URLField(max_length=1024, blank=True, default="")
     thumbnail_url = models.URLField(max_length=1024, blank=True, default="")
+    recording_status = models.CharField(
+        max_length=16, choices=RecordingStatus.choices, default=RecordingStatus.NOT_STARTED, db_index=True,
+    )
     thumbnail_media_type = models.CharField(
         max_length=8,
         choices=[("image", "Image"), ("video", "Video")],

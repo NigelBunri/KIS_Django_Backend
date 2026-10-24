@@ -16616,7 +16616,11 @@ class BroadcastChannelContentListCreateView(APIView):
         can_manage = _user_can_manage_channel(request.user, channel)
         if not channel.is_public and not can_manage:
             raise Http404
-        query = ChannelContent.objects.select_related("channel").filter(channel=channel, is_deleted=False)
+        # select_related("live_stream") - ChannelContentListSerializer's
+        # live_stream_id/live_stream_status fields access this reverse
+        # OneToOneField on every row; without it each one is a separate
+        # query (N+1 across up to 100 rows per page).
+        query = ChannelContent.objects.select_related("channel", "live_stream").filter(channel=channel, is_deleted=False)
         if not can_manage:
             from .moderation_gate import filter_channel_content_broadcast_eligible
 
@@ -22047,12 +22051,36 @@ class ChannelLiveStreamArchiveView(APIView):
     # check anyone could plant an arbitrary recording_url + title/thumbnail
     # as a channel's "archived" stream content. Uses the same shared-secret
     # header convention as ChannelLiveStreamWebhookView's generic fallback.
+    #
+    # HONESTY NOTE for whoever builds the real recording pipeline: nothing
+    # in this codebase calls this endpoint today. kisvideo-live's
+    # mediamtx.yml has no `record:` block, and no job/worker anywhere
+    # uploads a recording and POSTs here - confirmed by grepping both
+    # repos, not assumed. ChannelLiveStream.recording_status therefore
+    # only ever reaches NOT_STARTED (default) or, via this view, READY/
+    # FAILED - RECORDING/FINALIZING/PROCESSING are real states the full
+    # lifecycle models for when a real pipeline exists, but nothing sets
+    # them yet. Do not surface "processing" to creators until something
+    # actually transitions a stream into that state.
     permission_classes = [AllowAny]
 
     def post(self, request, stream_id):
         if not _live_stream_shared_secret_valid(request):
             return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
         stream = get_object_or_404(ChannelLiveStream, id=stream_id)
+
+        reported_status = str(request.data.get("status") or "").strip().lower()
+        if reported_status == "failed":
+            stream.recording_status = ChannelLiveStream.RecordingStatus.FAILED
+            error_detail = str(request.data.get("error") or "").strip()
+            if error_detail:
+                stream.metadata = {**(stream.metadata or {}), "recording_error": error_detail[:500]}
+                stream.save(update_fields=["recording_status", "metadata", "updated_at"])
+            else:
+                stream.save(update_fields=["recording_status", "updated_at"])
+            logger.warning("[LiveStream] recording failed stream=%s error=%s", stream_id, error_detail or "(none given)")
+            return Response({"archived": False, "stream_id": str(stream.id), "recording_status": stream.recording_status})
+
         recording_url = str(request.data.get("recording_url") or "").strip()
         duration_seconds = request.data.get("duration_seconds")
         thumbnail_url = str(request.data.get("thumbnail_url") or "").strip()
@@ -22068,9 +22096,14 @@ class ChannelLiveStreamArchiveView(APIView):
         if thumbnail_url:
             metadata["thumbnail_url"] = thumbnail_url
         stream.metadata = metadata
-        stream.save(update_fields=["metadata", "updated_at"])
+        stream.recording_status = ChannelLiveStream.RecordingStatus.READY
+        stream.save(update_fields=["metadata", "recording_status", "updated_at"])
 
-        # Create VOD content entry
+        # Create VOD content entry - idempotent against retries/duplicate
+        # provider callbacks (the one documented failure mode of this
+        # webhook contract - see ChannelLiveStreamWebhookView's own
+        # dedup-guard comment for why "fires twice" is the realistic case
+        # to guard, not a malicious replay).
         if not ChannelContent.objects.filter(
             channel=stream.channel, metadata__archived_from_stream=str(stream.id)
         ).exists():
@@ -22086,7 +22119,7 @@ class ChannelLiveStreamArchiveView(APIView):
                 metadata={"archived_from_stream": str(stream.id), "recording_url": recording_url},
             )
 
-        return Response({"archived": True, "stream_id": str(stream.id)})
+        return Response({"archived": True, "stream_id": str(stream.id), "recording_status": stream.recording_status})
 
 
 # ── Task 4: Content Download ──────────────────────────────────────────────────

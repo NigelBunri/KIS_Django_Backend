@@ -654,6 +654,75 @@ class LiveStreamArchiveWebhookAuthTests(LiveStreamTestBase):
         self.assertEqual((self.live.metadata or {}).get("recording_url"), None)
 
 
+class LiveStreamRecordingStatusTests(LiveStreamTestBase):
+    """ChannelLiveStream.recording_status - the lifecycle field the real
+    recording pipeline will drive once it exists (see
+    ChannelLiveStreamArchiveView's own honesty-note docstring: nothing
+    calls this webhook in production today, so only NOT_STARTED (default)
+    and the READY/FAILED transitions this view makes are reachable right
+    now)."""
+
+    def setUp(self):
+        super().setUp()
+        self.live_data = self._schedule_stream()
+        self.live = ChannelLiveStream.objects.get(id=self.live_data["id"])
+
+    def test_defaults_to_not_started(self):
+        self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.NOT_STARTED)
+        self.assertEqual(self.live_data["recording_status"], ChannelLiveStream.RecordingStatus.NOT_STARTED)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_successful_archive_sets_ready(self):
+        res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"recording_url": "https://cdn.example.com/r.mp4", "duration_seconds": 1800},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["recording_status"], ChannelLiveStream.RecordingStatus.READY)
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.READY)
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_failed_status_does_not_create_a_replay_content_row(self):
+        # The hard requirement this guards: never show a replay as ready
+        # when no playable asset actually exists.
+        res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"status": "failed", "error": "transcode timed out"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["recording_status"], ChannelLiveStream.RecordingStatus.FAILED)
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.recording_status, ChannelLiveStream.RecordingStatus.FAILED)
+        self.assertEqual(self.live.metadata.get("recording_error"), "transcode timed out")
+        self.assertFalse(
+            ChannelContent.objects.filter(channel=self.channel, metadata__archived_from_stream=str(self.live.id)).exists()
+        )
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_duplicate_success_callbacks_create_exactly_one_replay(self):
+        # The realistic failure mode this guards against: a flaky webhook
+        # delivery firing twice for the same completed recording, not a
+        # malicious replay - see ChannelLiveStreamWebhookView's own
+        # dedup-guard comment for the same reasoning applied there.
+        payload = {"recording_url": "https://cdn.example.com/r.mp4", "duration_seconds": 1800}
+        for _ in range(2):
+            res = self.client.post(
+                f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+                payload, format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+            )
+            self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        self.assertEqual(
+            ChannelContent.objects.filter(channel=self.channel, metadata__archived_from_stream=str(self.live.id)).count(),
+            1,
+        )
+
+
 class ChannelLiveStreamWebhookAuthTests(LiveStreamTestBase):
     """ChannelLiveStreamWebhookView's generic shared-secret fallback - the
     only check KisVideoLiveProvider's webhooks ever get, since that
@@ -1558,3 +1627,67 @@ class ChannelAnalyticsLiveEngagementRollupTests(LiveStreamTestBase):
         self.assertEqual(rollup["metadata"]["live_chat_messages"], 1)
         self.assertEqual(rollup["metadata"]["live_tips_count"], 0)
         self.assertEqual(rollup["metadata"]["live_tips_amount_cents"], 0)
+
+
+class LiveStreamContentListNavigationTests(LiveStreamTestBase):
+    """Regression coverage for the channel-content-list navigation bug:
+    opening a live stream from the main Channels list worked (it already
+    had the real ChannelLiveStream id), but opening the SAME stream from
+    inside its own channel's content list showed it as upcoming forever,
+    because the content list's response had no correct id for the
+    frontend to navigate with at all - ChannelContent.id and
+    ChannelLiveStream.id are different rows/ids, related only via
+    ChannelLiveStream.content (a reverse OneToOneField, related_name
+    "live_stream" on ChannelContent). See ChannelContentListSerializer's
+    live_stream_id/live_stream_status fields."""
+
+    def test_channel_content_list_exposes_the_real_live_stream_id(self):
+        data = self._schedule_stream()
+        live = ChannelLiveStream.objects.get(id=data["id"])
+        # Scheduled content is owner/manager-only visible (not yet public -
+        # see test_scheduling_creates_scheduled_content_not_yet_public), so
+        # fetch as the owner, matching how a creator previewing their own
+        # channel would see it.
+        self.client.force_authenticate(self.owner)
+
+        res = self.client.get(f"/api/v1/broadcasts/channels/{self.channel.id}/contents/")
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        rows = res.data["results"]
+        row = next((r for r in rows if r["id"] == str(live.content_id)), None)
+        self.assertIsNotNone(row, "scheduled live-stream content row not found in content list")
+        # The actual regression: content["id"] (ChannelContent.id) must
+        # NOT be confused with the id a client needs to open the stream.
+        self.assertNotEqual(row["id"], str(live.id))
+        self.assertEqual(row["live_stream_id"], str(live.id))
+        self.assertEqual(row["live_stream_status"], ChannelLiveStream.Status.SCHEDULED)
+        self.assertEqual(row["content_type"], "live_stream")
+
+    def test_live_stream_id_reflects_status_transitions_from_the_same_list(self):
+        data = self._schedule_stream()
+        live = ChannelLiveStream.objects.get(id=data["id"])
+        self.client.force_authenticate(self.owner)
+        self.client.post(f"/api/v1/broadcasts/live-streams/{live.id}/start/")
+
+        res = self.client.get(f"/api/v1/broadcasts/channels/{self.channel.id}/contents/")
+
+        row = next(r for r in res.data["results"] if r["id"] == str(live.content_id))
+        self.assertEqual(row["live_stream_id"], str(live.id))
+        self.assertEqual(row["live_stream_status"], ChannelLiveStream.Status.LIVE)
+
+    def test_ordinary_content_has_no_live_stream_id(self):
+        content = ChannelContent.objects.create(
+            channel=self.channel,
+            content_type="video",
+            title="A normal video",
+            status=ChannelContent.Status.PUBLISHED,
+            visibility=ChannelContent.Visibility.PUBLIC,
+            moderation_status=ContentModerationStatus.PASSED,
+        )
+        self.client.force_authenticate(self.owner)
+
+        res = self.client.get(f"/api/v1/broadcasts/channels/{self.channel.id}/contents/")
+
+        row = next(r for r in res.data["results"] if r["id"] == str(content.id))
+        self.assertEqual(row["live_stream_id"], "")
+        self.assertEqual(row["live_stream_status"], "")
