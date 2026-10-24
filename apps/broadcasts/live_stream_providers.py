@@ -15,10 +15,30 @@ reason to keep dead code around "just in case."
 All other LIVE_STREAM_PROVIDER values keep the disabled/dev-URL behaviour.
 """
 
+import logging
 import os
 from typing import Any, Dict, Optional
 
 import requests as _requests
+
+logger = logging.getLogger(__name__)
+
+
+def redact_stream_ref(value: Any) -> str:
+    """Logging helper: provider_stream_id/ingest_url for the kisvideo
+    provider embed the raw RTMP/WHIP stream key as their last path segment
+    (see kisvideo-live's app/main.py::create_stream) - never log either in
+    full. Mirrors kisvideo-live's own redact_stream_id (app/redact.py) so a
+    redacted id grepped in one service's logs matches the other's."""
+    text = str(value or "")
+    if not text:
+        return text
+    prefix, sep, key = text.rpartition("/")
+    if not sep:
+        return "***" if len(text) > 4 else text
+    if len(key) <= 4:
+        return f"{prefix}/***"
+    return f"{prefix}/...{key[-4:]}"
 
 
 class LiveStreamProviderError(Exception):
@@ -50,6 +70,10 @@ class KisVideoLiveProvider:
 
     def _require_credentials(self) -> None:
         if not self.base_url or not self.internal_token:
+            logger.error(
+                "[kisvideo-live] not configured: base_url=%r internal_token_set=%s",
+                self.base_url, bool(self.internal_token),
+            )
             raise LiveStreamProviderError(
                 "KIS_VIDEO_LIVE_SERVICE_URL and KIS_VIDEO_LIVE_SERVICE_INTERNAL_TOKEN environment variables must be set."
             )
@@ -74,17 +98,32 @@ class KisVideoLiveProvider:
         # either way) and otherwise ignored.
         self._require_credentials()
 
-        resp = _requests.post(
-            f"{self.base_url}/streams",
-            headers=self._headers(),
-            timeout=15,
-        )
+        logger.info("[kisvideo-live] POST %s/streams", self.base_url)
+        try:
+            resp = _requests.post(
+                f"{self.base_url}/streams",
+                headers=self._headers(),
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.error("[kisvideo-live] create_live_stream request failed: %s", exc, exc_info=True)
+            raise LiveStreamProviderError(f"kisvideo-live request failed: {exc}") from exc
         if not resp.ok:
+            logger.error(
+                "[kisvideo-live] create_live_stream returned %s: %s",
+                resp.status_code, resp.text[:500],
+            )
             raise LiveStreamProviderError(
                 f"kisvideo-live API returned {resp.status_code}: {resp.text[:500]}"
             )
 
         data = resp.json()
+        logger.info(
+            "[kisvideo-live] stream created provider_stream_id=%s whip_url=%s playback_url=%s",
+            redact_stream_ref(data.get("provider_stream_id", "")),
+            redact_stream_ref(data.get("whip_url", "")),
+            data.get("playback_url", ""),
+        )
         return {
             "provider": "kisvideo",
             "provider_stream_id": data.get("provider_stream_id", ""),
@@ -97,15 +136,26 @@ class KisVideoLiveProvider:
 
     def delete_live_stream(self, provider_stream_id: str) -> bool:
         if not self.base_url or not self.internal_token:
+            logger.warning("[kisvideo-live] delete_live_stream skipped — service not configured")
             return False
         try:
+            logger.info("[kisvideo-live] DELETE %s/streams/%s", self.base_url, redact_stream_ref(provider_stream_id))
             resp = _requests.delete(
                 f"{self.base_url}/streams/{provider_stream_id}",
                 headers=self._headers(),
                 timeout=10,
             )
+            if not resp.ok:
+                logger.warning(
+                    "[kisvideo-live] delete_live_stream for %s returned %s: %s",
+                    redact_stream_ref(provider_stream_id), resp.status_code, resp.text[:300],
+                )
             return resp.ok
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[kisvideo-live] delete_live_stream for %s raised: %s",
+                redact_stream_ref(provider_stream_id), exc, exc_info=True,
+            )
             return False
 
     def sync_targets(self, provider_stream_id: str, targets: Any) -> bool:
@@ -115,6 +165,7 @@ class KisVideoLiveProvider:
         Called after any ChannelLiveStreamTarget CRUD - see
         ChannelLiveStreamTargetsView/ChannelLiveStreamTargetDetailView."""
         if not self.base_url or not self.internal_token:
+            logger.warning("[kisvideo-live] sync_targets skipped — service not configured")
             return False
         payload = {
             "targets": [
@@ -127,14 +178,28 @@ class KisVideoLiveProvider:
             ]
         }
         try:
+            logger.info(
+                "[kisvideo-live] PUT %s/streams/%s/targets platforms=%s",
+                self.base_url, redact_stream_ref(provider_stream_id),
+                [t.platform for t in targets],
+            )
             resp = _requests.put(
                 f"{self.base_url}/streams/{provider_stream_id}/targets",
                 json=payload,
                 headers=self._headers(),
                 timeout=10,
             )
+            if not resp.ok:
+                logger.warning(
+                    "[kisvideo-live] sync_targets for %s returned %s: %s",
+                    redact_stream_ref(provider_stream_id), resp.status_code, resp.text[:300],
+                )
             return resp.ok
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[kisvideo-live] sync_targets for %s raised: %s",
+                redact_stream_ref(provider_stream_id), exc, exc_info=True,
+            )
             return False
 
 

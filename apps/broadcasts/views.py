@@ -17033,7 +17033,7 @@ class ChannelLiveStreamListCreateView(APIView):
         return Response({"results": ChannelLiveStreamSerializer(rows, many=True, context={"request": request}).data})
 
     def post(self, request, channel_id):
-        from .live_stream_providers import LiveStreamProviderError, get_live_stream_provider
+        from .live_stream_providers import LiveStreamProviderError, get_live_stream_provider, redact_stream_ref
 
         require_feature(
             request.user,
@@ -17058,12 +17058,25 @@ class ChannelLiveStreamListCreateView(APIView):
         # Call the live-streaming provider when enabled and not in sandbox/dev mode
         provider_payload: dict = {}
         provider_name = _live_stream_provider()
+        logger.info(
+            "[LiveStream] create channel=%s user=%s provider=%s dev_payload=%s",
+            channel_id, request.user.id, provider_name, bool(dev_payload),
+        )
         if provider_name != "disabled" and not dev_payload:
             lsp = get_live_stream_provider(provider_name)
+            if not lsp:
+                logger.error("[LiveStream] no provider adapter registered for %r", provider_name)
             if lsp:
                 try:
                     provider_payload = lsp.create_live_stream()
+                    logger.info(
+                        "[LiveStream] provider_payload received provider=%s provider_stream_id=%s whip_url=%s",
+                        provider_payload.get("provider"),
+                        redact_stream_ref(provider_payload.get("provider_stream_id")),
+                        redact_stream_ref(provider_payload.get("whip_url")),
+                    )
                 except LiveStreamProviderError as exc:
+                    logger.error("[LiveStream] provider create_live_stream failed: %s", exc, exc_info=True)
                     raise ValidationError({"provider": str(exc)})
 
         merged = provider_payload or dev_payload
@@ -17268,14 +17281,15 @@ class ChannelLiveStreamCancelView(APIView):
             if lsp:
                 try:
                     lsp.delete_live_stream(live.provider_stream_id)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("[LiveStream] cancel: provider delete_live_stream raised for %s: %s", stream_id, exc, exc_info=True)
 
         live.status = ChannelLiveStream.Status.CANCELLED
         live.save(update_fields=["status", "updated_at"])
         if live.content_id:
             live.content.status = ChannelContent.Status.ARCHIVED
             live.content.save(update_fields=["status"])
+        logger.info("[LiveStream] cancelled stream=%s provider=%s", stream_id, live.provider)
         _channel_audit(request, action="channel_live.cancel", target_type="channel", target_id=live.channel_id, metadata={"stream_id": str(live.id)})
         return Response(ChannelLiveStreamSerializer(live, context={"request": request}).data)
 
@@ -17336,6 +17350,14 @@ def _derive_stream_key(live) -> str:
         return ingest_url.rsplit("/", 1)[-1]
     if ingest_url.startswith(("rtmp://", "rtmps://")) and live.provider == "disabled":
         return str(live.provider_stream_id or live.id)
+    if ingest_url.startswith(("rtmp://", "rtmps://")) and live.provider == "kisvideo":
+        # kisvideo-live has no "/app/" segment like Mux - its path IS the key
+        # (app/main.py::create_stream: path = f"live/{key}", ingest_url =
+        # rtmp://host:port/live/{key}). Without this branch every kisvideo-
+        # backed stream fell through to the empty-string return below, so
+        # ChannelLiveStreamStreamKeyView always reported "not available yet"
+        # for the one provider actually wired up in production.
+        return ingest_url.rsplit("/", 1)[-1]
     return ""
 
 
@@ -17353,7 +17375,15 @@ class ChannelLiveStreamStreamKeyView(APIView):
             raise PermissionDenied("You cannot view ingest details for this live stream.")
         stream_key = _derive_stream_key(live)
         ingest_url = str(live.ingest_url or "").strip()
+        logger.info(
+            "[LiveStream] stream_key requested stream=%s provider=%s available=%s",
+            stream_id, live.provider, bool(stream_key),
+        )
         if not stream_key:
+            logger.warning(
+                "[LiveStream] stream_key unavailable stream=%s provider=%s ingest_url_set=%s",
+                stream_id, live.provider, bool(ingest_url),
+            )
             raise ValidationError({"stream_key": "Stream key is not available for this provider yet."})
         _channel_audit(
             request,
@@ -17405,7 +17435,7 @@ class ChannelLiveStreamStreamKeyRotateView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, stream_id):
-        from .live_stream_providers import LiveStreamProviderError, get_live_stream_provider
+        from .live_stream_providers import LiveStreamProviderError, get_live_stream_provider, redact_stream_ref
 
         live = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
         if not _user_can_edit_content(request.user, ChannelContent(channel=live.channel)):
@@ -17413,22 +17443,29 @@ class ChannelLiveStreamStreamKeyRotateView(APIView):
         if live.status == ChannelLiveStream.Status.LIVE:
             raise ValidationError({"status": "Cannot rotate the stream key while the broadcast is live. End it first."})
 
+        logger.info("[LiveStream] rotate stream_key stream=%s provider=%s", stream_id, live.provider)
         old_provider_stream_id = str(live.provider_stream_id or "")
         if live.provider and live.provider != "disabled":
             lsp = get_live_stream_provider(live.provider)
             if lsp is None:
+                logger.error("[LiveStream] rotate: no provider adapter for %r", live.provider)
                 raise ValidationError({"provider": f"No active provider adapter for '{live.provider}'."})
             if old_provider_stream_id:
                 lsp.delete_live_stream(old_provider_stream_id)
             try:
                 provider_payload = lsp.create_live_stream()
             except LiveStreamProviderError as exc:
+                logger.error("[LiveStream] rotate: provider create_live_stream failed: %s", exc, exc_info=True)
                 raise ValidationError({"provider": str(exc)})
             live.provider_stream_id = provider_payload.get("provider_stream_id") or str(uuid.uuid4())
             live.ingest_url = provider_payload.get("ingest_url", "")
             live.playback_url = provider_payload.get("playback_url", "") or live.playback_url
             if provider_payload.get("whip_url"):
                 live.metadata = {**(live.metadata or {}), "whip_url": provider_payload.get("whip_url")}
+            logger.info(
+                "[LiveStream] rotate: new provider_stream_id=%s whip_url=%s",
+                redact_stream_ref(live.provider_stream_id), redact_stream_ref(provider_payload.get("whip_url")),
+            )
         else:
             live.provider_stream_id = str(uuid.uuid4())
 
@@ -17473,6 +17510,10 @@ class ChannelLiveStreamStartView(APIView):
         live.save(update_fields=["status", "started_at", "updated_at"])
         if live.content_id:
             _activate_live_stream_content(live.content_id)
+        logger.info(
+            "[LiveStream] start tapped stream=%s channel=%s provider=%s subscribers_notified_now=%s",
+            stream_id, live.channel_id, live.provider, (live.provider or "disabled") == "disabled",
+        )
         _channel_audit(request, action="channel_live.start", target_type="channel", target_id=live.channel_id, metadata={"stream_id": str(live.id), "content_id": str(live.content_id or "")})
         # Only tell subscribers "it's live" immediately when nothing will ever
         # confirm real ingest for us: disabled/dev-payload streams always store
@@ -17513,6 +17554,7 @@ class ChannelLiveStreamEndView(APIView):
         live.ended_at = live.ended_at or timezone.now()
         live.replay_url = str(request.data.get("replay_url") or request.data.get("replayUrl") or live.replay_url or "").strip()
         live.save(update_fields=["status", "ended_at", "replay_url", "updated_at"])
+        logger.info("[LiveStream] end tapped stream=%s channel=%s provider=%s", stream_id, live.channel_id, live.provider)
 
         # Auto-archive live stream as VOD if recording URL is present
         recording_url = (live.metadata or {}).get("recording_url") or ""
@@ -17567,9 +17609,14 @@ class ChannelLiveStreamWebhookView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request, provider):
-        from .live_stream_providers import get_live_stream_provider
+        from .live_stream_providers import get_live_stream_provider, redact_stream_ref
 
         provider_name = str(provider).strip().lower()
+        logger.info(
+            "[LiveStream] webhook received provider=%s remote=%s headers_has_secret=%s",
+            provider_name, request.META.get("REMOTE_ADDR"),
+            bool(request.headers.get("X-Live-Webhook-Secret") or request.headers.get("X-KIS-Live-Secret")),
+        )
 
         # Provider-specific signature verification
         lsp = get_live_stream_provider(provider_name)
@@ -17581,10 +17628,12 @@ class ChannelLiveStreamWebhookView(APIView):
             )
             raw_body = request.body if hasattr(request, "body") else b""
             if sig_header and not lsp.verify_webhook_signature(raw_body, sig_header):
+                logger.warning("[LiveStream] webhook rejected: invalid signature provider=%s", provider_name)
                 return Response({"detail": "Invalid webhook signature."}, status=status.HTTP_403_FORBIDDEN)
         else:
             # Generic shared-secret fallback
             if not _live_stream_shared_secret_valid(request):
+                logger.warning("[LiveStream] webhook rejected: invalid/missing shared secret provider=%s", provider_name)
                 return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
 
         payload = request.data if isinstance(request.data, dict) else {}
@@ -17596,6 +17645,7 @@ class ChannelLiveStreamWebhookView(APIView):
             provider_stream_id = str(payload.get("provider_stream_id") or payload.get("stream_id") or "").strip()
 
         if not provider_stream_id:
+            logger.warning("[LiveStream] webhook has no stream id provider=%s payload_keys=%s", provider_name, list(payload.keys()))
             return Response({"matched": False, "reason": "no_stream_id"}, status=status.HTTP_202_ACCEPTED)
 
         # Map provider event type to KIS status
@@ -17605,8 +17655,17 @@ class ChannelLiveStreamWebhookView(APIView):
         else:
             mapped_status = str(payload.get("status") or "").strip().lower() or None
 
+        logger.info(
+            "[LiveStream] webhook provider=%s provider_stream_id=%s event_type=%s mapped_status=%s",
+            provider_name, redact_stream_ref(provider_stream_id), event_type, mapped_status,
+        )
+
         live = ChannelLiveStream.objects.filter(provider=provider_name, provider_stream_id=provider_stream_id).first()
         if not live:
+            logger.warning(
+                "[LiveStream] webhook matched no ChannelLiveStream row provider=%s provider_stream_id=%s",
+                provider_name, redact_stream_ref(provider_stream_id),
+            )
             return Response({"matched": False}, status=status.HTTP_202_ACCEPTED)
 
         # Duplicate-delivery guard: kisvideo-live's MediaMTX hooks are
@@ -17625,7 +17684,13 @@ class ChannelLiveStreamWebhookView(APIView):
         # (e.g. the stream going live again after a real reconnect).
         dedup_key = f"broadcast:live_webhook_dedup:{provider_name}:{provider_stream_id}:{mapped_status or 'nostatus'}"
         if not cache.add(dedup_key, 1, timeout=10):
+            logger.info("[LiveStream] webhook deduped stream=%s mapped_status=%s", live.id, mapped_status)
             return Response({"matched": True, "deduped": True}, status=status.HTTP_200_OK)
+
+        logger.info(
+            "[LiveStream] webhook matched stream=%s channel=%s old_status=%s mapped_status=%s",
+            live.id, live.channel_id, live.status, mapped_status,
+        )
 
         if mapped_status and mapped_status in ChannelLiveStream.Status.values:
             live.status = mapped_status
@@ -17669,6 +17734,10 @@ class ChannelLiveStreamWebhookView(APIView):
         }
         live.save(update_fields=["status", "viewer_count", "metadata", "started_at", "ended_at", "updated_at"])
         _bump_peak_viewer_count(live.id, viewer_count)
+        logger.info(
+            "[LiveStream] webhook applied stream=%s new_status=%s viewer_count=%s",
+            live.id, live.status, viewer_count,
+        )
         return Response({"matched": True, "id": str(live.id), "status": live.status})
 
 
@@ -21564,10 +21633,16 @@ class ChannelLiveStreamWhipView(APIView):
     parser_classes = []  # accept raw SDP body
 
     def post(self, request, stream_id):
+        from .live_stream_providers import redact_stream_ref
+
         stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel"), id=stream_id)
         if not _user_can_edit_content(request.user, ChannelContent(channel=stream.channel)):
             raise PermissionDenied("You cannot publish to this live stream.")
         whip_url = (stream.metadata or {}).get("whip_url") or ""
+        logger.info(
+            "[WHIP] offer received stream=%s channel=%s provider=%s whip_url_configured=%s sdp_bytes=%s",
+            stream_id, stream.channel_id, stream.provider, bool(whip_url), len(request.body or b""),
+        )
         if whip_url and not is_safe_external_url(whip_url):
             # Defense in depth: whip_url can no longer be set by clients (see
             # the metadata allowlist in ChannelLiveStreamListCreateView), but
@@ -21591,14 +21666,19 @@ class ChannelLiveStreamWhipView(APIView):
                     http_resp = HttpResponse(sdp_answer, content_type="application/sdp", status=201)
                     if location := resp.headers.get("Location"):
                         http_resp["Location"] = location
+                    logger.info(
+                        "[WHIP] proxy succeeded stream=%s whip_url=%s upstream_status=%s",
+                        stream_id, redact_stream_ref(whip_url), resp.status,
+                    )
                     return http_resp
             except Exception as exc:
-                logger.warning("[WHIP] proxy error for stream %s: %s", stream_id, exc)
+                logger.warning("[WHIP] proxy error for stream %s whip_url=%s: %s", stream_id, redact_stream_ref(whip_url), exc, exc_info=True)
                 return Response({"error": "WHIP proxy failed", "detail": str(exc)}, status=502)
         # No WHIP URL configured — return stream key so client can fall back to RTMP.
         # (Reads the real ingest_url/key the same way ChannelLiveStreamStreamKeyView
         # does - stream.metadata never actually holds these, so reading from there
         # always returned null.)
+        logger.warning("[WHIP] no whip_url configured for stream=%s provider=%s — falling back to RTMP key", stream_id, stream.provider)
         return Response(
             {
                 "error": "WHIP not configured for this stream",
