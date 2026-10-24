@@ -32,28 +32,16 @@ class BroadcastSourceType(models.TextChoices):
     EDUCATION_BROADCAST = "education_broadcast", "Education Broadcast"
 
 
+# Broadcast feed content no longer expires. This used to be 10 days (with
+# market/education categories special-cased to 365 via
+# LONG_LIVED_BROADCAST_SOURCE_TYPES/BroadcastItem.save()) - both the
+# default and the override are gone now, so every category gets the same
+# effectively-never expiry below.
+BROADCAST_NO_EXPIRY_DAYS = 36500  # ~100 years
+
+
 def _default_expires_at():
-    return timezone.now() + timedelta(days=10)
-
-
-# Every current BroadcastItem creation call site (apps/broadcasts/views.py,
-# ~8 of them) independently re-implements "now + 10 days" in Python rather
-# than relying on the field default - so a uniform "specialized categories
-# get a longer lifecycle" rule can't be applied by fixing the field default
-# alone; it has to override whatever those call sites compute. Limited to
-# the two categories that actually exist as real BroadcastSourceType
-# values today (market, education) - the directive's "health/jobs/
-# institutional" examples don't correspond to any implemented content
-# type in this codebase, so there's nothing to apply that part of the
-# rule to yet.
-LONG_LIVED_BROADCAST_SOURCE_TYPES = {
-    BroadcastSourceType.MARKET_PRODUCT,
-    BroadcastSourceType.MARKET_SERVICE,
-    BroadcastSourceType.EDUCATION_COURSE,
-    BroadcastSourceType.EDUCATION_PROFILE,
-    BroadcastSourceType.EDUCATION_BROADCAST,
-}
-LONG_LIVED_BROADCAST_LIFETIME_DAYS = 365
+    return timezone.now() + timedelta(days=BROADCAST_NO_EXPIRY_DAYS)
 
 
 class BroadcastItem(models.Model):
@@ -92,19 +80,6 @@ class BroadcastItem(models.Model):
             models.Index(fields=["source_type", "source_id"]),
             models.Index(fields=["expires_at"]),
         ]
-
-    def save(self, *args, **kwargs):
-        # New row + a specialized category: always give it the long
-        # lifecycle, regardless of what the caller computed for
-        # expires_at - see LONG_LIVED_BROADCAST_SOURCE_TYPES's comment.
-        # Re-broadcasting (calling the same broadcast endpoint again on an
-        # existing source_type/source_id via update_or_create) already
-        # gives every category a fresh lifecycle on each call, since
-        # broadcasted_at/expires_at are both in defaults= at every call
-        # site - this only needs to handle the FIRST creation.
-        if self._state.adding and self.source_type in LONG_LIVED_BROADCAST_SOURCE_TYPES:
-            self.expires_at = timezone.now() + timedelta(days=LONG_LIVED_BROADCAST_LIFETIME_DAYS)
-        super().save(*args, **kwargs)
 
 
 class EducationProfileType(models.TextChoices):

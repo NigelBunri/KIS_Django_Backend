@@ -207,6 +207,7 @@ from apps.broadcasts.models import (
     Medium,
     Service,
     ServiceMediumMap,
+    BROADCAST_NO_EXPIRY_DAYS,
     _default_expires_at,
     LiveChatMessage,
     ChannelChatBan,
@@ -563,7 +564,7 @@ class EducationCourseBroadcastView(APIView):
         if profile_id:
             education_profile = _get_education_profile_or_404(request.user, profile_id)
 
-        expires_at = timezone.now() + timedelta(days=10)
+        expires_at = _default_expires_at()
         raw_price_amount = _education_price_amount_from_payload(metadata)
         if raw_price_amount in (None, ""):
             raw_price_amount = _education_price_amount_from_payload(request.data)
@@ -612,7 +613,7 @@ class EducationProfileBroadcastView(APIView):
 
     def post(self, request, profile_id: str):
         profile = _get_education_profile_or_404(request.user, profile_id)
-        expires_at = timezone.now() + timedelta(days=10)
+        expires_at = _default_expires_at()
         courses = list(
             profile.courses.all().values("id", "title", "summary")[:10]
         )
@@ -7797,7 +7798,9 @@ class BroadcastFeedView(APIView):
             offset = _parse_positive_int(request.query_params.get("offset", 0), 0)
         else:
             offset = _decode_feed_cursor(request.query_params.get("cursor"), 0)
-        since = timezone.now() - timedelta(days=10)
+        # No lookback limit - channel messages pulled into the feed aren't
+        # cut off by age (previously 10 days).
+        since = timezone.now() - timedelta(days=BROADCAST_NO_EXPIRY_DAYS)
         now = timezone.now()
         query = str(request.query_params.get("q") or "").strip().lower()
 
@@ -9151,7 +9154,7 @@ class BroadcastChannelMessageView(APIView):
             return Response({"detail": "No valid messages found for broadcast."}, status=400)
 
         created = []
-        expires_at = timezone.now() + timedelta(days=10)
+        expires_at = _default_expires_at()
         for msg_id in valid_message_ids:
             item, _ = BroadcastItem.objects.update_or_create(
                 source_type=BroadcastSourceType.CHANNEL_MESSAGE,
@@ -14387,16 +14390,15 @@ class ProfileCreationView(APIView):
 
     def _handle_broadcast_feed(self, user, profiles, payload):
         now = timezone.now()
-        expires_at = now + timedelta(days=10)
         existing = profiles.get('broadcast_feed') or {}
         profiles['broadcast_feed'] = {
             'title': payload.get('title') or existing.get('title') or 'Scheduled broadcast feed',
             'profile_name': existing.get('profile_name') or payload.get('profile_name') or 'Broadcast feed',
-            'notes': payload.get('notes') or existing.get('notes') or 'Feeds expire after 10 days.',
+            'notes': payload.get('notes') or existing.get('notes') or 'Feeds do not expire.',
             'created_at': existing.get('created_at') or now.isoformat(),
             'updated_at': now.isoformat(),
-            'expires_at': expires_at.isoformat(),
-            'max_duration_days': 10,
+            'expires_at': None,
+            'max_duration_days': None,
             'feeds': existing.get('feeds', []),
         }
         return profiles['broadcast_feed']
@@ -15142,11 +15144,11 @@ def _bootstrap_broadcast_feed_profile(user, profiles: dict[str, Any]) -> dict[st
     bootstrapped = {
         'title': profile.get('title') or 'Scheduled broadcast feed',
         'profile_name': profile.get('profile_name') or 'Broadcast feed',
-        'notes': profile.get('notes') or 'Feeds expire after 10 days.',
+        'notes': profile.get('notes') or 'Feeds do not expire.',
         'created_at': profile.get('created_at') or now.isoformat(),
         'updated_at': now.isoformat(),
-        'expires_at': profile.get('expires_at') or (now + timedelta(days=10)).isoformat(),
-        'max_duration_days': profile.get('max_duration_days') or 10,
+        'expires_at': profile.get('expires_at'),
+        'max_duration_days': profile.get('max_duration_days'),
         'feeds': list(profile.get('feeds') or []),
     }
     profiles['broadcast_feed'] = bootstrapped
@@ -15375,7 +15377,7 @@ def _broadcast_channel_for_feed(channel: BroadcastChannel, user) -> BroadcastIte
             "metadata": _channel_broadcast_metadata(channel),
             "broadcasted_by": user,
             "broadcasted_at": timezone.now(),
-            "expires_at": timezone.now() + timedelta(days=10),
+            "expires_at": _default_expires_at(),
             "is_deleted": False,
         },
     )
@@ -15399,7 +15401,7 @@ def _broadcast_channel_content_for_feed(content: ChannelContent, user) -> Broadc
             "metadata": metadata,
             "broadcasted_by": user,
             "broadcasted_at": timezone.now(),
-            "expires_at": timezone.now() + timedelta(days=10),
+            "expires_at": _default_expires_at(),
             "is_deleted": False,
         },
     )
@@ -19088,7 +19090,7 @@ class BroadcastFeedEntryBroadcastView(APIView):
             broadcasted_by=request.user,
             defaults={
                 'broadcasted_at': timezone.now(),
-                'expires_at': timezone.now() + timedelta(days=10),
+                'expires_at': _default_expires_at(),
                 'is_deleted': False,
             },
         )
@@ -19980,7 +19982,7 @@ class HealthInstitutionCardsView(APIView):
                     defaults={
                         'broadcasted_by': request.user,
                         'broadcasted_at': timezone.now(),
-                        'expires_at': timezone.now() + timedelta(days=10),
+                        'expires_at': _default_expires_at(),
                         'is_deleted': False,
                         'metadata': payload_metadata,
                     },
