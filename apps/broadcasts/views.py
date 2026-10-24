@@ -22071,6 +22071,28 @@ class BroadcastTrendingView(APIView):
 RECORDING_UPLOAD_KEY_PREFIX = "broadcast_videos/live_recordings"
 
 
+def _resolve_live_stream_for_recording_pipeline(stream_id: str):
+    """kisvideo-live-api's app/recording.py only ever knows MediaMTX's own
+    "path" identifier (e.g. "live/<key>") - stored as
+    ChannelLiveStream.provider_stream_id, a DIFFERENT value from
+    ChannelLiveStream.id (the UUID these two views were originally,
+    incorrectly, keyed on in their URL - caught by an actual end-to-end
+    test against real production infrastructure, not assumed: the first
+    real call from kisvideo-live-api 404'd because "live/<key>" doesn't
+    fit the <uuid:stream_id> URL converter at all). Falls back to
+    provider_stream_id lookup (the same resolution
+    ChannelLiveStreamWebhookView already does) when the value isn't a
+    valid UUID, so this single endpoint shape serves both the real
+    recording-pipeline caller AND a UUID-based admin/manual-testing path
+    (also what this session's own test suite already exercises)."""
+    try:
+        return ChannelLiveStream.objects.select_related("channel", "content").get(id=stream_id)
+    except (ValueError, ChannelLiveStream.DoesNotExist):
+        return ChannelLiveStream.objects.select_related("channel", "content").filter(
+            provider="kisvideo", provider_stream_id=stream_id,
+        ).first()
+
+
 class ChannelLiveStreamRecordingUploadUrlView(APIView):
     """Issues a presigned S3 PUT for kisvideo-live-api's app/recording.py
     to upload a finalized recording to - called once per broadcast, right
@@ -22099,7 +22121,9 @@ class ChannelLiveStreamRecordingUploadUrlView(APIView):
     def post(self, request, stream_id):
         if not _live_stream_shared_secret_valid(request):
             return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
-        stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel"), id=stream_id)
+        stream = _resolve_live_stream_for_recording_pipeline(stream_id)
+        if stream is None:
+            raise Http404
 
         # The key is generated server-side from the validated stream_id,
         # NEVER accepted from the caller - app/recording.py never gets to
@@ -22135,7 +22159,9 @@ class ChannelLiveStreamArchiveView(APIView):
     def post(self, request, stream_id):
         if not _live_stream_shared_secret_valid(request):
             return Response({"detail": "Invalid live webhook signature."}, status=status.HTTP_403_FORBIDDEN)
-        stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id)
+        stream = _resolve_live_stream_for_recording_pipeline(stream_id)
+        if stream is None:
+            raise Http404
 
         reported_status = str(request.data.get("status") or "").strip().lower()
         if reported_status == "failed":

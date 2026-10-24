@@ -886,8 +886,14 @@ urlpatterns = [
     # Task 2b: trending
     path("broadcasts/trending/", BroadcastTrendingView.as_view(), name="broadcast-trending"),
     # Task 3b: DVR archive webhook
-    path("broadcasts/live-streams/<uuid:stream_id>/archive/", ChannelLiveStreamArchiveView.as_view(), name="broadcast-live-stream-archive"),
-    path("broadcasts/live-streams/<uuid:stream_id>/recording-upload-url/", ChannelLiveStreamRecordingUploadUrlView.as_view(), name="broadcast-live-stream-recording-upload-url"),
+    # <path:stream_id>, not <uuid:stream_id> - kisvideo-live-api's real
+    # caller only ever knows MediaMTX's own path identifier (e.g.
+    # "live/<key>", which contains a literal "/" and is never a valid
+    # UUID) - see _resolve_live_stream_for_recording_pipeline's own
+    # docstring for why both this AND a UUID still both resolve
+    # correctly through the same URL shape.
+    path("broadcasts/live-streams/<path:stream_id>/archive/", ChannelLiveStreamArchiveView.as_view(), name="broadcast-live-stream-archive"),
+    path("broadcasts/live-streams/<path:stream_id>/recording-upload-url/", ChannelLiveStreamRecordingUploadUrlView.as_view(), name="broadcast-live-stream-recording-upload-url"),
     # Task 4: content download
     path("broadcasts/channel-contents/<uuid:content_id>/download/", ChannelContentDownloadView.as_view(), name="broadcast-channel-content-download"),
     # Task 5: channel membership tiers and membership
