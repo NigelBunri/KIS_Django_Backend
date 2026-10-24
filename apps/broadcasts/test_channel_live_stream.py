@@ -185,6 +185,40 @@ class LiveStreamSchedulingTests(LiveStreamTestBase):
         # scheduled stream's content card.
         self.assertEqual(live.content.thumbnail_url, "")
 
+    def test_schedule_with_realistic_presigned_wait_image_url_succeeds(self):
+        # CONFIRMED ROOT CAUSE of "Could not schedule stream" whenever a
+        # wait-image/video was set: ChannelLiveStream.thumbnail_url (and
+        # playback_url/replay_url) used Django's default URLField
+        # max_length=200 and were written via a plain .create() call with
+        # no full_clean(), so a real presigned S3 GET URL (X-Amz-Signature/
+        # Credential/Date/Expires/SignedHeaders query string, 250-400+
+        # chars) hit Postgres directly as "value too long for type
+        # character varying(200)" - same bug class already fixed once for
+        # BroadcastChannel.avatar_url/banner_url. A short fixed test URL
+        # like the happy-path test above never exercises this at all.
+        self.client.force_authenticate(self.owner)
+        realistic_presigned_url = (
+            "https://kis-media-bucket.s3.eu-west-2.amazonaws.com/"
+            "broadcast_live_wait_media/2026/10/24/"
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890-wait-screen.jpg"
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            "&X-Amz-Credential=AKIAEXAMPLE1234567890%2F20261024%2Feu-west-2%2Fs3%2Faws4_request"
+            "&X-Amz-Date=20261024T140000Z"
+            "&X-Amz-Expires=604800"
+            "&X-Amz-SignedHeaders=host"
+            "&X-Amz-Signature=" + "a" * 64
+        )
+        self.assertGreater(len(realistic_presigned_url), 200)
+
+        res = self.client.post(
+            f"/api/v1/broadcasts/channels/{self.channel.id}/live-streams/",
+            {"title": "x", "thumbnail_url": realistic_presigned_url, "thumbnail_media_type": "image"},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(res.data["thumbnail_url"], realistic_presigned_url)
+
     def test_schedule_rejects_invalid_thumbnail_media_type(self):
         self.client.force_authenticate(self.owner)
 

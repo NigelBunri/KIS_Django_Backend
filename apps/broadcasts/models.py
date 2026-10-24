@@ -493,9 +493,19 @@ class ChannelLiveStream(models.Model):
     provider_stream_id = models.CharField(max_length=160, blank=True, default="")
     ingest_url = models.CharField(max_length=512, blank=True, default="")
     stream_key_hash = models.CharField(max_length=128, blank=True, default="")
-    playback_url = models.URLField(blank=True, default="")
-    replay_url = models.URLField(blank=True, default="")
-    thumbnail_url = models.URLField(blank=True, default="")
+    # Same bug class already fixed once for BroadcastChannel.avatar_url/
+    # banner_url (see that migration's commit): Django's URLField defaults
+    # to max_length=200, but a presigned S3 GET URL (X-Amz-Signature/
+    # Credential/Date/Expires/SignedHeaders query string) routinely runs
+    # 250-400+ characters. These three are populated straight from such
+    # URLs (wait-screen upload confirm, provider playback/replay links) via
+    # a plain .create() call with no full_clean(), so the too-long value
+    # hit Postgres directly as "value too long for type character varying
+    # (200)" - every single ChannelLiveStreamListCreateView.post() with a
+    # wait-image/video set failed outright ("Could not schedule stream").
+    playback_url = models.URLField(max_length=1024, blank=True, default="")
+    replay_url = models.URLField(max_length=1024, blank=True, default="")
+    thumbnail_url = models.URLField(max_length=1024, blank=True, default="")
     thumbnail_media_type = models.CharField(
         max_length=8,
         choices=[("image", "Image"), ("video", "Video")],
