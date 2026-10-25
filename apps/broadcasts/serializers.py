@@ -846,6 +846,7 @@ class ChannelLiveStreamSerializer(serializers.ModelSerializer):
     ingest_url = serializers.SerializerMethodField()
     stream_key_available = serializers.SerializerMethodField()
     metadata = serializers.SerializerMethodField()
+    replay_content_id = serializers.SerializerMethodField()
 
     # Internal-only keys stored in ChannelLiveStream.metadata that must
     # never reach a non-manager viewer. whip_url in particular is the
@@ -884,6 +885,7 @@ class ChannelLiveStreamSerializer(serializers.ModelSerializer):
             "thumbnail_url",
             "thumbnail_media_type",
             "recording_status",
+            "replay_content_id",
             "viewer_count",
             "peak_viewer_count",
             "total_view_count",
@@ -896,6 +898,22 @@ class ChannelLiveStreamSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+    def get_replay_content_id(self, obj: ChannelLiveStream) -> str:
+        # The replay is a brand new standalone ChannelContent row
+        # (ChannelLiveStreamArchiveView creates it fresh, never through
+        # obj.content), linked back only via
+        # metadata["archived_from_stream"] - same lookup
+        # delete_channel_content/the archive view's own idempotency
+        # check already use. Only worth querying once recording_status
+        # has actually reached ready (every other state has no replay
+        # content row to find yet).
+        if obj.recording_status != ChannelLiveStream.RecordingStatus.READY:
+            return ""
+        replay = ChannelContent.objects.filter(
+            channel_id=obj.channel_id, metadata__archived_from_stream=str(obj.id),
+        ).values_list("id", flat=True).first()
+        return str(replay) if replay else ""
 
     def get_health_status(self, obj: ChannelLiveStream) -> str:
         samples = (obj.metadata or {}).get("health_samples") or []

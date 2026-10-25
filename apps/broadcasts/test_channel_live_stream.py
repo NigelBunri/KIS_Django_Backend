@@ -906,6 +906,25 @@ class LiveStreamRecordingStatusTests(LiveStreamTestBase):
         plain_content.refresh_from_db()
         self.assertTrue(plain_content.is_deleted)
 
+    def test_replay_content_id_is_blank_before_ready(self):
+        # Covers every pre-ready state (not_started/recording/finalizing/
+        # processing/failed) with one representative case - none of them
+        # have a replay content row to find yet.
+        res = self.client.get(f"/api/v1/broadcasts/live-streams/{self.live.id}/")
+        self.assertEqual(res.data["replay_content_id"], "")
+
+    @override_settings(LIVE_STREAM_WEBHOOK_SECRET="shh-its-a-secret")
+    def test_replay_content_id_resolves_once_ready(self):
+        archive_res = self.client.post(
+            f"/api/v1/broadcasts/live-streams/{self.live.id}/archive/",
+            {"recording_url": "https://cdn.example.com/r.mp4"},
+            format="json", HTTP_X_LIVE_WEBHOOK_SECRET="shh-its-a-secret",
+        )
+
+        res = self.client.get(f"/api/v1/broadcasts/live-streams/{self.live.id}/")
+
+        self.assertEqual(res.data["replay_content_id"], archive_res.data["content_id"])
+
 
 class LiveStreamRecordingUploadUrlTests(LiveStreamTestBase):
     """ChannelLiveStreamRecordingUploadUrlView - issues the presigned S3
