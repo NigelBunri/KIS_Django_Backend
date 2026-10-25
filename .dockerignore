@@ -1,0 +1,70 @@
+# Prevents exactly the bug this file exists to catch: COPY . /app
+# sweeping in a developer's own local, untracked working-tree state (not
+# merely git-ignored - actually present on disk) into a production
+# image. Confirmed real this session: a locally-built kis-django image
+# came out 8.48GB instead of the historical ~4.07GB specifically because
+# the developer's own local media/ directory (1GB, correctly gitignored,
+# but still a real directory on disk) and .git (221MB) both got copied
+# in wholesale. A fresh git clone has none of this; a local working
+# directory does, and COPY has no way to tell the difference without
+# this file.
+#
+# Mirrors .gitignore's own exclusions first (these are never supposed to
+# be part of the source tree in the first place) plus Docker-specific
+# additions (.git itself is tracked and real, but still has no business
+# inside a runtime image).
+
+.git
+.gitignore
+.dockerignore
+
+# Local media/static/logs - /media and /static are gitignored precisely
+# because they're runtime output (uploaded files, collectstatic output,
+# app logs), never source. A production image serves media from S3
+# (see apps/media/storage_backends.py), not from a local directory baked
+# into the image at build time.
+/media
+/static
+static/
+/logs
+logs/
+*.log
+*.log.*
+
+# Local secrets / environment files - never baked into an image; the
+# real production secrets are injected via env_file in
+# docker-compose.yml at container-run time, confirmed to be how this
+# service is actually deployed.
+.env
+.env.*
+!.env.example
+
+# Python/runtime artifacts - never useful inside the image, and a stray
+# .pyc from the HOST's Python version can occasionally shadow a correct
+# one Python would otherwise regenerate for the image's own interpreter.
+__pycache__/
+*.py[cod]
+*.sqlite3
+test_db.sqlite3
+.pytest_cache/
+*.egg-info/
+
+# Local virtualenvs - if a developer's working tree has one, it must
+# never be copied in; the image installs its OWN dependencies via
+# requirements/ + pip, from a clean interpreter, not a host venv that
+# may not even match the image's Python version or architecture.
+.venv/
+venv/
+
+# Git worktrees / editor and OS cruft - never relevant inside a runtime
+# image.
+.worktrees/
+.wrangler/
+.vscode/
+.idea/
+.DS_Store
+
+# Test artifacts that occasionally land in the working tree during local
+# development but are never meant to ship.
+.coverage
+htmlcov/
