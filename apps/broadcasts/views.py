@@ -1,5 +1,6 @@
 import logging
 import hashlib
+import math
 import secrets
 import os
 import re
@@ -22,7 +23,7 @@ from django.core.files.storage import FileSystemStorage, default_storage
 from django.db import IntegrityError, models, transaction
 from django.db.models import Q
 from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect, StreamingHttpResponse
-from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.exceptions import ObjectDoesNotExist, ValidationError as DjangoValidationError
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
@@ -20857,6 +20858,201 @@ class ChannelContentRelatedView(APIView):
             )
         ).exclude(id=content.id).order_by("-published_at")[:10]
         return Response({"results": ChannelContentListSerializer(related, many=True, context={"request": request}).data})
+
+
+# ── Related content for the live-watch screen ─────────────────────────────────
+# Distinct from ChannelContentRelatedView just above (same-channel, same-type,
+# recency-only - built for the VOD detail page). This one ranks primarily by
+# *topic* relevance (tag/keyword overlap) across the whole public catalog, not
+# just one channel/type, and is keyed by ChannelLiveStream.id (the identifier
+# LiveWatchPage.tsx actually has) rather than ChannelContent.id - see
+# ChannelLiveStreamSerializer vs ChannelContentListSerializer's docstrings for
+# why the two ids must never be used interchangeably.
+_TOPIC_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+    "is", "are", "was", "were", "this", "that", "it", "be", "as", "at",
+    "by", "from", "we", "you", "your", "our", "my", "will", "live", "stream",
+}
+
+
+def _topic_keywords(text: str) -> set:
+    words = re.findall(r"[a-z0-9']+", str(text or "").lower())
+    return {w for w in words if len(w) > 2 and w not in _TOPIC_STOPWORDS}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    intersection = len(a & b)
+    if not intersection:
+        return 0.0
+    return intersection / len(a | b)
+
+
+def _content_live_stream(content: "ChannelContent"):
+    # Reverse OneToOneField (ChannelLiveStream.content) raises DoesNotExist
+    # rather than returning None when absent - true for most rows, which
+    # aren't live-stream content at all. Mirrors ChannelContentListSerializer's
+    # own _live_stream helper so the two can't silently disagree.
+    try:
+        return content.live_stream
+    except ObjectDoesNotExist:
+        return None
+
+
+class ChannelLiveStreamRelatedView(APIView):
+    """Related-content feed shown below the player on LiveWatchPage.tsx.
+
+    Deterministic, explainable scoring (no external ML/embedding service -
+    see this module's own precedent in ChannelContentRecommendationsView for
+    "score in Python over a bounded candidate set" rather than dialect-
+    specific SQL). Topic relevance (tag + title/description keyword overlap)
+    dominates the score; same-channel, same-category, freshness, engagement,
+    and "currently live" are tie-breakers layered on top, in that order of
+    weight. A simple per-channel cap enforces diversity.
+    """
+
+    permission_classes = [AllowAny]
+
+    MAX_PER_CHANNEL = 3
+    CANDIDATE_POOL_SAME_CHANNEL = 40
+    CANDIDATE_POOL_OTHER = 260
+
+    def get(self, request, stream_id):
+        from .moderation_gate import filter_channel_content_broadcast_eligible
+
+        stream = get_object_or_404(
+            ChannelLiveStream.objects.select_related("channel", "content"), id=stream_id,
+        )
+        if not stream.channel.is_public and not _user_can_manage_channel(request.user, stream.channel):
+            raise Http404
+
+        limit = min(max(int(request.query_params.get("limit") or 12), 1), 30)
+        offset = _decode_feed_cursor(request.query_params.get("cursor"), 0)
+
+        source_content = stream.content
+        source_tags = {
+            str(t).strip().lower() for t in (source_content.tags if source_content else []) if str(t).strip()
+        }
+        source_keywords = _topic_keywords(f"{stream.title} {stream.description}")
+        source_category = (stream.channel.category or "").strip().lower()
+
+        exclude_ids = {stream.content_id} if stream.content_id else set()
+        exclude_ids |= set(
+            ChannelContent.objects.filter(metadata__archived_from_stream=str(stream.id)).values_list("id", flat=True)
+        )
+
+        blocked_user_ids: set = set()
+        if getattr(request.user, "is_authenticated", False):
+            blocked_user_ids = set(
+                UserBlock.objects.filter(blocker=request.user).values_list("blocked_id", flat=True)
+            ) | set(
+                UserBlock.objects.filter(blocked=request.user).values_list("blocker_id", flat=True)
+            )
+
+        base_qs = filter_channel_content_broadcast_eligible(
+            ChannelContent.objects.filter(
+                status=ChannelContent.Status.PUBLISHED,
+                visibility=ChannelContent.Visibility.PUBLIC,
+                is_deleted=False,
+                channel__is_public=True,
+                channel__is_deleted=False,
+            )
+            .exclude(id__in=exclude_ids)
+            .exclude(channel__owner_type=BroadcastChannel.OwnerType.USER, channel__owner_user_id__in=blocked_user_ids)
+            .select_related("channel", "live_stream")
+        )
+
+        same_channel = list(
+            base_qs.filter(channel_id=stream.channel_id).order_by("-published_at")[: self.CANDIDATE_POOL_SAME_CHANNEL]
+        )
+        other = list(
+            base_qs.exclude(channel_id=stream.channel_id).order_by("-published_at")[: self.CANDIDATE_POOL_OTHER]
+        )
+        seen_ids: set = set()
+        candidates = []
+        for item in same_channel + other:
+            if item.id in seen_ids:
+                continue
+            seen_ids.add(item.id)
+            candidates.append(item)
+
+        def score(item) -> tuple:
+            item_tags = {str(t).strip().lower() for t in (item.tags or []) if str(t).strip()}
+            item_keywords = _topic_keywords(f"{item.title} {item.description}")
+            topic_score = _jaccard(source_tags, item_tags) * 6.0 + _jaccard(source_keywords, item_keywords) * 3.0
+
+            is_same_channel = item.channel_id == stream.channel_id
+            channel_score = 1.5 if is_same_channel else 0.0
+
+            item_category = (item.channel.category or "").strip().lower()
+            category_score = 1.0 if source_category and item_category == source_category else 0.0
+
+            anchor = item.published_at or item.created_at
+            age_days = max(0, (timezone.now() - anchor).days) if anchor else 365
+            freshness_score = max(0.0, 2.0 - age_days / 30.0)
+
+            # Deliberately a small coefficient: log-scaled so it still acts as
+            # a tie-breaker between similarly-topical items, but even a huge
+            # view count (hundreds of thousands+) can't let a topically
+            # unrelated item outrank a genuinely related one on popularity
+            # alone - the primary signal is topic_score above, not this.
+            stats = item.stats if isinstance(item.stats, dict) else {}
+            engagement = (int(stats.get("views") or 0) // 10) + int(stats.get("reactions") or 0) + int(stats.get("comments") or 0)
+            engagement_score = math.log(engagement + 1, 2) * 0.15
+
+            live_item = _content_live_stream(item)
+            live_bonus = 1.5 if live_item and live_item.status == ChannelLiveStream.Status.LIVE else 0.0
+
+            total = topic_score + channel_score + category_score + freshness_score + engagement_score + live_bonus
+            components = {
+                "topic_score": topic_score,
+                "same_channel": is_same_channel,
+                "category_score": category_score,
+                "live_bonus": live_bonus,
+            }
+            return total, components
+
+        scored = [(item, *score(item)) for item in candidates]
+        scored.sort(key=lambda row: (row[1], row[0].published_at or row[0].created_at), reverse=True)
+
+        # Diversity: cap how many results any single channel can contribute.
+        # This is intentionally never relaxed to pad the page out to `limit`
+        # - showing fewer, more diverse results is the whole point of the
+        # cap, not a shortfall to paper over. A thin catalog (few distinct
+        # channels with eligible content) legitimately produces a short
+        # page; that's correct, not a bug.
+        per_channel: dict = {}
+        diversified = []
+        for item, total, components in scored:
+            if per_channel.get(item.channel_id, 0) >= self.MAX_PER_CHANNEL:
+                continue
+            per_channel[item.channel_id] = per_channel.get(item.channel_id, 0) + 1
+            diversified.append((item, total, components))
+
+        page = diversified[offset:offset + limit]
+        has_more = len(diversified) > offset + limit
+        next_cursor = _encode_feed_cursor(offset + limit) if has_more else None
+
+        def section_for(components: dict) -> str:
+            if components["live_bonus"] > 0:
+                return "live_now"
+            if components["topic_score"] >= 1.5:
+                return "related_topic"
+            if components["same_channel"]:
+                return "more_from_creator"
+            return "recommended"
+
+        items = [row[0] for row in page]
+        serialized = ChannelContentListSerializer(items, many=True, context={"request": request}).data
+        for row_data, (_item, _total, components) in zip(serialized, page):
+            row_data["section"] = section_for(components)
+
+        return Response({
+            "results": serialized,
+            "cursor": next_cursor,
+            "has_more": has_more,
+        })
 
 
 class ChannelLivePollListCreateView(APIView):
