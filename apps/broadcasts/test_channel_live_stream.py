@@ -1578,6 +1578,174 @@ class LiveChatHistoryVisibilityTests(LiveStreamTestBase):
         self.assertEqual(len(get_res.data["results"]), 1)
 
 
+class LiveChatRichMessageTests(LiveStreamTestBase):
+    """Live chat's rich message types (sticker/voice note) - deliberately
+    NOT routed through Nest's conversation/messaging stack (no
+    Conversation row, no end-to-end encryption, no calls - see
+    LiveChatMessage's own docstring). Stickers reuse the existing,
+    conversation-agnostic Sticker model directly; voice notes reuse the
+    generic direct-to-S3 media-upload pipeline via a new confirm-only
+    "live_chat_voice_note" context (apps/media/upload_intent.py)."""
+
+    def setUp(self):
+        super().setUp()
+        self.live_data = self._schedule_stream()
+        self.live = ChannelLiveStream.objects.get(id=self.live_data["id"])
+
+    def _url(self, suffix=""):
+        return f"/api/v1/broadcasts/live-streams/{self.live.id}/chat/{suffix}"
+
+    def _make_sticker(self, owner=None):
+        from apps.chat.models import Sticker
+        from apps.media.models import MediaAsset
+        asset = MediaAsset.objects.create(
+            owner=owner or self.owner, type="image", bucket_key="stickers/test.png",
+        )
+        return Sticker.objects.create(owner=owner or self.owner, asset=asset)
+
+    def _make_confirmed_voice_note_intent(self, owner=None, object_key="broadcast_videos/live_chat_voice/test.m4a"):
+        from apps.media.models import MediaUploadIntent
+        return MediaUploadIntent.objects.create(
+            owner=owner or self.viewer,
+            context="live_chat_voice_note",
+            object_key=object_key,
+            content_type="audio/mp4",
+            size_bytes=123_456,
+            status=MediaUploadIntent.STATUS_CONFIRMED,
+            expires_at=timezone.now() + timedelta(hours=1),
+            confirmed_at=timezone.now(),
+        )
+
+    def test_sends_a_sticker_message_and_it_appears_in_history_with_its_asset_id(self):
+        # Deliberately NOT a baked image url - see the view's own comment
+        # for why (private bucket, real access-control chokepoint, ~1h
+        # presigned expiry). The client is expected to fetch a fresh
+        # signed URL itself via the existing GET
+        # /media/assets/<id>/signed-url/ endpoint, same as the real chat
+        # module's own StickerSerializer already requires.
+        sticker = self._make_sticker()
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(self._url(), {"message_type": "sticker", "sticker_id": str(sticker.id)}, format="json")
+
+        self.assertEqual(res.status_code, 201, res.data)
+        msg = LiveChatMessage.objects.get(id=res.data["id"])
+        self.assertEqual(msg.message_type, LiveChatMessage.MessageType.STICKER)
+        self.assertEqual(msg.sticker_id, sticker.id)
+
+        history = self.client.get(self._url())
+        row = history.data["results"][0]
+        self.assertEqual(row["message_type"], "sticker")
+        self.assertEqual(row["sticker_asset_id"], str(sticker.asset_id))
+        # TEXT-only fields must not leak onto a sticker row.
+        self.assertNotIn("asset_url", row)
+        self.assertNotIn("duration_seconds", row)
+
+    def test_sticker_message_requires_a_real_existing_sticker(self):
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(self._url(), {"message_type": "sticker", "sticker_id": "00000000-0000-0000-0000-000000000000"}, format="json")
+
+        self.assertEqual(res.status_code, 404)
+        self.assertFalse(LiveChatMessage.objects.filter(stream=self.live).exists())
+
+    def test_removed_sticker_cannot_be_sent(self):
+        sticker = self._make_sticker()
+        sticker.is_removed = True
+        sticker.save(update_fields=["is_removed"])
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(self._url(), {"message_type": "sticker", "sticker_id": str(sticker.id)}, format="json")
+
+        self.assertEqual(res.status_code, 404)
+
+    def test_sends_a_voice_note_using_a_confirmed_upload_and_it_appears_in_history(self):
+        intent = self._make_confirmed_voice_note_intent(owner=self.viewer)
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(
+            self._url(), {"message_type": "voice_note", "media_id": str(intent.id), "duration_seconds": 7}, format="json",
+        )
+
+        self.assertEqual(res.status_code, 201, res.data)
+        msg = LiveChatMessage.objects.get(id=res.data["id"])
+        self.assertEqual(msg.message_type, LiveChatMessage.MessageType.VOICE_NOTE)
+        self.assertEqual(msg.duration_seconds, 7)
+        self.assertTrue(msg.asset_url)
+
+        history = self.client.get(self._url())
+        row = history.data["results"][0]
+        self.assertEqual(row["message_type"], "voice_note")
+        self.assertEqual(row["duration_seconds"], 7)
+        self.assertTrue(row["asset_url"])
+        self.assertNotIn("sticker_asset_id", row)
+
+        intent.refresh_from_db()
+        self.assertIsNotNone(intent.attached_at, "a consumed voice-note intent must be marked attached so it can't be reused/garbage-collected as orphaned")
+
+    def test_voice_note_requires_sign_in(self):
+        intent = self._make_confirmed_voice_note_intent(owner=self.viewer)
+        self.client.force_authenticate(user=None)
+
+        res = self.client.post(self._url(), {"message_type": "voice_note", "media_id": str(intent.id)}, format="json")
+
+        self.assertEqual(res.status_code, 400)
+        self.assertFalse(LiveChatMessage.objects.filter(stream=self.live).exists())
+
+    def test_voice_note_cannot_reuse_another_users_confirmed_upload(self):
+        # resolve_confirmed_intent is owner-scoped - a viewer must not be
+        # able to send someone else's voice-note upload as their own by
+        # guessing/reusing its media_id.
+        intent = self._make_confirmed_voice_note_intent(owner=self.other)
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(self._url(), {"message_type": "voice_note", "media_id": str(intent.id)}, format="json")
+
+        self.assertEqual(res.status_code, 404)
+
+    def test_voice_note_cannot_reuse_an_already_attached_upload(self):
+        intent = self._make_confirmed_voice_note_intent(owner=self.viewer)
+        intent.attached_at = timezone.now()
+        intent.save(update_fields=["attached_at"])
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(self._url(), {"message_type": "voice_note", "media_id": str(intent.id)}, format="json")
+
+        self.assertEqual(res.status_code, 400)
+
+    def test_voice_note_cannot_reuse_an_upload_confirmed_for_a_different_context(self):
+        from apps.media.models import MediaUploadIntent
+        intent = MediaUploadIntent.objects.create(
+            owner=self.viewer, context="status_audio", object_key="status/aud/test.m4a",
+            content_type="audio/mp4", size_bytes=1000,
+            status=MediaUploadIntent.STATUS_CONFIRMED,
+            expires_at=timezone.now() + timedelta(hours=1), confirmed_at=timezone.now(),
+        )
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(self._url(), {"message_type": "voice_note", "media_id": str(intent.id)}, format="json")
+
+        self.assertEqual(res.status_code, 400)
+
+    def test_invalid_message_type_is_rejected(self):
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.post(self._url(), {"message_type": "video_call"}, format="json")
+
+        self.assertEqual(res.status_code, 400)
+
+    def test_plain_text_message_omits_rich_fields_entirely(self):
+        self.client.force_authenticate(self.viewer)
+        self.client.post(self._url(), {"message": "just text"}, format="json")
+
+        history = self.client.get(self._url())
+        row = history.data["results"][0]
+        self.assertEqual(row["message_type"], "text")
+        self.assertNotIn("sticker_asset_id", row)
+        self.assertNotIn("asset_url", row)
+        self.assertNotIn("duration_seconds", row)
+
+
 class LiveChatModerationTests(LiveStreamTestBase):
     def setUp(self):
         super().setUp()
@@ -1645,6 +1813,62 @@ class LiveChatModerationTests(LiveStreamTestBase):
             target_type=ChannelModerationRecord.TargetType.LIVE_CHAT_MESSAGE, target_id=msg.id, reporter=self.other,
         ).exists())
         self.assertTrue(ModerationFlag.objects.filter(target_id=msg.id, reporter_id=self.other.id).exists())
+
+    def test_owner_can_pin_a_message(self):
+        msg = self._post_message(self.viewer)
+        self.client.force_authenticate(self.owner)
+
+        res = self.client.patch(self._delete_url(msg.id), {"is_pinned": True}, format="json")
+
+        self.assertEqual(res.status_code, 200, res.data)
+        msg.refresh_from_db()
+        self.assertTrue(msg.is_pinned)
+
+    def test_pinning_a_message_unpins_whatever_was_pinned_before(self):
+        first = self._post_message(self.viewer, text="first")
+        second = self._post_message(self.viewer, text="second")
+        self.client.force_authenticate(self.owner)
+        self.client.patch(self._delete_url(first.id), {"is_pinned": True}, format="json")
+
+        res = self.client.patch(self._delete_url(second.id), {"is_pinned": True}, format="json")
+
+        self.assertEqual(res.status_code, 200, res.data)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertFalse(first.is_pinned)
+        self.assertTrue(second.is_pinned)
+
+    def test_owner_can_unpin(self):
+        msg = self._post_message(self.viewer)
+        msg.is_pinned = True
+        msg.save(update_fields=["is_pinned"])
+        self.client.force_authenticate(self.owner)
+
+        res = self.client.patch(self._delete_url(msg.id), {"is_pinned": False}, format="json")
+
+        self.assertEqual(res.status_code, 200, res.data)
+        msg.refresh_from_db()
+        self.assertFalse(msg.is_pinned)
+
+    def test_non_manager_cannot_pin(self):
+        msg = self._post_message(self.viewer)
+        self.client.force_authenticate(self.viewer)
+
+        res = self.client.patch(self._delete_url(msg.id), {"is_pinned": True}, format="json")
+
+        self.assertEqual(res.status_code, 403)
+        msg.refresh_from_db()
+        self.assertFalse(msg.is_pinned)
+
+    def test_pinned_state_reflected_in_chat_history(self):
+        msg = self._post_message(self.viewer)
+        self.client.force_authenticate(self.owner)
+        self.client.patch(self._delete_url(msg.id), {"is_pinned": True}, format="json")
+
+        res = self.client.get(f"/api/v1/broadcasts/live-streams/{self.live.id}/chat/")
+
+        row = next(r for r in res.data["results"] if r["id"] == str(msg.id))
+        self.assertTrue(row["is_pinned"])
 
 
 class ChannelChatBanTests(LiveStreamTestBase):
@@ -1853,6 +2077,69 @@ class LiveStreamAnalyticsTests(LiveStreamTestBase):
 
         self.live.refresh_from_db()
         self.assertGreaterEqual(self.live.total_watch_seconds, 9)
+
+    def test_repeated_pings_from_the_same_two_viewers_never_inflate_the_count(self):
+        # The real production incident this test exists to prevent: with
+        # only 2 real viewers, the viewer count kept climbing indefinitely
+        # over the course of a long stream. Root cause was a one-way
+        # counter with no concept of "still the same viewer" surviving past
+        # a narrow 35s dedup window - simulated here by pinging the SAME
+        # two identities many times, including across simulated real-world
+        # timing gaps, and asserting the count never exceeds 2.
+        self.client.force_authenticate(self.viewer)
+        for _ in range(5):
+            res = self.client.post(f"/api/v1/broadcasts/live-streams/{self.live.id}/viewer-ping/")
+            self.assertLessEqual(res.data["viewer_count"], 1)
+
+        self.client.force_authenticate(self.other)
+        for _ in range(5):
+            res = self.client.post(f"/api/v1/broadcasts/live-streams/{self.live.id}/viewer-ping/")
+            self.assertLessEqual(res.data["viewer_count"], 2)
+
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.viewer_count, 2)
+        self.assertEqual(self.live.peak_viewer_count, 2)
+
+    def test_a_viewer_who_stops_pinging_drops_out_of_the_live_count(self):
+        # The core fix: presence must actually decay. Two viewers ping
+        # once each (count=2); one of them goes stale (simulated by
+        # backdating their presence entry past the staleness window) and
+        # the OTHER viewer's next ping must observe the count drop to 1 -
+        # proving this is a real decaying presence set, not a counter that
+        # can only ever go up.
+        self.client.force_authenticate(self.viewer)
+        self.client.post(f"/api/v1/broadcasts/live-streams/{self.live.id}/viewer-ping/")
+        self.client.force_authenticate(self.other)
+        res = self.client.post(f"/api/v1/broadcasts/live-streams/{self.live.id}/viewer-ping/")
+        self.assertEqual(res.data["viewer_count"], 2)
+
+        presence_key = f"live_viewers_presence:{self.live.id}"
+        presence = cache.get(presence_key)
+        stale_ts = timezone.now().timestamp() - 1000
+        presence[str(self.viewer.id)] = stale_ts
+        cache.set(presence_key, presence, timeout=300)
+
+        res = self.client.post(f"/api/v1/broadcasts/live-streams/{self.live.id}/viewer-ping/")
+        self.assertEqual(res.data["viewer_count"], 1, "a viewer who stopped pinging must age out of the live count")
+
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.viewer_count, 1)
+        # Peak must still reflect the real high-water mark (2), even though
+        # the CURRENT count correctly dropped back down - peak is a
+        # separate, monotonic metric that should never regress.
+        self.assertEqual(self.live.peak_viewer_count, 2)
+
+    def test_a_single_viewer_pinging_many_times_only_counts_as_one_lifetime_view(self):
+        # Guards the is_new_view fix too: the old user_key's narrow 35s
+        # window could itself double-count a single person's lifetime view
+        # if their own pings happened to straddle it. last_seen_key's
+        # longer-lived 120s window is what is_new_view is now based on.
+        self.client.force_authenticate(self.viewer)
+        for _ in range(4):
+            self.client.post(f"/api/v1/broadcasts/live-streams/{self.live.id}/viewer-ping/")
+
+        self.live.refresh_from_db()
+        self.assertEqual(self.live.total_view_count, 1)
 
     def test_viewer_count_report_requires_internal_auth(self):
         res = self.client.post(

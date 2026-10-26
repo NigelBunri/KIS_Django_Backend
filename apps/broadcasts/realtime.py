@@ -157,17 +157,41 @@ def notify_live_chat_message_deleted(stream_id, *, message_id) -> None:
     )
 
 
+def notify_live_chat_message_pinned(stream_id, *, message_id, is_pinned: bool) -> None:
+    notify_nest_of_live_stream_broadcast(
+        stream_id=stream_id,
+        event="channel.chat.message_pinned",
+        payload={"streamId": str(stream_id), "id": str(message_id), "isPinned": is_pinned},
+    )
+
+
 def notify_live_chat_message(stream_id, *, message, is_member: bool = False) -> None:
+    payload = {
+        "streamId": str(stream_id),
+        "id": str(message.id),
+        "userId": str(message.user_id) if message.user_id else "",
+        "displayName": message.display_name,
+        "text": message.message,
+        "messageType": message.message_type,
+        "sentAt": message.created_at.isoformat(),
+        "isMember": is_member,
+    }
+    # Only ever one of these applies per message (STICKER xor VOICE_NOTE) -
+    # same "omit entirely rather than send null" convention
+    # ChannelLiveStreamChatHistoryView.get already uses for the REST
+    # history payload, so a live-socket delivery and a page-load fetch of
+    # the same message always look identical to the client. Deliberately
+    # NEVER a baked sticker image url - see that view's own comment for
+    # why (private bucket, real access-control chokepoint, ~1h presigned
+    # expiry) - stickerAssetId lets the client fetch a fresh signed URL
+    # itself via the existing GET /media/assets/<id>/signed-url/ endpoint.
+    if message.message_type == message.MessageType.STICKER and message.sticker_id:
+        payload["stickerAssetId"] = str(message.sticker.asset_id)
+    elif message.message_type == message.MessageType.VOICE_NOTE and message.asset_url:
+        payload["assetUrl"] = message.asset_url
+        payload["durationSeconds"] = message.duration_seconds
     notify_nest_of_live_stream_broadcast(
         stream_id=stream_id,
         event="channel.chat.message",
-        payload={
-            "streamId": str(stream_id),
-            "id": str(message.id),
-            "userId": str(message.user_id) if message.user_id else "",
-            "displayName": message.display_name,
-            "text": message.message,
-            "sentAt": message.created_at.isoformat(),
-            "isMember": is_member,
-        },
+        payload=payload,
     )

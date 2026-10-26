@@ -21706,6 +21706,29 @@ class LiveStreamViewerPingView(APIView):
 
     _PING_INTERVAL_CAP_SECONDS = 60  # cap a single inter-ping gap's contribution
 
+    # Real incident, not a hypothetical: the previous implementation kept a
+    # single cache int that only ever incremented ("is_new" -> +1) and NEVER
+    # decremented - there was no concept of a viewer leaving. "is_new" was
+    # decided by a 35s-TTL dedup key, but the RN client pings every 25s (see
+    # useLiveStream.ts) - any real-world timing jitter (backgrounded app,
+    # slow network, a single missed tick) past that 10s margin made the SAME
+    # still-watching viewer look "new" again, permanently bumping the count
+    # up with no way back down. A real production stream with exactly 2
+    # viewers was observed climbing indefinitely - confirmed by reading this
+    # exact code path, not assumed.
+    #
+    # Fixed by replacing the one-way counter with a real presence SET keyed
+    # by viewer identity -> last-ping timestamp, stored as a single cache
+    # entry (works identically on locmem and Redis - no backend-specific
+    # command needed). Every ping (a) upserts the caller's own timestamp and
+    # (b) drops any entry older than _PRESENCE_STALE_SECONDS before counting
+    # - so the count is always "how many distinct viewers pinged recently,"
+    # self-correcting both up AND down, never a ratchet. 70s gives
+    # comfortable margin over the 25s client interval (nearly 3 missed
+    # pings' worth) while still dropping a genuinely gone viewer within
+    # under a minute and a half, not permanently.
+    _PRESENCE_STALE_SECONDS = 70
+
     def post(self, request, stream_id):
         stream = get_object_or_404(ChannelLiveStream, id=stream_id)
         if stream.status != "live":
@@ -21714,23 +21737,35 @@ class LiveStreamViewerPingView(APIView):
         from django.db.models import F
 
         ident = str(request.user.id) if request.user.is_authenticated else request.META.get("REMOTE_ADDR", "anon")
-        user_key = f"live_viewer:{stream_id}:{ident}"
         last_seen_key = f"live_viewer_last_seen:{stream_id}:{ident}"
+        presence_key = f"live_viewers_presence:{stream_id}"
         try:
-            is_new = cache.add(user_key, 1, timeout=35)
             now_ts = timezone.now().timestamp()
             last_seen = cache.get(last_seen_key)
+            # A viewer's first ping EVER on this stream (last_seen_key has
+            # never been set, timeout=120 - comfortably longer than the
+            # presence staleness window above) is one confirmed lifetime
+            # view - a one-time count, entirely separate from the
+            # fluctuating presence set below, and itself a quiet
+            # correctness improvement over the old user_key's 35s window
+            # (which could also spuriously re-fire "is_new" for the same
+            # still-present viewer and double-count a single person's view).
+            is_new_view = last_seen is None
             cache.set(last_seen_key, now_ts, timeout=120)
 
-            if is_new:
-                count = int(cache.get(f"live_viewers:{stream_id}") or 0) + 1
-                cache.set(f"live_viewers:{stream_id}", count, timeout=300)
-                if count % 10 == 1 or count <= 5:
-                    ChannelLiveStream.objects.filter(id=stream_id).update(viewer_count=count)
-                # First ping ever for this viewer on this stream = one confirmed view.
+            presence = cache.get(presence_key) or {}
+            presence[ident] = now_ts
+            stale_before = now_ts - self._PRESENCE_STALE_SECONDS
+            presence = {k: v for k, v in presence.items() if v >= stale_before}
+            cache.set(presence_key, presence, timeout=300)
+            count = len(presence)
+            # Cheap scalar mirror so GET() below (a plain read, no need to
+            # register presence) doesn't need to carry the full dict.
+            cache.set(f"live_viewers:{stream_id}", count, timeout=300)
+            ChannelLiveStream.objects.filter(id=stream_id).update(viewer_count=count)
+
+            if is_new_view:
                 ChannelLiveStream.objects.filter(id=stream_id).update(total_view_count=F("total_view_count") + 1)
-            else:
-                count = int(cache.get(f"live_viewers:{stream_id}") or stream.viewer_count or 0)
 
             if last_seen:
                 gap = max(0.0, min(now_ts - float(last_seen), self._PING_INTERVAL_CAP_SECONDS))
@@ -21985,7 +22020,13 @@ class ChannelLiveStreamChatHistoryView(APIView):
             raise Http404
         limit = min(int(request.query_params.get("limit", 100) or 100), 500)
         before_id = request.query_params.get("before")
-        qs = LiveChatMessage.objects.filter(stream=stream, is_deleted=False)
+        # select_related("sticker") avoids an N+1 query per STICKER row
+        # below (just reading sticker.asset_id - the raw FK column, no
+        # nested MediaAsset join needed, see this view's own comment on
+        # why a message never exposes a baked asset url) - "user" was
+        # already implicitly needed for the display_name fallback a few
+        # lines down.
+        qs = LiveChatMessage.objects.filter(stream=stream, is_deleted=False).select_related("user", "sticker")
         if before_id:
             try:
                 qs = qs.filter(id__lt=int(before_id))
@@ -22030,22 +22071,51 @@ class ChannelLiveStreamChatHistoryView(APIView):
                     ),
                     "avatar_url": m.avatar_url,
                     "message": m.message,
+                    "message_type": m.message_type,
+                    # Only ever one of these is non-null for a given row
+                    # (STICKER vs VOICE_NOTE) - both omitted entirely for
+                    # TEXT/EMOJI rather than sent as null, so a client that
+                    # only checks `if (msg.sticker_asset_id)` never has to
+                    # also special-case "present but null". Deliberately
+                    # NEVER a baked image URL here, matching the real chat
+                    # module's own StickerSerializer convention exactly
+                    # (see that serializer's own comment) - the underlying
+                    # asset lives in a private bucket behind a real
+                    # access-control chokepoint (can_user_access_media /
+                    # can_view_sticker_media in apps/chat/media_hooks.py),
+                    # and a presigned GET expires in ~1h regardless, so the
+                    # client must always fetch a FRESH one itself via the
+                    # existing GET /media/assets/<id>/signed-url/ endpoint,
+                    # never trust one cached in a chat history payload.
+                    **({"sticker_asset_id": str(m.sticker.asset_id)} if m.message_type == LiveChatMessage.MessageType.STICKER and m.sticker_id else {}),
+                    **({"asset_url": m.asset_url, "duration_seconds": m.duration_seconds} if m.message_type == LiveChatMessage.MessageType.VOICE_NOTE and m.asset_url else {}),
                     "created_at": m.created_at.isoformat(),
                     "user_id": str(m.user_id) if m.user_id else None,
                     "is_member": m.user_id in member_user_ids,
+                    "is_pinned": m.is_pinned,
                 }
                 for m in messages
             ]
         })
 
     def post(self, request, stream_id):
-        """Persist a chat message (called by the NestJS gateway or directly)."""
+        """Persist a chat message (called by the NestJS gateway or directly).
+
+        Rich message types (sticker/voice note) are deliberately NOT routed
+        through Nest's conversation-attachment pipeline - see
+        LiveChatMessage's own docstring for why live chat stays decoupled
+        from the DM/room messaging system entirely. A sticker send supplies
+        `sticker_id` (a real, existing Sticker row - anyone's, matching
+        this feature's existing zero-ACL precedent for stickers); a voice
+        note supplies `media_id` (a confirmed MediaUploadIntent from the
+        generic live_chat_voice_note upload context - see
+        apps/media/upload_intent.py), resolved and consumed here exactly
+        once via resolve_confirmed_intent, same safety guarantee (never
+        trust a client-supplied storage key/URL directly) every other
+        confirm-only upload context already relies on."""
         stream = get_object_or_404(ChannelLiveStream.objects.select_related("channel"), id=stream_id)
         if not stream.channel.is_public and not _user_can_manage_channel(request.user, stream.channel):
             raise Http404
-        message_text = str(request.data.get("message") or "").strip()[:1000]
-        if not message_text:
-            return Response({"error": "message required"}, status=400)
         user = request.user if request.user.is_authenticated else None
         if user:
             ban = ChannelChatBan.objects.filter(channel=stream.channel, user=user).first()
@@ -22053,6 +22123,53 @@ class ChannelLiveStreamChatHistoryView(APIView):
                 return Response({"error": "You are banned from chatting in this channel."}, status=403)
             if _channel_blocks_user(stream.channel, user):
                 return Response({"error": "You cannot post in this channel's chat."}, status=403)
+
+        requested_type = str(request.data.get("message_type") or "text").strip().lower()
+        if requested_type not in LiveChatMessage.MessageType.values:
+            return Response({"error": f"Invalid message_type: {requested_type}"}, status=400)
+
+        message_text = ""
+        sticker = None
+        asset_url = ""
+        duration_seconds = None
+
+        if requested_type == LiveChatMessage.MessageType.STICKER:
+            from apps.chat.models import Sticker
+            sticker_id = str(request.data.get("sticker_id") or "").strip()
+            if not sticker_id:
+                return Response({"error": "sticker_id required"}, status=400)
+            sticker = Sticker.objects.filter(id=sticker_id, is_removed=False).select_related("asset").first()
+            if not sticker:
+                return Response({"error": "Sticker not found"}, status=404)
+        elif requested_type == LiveChatMessage.MessageType.VOICE_NOTE:
+            from apps.media import upload_intent
+            media_id = str(request.data.get("media_id") or "").strip()
+            if not media_id or not user:
+                return Response({"error": "media_id required (voice notes require sign-in)"}, status=400)
+            try:
+                intent = upload_intent.resolve_confirmed_intent(
+                    user=user, media_id=media_id, expected_context="live_chat_voice_note",
+                )
+            except (ValidationError, NotFound) as exc:
+                detail = getattr(exc, "detail", str(exc))
+                return Response({"error": str(detail)}, status=getattr(exc, "status_code", 400))
+            # live_chat_voice_note's key_prefix ("broadcast_videos/...")
+            # matches AWS_S3_PUBLIC_PREFIXES, so this resolves to a stable,
+            # non-expiring plain URL (confirmed via S3MediaStorage.url's
+            # own startswith check) - no signed-URL refresh flow needed for
+            # chat playback, same convention the recording pipeline relies
+            # on for its own replay asset URLs.
+            asset_url = default_storage.url(intent.object_key)
+            duration_seconds = int(request.data.get("duration_seconds") or 0) or None
+            intent.attached_at = timezone.now()
+            intent.save(update_fields=["attached_at"])
+            if not asset_url:
+                return Response({"error": "Could not resolve the uploaded voice note."}, status=500)
+        else:
+            message_text = str(request.data.get("message") or "").strip()[:1000]
+            if not message_text:
+                return Response({"error": "message required"}, status=400)
+
         # SECURITY: an authenticated user's display_name always comes from
         # their own account, never the request body - otherwise a logged-in
         # attacker could impersonate any other user/creator's name in a
@@ -22068,6 +22185,10 @@ class ChannelLiveStreamChatHistoryView(APIView):
             display_name=display_name,
             avatar_url=str(request.data.get("avatar_url") or "")[:1024],
             message=message_text,
+            message_type=requested_type,
+            sticker=sticker,
+            asset_url=asset_url,
+            duration_seconds=duration_seconds,
         )
         is_member = bool(user) and ChannelMembership.objects.filter(
             user_id=user.id, tier__channel_id=stream.channel_id, status=ChannelMembership.Status.ACTIVE,
@@ -22139,6 +22260,34 @@ class ChannelLiveChatMessageModerationView(APIView):
             logger.exception("Unable to mirror live chat message report into moderation flags")
         _channel_audit(request, action="channel_live_chat.report", target_type="live_chat_message", target_id=msg.id, metadata={"record_id": str(record.id)})
         return Response({"reported": True, "id": str(record.id)}, status=status.HTTP_201_CREATED)
+
+    def patch(self, request, stream_id, message_id):
+        # Manager-only pin/unpin - unlike delete() above, this is never a
+        # self-service action for the message's own sender; pinning is a
+        # moderator highlighting *someone's* message for the room, not a
+        # thing you do to your own. At most one pinned message per stream
+        # (LiveWatchPage.tsx's pinnedMessage picks the first is_pinned=True
+        # row it finds) - unpin whatever else was pinned first so pinning a
+        # second message doesn't just silently leave two rows marked True
+        # with only one of them ever shown.
+        msg = get_object_or_404(
+            LiveChatMessage.objects.select_related("stream__channel"),
+            id=message_id, stream_id=stream_id, is_deleted=False,
+        )
+        if not _user_can_manage_channel(request.user, msg.stream.channel):
+            raise PermissionDenied("Only channel managers can pin messages.")
+        pin = bool(request.data.get("is_pinned", True))
+        if pin:
+            LiveChatMessage.objects.filter(stream_id=stream_id, is_pinned=True).update(is_pinned=False)
+        msg.is_pinned = pin
+        msg.save(update_fields=["is_pinned"])
+        _channel_audit(
+            request, action="channel_live_chat.pin" if pin else "channel_live_chat.unpin",
+            target_type="live_chat_message", target_id=msg.id, metadata={"stream_id": str(stream_id)},
+        )
+        from apps.broadcasts.realtime import notify_live_chat_message_pinned
+        notify_live_chat_message_pinned(stream_id, message_id=msg.id, is_pinned=pin)
+        return Response({"id": str(msg.id), "is_pinned": pin})
 
 
 class ChannelLiveChatBansView(APIView):

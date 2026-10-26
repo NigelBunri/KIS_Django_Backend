@@ -163,6 +163,18 @@ def _status_audio_max_bytes() -> int:
     return int(getattr(settings, "STATUS_AUDIO_MAX_UPLOAD_BYTES", 15 * 1024 * 1024))
 
 
+def _live_chat_voice_note_max_bytes() -> int:
+    # A live-chat voice note is a short aside in a fast-moving public
+    # stream, not a status/DM voice message meant to carry a longer
+    # recording - 5MB comfortably covers several minutes of the AAC-in-M4A
+    # format HoldToLockComposer.tsx's recorder actually produces (~1MB/min
+    # at its configured bitrate), while keeping a single bad upload from
+    # being able to meaningfully strain this box's same tight disk budget
+    # the livestream recording pipeline (kisvideo-live) already has to
+    # watch carefully - see that service's docs/CAPACITY.md.
+    return int(getattr(settings, "LIVE_CHAT_VOICE_NOTE_MAX_UPLOAD_BYTES", 5 * 1024 * 1024))
+
+
 def _status_document_allowed_content_types() -> set[str]:
     configured = getattr(settings, "STATUS_DOCUMENT_ALLOWED_CONTENT_TYPES", "")
     values = {v.strip().lower() for v in str(configured or "").split(",") if v.strip()}
@@ -377,6 +389,23 @@ UPLOAD_CONTEXTS: dict[str, UploadContextConfig] = {
         allowed_content_types=_status_audio_allowed_content_types,
         max_bytes=_status_audio_max_bytes,
         key_prefix="status/aud",
+    ),
+    # Live-chat voice notes - deliberately reuses this generic direct-to-S3
+    # pipeline (same content-safety posture as status_audio: audio isn't
+    # visually scannable, goes straight to moderation_status=PASSED)
+    # rather than Nest's conversation-specific voice pipeline
+    # (VoicePlaybackService), which is tied to a real Conversation row this
+    # feature intentionally has none of - live chat is not a conversation,
+    # per the product requirement that it stay decoupled from the DM/room
+    # messaging system entirely. Confirm-only (see
+    # _confirm_only_media_descriptor) - ChannelLiveStreamChatHistoryView.post
+    # resolves the confirmed intent itself via resolve_confirmed_intent and
+    # reads its url/size straight off, no separate attach step needed since
+    # a live chat message has no other owning resource to attach to.
+    "live_chat_voice_note": UploadContextConfig(
+        allowed_content_types=_status_audio_allowed_content_types,
+        max_bytes=_live_chat_voice_note_max_bytes,
+        key_prefix="broadcast_videos/live_chat_voice",
     ),
     # PDF/Word status attachments - not visually scannable (see
     # SCANNABLE_STATUS_TYPES in apps/statuses/status_media.py), so like
@@ -1083,6 +1112,7 @@ ATTACH_HANDLERS: dict[str, Callable[[MediaUploadIntent], dict]] = {
     "status_video": _confirm_only_media_descriptor,
     "channel_content_video": _confirm_only_media_descriptor,
     "status_audio": _confirm_only_media_descriptor,
+    "live_chat_voice_note": _confirm_only_media_descriptor,
     "status_document": _confirm_only_media_descriptor,
     "education_institution_logo": _confirm_only_media_descriptor,
     "education_module_cover_image": _confirm_only_media_descriptor,

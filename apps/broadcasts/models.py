@@ -3612,6 +3612,25 @@ class LiveStreamCamera(models.Model):
 # ── Live Chat Messages ────────────────────────────────────────────────────────
 
 class LiveChatMessage(models.Model):
+    # Rich live-chat message types (emoji/sticker/voice note), deliberately
+    # NOT wired through the Nest conversation/messaging stack (no
+    # Conversation row, no end-to-end encryption, no calls) - a live
+    # stream's chat is a single shared public room every viewer sees the
+    # same messages in, closer in shape to a stadium announcement feed than
+    # a private DM, so it reuses the real chat module's RICH INPUT UI
+    # (EmojiPicker/StickerPicker/HoldToLockComposer) and underlying content
+    # systems (the Sticker model, the generic direct-to-S3 media-upload
+    # pipeline) without adopting conversation semantics at all. TEXT may
+    # still contain plain unicode emoji typed inline (unchanged) - EMOJI is
+    # specifically for the "send one big emoji as its own message" UX
+    # pattern the real chat module already has (WhatsApp-style), not a
+    # requirement to use this type for every emoji.
+    class MessageType(models.TextChoices):
+        TEXT = "text", "Text"
+        EMOJI = "emoji", "Emoji"
+        STICKER = "sticker", "Sticker"
+        VOICE_NOTE = "voice_note", "Voice note"
+
     id = models.BigAutoField(primary_key=True)
     stream = models.ForeignKey(
         "ChannelLiveStream", on_delete=models.CASCADE, related_name="chat_messages"
@@ -3621,8 +3640,25 @@ class LiveChatMessage(models.Model):
     )
     display_name = models.CharField(max_length=150, blank=True, default="")
     avatar_url = models.URLField(max_length=1024, blank=True, default="")
-    message = models.TextField(max_length=1000)
+    message = models.TextField(max_length=1000, blank=True, default="")
+    message_type = models.CharField(max_length=16, choices=MessageType.choices, default=MessageType.TEXT)
+    # Populated for STICKER (the real, permanent Sticker row that was sent -
+    # a foreign key, not a copied url, so a sticker's own image can never
+    # drift from what StickerPicker/the sticker library shows elsewhere)
+    # and VOICE_NOTE (asset_url/duration_seconds from the confirmed
+    # live_chat_voice_note upload - see
+    # ChannelLiveStreamChatHistoryView.post). All blank/null for TEXT/EMOJI,
+    # which carry their content directly in `message`.
+    sticker = models.ForeignKey(
+        "chat.Sticker", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    asset_url = models.URLField(max_length=2048, blank=True, default="")
+    duration_seconds = models.PositiveIntegerField(null=True, blank=True)
     is_deleted = models.BooleanField(default=False)
+    # Manager-only highlight, toggled via ChannelLiveStreamChatHistoryView's
+    # sibling moderation view (patch()) - at most one True per stream, see
+    # that view's own comment. Not exposed to self-service senders at all.
+    is_pinned = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
