@@ -310,6 +310,36 @@ def _apply_content_takedown(flag, *, actor) -> bool:
             return resolve_and_apply_moderation_decision(
                 target_type, target_id, action="delete", actor=actor,
             )
+        elif target_type == "book":
+            # The generic queue's "takedown" only ever suspends a book
+            # (reversible) — it never touches the author's wider account.
+            # Deliberate, granular account-level restrictions go through
+            # the dedicated admin_control.views.book_moderation endpoints
+            # instead, so a reviewer can't accidentally ban someone's whole
+            # KIS account by clicking the universal queue's generic button.
+            from apps.books.models import Book
+            from apps.books.services import apply_moderation_decision
+
+            book = Book.objects.filter(id=target_id).first()
+            if not book:
+                return False
+            apply_moderation_decision(book, action="block", actor=actor, notes="Takedown via platform content queue.")
+            return True
+        elif target_type == "book_review":
+            # Unlike a book (reversible suspend), a reported review is just
+            # removed outright — there's no "restore" workflow for reviews,
+            # and recompute_book_rating keeps the book's aggregate honest
+            # the moment it's gone.
+            from apps.books.models import BookReview
+            from apps.books.services import recompute_book_rating
+
+            review = BookReview.objects.filter(id=target_id).first()
+            if not review:
+                return False
+            book = review.book
+            review.delete()
+            recompute_book_rating(book)
+            return True
         else:
             return False
     except Exception:

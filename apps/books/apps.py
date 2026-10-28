@@ -1,0 +1,8 @@
+from django.apps import AppConfig
+
+
+class BooksConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "apps.books"
+    label = "books"
+    verbose_name = "KIS Books Marketplace"

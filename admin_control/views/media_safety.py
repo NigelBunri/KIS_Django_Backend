@@ -47,6 +47,14 @@ def target_content_exists(target_type: str, target_id: str) -> bool:
         from apps.broadcasts.models import ChannelContent
 
         return ChannelContent.objects.filter(id=target_id).exists()
+    if target_type == "book":
+        from apps.books.models import Book
+
+        return Book.objects.filter(id=target_id).exists()
+    if target_type == "book_review":
+        from apps.books.models import BookReview
+
+        return BookReview.objects.filter(id=target_id).exists()
     return False
 
 

@@ -15,7 +15,12 @@ WORKDIR /app
 # never generated. Video safety scans: silently fell back to
 # pending_review/quarantine for every single video upload, not a bypass,
 # but likely explains a permanently-growing moderation queue.
-RUN apt-get update && apt-get install -y build-essential libpq-dev git curl ffmpeg && rm -rf /var/lib/apt/lists/*
+# tesseract-ocr: apps.books.conversion shells out to it (via pytesseract)
+# to recognize text on scanned/image-only PDF pages. Same class of gap as
+# the ffmpeg note above — fails loudly with a clear "OCR is unavailable on
+# this server" error if missing (never silently skips OCR), but add it so
+# that error path is never hit in production.
+RUN apt-get update && apt-get install -y build-essential libpq-dev git curl ffmpeg tesseract-ocr && rm -rf /var/lib/apt/lists/*
 
 COPY requirements /app/requirements
 RUN pip install --upgrade pip

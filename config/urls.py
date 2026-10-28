@@ -267,6 +267,7 @@ urlpatterns = [
     path("api/v1/", include("apps.notifications.urls")),
     path("api/v1/", include("apps.moderation.urls")),
     path("api/v1/commerce/", include("apps.commerce.urls")),
+    path("api/v1/", include("apps.books.urls")),
     path("api/v1/", include("apps.surveys.urls")),
     path("api/v1/", include("apps.bridge.urls")),
     path("api/v1/", include("apps.analytics.urls")),

@@ -6,8 +6,6 @@ from .media_extended_models import (
     KingdomMusicTrack,
     MusicPlaylist,
     RoyaltyRecord,
-    Ebook,
-    EbookPurchase,
     PPVEvent,
     PPVTicket,
     NewsArticle,
@@ -104,41 +102,6 @@ class RoyaltyRecordSerializer(serializers.ModelSerializer):
             "play_count",
             "total_royalty",
             "paid_at",
-            "created_at",
-            "updated_at",
-        ]
-
-
-class EbookSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Ebook
-        fields = [
-            "id",
-            "title",
-            "author",
-            "description",
-            "cover_url",
-            "file_url",
-            "price",
-            "currency",
-            "is_free",
-            "genre",
-            "uploaded_by",
-            "download_count",
-            "created_at",
-            "updated_at",
-        ]
-
-
-class EbookPurchaseSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = EbookPurchase
-        fields = [
-            "id",
-            "ebook",
-            "buyer",
-            "price_paid",
-            "purchased_at",
             "created_at",
             "updated_at",
         ]

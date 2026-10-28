@@ -232,6 +232,17 @@ def resolve_payout_entity(target_type: str, target_id: uuid.UUID | str):
         if not channel or channel.owner_type != BroadcastChannel.OwnerType.USER:
             return None
         return channel
+    if target_type == DirectPaymentIntent.TARGET_BOOK_PURCHASE:
+        from apps.books.models import BookPurchase
+
+        purchase = BookPurchase.objects.select_related("book__publisher_shop").filter(id=target_id).first()
+        if not purchase:
+            return None
+        # A free book is never a payment target in the first place, but a
+        # paid book with no verified publisher_shop (eligibility revoked
+        # after submission, before this purchase) has nothing to resolve
+        # to — can_receive_payments is never called with None.
+        return purchase.book.publisher_shop
     return None
 
 
@@ -551,6 +562,11 @@ def _target_owner_and_amount(target_type: str, target_id: uuid.UUID | str) -> tu
         if tip is None:
             raise DirectPaymentIntent.DoesNotExist("Tip not found")
         return tip.user, int(tip.amount_cents or 0), "Channel tip payment", tip
+    if target_type == DirectPaymentIntent.TARGET_BOOK_PURCHASE:
+        from apps.books.models import BookPurchase
+
+        purchase = BookPurchase.objects.select_related("buyer", "book").get(id=target_uuid)
+        return purchase.buyer, int(purchase.amount_cents or 0), f"Book purchase: {purchase.book.title}", purchase
     raise ValueError("Unsupported payment target type")
 
 
@@ -689,6 +705,11 @@ def _attach_intent_to_target(intent: DirectPaymentIntent, target: Any | None = N
         target.status = "pending_payment"
         target.metadata = {**(target.metadata or {}), **metadata}
         target.save(update_fields=["payment_reference", "status", "metadata"])
+    elif intent.target_type == DirectPaymentIntent.TARGET_BOOK_PURCHASE:
+        target.payment_method = intent.provider
+        target.transaction_reference = intent.tx_ref
+        target.metadata = {**(target.metadata or {}), **metadata}
+        target.save(update_fields=["payment_method", "transaction_reference", "metadata", "updated_at"])
 
 
 def reconcile_direct_payment_callback(*, payload: dict, signature: str = "") -> tuple[bool, str, DirectPaymentIntent | None]:
@@ -953,6 +974,22 @@ def _mark_target_paid(intent: DirectPaymentIntent, data: dict) -> None:
             target.pinned_until = timezone.now() + timezone.timedelta(minutes=2)
             update_fields.extend(["is_pinned", "pinned_until"])
         target.save(update_fields=update_fields)
+    elif intent.target_type == DirectPaymentIntent.TARGET_BOOK_PURCHASE:
+        from apps.books.models import BookEntitlement, BookPurchase
+        from apps.books.services import grant_entitlement
+
+        target.status = BookPurchase.STATUS_PAID
+        target.payment_method = intent.provider
+        target.transaction_reference = intent.tx_ref
+        target.paid_at = target.paid_at or timezone.now()
+        target.metadata = {**(target.metadata or {}), **paid_metadata}
+        target.save(update_fields=["status", "payment_method", "transaction_reference", "paid_at", "metadata", "updated_at"])
+        # Idempotent — a replayed/duplicate webhook calling this twice for
+        # the same purchase must not create two entitlement rows or raise.
+        grant_entitlement(target.book, target.buyer, source=BookEntitlement.SOURCE_PURCHASE)
+        from apps.books.services import record_royalty
+
+        record_royalty(target)
 
 
 def _mark_target_failed(intent: DirectPaymentIntent, status_value: str) -> None:
@@ -979,3 +1016,9 @@ def _mark_target_failed(intent: DirectPaymentIntent, status_value: str) -> None:
         target.metadata = {**(target.metadata or {}), **metadata}
         target.payload = {**(target.payload or {}), **metadata}
         target.save(update_fields=["metadata", "payload", "updated_at"])
+    elif intent.target_type == DirectPaymentIntent.TARGET_BOOK_PURCHASE:
+        from apps.books.models import BookPurchase
+
+        target.status = BookPurchase.STATUS_FAILED
+        target.metadata = {**(target.metadata or {}), **metadata}
+        target.save(update_fields=["status", "metadata", "updated_at"])

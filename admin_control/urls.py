@@ -4,6 +4,12 @@ from django.urls import path
 from admin_control.views import (
     ActivityStreamView,
     AccessOverviewView,
+    AdminAuthorModerationHistoryView,
+    AdminAuthorRestrictionLiftView,
+    AdminAuthorRestrictionView,
+    AdminBookActionView,
+    AdminBookDetailReaderView,
+    AdminBookQueueView,
     AdminRoleAssignmentDetailView,
     AdminRoleAssignmentView,
     AdminRoleView,
@@ -117,6 +123,14 @@ urlpatterns = [
     path("content/summary/", AdminContentQueueSummaryView.as_view(), name="admin-content-summary"),
     path("content/trends/", AdminContentTrendView.as_view(), name="admin-content-trends"),
     path("content/flags/<str:flag_id>/action/", AdminContentActionView.as_view(), name="admin-content-action"),
+
+    # ── Books moderation (Christian publishing policy) ────────────────────
+    path("books/queue/", AdminBookQueueView.as_view(), name="admin-books-queue"),
+    path("books/<str:id>/", AdminBookDetailReaderView.as_view(), name="admin-books-detail"),
+    path("books/<str:id>/action/", AdminBookActionView.as_view(), name="admin-books-action"),
+    path("authors/<str:user_id>/restrictions/", AdminAuthorRestrictionView.as_view(), name="admin-author-restrictions"),
+    path("authors/restrictions/<str:id>/lift/", AdminAuthorRestrictionLiftView.as_view(), name="admin-author-restriction-lift"),
+    path("authors/<str:user_id>/moderation-history/", AdminAuthorModerationHistoryView.as_view(), name="admin-author-moderation-history"),
 
     # ── Incident response ─────────────────────────────────────────────────
     path("incidents/", AdminIncidentListView.as_view(), name="admin-incidents-list"),

@@ -413,6 +413,7 @@ INSTALLED_APPS = [
     "apps.health_dashboard.apps.HealthDashboardConfig",
     "apps.feed_personalization.apps.FeedPersonalizationConfig",
     "apps.bible.apps.BibleConfig",
+    "apps.books.apps.BooksConfig",
     "apps.location.apps.LocationConfig",
     "admin_control.apps.AdminControlConfig",
     "apps.testimony.apps.TestimonyConfig",
@@ -532,6 +533,34 @@ GO_DEVICE_BINDING_EXEMPT = str(os.environ.get("GO_DEVICE_BINDING_EXEMPT", "1")).
     "1", "true", "yes", "on",
 }
 WEBAUTHN_ORIGIN = os.environ.get("WEBAUTHN_ORIGIN", f"https://{WEBAUTHN_RP_ID}").strip()
+
+# Master Key-Encryption-Key for apps.books.encryption's envelope scheme —
+# every book's own data-encryption-key is generated randomly and stored
+# wrapped (encrypted) by THIS key, never in plaintext (see
+# apps.books.models.BookContentKey). MUST be a real, random, securely
+# generated Fernet key (cryptography.fernet.Fernet.generate_key()) from a
+# proper secrets manager / KMS in production — losing it makes every
+# book's stored content permanently unreadable, and committing a real one
+# to source control defeats the entire point. In local dev/test only, if
+# unset, a key is deterministically derived from SECRET_KEY so you don't
+# need extra setup to run the test suite — this fallback provides NO real
+# secrecy (SECRET_KEY is already far more exposed) and must never be
+# relied on outside DEBUG.
+BOOKS_CONTENT_KEK = os.environ.get("BOOKS_CONTENT_KEK", "").strip()
+if not BOOKS_CONTENT_KEK:
+    import base64
+    import hashlib as _hashlib
+
+    if not DEBUG:
+        import logging as _logging
+
+        _logging.getLogger("security.books").error(
+            "BOOKS_CONTENT_KEK is not set in a non-DEBUG environment — falling back to a key derived from "
+            "SECRET_KEY, which provides NO real secrecy. Set a real Fernet key via proper secrets management."
+        )
+    BOOKS_CONTENT_KEK = base64.urlsafe_b64encode(
+        _hashlib.sha256(f"books-content-kek:{SECRET_KEY}".encode()).digest()
+    ).decode()
 
 OBJECT_STORAGE_PROVIDER = os.environ.get("OBJECT_STORAGE_PROVIDER", "").strip().lower()
 if OBJECT_STORAGE_PROVIDER == "supabase":
@@ -677,6 +706,23 @@ REST_FRAMEWORK = {
         "broadcast_profile_attachment": _env_throttle_rate("THROTTLE_BROADCAST_PROFILE_ATTACHMENT", dev_default="6000/min", prod_default="300/min"),
         "website_form_submit": _env_throttle_rate("THROTTLE_WEBSITE_FORM_SUBMIT", dev_default="6000/min", prod_default="20/min"),
         "website_analytics_beacon": _env_throttle_rate("THROTTLE_WEBSITE_ANALYTICS_BEACON", dev_default="6000/min", prod_default="300/min"),
+        # KIS Books content-protection: BookChapterReadView serves full
+        # chapter text to anyone with reading access, including anonymous
+        # requests for free books (AllowAny) — a real reader never fetches
+        # more than a handful of chapters a minute, so this caps bulk
+        # catalog scraping without touching normal reading. Deliberately
+        # far below the generic anon/user throttle. See apps.books.services.
+        # record_chapter_read_and_detect_scraping for the companion
+        # abuse-flagging signal (same concern, different layer — this
+        # blocks the request outright; that one surfaces a pattern for
+        # GO/staff review even when individual requests stay under this cap).
+        "book_content_read": _env_throttle_rate("THROTTLE_BOOK_CONTENT_READ", dev_default="6000/min", prod_default="60/min"),
+        # Issuing/renewing an offline package re-encrypts a whole book's
+        # chapters on demand - a real but infrequent operation (one
+        # legitimate call per device per ~14-day license window, plus
+        # occasional retries), so this is deliberately low relative to
+        # book_content_read's already-tight cap, not a general browsing rate.
+        "book_offline_download": _env_throttle_rate("THROTTLE_BOOK_OFFLINE_DOWNLOAD", dev_default="6000/min", prod_default="12/min"),
     },
 }
 

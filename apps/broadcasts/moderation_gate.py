@@ -195,7 +195,7 @@ def apply_moderation_decision(video, *, action: str, actor, notes: str = "") -> 
 # The single source of truth - admin_control/views/media_safety.py imports
 # this rather than keeping its own copy, after the two independently
 # maintained sets were found to have already drifted apart in scope.
-MODERATABLE_TARGET_TYPES = {"broadcast_video", "channel_content"}
+MODERATABLE_TARGET_TYPES = {"broadcast_video", "channel_content", "book", "book_review"}
 
 
 def purge_channel_content_assets(content) -> None:

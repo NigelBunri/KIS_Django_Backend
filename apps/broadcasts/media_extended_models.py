@@ -119,42 +119,6 @@ class RoyaltyRecord(TimeStampedUUIDModel):
         return f"Royalty {self.track.title} {self.period_year}/{self.period_month}"
 
 
-class Ebook(TimeStampedUUIDModel):
-    title = models.CharField(max_length=255)
-    author = models.CharField(max_length=200)
-    description = models.TextField(blank=True)
-    cover_url = models.URLField(blank=True)
-    file_url = models.URLField(blank=True)
-    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    currency = models.CharField(max_length=3, default="USD")
-    is_free = models.BooleanField(default=False)
-    genre = models.CharField(max_length=200, blank=True)
-    uploaded_by = models.ForeignKey(
-        User, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="uploaded_ebooks"
-    )
-    download_count = models.IntegerField(default=0)
-
-    class Meta:
-        ordering = ["-created_at"]
-
-    def __str__(self):
-        return self.title
-
-
-class EbookPurchase(TimeStampedUUIDModel):
-    ebook = models.ForeignKey(Ebook, on_delete=models.CASCADE, related_name="purchases")
-    buyer = models.ForeignKey(User, on_delete=models.CASCADE, related_name="ebook_purchases")
-    price_paid = models.DecimalField(max_digits=10, decimal_places=2)
-    purchased_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ["-purchased_at"]
-
-    def __str__(self):
-        return f"{self.buyer} purchased {self.ebook.title}"
-
-
 class PPVEvent(TimeStampedUUIDModel):
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)

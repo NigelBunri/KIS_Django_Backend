@@ -32,6 +32,14 @@ from .user_management import (
     AdminDeviceWipeAllView,
     AdminPlatformStatsView,
 )
+from .book_moderation import (
+    AdminAuthorModerationHistoryView,
+    AdminAuthorRestrictionLiftView,
+    AdminAuthorRestrictionView,
+    AdminBookActionView,
+    AdminBookDetailReaderView,
+    AdminBookQueueView,
+)
 from .content_moderation import (
     AdminContentQueueView,
     AdminContentQueueSummaryView,
@@ -115,4 +123,11 @@ __all__ = [
     "AdminRevenueStatsView",
     "AdminEngagementStatsView",
     "AdminAnalyticsDashboardsView",
+    # Books moderation (Christian publishing policy)
+    "AdminBookQueueView",
+    "AdminBookDetailReaderView",
+    "AdminBookActionView",
+    "AdminAuthorRestrictionView",
+    "AdminAuthorRestrictionLiftView",
+    "AdminAuthorModerationHistoryView",
 ]

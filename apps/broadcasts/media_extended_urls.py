@@ -13,7 +13,6 @@ from .media_extended_views import (
     KingdomMusicTrackViewSet,
     MusicPlaylistViewSet,
     RoyaltyRecordViewSet,
-    EbookViewSet,
     PPVEventViewSet,
     NewsArticleViewSet,
     CreatorAnalyticsView,
@@ -24,7 +23,6 @@ router.register(r"podcasts", PodcastChannelViewSet, basename="podcast-channel")
 router.register(r"music", KingdomMusicTrackViewSet, basename="music-track")
 router.register(r"playlists", MusicPlaylistViewSet, basename="music-playlist")
 router.register(r"royalties", RoyaltyRecordViewSet, basename="royalty-record")
-router.register(r"ebooks", EbookViewSet, basename="ebook")
 router.register(r"ppv", PPVEventViewSet, basename="ppv-event")
 router.register(r"news", NewsArticleViewSet, basename="news-article")
 # Flat, ?channel=<id>-filterable alias used by the mobile app's episode list

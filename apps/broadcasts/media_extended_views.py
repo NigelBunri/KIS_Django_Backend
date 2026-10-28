@@ -22,8 +22,6 @@ from .media_extended_models import (
     KingdomMusicTrack,
     MusicPlaylist,
     RoyaltyRecord,
-    Ebook,
-    EbookPurchase,
     PPVEvent,
     PPVTicket,
     NewsArticle,
@@ -34,8 +32,6 @@ from .media_extended_serializers import (
     KingdomMusicTrackSerializer,
     MusicPlaylistSerializer,
     RoyaltyRecordSerializer,
-    EbookSerializer,
-    EbookPurchaseSerializer,
     PPVEventSerializer,
     PPVTicketSerializer,
     NewsArticleSerializer,
@@ -216,51 +212,6 @@ class RoyaltyRecordViewSet(viewsets.ModelViewSet):
 
 
 # ---------------------------------------------------------------------------
-# Ebooks
-# ---------------------------------------------------------------------------
-
-@extend_schema(tags=["Ebooks"])
-class EbookViewSet(viewsets.ModelViewSet):
-    queryset = Ebook.objects.all()
-    serializer_class = EbookSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ["title", "author", "genre"]
-    ordering_fields = ["created_at", "price", "download_count"]
-
-    def perform_create(self, serializer):
-        serializer.save(uploaded_by=self.request.user)
-
-    @extend_schema(
-        summary="Purchase an ebook",
-        responses={201: EbookPurchaseSerializer, 400: None},
-    )
-    @action(detail=True, methods=["post"], url_path="purchase")
-    def purchase(self, request, pk=None):
-        ebook = self.get_object()
-
-        already_purchased = EbookPurchase.objects.filter(
-            ebook=ebook, buyer=request.user
-        ).exists()
-        if already_purchased:
-            return Response(
-                {"detail": "You have already purchased this ebook."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        purchase = EbookPurchase.objects.create(
-            ebook=ebook,
-            buyer=request.user,
-            price_paid=ebook.price,
-        )
-        ebook.download_count += 1
-        ebook.save(update_fields=["download_count"])
-
-        serializer = EbookPurchaseSerializer(purchase)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-
-# ---------------------------------------------------------------------------
 # PPV
 # ---------------------------------------------------------------------------
 
@@ -378,18 +329,6 @@ class CreatorAnalyticsView(APIView):
             .aggregate(total=Sum("play_count"))["total"] or 0
         )
 
-        # Ebook downloads
-        ebook_downloads = (
-            Ebook.objects.filter(uploaded_by=user)
-            .aggregate(total=Sum("download_count"))["total"] or 0
-        )
-
-        # Ebook revenue
-        ebook_revenue = (
-            EbookPurchase.objects.filter(ebook__uploaded_by=user)
-            .aggregate(total=Sum("price_paid"))["total"] or Decimal("0.00")
-        )
-
         # PPV revenue
         ppv_revenue = (
             PPVTicket.objects.filter(event__creator=user)
@@ -402,15 +341,13 @@ class CreatorAnalyticsView(APIView):
             .aggregate(total=Sum("total_royalty"))["total"] or Decimal("0.00")
         )
 
-        total_revenue = ebook_revenue + ppv_revenue + royalty_revenue
+        total_revenue = ppv_revenue + royalty_revenue
 
         return Response(
             {
                 "podcast_plays": podcast_plays,
                 "music_plays": music_plays,
                 "total_plays": podcast_plays + music_plays,
-                "ebook_downloads": ebook_downloads,
-                "ebook_revenue": str(ebook_revenue),
                 "ppv_revenue": str(ppv_revenue),
                 "royalty_revenue": str(royalty_revenue),
                 "total_revenue": str(total_revenue),
