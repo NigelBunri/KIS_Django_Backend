@@ -10,7 +10,7 @@ from .internal_signing import sign_internal_request
 logger = logging.getLogger(__name__)
 
 
-def _post_to_nest(path: str, payload: dict) -> None:
+def _post_to_nest(path: str, payload: dict, *, required: bool = False, timeout: int = 3) -> dict | None:
     base = getattr(settings, "NEST_INTERNAL_URL", "").rstrip("/")
     # Nest's InternalAuthGuard checks incoming X-Internal-Auth against its
     # own DJANGO_INTERNAL_TOKEN env var - the same shared secret already
@@ -21,8 +21,10 @@ def _post_to_nest(path: str, payload: dict) -> None:
     # production test during this session's closure verification).
     token = getattr(settings, "DJANGO_INTERNAL_TOKEN", "")
     if not base or not token:
+        if required:
+            raise RuntimeError("NEST_INTERNAL_URL or DJANGO_INTERNAL_TOKEN is not configured.")
         logger.warning("[chat.tasks] Missing NEST_INTERNAL_URL or DJANGO_INTERNAL_TOKEN; skipping notify")
-        return
+        return None
 
     # RealtimeInternalController is mounted at @Controller('internal') on
     # the Nest side - every route path passed to this helper (conversations/
@@ -39,8 +41,49 @@ def _post_to_nest(path: str, payload: dict) -> None:
         **sign_internal_request("POST", url, payload, secret=token),
     }
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=3) as resp:
-        resp.read()
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+    if not body:
+        return {}
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError:
+        return {}
+
+
+def send_system_message_as_user(
+    *, conversation_id: str, sender_id: str, text: str, client_id: str,
+) -> dict:
+    """Posts a real, persisted message into a conversation on behalf of
+    `sender_id` via Nest's existing `internal/messages/send-as-user`
+    route (RealtimeInternalController.sendMessageAsUser) — the same
+    pipeline a live socket send uses (seq allocation + createIdempotent),
+    not a second parallel persistence path, and the same route Django's
+    status-reply endpoint already uses in production.
+
+    `client_id` MUST be deterministic and stable across retries (e.g.
+    derived from the conversation id, never a fresh uuid per call) —
+    Nest's createIdempotent dedupes on (conversationId, clientId), which
+    is what makes this safe to call from an idempotent provisioning
+    command run twice without posting the welcome message twice.
+
+    `required=True`: raises (rather than silently skipping) when Nest
+    integration isn't configured, and uses a longer timeout than the
+    fire-and-forget fanout calls below — a provisioning command should
+    surface a real failure here, not silently pretend the welcome
+    message went out.
+    """
+    return _post_to_nest(
+        "messages/send-as-user",
+        {
+            "conversationId": str(conversation_id),
+            "senderId": str(sender_id),
+            "text": text,
+            "clientId": client_id,
+        },
+        required=True,
+        timeout=10,
+    ) or {}
 
 
 def notify_nest_conversation_created(conversation_id: str, user_ids: list[str]) -> None:

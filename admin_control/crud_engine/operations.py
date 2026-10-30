@@ -32,6 +32,19 @@ _CRUD_ENGINE_BLOCKLIST = {
     ("auth", "group"),
     ("auth", "permission"),
     ("sessions", "session"),
+    # ReferralCommission is a financial/audit record — the referral-
+    # commission audit explicitly requires that no admin surface can
+    # silently modify a historical commission (status, amount, payout
+    # reference, ...). Django admin already enforces this
+    # (ReferralCommissionAdmin.has_change_permission returns False), but
+    # that only protects Django's own admin site; this generic engine is
+    # a second, independent write path keyed only on app_label/model_name
+    # permissions, so it needs its own entry here or it would bypass that
+    # protection entirely. ReferralPayoutAccount is deliberately NOT
+    # listed — it's a payout destination support staff may legitimately
+    # need to correct, not a record of a transaction that already
+    # happened.
+    ("referrals", "referralcommission"),
 }
 
 

@@ -850,6 +850,15 @@ def reverse_tier_upgrade_payment(
         if referral:
             _reverse_referral_reward(referral, reason=f"{event_type}:{reason}")
 
+        # Independent reversal of the lifetime cash-commission track (see
+        # apps.referrals.commission_services / ReferralCommission's
+        # docstring for why this is separate from the KIS-Coins reversal
+        # above). No-ops if this subscription never generated a
+        # commission (e.g. it predates the feature, or the payment source
+        # wasn't a qualifying one).
+        from apps.referrals.commission_services import reverse_referral_commission as _reverse_referral_commission
+        _reverse_referral_commission(referred_user=user, subscription=sub, reason=f"{event_type}:{reason}")
+
         was_current = sub.status == Subscription.STATUS_ACTIVE
         sub.status = Subscription.STATUS_REFUNDED
         sub.save(update_fields=["status", "updated_at"])

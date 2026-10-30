@@ -241,9 +241,10 @@ class StripeConnectTests(TestCase):
 
 class StripeConnectWebhookSyncTests(TestCase):
     """account.updated is the authoritative sync point — this proves it
-    finds the right entity (across all four payout-holder tables) purely
-    from the Stripe account id, with no target_type/target_id metadata to
-    go on (Stripe doesn't attach ours to Account objects)."""
+    finds the right entity (across all five payout-holder tables, as of
+    the referral-commission project's ReferralPayoutAccount addition)
+    purely from the Stripe account id, with no target_type/target_id
+    metadata to go on (Stripe doesn't attach ours to Account objects)."""
 
     def test_syncs_matching_shop_by_stripe_account_id(self):
         from apps.billing.views import _sync_stripe_connect_account_status
@@ -272,6 +273,58 @@ class StripeConnectWebhookSyncTests(TestCase):
         self.assertTrue(shop.stripe_charges_enabled)
         self.assertTrue(shop.stripe_payouts_enabled)
         self.assertTrue(shop.stripe_details_submitted)
+
+    def test_syncs_matching_referral_payout_account_and_derives_status(self):
+        # Production-readiness audit finding: ReferralPayoutAccount was
+        # missing from this lookup entirely (meaning a referrer's account
+        # activation never happened automatically unless they manually
+        # reopened the Referrals screen), and unlike the other four
+        # models, its payout-sweep eligibility is read off a cached
+        # `status` enum rather than the raw booleans — proving both the
+        # lookup and the status derivation here.
+        from apps.accounts.models import User
+        from apps.billing.views import _sync_stripe_connect_account_status
+        from apps.referrals.models import ReferralPayoutAccount
+
+        referrer = User.objects.create_user(phone="+237699980001", password="x", country="CM")
+        account = ReferralPayoutAccount.objects.create(
+            user=referrer, provider=ReferralPayoutAccount.PROVIDER_STRIPE,
+            status=ReferralPayoutAccount.STATUS_PENDING, stripe_account_id="acct_referral_webhook1",
+        )
+        with patch(
+            "apps.billing.stripe_connect.refresh_account_status",
+            return_value={
+                "stripe_charges_enabled": True,
+                "stripe_payouts_enabled": True,
+                "stripe_details_submitted": True,
+            },
+        ):
+            _sync_stripe_connect_account_status({"id": "acct_referral_webhook1"})
+        account.refresh_from_db()
+        self.assertTrue(account.stripe_payouts_enabled)
+        self.assertEqual(account.status, ReferralPayoutAccount.STATUS_ACTIVE)
+
+    def test_referral_payout_account_stays_pending_when_payouts_not_yet_enabled(self):
+        from apps.accounts.models import User
+        from apps.billing.views import _sync_stripe_connect_account_status
+        from apps.referrals.models import ReferralPayoutAccount
+
+        referrer = User.objects.create_user(phone="+237699980002", password="x", country="CM")
+        account = ReferralPayoutAccount.objects.create(
+            user=referrer, provider=ReferralPayoutAccount.PROVIDER_STRIPE,
+            status=ReferralPayoutAccount.STATUS_PENDING, stripe_account_id="acct_referral_webhook2",
+        )
+        with patch(
+            "apps.billing.stripe_connect.refresh_account_status",
+            return_value={
+                "stripe_charges_enabled": False,
+                "stripe_payouts_enabled": False,
+                "stripe_details_submitted": True,
+            },
+        ):
+            _sync_stripe_connect_account_status({"id": "acct_referral_webhook2"})
+        account.refresh_from_db()
+        self.assertEqual(account.status, ReferralPayoutAccount.STATUS_PENDING)
 
     def test_no_match_does_not_raise(self):
         from apps.billing.views import _sync_stripe_connect_account_status

@@ -56,7 +56,14 @@ if IS_TEST_RUN and not TEST_DATABASE_URL:
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": str(BASE_DIR / "test_db.sqlite3"),
     }
-elif TEST_DATABASE_URL:
+elif IS_TEST_RUN and TEST_DATABASE_URL:
+    # Gated on IS_TEST_RUN too — TEST_DATABASE_URL being merely *set* in
+    # .env must never redirect an ordinary `runserver`/`shell`/`migrate`
+    # command away from DATABASE_URL. Previously this branch fired for
+    # every management command whenever TEST_DATABASE_URL existed in the
+    # environment, silently pointing local dev work (including a running
+    # `runserver`) at the TEST database — which a plain `manage.py test`
+    # (no --keepdb) then destroys afterward, taking dev data down with it.
     DATABASES["default"] = dj_database_url.parse(
         TEST_DATABASE_URL,
         conn_max_age=int(os.environ.get("PG_CONN_MAX_AGE", "600")),

@@ -406,6 +406,7 @@ INSTALLED_APPS = [
     "apps.websites.apps.WebsitesConfig",
     "apps.communities.apps.CommunitiesConfig",
     "apps.groups.apps.GroupsConfig",
+    "apps.prayer.apps.PrayerConfig",
     "apps.channels.apps.ChannelsConfig",
     "apps.tasks.apps.TasksConfig",
     "apps.broadcasts.apps.BroadcastsConfig",
@@ -906,6 +907,31 @@ CELERY_BEAT_SCHEDULE = {
         # frequent enough to catch drift without adding noise to whatever
         # log/alerting pipeline watches this task's anomalies.
         "schedule": 24 * 60 * 60,
+    },
+    # Lifetime referral cash-commission sweeps (apps/referrals/
+    # commission_services.py) - a separate reward track from
+    # confirm-settled-referrals above, see that module for why. Same
+    # hourly cadence as the other settlement-window sweeps; a commission
+    # sitting PENDING or APPROVED up to an hour past when it technically
+    # could advance has no economic-safety impact worth a tighter
+    # interval.
+    "approve-referral-commissions": {
+        "task": "apps.referrals.tasks.approve_referral_commissions",
+        "schedule": 60 * 60,
+    },
+    "pay-out-referral-commissions": {
+        "task": "apps.referrals.tasks.pay_out_referral_commissions",
+        "schedule": 60 * 60,
+    },
+    # Prayer Calendar upcoming-watch reminders (apps/prayer/tasks.py) - a
+    # 5-minute cadence against a 10-minute reminder window, so every
+    # session's window is covered by at least one run even if a tick is
+    # briefly delayed; create_notification's dedup_key makes a second
+    # run catching the same session a safe no-op rather than a duplicate
+    # notification.
+    "send-upcoming-prayer-watch-reminders": {
+        "task": "apps.prayer.tasks.send_upcoming_watch_reminders",
+        "schedule": 5 * 60,
     },
     # Phase 4 of the Education system production-hardening project: backstop
     # for auto_complete_education_booking, which is otherwise only ever

@@ -97,14 +97,26 @@ def _ensure_kcan_verified() -> None:
             logger.info("[partners.seed] Re-activated KCAN badge: %s", code)
 
 
-def _ensure_go_identity() -> None:
+def get_go_user():
+    """The actual designated GO account, if it has ever logged in —
+    shared lookup for anything that needs a real User row to own/operate
+    as the GO (e.g. apps.prayer's group provisioning), rather than each
+    caller re-implementing the same email-then-phone fallback. Returns
+    None if the GO hasn't logged in yet (see _ensure_go_identity's own
+    docstring — this is an accepted, pre-existing state in a fresh
+    environment, not an error)."""
     from apps.accounts.models import User
-    from apps.partners.models import Partner
 
-    user = (
+    return (
         User.objects.filter(email__iexact=GO_EMAIL).first()
         or User.objects.filter(phone=GO_PHONE).first()
     )
+
+
+def _ensure_go_identity() -> None:
+    from apps.partners.models import Partner
+
+    user = get_go_user()
     if not user:
         logger.info("[partners.seed] GO user not found — will be enforced on first login.")
         return

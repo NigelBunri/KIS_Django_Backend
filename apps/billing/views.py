@@ -1639,6 +1639,21 @@ def reconcile_wallet_flutterwave_event(*, payload: dict) -> Response:
                     new_subscription,
                     net_amount_cents=transaction_obj.amount_cents,
                 )
+
+                # Lifetime cash-commission engine (apps.referrals.
+                # commission_services) — deliberately independent of
+                # qualify_referral above (see ReferralCommission's
+                # docstring): this fires on EVERY qualifying payment, not
+                # just the first, and pays real cash via a connected
+                # payout account rather than internal KIS Coins.
+                from apps.referrals.commission_services import award_referral_commission
+                award_referral_commission(
+                    referred_user=transaction_obj.user,
+                    subscription=new_subscription,
+                    source="flutterwave",
+                    gross_amount_cents=transaction_obj.amount_cents,
+                    source_payment_reference=transaction_obj.tx_ref,
+                )
         else:
             record_ledger(
                 user=transaction_obj.user,
@@ -1821,6 +1836,40 @@ class FlutterwaveWebhookView(APIView):
             return Response({"detail": "invalid signature"}, status=status.HTTP_403_FORBIDDEN)
 
         payload = request.data if isinstance(request.data, dict) else {}
+
+        # Transfer events (referral-commission payouts —
+        # apps.referrals.commission_services.initiate_commission_payout)
+        # have a different shape (`event: "transfer.completed"`, no
+        # tx_ref) than every other delivery this view previously handled,
+        # which all key off a WalletTransaction/DirectPaymentIntent
+        # tx_ref via reconcile_wallet_flutterwave_event. Dispatch on
+        # `event` first so a transfer webhook doesn't fall through to
+        # that function and get rejected as "tx_ref missing".
+        event_type = str(payload.get("event") or "")
+        if event_type.startswith("transfer."):
+            data = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
+            transfer_status = str(data.get("status") or "").upper()
+            payout_reference = str(data.get("id") or "")
+            # The merchant reference WE sent (payout_attempt_reference) is
+            # the primary lookup key — see
+            # confirm_flutterwave_commission_payout's docstring for why:
+            # if initiate_flutterwave_transfer raised before returning a
+            # transfer id (e.g. a timeout, even though Flutterwave had
+            # already accepted the request), payout_reference was never
+            # saved locally, and a lookup keyed only on Flutterwave's own
+            # id would never find this commission at all.
+            merchant_reference = str(data.get("reference") or "")
+            if not payout_reference and not merchant_reference:
+                return Response({"detail": "transfer id and reference both missing"}, status=status.HTTP_400_BAD_REQUEST)
+            from apps.referrals.commission_services import confirm_flutterwave_commission_payout
+            confirm_flutterwave_commission_payout(
+                payout_reference=payout_reference,
+                merchant_reference=merchant_reference,
+                successful=transfer_status == "SUCCESSFUL",
+                failure_reason="" if transfer_status == "SUCCESSFUL" else (data.get("complete_message") or transfer_status),
+            )
+            return Response({"status": "ok"})
+
         return reconcile_wallet_flutterwave_event(payload=payload)
 
 
@@ -2147,10 +2196,19 @@ def _sync_stripe_connect_account_status(account_obj: dict) -> None:
     from apps.broadcasts.models import BroadcastChannel, EducationInstitution
     from apps.commerce.models import Shop
     from apps.health_ops.models import HealthInstitution
+    from apps.referrals.models import ReferralPayoutAccount
 
     entity = None
     model_name = ""
-    for model in (Shop, EducationInstitution, HealthInstitution, BroadcastChannel):
+    # ReferralPayoutAccount added during the referral-commission
+    # production-readiness audit: without it, a referrer's payout account
+    # only ever picks up Stripe's real charges_enabled/payouts_enabled
+    # here via this webhook never firing for it, meaning the row stayed
+    # whatever it was at connect time until the user happened to reopen
+    # the Referrals screen (which re-queries Stripe directly) — connected
+    # accounts that finish onboarding without the user ever reopening that
+    # screen would never be picked up by the payout sweep at all.
+    for model in (Shop, EducationInstitution, HealthInstitution, BroadcastChannel, ReferralPayoutAccount):
         entity = model.objects.filter(stripe_account_id=account_id).first()
         if entity is not None:
             model_name = model.__name__
@@ -2168,7 +2226,24 @@ def _sync_stripe_connect_account_status(account_obj: dict) -> None:
 
     for field_name, value in fields.items():
         setattr(entity, field_name, value)
-    entity.save(update_fields=[*fields.keys(), "updated_at"])
+    update_fields = [*fields.keys(), "updated_at"]
+    if isinstance(entity, ReferralPayoutAccount):
+        # Unlike the other three models here, ReferralPayoutAccount's
+        # payout-readiness is read off a cached `status` enum (the payout
+        # sweep filters on status=ACTIVE, never the raw booleans directly)
+        # — the same derivation ReferralPayoutAccountStripeConnectView.get
+        # already applies when the user manually reopens the Referrals
+        # screen. Without doing it here too, this webhook firing would
+        # update the raw stripe_payouts_enabled flag but leave `status`
+        # stuck at PENDING, so a referrer whose Stripe onboarding
+        # completes without them ever reopening that screen would never
+        # be picked up by the payout sweep.
+        entity.status = (
+            ReferralPayoutAccount.STATUS_ACTIVE if fields.get("stripe_payouts_enabled")
+            else ReferralPayoutAccount.STATUS_PENDING
+        )
+        update_fields.append("status")
+    entity.save(update_fields=update_fields)
     logger.info(
         "[Stripe] account.updated synced %s id=%s charges_enabled=%s payouts_enabled=%s",
         model_name, entity.id, fields["stripe_charges_enabled"], fields["stripe_payouts_enabled"],

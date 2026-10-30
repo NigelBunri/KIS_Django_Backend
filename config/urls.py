@@ -316,6 +316,7 @@ urlpatterns = [
     path("api/v1/", include("apps.billing.urls")),
     path("api/v1/", include("apps.referrals.urls")),
     path("api/v1/", include("apps.rewards.urls")),
+    path("api/v1/", include("apps.prayer.urls")),
     path("api/v1/verification/", include("apps.verification.urls", namespace="verification")),
     path("api/v1/", include("apps.tasks.urls", namespace="tasks")),
     path("api/v1/", include("apps.testimony.urls")),
