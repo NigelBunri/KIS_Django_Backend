@@ -9091,6 +9091,12 @@ class BroadcastFeedView(APIView):
         next_cursor = _encode_feed_cursor(next_offset)
         previous_cursor = _encode_feed_cursor(previous_offset)
 
+        # Refresh every attachment/avatar URL on just this page (not the
+        # full unpaginated candidate list) before it goes out - see
+        # _refresh_feed_media_urls's docstring for why this is needed
+        # regardless of source type.
+        _refresh_feed_media_urls(results)
+
         return Response(
             {
                 "count": count,
@@ -15609,6 +15615,58 @@ def _safe_public_media_url(value: str) -> str:
     fresh some other way, e.g. ProfileSerializer's default_storage.url()
     pattern, which is why the app never showed this symptom)."""
     return _safe_public_media_url_raw(_resolve_stale_media_url(value))
+
+
+def _refresh_feed_media_urls(items: list[dict]) -> None:
+    """Mutates each already-built feed item in place, re-resolving every
+    media URL (attachment/attachments url+thumbnail_url, item-level
+    thumbnail_url, author/source avatar_url) via resolve_stale_media_url.
+
+    Several feed sources (CommunityPost.attachments JSON, ChannelContentAsset.url,
+    BroadcastChannel.avatar_url/banner_url, etc.) persist whatever presigned S3
+    GET URL the upload endpoint returned at write time, never re-signed
+    afterward. Once AWS_S3_PRESIGNED_EXPIRY_SECONDS elapses that stored URL
+    403s and the attachment silently stops rendering - this is the proven
+    "Community feed media not displaying" / stale-URL failure mode already
+    fixed for the public KISTube endpoints (_safe_public_media_url above) and
+    for apps.websites.kis_content_resolvers, applied here to this app's own
+    authenticated feed response so every source type (community/partner/
+    channel/market/lesson/profile) gets the same fix in one place, right
+    before the page actually goes out - never mutates storage, so historical
+    rows are fixed on read without any backfill migration. For an object
+    under a public-prefix/public bucket this also means a new permanent
+    public URL instead of yet another presigned one; for anything still
+    private it's simply a freshly-signed presigned URL, scoped only to the
+    page actually returned (not the full unpaginated candidate list)."""
+    def _refresh(value):
+        text = str(value or "").strip()
+        return _resolve_stale_media_url(text) if text else value
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("thumbnail_url"):
+            item["thumbnail_url"] = _refresh(item["thumbnail_url"])
+        attachment = item.get("attachment")
+        if isinstance(attachment, dict):
+            if attachment.get("url"):
+                attachment["url"] = _refresh(attachment["url"])
+            if attachment.get("thumbnail_url"):
+                attachment["thumbnail_url"] = _refresh(attachment["thumbnail_url"])
+        attachments = item.get("attachments")
+        if isinstance(attachments, list):
+            for entry in attachments:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("url", "thumbnail_url", "thumbUrl", "preview_url"):
+                    if entry.get(key):
+                        entry[key] = _refresh(entry[key])
+        author = item.get("author")
+        if isinstance(author, dict) and author.get("avatar_url"):
+            author["avatar_url"] = _refresh(author["avatar_url"])
+        source = item.get("source")
+        if isinstance(source, dict) and source.get("avatar_url"):
+            source["avatar_url"] = _refresh(source["avatar_url"])
 
 
 def _content_is_public_web_safe(content: ChannelContent) -> bool:
