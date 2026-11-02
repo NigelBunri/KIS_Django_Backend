@@ -1408,3 +1408,28 @@ from .returns_models import (  # noqa: E402,F401
     ReturnStatus,
 )
 from .drops_models import MarketDrop  # noqa: E402,F401
+
+# business_models.py was missed when shipping_models/returns_models/
+# drops_models were given this same fix above - CONFIRMED ROOT CAUSE of a
+# production 500 on any query that select_related's through
+# apps.accounts.models.Profile.hiring_job_listing (a lazy "commerce.
+# JobListing" string reference): whichever gunicorn worker happened not to
+# have already served a request that imports apps.commerce.business_views/
+# business_urls never registers JobListing with Django's app registry at
+# all, so the FK's target_field resolution raises ValueError the first
+# time any such query runs in that worker - intermittent and
+# worker-dependent, not a clean 500-every-time, which is why it went
+# unnoticed. apps.broadcasts.views.BroadcastFeedView (the main Feeds tab)
+# is one confirmed-affected caller.
+from .business_models import (  # noqa: E402,F401
+    BusinessMentorship,
+    CoWorkingSpace,
+    CrowdfundCampaign,
+    CrowdfundContribution,
+    ImpactReport,
+    JobApplication,
+    JobListing,
+    KingdomCertification,
+    SavingsGroup,
+    SavingsGroupMembership,
+)
