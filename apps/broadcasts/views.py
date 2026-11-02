@@ -15597,6 +15597,7 @@ from apps.core.public_web import (
     safe_public_description as _safe_public_description,
     safe_public_media_url as _safe_public_media_url_raw,
     resolve_stale_media_url as _resolve_stale_media_url,
+    extract_own_bucket_key as _extract_own_bucket_key,
 )
 
 
@@ -15617,30 +15618,63 @@ def _safe_public_media_url(value: str) -> str:
     return _safe_public_media_url_raw(_resolve_stale_media_url(value))
 
 
+def _force_presigned_media_url(value: str, explicit_key: str | None = None) -> str:
+    """Like resolve_stale_media_url, but never trusts default_storage.url()'s
+    own public-prefix/public-bucket shortcut (AWS_S3_PUBLIC_PREFIXES,
+    AWS_S3_PUBLIC_BUCKET) - it always asks the storage backend for a real,
+    freshly-signed GET URL using THIS app's own AWS credentials. Anonymous
+    public-read access to community_feed/broadcast_videos/broadcast_thumbnails
+    was configured but has not been verified to actually work in production
+    (repeated AccessDenied against real, existing objects even with a
+    correct-looking bucket policy and Block Public Access off - see the S3
+    media delivery investigation) - rather than keep handing back a URL that
+    may 403 forever, this always signs one with credentials we know work
+    (the same mechanism profile/cover images already use successfully).
+
+    Prefers `explicit_key` (a stored object key - e.g. an attachment's own
+    storageKey/storage_path field) over parsing one out of `value`'s URL
+    shape, since a raw key is unambiguous and doesn't depend on recognizing
+    a particular host/path format. Falls back to default_storage.url() for
+    a storage backend with no generate_presigned_get (e.g. Supabase), and
+    returns `value` unchanged if no key can be established either way (an
+    external URL, or already empty)."""
+    from django.core.files.storage import default_storage
+
+    key = str(explicit_key or "").strip().lstrip("/") or _extract_own_bucket_key(value)
+    if not key:
+        return value
+    try:
+        if hasattr(default_storage, "generate_presigned_get"):
+            ttl = int(getattr(default_storage, "presigned_expiry", 3600) or 3600)
+            return default_storage.generate_presigned_get(key, ttl)
+        return default_storage.url(key)
+    except Exception:
+        return value
+
+
 def _refresh_feed_media_urls(items: list[dict]) -> None:
     """Mutates each already-built feed item in place, re-resolving every
     media URL (attachment/attachments url+thumbnail_url, item-level
-    thumbnail_url, author/source avatar_url) via resolve_stale_media_url.
+    thumbnail_url, author/source avatar_url) to a freshly-signed, currently-
+    working URL via _force_presigned_media_url.
 
     Several feed sources (CommunityPost.attachments JSON, ChannelContentAsset.url,
-    BroadcastChannel.avatar_url/banner_url, etc.) persist whatever presigned S3
-    GET URL the upload endpoint returned at write time, never re-signed
-    afterward. Once AWS_S3_PRESIGNED_EXPIRY_SECONDS elapses that stored URL
-    403s and the attachment silently stops rendering - this is the proven
-    "Community feed media not displaying" / stale-URL failure mode already
-    fixed for the public KISTube endpoints (_safe_public_media_url above) and
-    for apps.websites.kis_content_resolvers, applied here to this app's own
-    authenticated feed response so every source type (community/partner/
-    channel/market/lesson/profile) gets the same fix in one place, right
-    before the page actually goes out - never mutates storage, so historical
-    rows are fixed on read without any backfill migration. For an object
-    under a public-prefix/public bucket this also means a new permanent
-    public URL instead of yet another presigned one; for anything still
-    private it's simply a freshly-signed presigned URL, scoped only to the
-    page actually returned (not the full unpaginated candidate list)."""
-    def _refresh(value):
+    BroadcastChannel.avatar_url/banner_url, etc.) persist whatever URL an
+    upload endpoint returned at write time - either a presigned S3 GET with
+    a fixed TTL, or (for a key under a prefix believed to be public) an
+    unsigned URL that depends on anonymous bucket access actually working.
+    Both go stale/break in ways nothing re-generates on its own. Applied
+    here to this app's own authenticated feed response so every source type
+    (community/partner/channel/market/lesson/profile) gets a real, working
+    URL in one place, right before the page actually goes out - never
+    mutates storage, so historical rows are fixed on read without any
+    backfill migration, scoped only to the page actually returned (not the
+    full unpaginated candidate list)."""
+    def _refresh(value, explicit_key=None):
         text = str(value or "").strip()
-        return _resolve_stale_media_url(text) if text else value
+        if not text and not explicit_key:
+            return value
+        return _force_presigned_media_url(text, explicit_key)
 
     for item in items:
         if not isinstance(item, dict):
@@ -15649,8 +15683,12 @@ def _refresh_feed_media_urls(items: list[dict]) -> None:
             item["thumbnail_url"] = _refresh(item["thumbnail_url"])
         attachment = item.get("attachment")
         if isinstance(attachment, dict):
-            if attachment.get("url"):
-                attachment["url"] = _refresh(attachment["url"])
+            attachment_key = str(
+                attachment.get("storageKey") or attachment.get("storage_key")
+                or attachment.get("storage_path") or attachment.get("path") or ""
+            ).strip()
+            if attachment.get("url") or attachment_key:
+                attachment["url"] = _refresh(attachment.get("url"), attachment_key)
             if attachment.get("thumbnail_url"):
                 attachment["thumbnail_url"] = _refresh(attachment["thumbnail_url"])
         attachments = item.get("attachments")
@@ -15658,7 +15696,13 @@ def _refresh_feed_media_urls(items: list[dict]) -> None:
             for entry in attachments:
                 if not isinstance(entry, dict):
                     continue
-                for key in ("url", "thumbnail_url", "thumbUrl", "preview_url"):
+                entry_key = str(
+                    entry.get("storageKey") or entry.get("storage_key")
+                    or entry.get("storage_path") or entry.get("path") or ""
+                ).strip()
+                if entry.get("url") or entry_key:
+                    entry["url"] = _refresh(entry.get("url"), entry_key)
+                for key in ("thumbnail_url", "thumbUrl", "preview_url"):
                     if entry.get(key):
                         entry[key] = _refresh(entry[key])
         author = item.get("author")

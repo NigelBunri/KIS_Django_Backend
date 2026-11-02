@@ -69,6 +69,40 @@ def safe_public_media_url(value: str) -> str:
     return raw
 
 
+def extract_own_bucket_key(url: str) -> str:
+    """Returns the S3 object key embedded in `url` if it points at our own
+    configured bucket (virtual-hosted or path-style), else "". Shared by
+    resolve_stale_media_url below and apps.broadcasts.views'
+    _refresh_feed_media_urls, which needs the raw key to force a genuine
+    presigned GET rather than trusting default_storage.url()'s own
+    public-prefix shortcut (see that function's docstring)."""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        from urllib.parse import unquote
+
+        from django.core.files.storage import default_storage
+
+        parsed = urlparse(text)
+        if parsed.scheme not in {"http", "https"}:
+            return ""
+        bucket = str(getattr(default_storage, "bucket", "") or "")
+        if not bucket:
+            return ""
+        host = parsed.hostname or ""
+        path = unquote(parsed.path or "").lstrip("/")
+        if host == f"{bucket}.s3.amazonaws.com" or host.startswith(f"{bucket}.s3."):
+            return path
+        if host.startswith("s3.") or host == "s3.amazonaws.com":
+            prefix = f"{bucket}/"
+            if path.startswith(prefix):
+                return path[len(prefix):]
+        return ""
+    except Exception:
+        return ""
+
+
 def resolve_stale_media_url(value: str) -> str:
     """Several freeform/legacy fields (website section `data`, broadcast
     ChannelContent.thumbnail_url and ChannelContentAsset.url/thumbnail_url)
@@ -86,25 +120,9 @@ def resolve_stale_media_url(value: str) -> str:
     if not text:
         return text
     try:
-        from urllib.parse import unquote
-
         from django.core.files.storage import default_storage
 
-        parsed = urlparse(text)
-        if parsed.scheme not in {"http", "https"}:
-            return text
-        bucket = str(getattr(default_storage, "bucket", "") or "")
-        if not bucket:
-            return text
-        host = parsed.hostname or ""
-        path = unquote(parsed.path or "").lstrip("/")
-        key = ""
-        if host == f"{bucket}.s3.amazonaws.com" or host.startswith(f"{bucket}.s3."):
-            key = path
-        elif host.startswith("s3.") or host == "s3.amazonaws.com":
-            prefix = f"{bucket}/"
-            if path.startswith(prefix):
-                key = path[len(prefix):]
+        key = extract_own_bucket_key(text)
         if not key:
             return text
         return default_storage.url(key)
