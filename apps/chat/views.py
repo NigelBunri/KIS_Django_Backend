@@ -283,6 +283,15 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 # reachable only from Partners — never from the main
                 # Messages tab.
                 | Q(group__slug__startswith="edu-course-")
+                # Same principle for the 24 permanent Prayer Watch rooms
+                # (apps.prayer.provisioning — slug "prayer-watch-{hour:02d}"):
+                # reachable only from the Bible section's Prayer Calendar
+                # tab, never surfaced in the main Messages chat list, even
+                # though self-joining one (apps.prayer's open join_policy,
+                # required for the call/text buttons to work at all — see
+                # PrayerWatchRoomScreen.tsx's ensureWatchGroupMembership)
+                # creates a completely ordinary GroupMembership underneath.
+                | Q(group__slug__startswith="prayer-watch-")
             )
         q = (self.request.query_params.get('q') or self.request.query_params.get('search') or '').strip()
         if q:
