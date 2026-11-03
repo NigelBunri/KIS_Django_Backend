@@ -8818,6 +8818,15 @@ class BroadcastFeedView(APIView):
                     "text_doc": _extract_rich_text_doc(entry),
                     "text_plain": text_plain,
                     "text_preview": entry.get("text_preview") or text_plain[:200],
+                    # Other source types in this merged feed (community,
+                    # channel_content, etc.) all set both "attachment"
+                    # (singular, primary) and "attachments" (full list) -
+                    # this one only ever set the list, which is harmless for
+                    # BroadcastFeedCard.tsx (reads attachments[]) but silently
+                    # breaks anything that only looks at .attachment, same
+                    # class of inconsistency _refresh_feed_media_urls already
+                    # handles for the url field itself.
+                    "attachment": attachments[0] if attachments else None,
                     "attachments": attachments,
                     "poll": entry.get("poll") or None,
                     "event": entry.get("event") or None,
