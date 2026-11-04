@@ -1446,18 +1446,33 @@ class ConversationViewSet(viewsets.ModelViewSet):
         except Conversation.DoesNotExist:
             return Response({"detail": "Conversation not found."}, status=404)
 
-        partner = _resolve_partner_from_conversation(conversation)
-        if not partner:
-            return Response({"delivered": 0})
+        full_payload = {"conversation_id": str(conversation.id), **(payload or {})}
+        delivered = 0
 
-        delivered = dispatch_partner_webhooks(
-            partner=partner,
-            event=event,
-            payload={
-                "conversation_id": str(conversation.id),
-                **(payload or {}),
-            },
-        )
+        partner = _resolve_partner_from_conversation(conversation)
+        if partner:
+            delivered += dispatch_partner_webhooks(partner=partner, event=event, payload=full_payload)
+
+        # KIS Bot Platform (apps.bots) — fans out to every active bot
+        # resource grant on THIS conversation, independent of whether a
+        # Partner webhook exists for it at all (a Group- or Channel-level
+        # bot grant has nothing to do with Partner webhooks above). Reuses
+        # this exact, already-existing Nest -> Django call rather than
+        # adding a second Nest -> Django hook for the same event - see
+        # apps.bots.services.dispatch_bot_events_for_conversation's
+        # docstring. Never allowed to affect this endpoint's own response
+        # or raise - this sits on the critical message-send path.
+        try:
+            from apps.bots.services import dispatch_bot_events_for_conversation
+
+            message_id = str(payload.get("messageId") or payload.get("message_id") or "")
+            event_id = f"{event}:{message_id}" if message_id else f"{event}:{conversation.id}:{timezone.now().timestamp()}"
+            delivered += dispatch_bot_events_for_conversation(
+                conversation.id, event, full_payload, event_id=event_id,
+            )
+        except Exception:
+            logger.exception("[chat.webhook_dispatch] bot event dispatch failed conversation=%s event=%s", pk, event)
+
         return Response({"delivered": delivered})
 
 

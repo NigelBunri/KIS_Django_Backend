@@ -1,0 +1,140 @@
+# apps/bots/serializers.py
+from rest_framework import serializers
+
+from .models import (
+    Bot,
+    BotActivityLog,
+    BotAIConnection,
+    BotApprovalRequest,
+    BotCredential,
+    BotResourceGrant,
+    BotWebhookSubscription,
+)
+
+
+class BotAIConnectionSerializer(serializers.ModelSerializer):
+    # Write-only: owner can set a new key, but it is never read back once
+    # stored (section 10 — "AI credentials must remain protected
+    # server-side"). has_api_key tells the owner whether one is on file
+    # without ever exposing it.
+    api_key = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    has_api_key = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BotAIConnection
+        fields = [
+            "id", "provider", "api_key", "has_api_key", "custom_endpoint_url",
+            "model", "system_instructions", "daily_request_limit", "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def get_has_api_key(self, obj) -> bool:
+        return bool(obj.api_key_encrypted)
+
+
+class BotCredentialSerializer(serializers.ModelSerializer):
+    client_secret = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BotCredential
+        fields = [
+            "id", "client_id", "client_secret", "scopes", "is_active",
+            "created_at", "rotated_at", "revoked_at", "last_used_at",
+        ]
+        read_only_fields = fields
+
+    def get_client_secret(self, obj):
+        # Only present immediately after issue/rotate (views.py passes it
+        # via serializer context) - never derivable from the stored hash.
+        return self.context.get("plaintext_secret")
+
+
+class BotResourceGrantSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BotResourceGrant
+        fields = [
+            "id", "resource_type", "resource_id", "conversation_id", "scopes",
+            "auto_approved_actions", "is_active", "granted_by", "created_at",
+            "updated_at", "revoked_at",
+        ]
+        read_only_fields = ["id", "conversation_id", "granted_by", "created_at", "updated_at", "revoked_at", "is_active"]
+
+
+class BotWebhookSubscriptionSerializer(serializers.ModelSerializer):
+    secret = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BotWebhookSubscription
+        fields = [
+            "id", "url", "events", "secret", "is_active", "retry_limit",
+            "retry_backoff_seconds", "last_sent_at", "last_error", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "last_sent_at", "last_error", "created_at", "updated_at"]
+
+    def get_secret(self, obj):
+        # Shown once at creation/rotation via serializer context, same
+        # posture as BotCredentialSerializer's client_secret above.
+        reveal = self.context.get("reveal_secret")
+        return obj.secret if reveal else None
+
+
+class BotActivityLogSerializer(serializers.ModelSerializer):
+    actor_display_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BotActivityLog
+        fields = [
+            "id", "action", "resource_type", "resource_id", "actor",
+            "actor_display_name", "metadata", "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_actor_display_name(self, obj):
+        return getattr(obj.actor, "display_name", None) if obj.actor_id else None
+
+
+class BotApprovalRequestSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BotApprovalRequest
+        fields = [
+            "id", "bot", "resource_grant", "action", "details", "status",
+            "decided_by", "decided_at", "expires_at", "created_at",
+        ]
+        read_only_fields = fields
+
+
+class BotSerializer(serializers.ModelSerializer):
+    has_credential = serializers.SerializerMethodField()
+    has_webhook = serializers.SerializerMethodField()
+    has_ai_connection = serializers.SerializerMethodField()
+    resource_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Bot
+        fields = [
+            "id", "owner", "partner", "name", "handle", "avatar_url", "description",
+            "kind", "status", "config", "created_at", "updated_at",
+            "has_credential", "has_webhook", "has_ai_connection", "resource_count",
+        ]
+        read_only_fields = ["id", "owner", "handle", "status", "created_at", "updated_at"]
+
+    def get_has_credential(self, obj) -> bool:
+        return hasattr(obj, "credential") and obj.credential.is_active
+
+    def get_has_webhook(self, obj) -> bool:
+        return hasattr(obj, "webhook_subscription") and obj.webhook_subscription.is_active
+
+    def get_has_ai_connection(self, obj) -> bool:
+        return hasattr(obj, "ai_connection") and obj.ai_connection.is_active
+
+    def get_resource_count(self, obj) -> int:
+        return obj.resource_grants.filter(is_active=True).count()
+
+
+class BotCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=120)
+    description = serializers.CharField(required=False, allow_blank=True, default="")
+    avatar_url = serializers.URLField(required=False, allow_blank=True, default="")
+    kind = serializers.ChoiceField(choices=[c[0] for c in Bot._meta.get_field("kind").choices])
+    partner_id = serializers.UUIDField(required=False, allow_null=True)

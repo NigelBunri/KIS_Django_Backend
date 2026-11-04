@@ -134,6 +134,10 @@ TIER_PRESETS: list[dict[str, Any]] = [
             "website_kis_content_sections_limit": 5,
             "website_custom_branding": True,
             "website_publish": True,
+            # KIS Bot Platform (apps.bots) — Business is the lowest
+            "bots_enabled": True,
+            "bots_limit": 2,
+            "bot_events_per_day_limit": 500,
         },
     },
     {
@@ -187,6 +191,8 @@ TIER_PRESETS: list[dict[str, Any]] = [
             "website_custom_branding": True,
             "website_publish": True,
             "web_control_panel": True,
+            "bots_limit": 5,
+            "bot_events_per_day_limit": 2000,
         },
     },
     {
@@ -259,6 +265,8 @@ TIER_PRESETS: list[dict[str, Any]] = [
             "website_custom_branding": True,
             "website_publish": True,
             "web_control_panel": True,
+            "bots_limit": 20,
+            "bot_events_per_day_limit": 10000,
         },
     },
     {
@@ -334,6 +342,8 @@ TIER_PRESETS: list[dict[str, Any]] = [
             "website_custom_branding": True,
             "website_publish": True,
             "web_control_panel": True,
+            "bots_limit": "unlimited",
+            "bot_events_per_day_limit": "unlimited",
         },
     },
 ]

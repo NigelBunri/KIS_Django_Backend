@@ -407,6 +407,7 @@ INSTALLED_APPS = [
     "apps.communities.apps.CommunitiesConfig",
     "apps.groups.apps.GroupsConfig",
     "apps.prayer.apps.PrayerConfig",
+    "apps.bots.apps.BotsConfig",
     "apps.channels.apps.ChannelsConfig",
     "apps.tasks.apps.TasksConfig",
     "apps.broadcasts.apps.BroadcastsConfig",
@@ -561,6 +562,31 @@ if not BOOKS_CONTENT_KEK:
         )
     BOOKS_CONTENT_KEK = base64.urlsafe_b64encode(
         _hashlib.sha256(f"books-content-kek:{SECRET_KEY}".encode()).digest()
+    ).decode()
+
+# Encryption key for apps.bots.BotAIConnection.api_key_encrypted - a bot
+# owner's own AI provider credential (OpenAI/Anthropic/Gemini key, or a
+# custom endpoint's secret). Deliberately a SEPARATE key from
+# BOOKS_CONTENT_KEK above, even though both are Fernet KEKs with the same
+# env-configured/DEBUG-fallback shape - these protect unrelated secret
+# domains, and losing or rotating one must never affect the other. MUST
+# be a real Fernet key (cryptography.fernet.Fernet.generate_key()) from
+# proper secrets management in production; the DEBUG-only fallback below
+# provides no real secrecy, same caveat as BOOKS_CONTENT_KEK's.
+BOTS_AI_CREDENTIAL_KEK = os.environ.get("BOTS_AI_CREDENTIAL_KEK", "").strip()
+if not BOTS_AI_CREDENTIAL_KEK:
+    import base64 as _base64
+    import hashlib as _hashlib2
+
+    if not DEBUG:
+        import logging as _logging2
+
+        _logging2.getLogger("security.bots").error(
+            "BOTS_AI_CREDENTIAL_KEK is not set in a non-DEBUG environment — falling back to a key derived "
+            "from SECRET_KEY, which provides NO real secrecy. Set a real Fernet key via proper secrets management."
+        )
+    BOTS_AI_CREDENTIAL_KEK = _base64.urlsafe_b64encode(
+        _hashlib2.sha256(f"bots-ai-credential-kek:{SECRET_KEY}".encode()).digest()
     ).decode()
 
 OBJECT_STORAGE_PROVIDER = os.environ.get("OBJECT_STORAGE_PROVIDER", "").strip().lower()
@@ -837,6 +863,13 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 # confirmed-but-never-attached uploads accumulate indefinitely (S3 objects
 # included) in any deployment that runs `celery beat`.
 CELERY_BEAT_SCHEDULE = {
+    "retry-pending-bot-webhook-deliveries": {
+        "task": "apps.bots.tasks.retry_pending_bot_webhook_deliveries",
+        # Matches BotWebhookSubscription's own default retry_backoff_seconds
+        # (30s) floor - no point sweeping more often than the shortest
+        # possible next_retry_at any delivery could have.
+        "schedule": 30,
+    },
     "expire-abandoned-media-uploads": {
         "task": "apps.media.tasks.expire_abandoned_media_uploads",
         # Matches the shortest default presign lifetime (10 min) with room
