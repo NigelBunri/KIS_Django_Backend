@@ -9,6 +9,9 @@ from .models import (
     BotCredential,
     BotResourceGrant,
     BotWebhookSubscription,
+    BotWorkflow,
+    BotWorkflowRun,
+    BotWorkflowVersion,
 )
 
 
@@ -138,3 +141,55 @@ class BotCreateSerializer(serializers.Serializer):
     avatar_url = serializers.URLField(required=False, allow_blank=True, default="")
     kind = serializers.ChoiceField(choices=[c[0] for c in Bot._meta.get_field("kind").choices])
     partner_id = serializers.UUIDField(required=False, allow_null=True)
+
+
+class BotWorkflowSerializer(serializers.ModelSerializer):
+    resource_grant_id = serializers.UUIDField(read_only=True)
+
+    class Meta:
+        model = BotWorkflow
+        fields = [
+            "id", "bot", "resource_grant_id", "name", "description", "status", "version",
+            "trigger_type", "trigger_config", "definition",
+            "created_at", "updated_at", "published_at", "last_run_at",
+        ]
+        read_only_fields = ["id", "bot", "status", "version", "created_at", "updated_at", "published_at", "last_run_at"]
+
+
+class BotWorkflowCreateSerializer(serializers.Serializer):
+    resource_grant_id = serializers.UUIDField()
+    name = serializers.CharField(max_length=160)
+    description = serializers.CharField(required=False, allow_blank=True, default="")
+    trigger_type = serializers.ChoiceField(
+        choices=[c[0] for c in BotWorkflow._meta.get_field("trigger_type").choices],
+    )
+    trigger_config = serializers.JSONField(required=False, default=dict)
+    definition = serializers.JSONField(required=False, default=dict)
+
+
+class BotWorkflowUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=160, required=False)
+    description = serializers.CharField(required=False, allow_blank=True)
+    trigger_type = serializers.ChoiceField(
+        choices=[c[0] for c in BotWorkflow._meta.get_field("trigger_type").choices], required=False,
+    )
+    trigger_config = serializers.JSONField(required=False)
+    definition = serializers.JSONField(required=False)
+
+
+class BotWorkflowVersionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BotWorkflowVersion
+        fields = ["id", "version", "trigger_type", "trigger_config", "definition", "created_at", "created_by"]
+        read_only_fields = fields
+
+
+class BotWorkflowRunSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BotWorkflowRun
+        fields = [
+            "id", "workflow", "workflow_version", "trigger_event", "status",
+            "event_context", "condition_result", "steps_log", "error_message",
+            "started_at", "finished_at",
+        ]
+        read_only_fields = fields

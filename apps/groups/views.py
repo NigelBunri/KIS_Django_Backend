@@ -40,6 +40,7 @@ from apps.chat.models import ConversationMember, BaseConversationRole
 from apps.groups.services import (
     reactivate_group_membership,
     sync_community_membership_for_group,
+    dispatch_member_event,
     CommunityBanned,
 )
 
@@ -404,6 +405,7 @@ class GroupViewSet(viewsets.ModelViewSet):
         membership.left_at = timezone.now()
         membership.save(update_fields=["left_at"])
         ConversationMember.objects.filter(conversation=group.conversation, user=request.user).update(left_at=timezone.now())
+        dispatch_member_event(group, request.user.id, "member.left")
         return Response({"detail": "Left group."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="request-join")
@@ -584,6 +586,7 @@ class GroupViewSet(viewsets.ModelViewSet):
         ConversationMember.objects.filter(
             conversation=group.conversation, user_id=user_id, left_at__isnull=True,
         ).update(left_at=timezone.now())
+        dispatch_member_event(group, user_id, "member.left")
 
         return Response({"detail": "Member removed."}, status=status.HTTP_200_OK)
 
@@ -613,6 +616,7 @@ class GroupViewSet(viewsets.ModelViewSet):
         now = timezone.now()
         GroupMembership.objects.filter(group=group, user_id=user_id).update(is_banned=True, left_at=now)
         ConversationMember.objects.filter(conversation=group.conversation, user_id=user_id).update(left_at=now)
+        dispatch_member_event(group, user_id, "member.left")
         return Response(GroupBanSerializer(ban).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="unban")

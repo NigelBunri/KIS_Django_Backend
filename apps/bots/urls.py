@@ -17,6 +17,14 @@ bot_webhook_rotate = views.BotViewSet.as_view({"post": "rotate_webhook_secret"})
 bot_ai_connection = views.BotViewSet.as_view({"get": "ai_connection", "put": "ai_connection", "delete": "ai_connection"})
 bot_activity = views.BotViewSet.as_view({"get": "activity"})
 bot_approvals = views.BotViewSet.as_view({"get": "approvals"})
+bot_workflows = views.BotViewSet.as_view({"get": "workflows", "post": "workflows"})
+bot_workflow_detail = views.BotViewSet.as_view({"get": "workflow_detail", "patch": "workflow_detail", "delete": "workflow_detail"})
+bot_workflow_test = views.BotViewSet.as_view({"post": "workflow_test"})
+bot_workflow_publish = views.BotViewSet.as_view({"post": "workflow_publish"})
+bot_workflow_pause = views.BotViewSet.as_view({"post": "workflow_pause"})
+bot_workflow_resume = views.BotViewSet.as_view({"post": "workflow_resume"})
+bot_workflow_versions = views.BotViewSet.as_view({"get": "workflow_versions"})
+bot_workflow_runs = views.BotViewSet.as_view({"get": "workflow_runs"})
 
 urlpatterns = [
     # Owner-facing management API
@@ -35,6 +43,16 @@ urlpatterns = [
     path("bots/<uuid:pk>/activity/", bot_activity, name="bot-activity"),
     path("bots/<uuid:pk>/approvals/", bot_approvals, name="bot-approvals"),
     path("bots/approvals/<uuid:approval_id>/decide/", views.BotApprovalDecisionView.as_view(), name="bot-approval-decide"),
+
+    # Phase 2: no-code workflows
+    path("bots/<uuid:pk>/workflows/", bot_workflows, name="bot-workflows"),
+    path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/", bot_workflow_detail, name="bot-workflow-detail"),
+    path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/test/", bot_workflow_test, name="bot-workflow-test"),
+    path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/publish/", bot_workflow_publish, name="bot-workflow-publish"),
+    path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/pause/", bot_workflow_pause, name="bot-workflow-pause"),
+    path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/resume/", bot_workflow_resume, name="bot-workflow-resume"),
+    path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/versions/", bot_workflow_versions, name="bot-workflow-versions"),
+    path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/runs/", bot_workflow_runs, name="bot-workflow-runs"),
 
     # OAuth2 client-credentials + external bot API
     path("bots/oauth/token/", views.BotOAuthTokenView.as_view(), name="bot-oauth-token"),

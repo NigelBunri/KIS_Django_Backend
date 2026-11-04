@@ -28,6 +28,11 @@ from .serializers import (
     BotResourceGrantSerializer,
     BotSerializer,
     BotWebhookSubscriptionSerializer,
+    BotWorkflowCreateSerializer,
+    BotWorkflowRunSerializer,
+    BotWorkflowSerializer,
+    BotWorkflowUpdateSerializer,
+    BotWorkflowVersionSerializer,
 )
 
 
@@ -245,6 +250,83 @@ class BotViewSet(viewsets.ViewSet):
         bot = _owned_bot_or_404(request.user, pk)
         pending = bot.approval_requests.filter(status="pending").order_by("-created_at")
         return Response(BotApprovalRequestSerializer(pending, many=True).data)
+
+    # ---- Phase 2: no-code workflows ----
+
+    @action(detail=True, methods=["get", "post"], url_path="workflows")
+    def workflows(self, request, pk=None):
+        from .models import BotWorkflowStatus
+
+        bot = _owned_bot_or_404(request.user, pk)
+        if request.method == "GET":
+            qs = bot.workflows.exclude(status=BotWorkflowStatus.DELETED).order_by("-created_at")
+            return Response(BotWorkflowSerializer(qs, many=True).data)
+        serializer = BotWorkflowCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        workflow = services.create_workflow(
+            bot, request.user,
+            resource_grant_id=data["resource_grant_id"], name=data["name"],
+            description=data.get("description", ""), trigger_type=data["trigger_type"],
+            trigger_config=data.get("trigger_config") or {}, definition=data.get("definition") or {},
+        )
+        return Response(BotWorkflowSerializer(workflow).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get", "patch", "delete"], url_path="workflows/(?P<workflow_id>[^/.]+)")
+    def workflow_detail(self, request, pk=None, workflow_id=None):
+        bot = _owned_bot_or_404(request.user, pk)
+        workflow = services._require_own_workflow(bot, request.user, workflow_id)
+        if request.method == "GET":
+            return Response(BotWorkflowSerializer(workflow).data)
+        if request.method == "DELETE":
+            services.delete_workflow(workflow, request.user)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = BotWorkflowUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        workflow = services.update_workflow(workflow, request.user, **serializer.validated_data)
+        return Response(BotWorkflowSerializer(workflow).data)
+
+    @action(detail=True, methods=["post"], url_path="workflows/(?P<workflow_id>[^/.]+)/test")
+    def workflow_test(self, request, pk=None, workflow_id=None):
+        bot = _owned_bot_or_404(request.user, pk)
+        workflow = services._require_own_workflow(bot, request.user, workflow_id)
+        result = services.test_workflow(workflow, request.user, request.data.get("sample_payload") or {})
+        return Response(result)
+
+    @action(detail=True, methods=["post"], url_path="workflows/(?P<workflow_id>[^/.]+)/publish")
+    def workflow_publish(self, request, pk=None, workflow_id=None):
+        bot = _owned_bot_or_404(request.user, pk)
+        workflow = services._require_own_workflow(bot, request.user, workflow_id)
+        workflow = services.publish_workflow(workflow, request.user)
+        return Response(BotWorkflowSerializer(workflow).data)
+
+    @action(detail=True, methods=["post"], url_path="workflows/(?P<workflow_id>[^/.]+)/pause")
+    def workflow_pause(self, request, pk=None, workflow_id=None):
+        bot = _owned_bot_or_404(request.user, pk)
+        workflow = services._require_own_workflow(bot, request.user, workflow_id)
+        workflow = services.pause_workflow(workflow, request.user)
+        return Response(BotWorkflowSerializer(workflow).data)
+
+    @action(detail=True, methods=["post"], url_path="workflows/(?P<workflow_id>[^/.]+)/resume")
+    def workflow_resume(self, request, pk=None, workflow_id=None):
+        bot = _owned_bot_or_404(request.user, pk)
+        workflow = services._require_own_workflow(bot, request.user, workflow_id)
+        workflow = services.resume_workflow(workflow, request.user)
+        return Response(BotWorkflowSerializer(workflow).data)
+
+    @action(detail=True, methods=["get"], url_path="workflows/(?P<workflow_id>[^/.]+)/versions")
+    def workflow_versions(self, request, pk=None, workflow_id=None):
+        bot = _owned_bot_or_404(request.user, pk)
+        workflow = services._require_own_workflow(bot, request.user, workflow_id)
+        versions = workflow.versions.order_by("-version")
+        return Response(BotWorkflowVersionSerializer(versions, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path="workflows/(?P<workflow_id>[^/.]+)/runs")
+    def workflow_runs(self, request, pk=None, workflow_id=None):
+        bot = _owned_bot_or_404(request.user, pk)
+        workflow = services._require_own_workflow(bot, request.user, workflow_id)
+        runs = workflow.runs.order_by("-started_at")[:100]
+        return Response(BotWorkflowRunSerializer(runs, many=True).data)
 
 
 class BotApprovalDecisionView(APIView):

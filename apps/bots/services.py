@@ -23,7 +23,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from django.utils.text import slugify
-from rest_framework.exceptions import PermissionDenied, Throttled, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, Throttled, ValidationError
 
 from apps.accounts.feature_gate import has_feature
 from apps.accounts.models import User
@@ -46,6 +46,10 @@ from .models import (
     BotWebhookDelivery,
     BotWebhookDeliveryStatus,
     BotWebhookSubscription,
+    BotWorkflow,
+    BotWorkflowRun,
+    BotWorkflowStatus,
+    BotWorkflowVersion,
 )
 
 SENSITIVE_ACTIONS = {
@@ -902,22 +906,37 @@ def _attempt_delivery(subscription: BotWebhookSubscription, delivery: BotWebhook
     return ok
 
 
-def dispatch_bot_events_for_conversation(conversation_id, event: str, payload: dict, *, event_id: str) -> int:
-    """Entry point from apps.chat.views.webhook_dispatch (the EXISTING
-    Nest -> Django message.created call) - fans out to every active bot
-    resource grant on this conversation, in addition to whatever Partner
-    webhook dispatch already happens there. Never raises - a bot
-    delivery failure must never affect the caller (which is itself on
-    the critical message-send path)."""
+def dispatch_bot_events_for_conversation(
+    conversation_id, event: str, payload: dict, *, event_id: str,
+    required_scope: str = BotPermissionScope.READ_MESSAGES,
+) -> int:
+    """Entry point from apps.chat.views.webhook_dispatch (message events,
+    the EXISTING Nest -> Django call) and from apps.groups' member.
+    joined/member.left publishers (Phase 2) - fans out to every active
+    bot resource grant on this conversation that holds `required_scope`,
+    both as a webhook delivery AND as a workflow trigger (a workflow is
+    a separate concept from a webhook subscription: one per resource
+    grant, not per bot). required_scope defaults to READ_MESSAGES for
+    the message-event call sites; member events pass READ_MEMBERS - a
+    workflow or webhook must never react to an event its grant's scopes
+    don't actually cover. Never raises - a bot delivery failure must
+    never affect the caller (which is itself on the critical message-
+    send path for message events)."""
     delivered = 0
     grants = BotResourceGrant.objects.filter(
         conversation_id=conversation_id, is_active=True,
     ).select_related("bot", "bot__webhook_subscription")
     for grant in grants:
         try:
-            if grant_has_scope(grant, BotPermissionScope.READ_MESSAGES):
+            if grant_has_scope(grant, required_scope):
                 if dispatch_bot_event(grant, event, payload, event_id=f"{event_id}:{grant.id}"):
                     delivered += 1
+                from .workflow_engine import dispatch_event_to_workflows
+
+                dispatch_event_to_workflows(
+                    resource_type=grant.resource_type, resource_id=grant.resource_id,
+                    event=event, payload=payload, event_id=event_id,
+                )
         except Exception:  # noqa: BLE001
             continue
     return delivered
@@ -986,3 +1005,187 @@ def disconnect_ai_provider(bot: Bot, user: User) -> None:
     _require_owner(bot, user)
     BotAIConnection.objects.filter(bot=bot).delete()
     log_activity(bot, BotActivityAction.UPDATED, actor=user, metadata={"ai_provider": None})
+
+
+# ---------------------------------------------------------------------
+# Phase 2 — no-code workflow lifecycle (create/edit/publish/pause/
+# resume/delete, version snapshots). Every function here re-checks
+# ownership and re-derives the resource_grant's live validity - a
+# workflow is configuration on top of ONE existing grant, never a
+# broader authority than that grant already carries (section 4's "a
+# workflow must never gain permissions simply because its owner can
+# access a resource").
+# ---------------------------------------------------------------------
+
+def _require_own_grant(bot: Bot, user: User, resource_grant_id) -> BotResourceGrant:
+    _require_owner(bot, user)
+    grant = BotResourceGrant.objects.filter(id=resource_grant_id, bot=bot, is_active=True).first()
+    if not grant:
+        raise ValidationError({"resource_grant_id": "This bot has no active grant for that resource."})
+    return grant
+
+
+def create_workflow(
+    bot: Bot, user: User, *, resource_grant_id, name: str, description: str = "",
+    trigger_type: str, trigger_config: dict | None = None, definition: dict | None = None,
+) -> BotWorkflow:
+    from .workflow_engine import validate_definition, validate_trigger_config
+
+    grant = _require_own_grant(bot, user, resource_grant_id)
+    name = (name or "").strip()
+    if not name:
+        raise ValidationError({"name": "A workflow name is required."})
+    from .models import BotWorkflowTriggerType
+
+    if trigger_type not in BotWorkflowTriggerType.values:
+        raise ValidationError({"trigger_type": f"Unsupported trigger type '{trigger_type}'."})
+    clean_trigger_config = validate_trigger_config(trigger_type, trigger_config or {})
+    clean_definition = validate_definition(definition or {})
+
+    workflow = BotWorkflow.objects.create(
+        bot=bot, resource_grant=grant, name=name[:160], description=description[:4000],
+        trigger_type=trigger_type, trigger_config=clean_trigger_config, definition=clean_definition,
+        status=BotWorkflowStatus.DRAFT,
+    )
+    log_activity(
+        bot, BotActivityAction.WORKFLOW_CREATED, actor=user,
+        resource_type=grant.resource_type, resource_id=grant.resource_id,
+        metadata={"workflow_id": str(workflow.id), "trigger_type": trigger_type},
+    )
+    return workflow
+
+
+def _require_own_workflow(bot: Bot, user: User, workflow_id) -> BotWorkflow:
+    _require_owner(bot, user)
+    workflow = BotWorkflow.objects.filter(
+        id=workflow_id, bot=bot,
+    ).exclude(status=BotWorkflowStatus.DELETED).select_related("resource_grant").first()
+    if not workflow:
+        raise NotFound("Workflow not found.")
+    return workflow
+
+
+def update_workflow(workflow: BotWorkflow, user: User, **fields) -> BotWorkflow:
+    """Only a DRAFT (or a PAUSED workflow being edited before republish)
+    may have its definition/trigger edited directly - an ACTIVE
+    workflow's live definition is immutable; pause it first. This is
+    what makes "safe updates" (section 1) actual: there is no path to
+    silently change what a currently-running automation does."""
+    from .workflow_engine import validate_definition, validate_trigger_config
+
+    _require_owner(workflow.bot, user)
+    if workflow.status == BotWorkflowStatus.ACTIVE:
+        raise ValidationError({"status": "Pause this workflow before editing it."})
+
+    changed = []
+    if "name" in fields and fields["name"] is not None:
+        name = str(fields["name"]).strip()
+        if not name:
+            raise ValidationError({"name": "A workflow name is required."})
+        workflow.name = name[:160]
+        changed.append("name")
+    if "description" in fields and fields["description"] is not None:
+        workflow.description = str(fields["description"])[:4000]
+        changed.append("description")
+    if "trigger_type" in fields and fields["trigger_type"] is not None:
+        workflow.trigger_type = fields["trigger_type"]
+        changed.append("trigger_type")
+    if "trigger_config" in fields and fields["trigger_config"] is not None:
+        workflow.trigger_config = validate_trigger_config(
+            fields.get("trigger_type", workflow.trigger_type), fields["trigger_config"],
+        )
+        changed.append("trigger_config")
+    if "definition" in fields and fields["definition"] is not None:
+        workflow.definition = validate_definition(fields["definition"])
+        changed.append("definition")
+
+    if changed:
+        workflow.save(update_fields=[*changed, "updated_at"])
+        log_activity(
+            workflow.bot, BotActivityAction.UPDATED, actor=user,
+            metadata={"workflow_id": str(workflow.id), "fields": changed},
+        )
+    return workflow
+
+
+def test_workflow(workflow: BotWorkflow, user: User, sample_payload: dict | None = None) -> dict:
+    """A pure, side-effect-free dry run (section 1's "test before
+    publishing" / section 6's "test workflows before publishing") - the
+    SAME condition evaluator the real engine uses, but actions are only
+    described, never executed, and nothing is persisted. Allowed in any
+    status (including DRAFT) so an owner can iterate before ever
+    activating anything."""
+    from .workflow_engine import build_event_context, evaluate_conditions
+
+    _require_owner(workflow.bot, user)
+    context = build_event_context(workflow.trigger_type, sample_payload or {})
+    condition_result = evaluate_conditions(workflow.definition.get("conditions") or {}, context)
+    branch = workflow.definition.get("then_actions" if condition_result else "else_actions") or []
+    return {
+        "event_context": context,
+        "condition_result": condition_result,
+        "would_run_actions": [
+            {"type": a.get("type"), "params": a.get("params", {}), "delay_seconds": a.get("delay_seconds", 0)}
+            for a in branch
+        ],
+    }
+
+
+def publish_workflow(workflow: BotWorkflow, user: User) -> BotWorkflow:
+    _require_owner(workflow.bot, user)
+    if workflow.status == BotWorkflowStatus.DELETED:
+        raise ValidationError({"status": "A deleted workflow cannot be published."})
+    if not _grant_is_currently_valid(workflow.resource_grant):
+        raise PermissionDenied("This bot no longer has valid access to the resource this workflow runs against.")
+
+    from .workflow_engine import validate_definition, validate_trigger_config
+
+    validate_definition(workflow.definition or {})
+    validate_trigger_config(workflow.trigger_type, workflow.trigger_config or {})
+
+    is_republish = workflow.published_at is not None
+    with transaction.atomic():
+        if is_republish:
+            workflow.version += 1
+        workflow.status = BotWorkflowStatus.ACTIVE
+        workflow.published_at = timezone.now()
+        workflow.save(update_fields=["status", "version", "published_at", "updated_at"])
+        BotWorkflowVersion.objects.create(
+            workflow=workflow, version=workflow.version, trigger_type=workflow.trigger_type,
+            trigger_config=workflow.trigger_config, definition=workflow.definition, created_by=user,
+        )
+    log_activity(
+        workflow.bot, BotActivityAction.WORKFLOW_PUBLISHED, actor=user,
+        metadata={"workflow_id": str(workflow.id), "version": workflow.version},
+    )
+    return workflow
+
+
+def pause_workflow(workflow: BotWorkflow, user: User) -> BotWorkflow:
+    _require_owner(workflow.bot, user)
+    if workflow.status != BotWorkflowStatus.ACTIVE:
+        raise ValidationError({"status": "Only an active workflow can be paused."})
+    workflow.status = BotWorkflowStatus.PAUSED
+    workflow.save(update_fields=["status", "updated_at"])
+    log_activity(workflow.bot, BotActivityAction.WORKFLOW_PAUSED, actor=user, metadata={"workflow_id": str(workflow.id)})
+    return workflow
+
+
+def resume_workflow(workflow: BotWorkflow, user: User) -> BotWorkflow:
+    _require_owner(workflow.bot, user)
+    if workflow.status != BotWorkflowStatus.PAUSED:
+        raise ValidationError({"status": "Only a paused workflow can be resumed."})
+    if not _grant_is_currently_valid(workflow.resource_grant):
+        raise PermissionDenied("This bot no longer has valid access to the resource this workflow runs against.")
+    workflow.status = BotWorkflowStatus.ACTIVE
+    workflow.save(update_fields=["status", "updated_at"])
+    log_activity(workflow.bot, BotActivityAction.WORKFLOW_RESUMED, actor=user, metadata={"workflow_id": str(workflow.id)})
+    return workflow
+
+
+def delete_workflow(workflow: BotWorkflow, user: User) -> None:
+    _require_owner(workflow.bot, user)
+    workflow.status = BotWorkflowStatus.DELETED
+    workflow.deleted_at = timezone.now()
+    workflow.save(update_fields=["status", "deleted_at", "updated_at"])
+    log_activity(workflow.bot, BotActivityAction.WORKFLOW_DELETED, actor=user, metadata={"workflow_id": str(workflow.id)})

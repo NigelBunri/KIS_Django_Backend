@@ -80,6 +80,7 @@ def reactivate_group_membership(group: Group, user: User, *, role=None):
         user=user,
         defaults={"role": role},
     )
+    reactivated = created or membership.left_at is not None or membership.is_banned
     if not created and (membership.left_at is not None or membership.is_banned):
         membership.left_at = None
         membership.is_banned = False
@@ -96,7 +97,31 @@ def reactivate_group_membership(group: Group, user: User, *, role=None):
         cm.joined_at = timezone.now()
         cm.save(update_fields=["left_at", "joined_at"])
 
+    if reactivated:
+        dispatch_member_event(group, user.id, "member.joined")
+
     return membership, cm
+
+
+def dispatch_member_event(group: Group, user_id, event: str) -> None:
+    """Bot Platform Phase 2's member.joined/member.left publisher for
+    Groups — a plain Django event, never touching Nest, since group
+    membership changes are Django-only operations. Never raises: a
+    workflow-trigger failure must never break an ordinary join/leave.
+    Takes a bare user_id (not a User instance) since every call site
+    already has one on hand and some (remove_member) never load the
+    full row at all."""
+    try:
+        from apps.bots.models import BotPermissionScope
+        from apps.bots.services import dispatch_bot_events_for_conversation
+
+        dispatch_bot_events_for_conversation(
+            group.conversation_id, event, {"user_id": str(user_id)},
+            event_id=f"{event}:{group.id}:{user_id}:{timezone.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MEMBERS,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class CommunityBanned(Exception):

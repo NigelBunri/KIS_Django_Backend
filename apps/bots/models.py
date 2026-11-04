@@ -328,6 +328,12 @@ class BotActivityAction(models.TextChoices):
     ACTION_PENDING_APPROVAL = "action_pending_approval", "Action pending approval"
     ABUSE_DETECTED = "abuse_detected", "Abuse detected — auto-suspended"
     AUTH_FAILED = "auth_failed", "Authentication attempt failed"
+    WORKFLOW_CREATED = "workflow_created", "Workflow created"
+    WORKFLOW_PUBLISHED = "workflow_published", "Workflow published"
+    WORKFLOW_PAUSED = "workflow_paused", "Workflow paused"
+    WORKFLOW_RESUMED = "workflow_resumed", "Workflow resumed"
+    WORKFLOW_DELETED = "workflow_deleted", "Workflow deleted"
+    WORKFLOW_RUN_FAILED = "workflow_run_failed", "Workflow run failed"
 
 
 class BotActivityLog(models.Model):
@@ -390,4 +396,146 @@ class BotApprovalRequest(models.Model):
         db_table = "bots_approval_request"
         indexes = [
             models.Index(fields=["bot", "status"]),
+        ]
+
+
+# ---------------------------------------------------------------------
+# Phase 2 — no-code rule-based workflow builder. A workflow is NOT a new
+# execution/permission system: it is owner-authored JSON (conditions +
+# actions, never executed code — see workflow_engine.py's validator) that
+# runs against ONE existing BotResourceGrant, so it can never do anything
+# the bot's own grant-and-scope enforcement (services.execute_bot_action /
+# send_message_as_bot) wouldn't already allow or gate behind approval.
+# ---------------------------------------------------------------------
+
+class BotWorkflowStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    ACTIVE = "active", "Active"
+    PAUSED = "paused", "Paused"
+    DELETED = "deleted", "Deleted"
+
+
+class BotWorkflowTriggerType(models.TextChoices):
+    # Only trigger types this platform can actually, reliably produce
+    # today (see apps.bots.workflow_engine's module docstring for the
+    # exact event-publisher audit). Adding a new one here means a real
+    # publisher exists for it, not a placeholder.
+    MESSAGE_CREATED = "message.created", "New message"
+    MEMBER_JOINED = "member.joined", "Member joined"
+    MEMBER_LEFT = "member.left", "Member left"
+    SCHEDULE = "schedule", "Scheduled"
+
+
+class BotWorkflow(models.Model):
+    """One owner-authored automation, scoped to exactly one resource
+    grant. `definition` is validated, declarative JSON (conditions/
+    actions/branches) — see workflow_engine.validate_definition — never
+    executed as code. `version` bumps and a BotWorkflowVersion snapshot
+    is written every time a DRAFT's definition is published, so a bad
+    publish can be rolled back to the last-known-good version without
+    losing the draft being worked on."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    bot = models.ForeignKey(Bot, on_delete=models.CASCADE, related_name="workflows")
+    resource_grant = models.ForeignKey(
+        BotResourceGrant, on_delete=models.CASCADE, related_name="workflows",
+    )
+    name = models.CharField(max_length=160)
+    description = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=16, choices=BotWorkflowStatus.choices, default=BotWorkflowStatus.DRAFT, db_index=True,
+    )
+    version = models.PositiveIntegerField(default=1)
+    trigger_type = models.CharField(max_length=32, choices=BotWorkflowTriggerType.choices)
+    # e.g. {"cron": "0 9 * * *"} for SCHEDULE; {} for pure event triggers.
+    trigger_config = models.JSONField(default=dict, blank=True)
+    # {"conditions": {...}, "then_actions": [...], "else_actions": [...]}
+    definition = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    last_schedule_run_at = models.DateTimeField(null=True, blank=True)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "bots_workflow"
+        indexes = [
+            models.Index(fields=["bot", "status"]),
+            models.Index(fields=["resource_grant", "status"]),
+            models.Index(fields=["trigger_type", "status"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.trigger_type})"
+
+
+class BotWorkflowVersion(models.Model):
+    """Immutable snapshot taken every time a workflow is published —
+    the actual rollback/history mechanism (section 1's "workflow
+    versioning and safe updates"). The live, editable copy always lives
+    on BotWorkflow itself; this table is write-once."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workflow = models.ForeignKey(BotWorkflow, on_delete=models.CASCADE, related_name="versions")
+    version = models.PositiveIntegerField()
+    trigger_type = models.CharField(max_length=32, choices=BotWorkflowTriggerType.choices)
+    trigger_config = models.JSONField(default=dict, blank=True)
+    definition = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+
+    class Meta:
+        db_table = "bots_workflow_version"
+        constraints = [
+            models.UniqueConstraint(fields=["workflow", "version"], name="uniq_bot_workflow_version"),
+        ]
+        indexes = [
+            models.Index(fields=["workflow", "-version"]),
+        ]
+
+
+class BotWorkflowRunStatus(models.TextChoices):
+    RUNNING = "running", "Running"
+    SUCCEEDED = "succeeded", "Succeeded"
+    FAILED = "failed", "Failed"
+    DENIED = "denied", "Denied"
+    PENDING_APPROVAL = "pending_approval", "Pending approval"
+    SKIPPED = "skipped", "Skipped"
+
+
+class BotWorkflowRun(models.Model):
+    """One row per trigger-event the engine evaluated for this workflow —
+    the execution history/error-reporting surface (section 1 and 5).
+    `event_id` + the UniqueConstraint below is this workflow's own
+    idempotency guard: the same underlying occurrence (e.g. a retried
+    Nest webhook call) must never run a workflow's actions twice, same
+    principle as BotWebhookDelivery's event_id uniqueness."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workflow = models.ForeignKey(BotWorkflow, on_delete=models.CASCADE, related_name="runs")
+    workflow_version = models.PositiveIntegerField()
+    trigger_event = models.CharField(max_length=64)
+    event_id = models.CharField(max_length=160)
+    status = models.CharField(
+        max_length=20, choices=BotWorkflowRunStatus.choices, default=BotWorkflowRunStatus.RUNNING,
+    )
+    # Normalized event context the conditions were evaluated against
+    # (e.g. {"message": {"text": "..."}, "sender": {"id": "..."}}).
+    event_context = models.JSONField(default=dict, blank=True)
+    condition_result = models.BooleanField(null=True, blank=True)
+    # Ordered list of {"action": "...", "status": "...", "result"/"error": ...}
+    steps_log = models.JSONField(default=list, blank=True)
+    error_message = models.TextField(blank=True, default="")
+    started_at = models.DateTimeField(default=timezone.now)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "bots_workflow_run"
+        constraints = [
+            models.UniqueConstraint(fields=["workflow", "event_id"], name="uniq_bot_workflow_run_idempotency"),
+        ]
+        indexes = [
+            models.Index(fields=["workflow", "-started_at"]),
+            models.Index(fields=["status", "-started_at"]),
         ]

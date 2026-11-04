@@ -870,6 +870,13 @@ CELERY_BEAT_SCHEDULE = {
         # possible next_retry_at any delivery could have.
         "schedule": 30,
     },
+    "run-due-scheduled-workflows": {
+        "task": "apps.bots.tasks.run_due_scheduled_workflows",
+        # The finest-grained interval_minutes a workflow's own schedule
+        # trigger supports is 5 - sweeping every 60s is frequent enough
+        # to never miss a due window by more than a minute.
+        "schedule": 60,
+    },
     "expire-abandoned-media-uploads": {
         "task": "apps.media.tasks.expire_abandoned_media_uploads",
         # Matches the shortest default presign lifetime (10 min) with room
