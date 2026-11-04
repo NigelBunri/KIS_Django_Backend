@@ -73,7 +73,7 @@ class BotAccessTokenAuthentication(BaseAuthentication):
             raise AuthenticationFailed("Invalid or expired bot access token.")
 
         try:
-            credential = BotCredential.objects.select_related("bot").get(
+            credential = BotCredential.objects.select_related("bot", "bot__owner").get(
                 id=claims.get("credential_id"), is_active=True,
             )
         except (BotCredential.DoesNotExist, ValueError, TypeError):
@@ -83,6 +83,16 @@ class BotAccessTokenAuthentication(BaseAuthentication):
             raise AuthenticationFailed("Token does not match its issuing bot.")
         if credential.bot.status != BotStatus.ACTIVE:
             raise AuthenticationFailed("This bot is not active.")
+        if not credential.bot.owner.is_active:
+            # Suspending/deactivating the owner's KIS account must take
+            # immediate effect on every bot they own, including already-
+            # issued short-lived access tokens — not just block new ones
+            # at the OAuth2 token endpoint (see services.
+            # authenticate_bot_credential). This is checked fresh from
+            # the DB on every single request, same as bot.status above,
+            # so there is no window where a suspended owner's bot keeps
+            # working until its current token happens to expire.
+            raise AuthenticationFailed("This bot's owner account is suspended.")
 
         from django.utils import timezone
 

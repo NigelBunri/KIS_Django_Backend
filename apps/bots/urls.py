@@ -45,4 +45,9 @@ urlpatterns = [
         views.ExternalBotSendMessageView.as_view(),
         name="bot-external-send-message",
     ),
+    path(
+        "bots/external/resources/<uuid:grant_id>/execute-action/",
+        views.ExternalBotExecuteActionView.as_view(),
+        name="bot-external-execute-action",
+    ),
 ]

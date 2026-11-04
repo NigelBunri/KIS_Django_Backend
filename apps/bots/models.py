@@ -322,6 +322,12 @@ class BotActivityAction(models.TextChoices):
     APPROVAL_REQUESTED = "approval_requested", "Approval requested"
     APPROVAL_DECIDED = "approval_decided", "Approval decided"
     SUSPENDED_BY_ADMIN = "suspended_by_admin", "Suspended by KIS admin"
+    ACTION_EXECUTED = "action_executed", "Action executed"
+    ACTION_DENIED = "action_denied", "Action denied"
+    ACTION_RATE_LIMITED = "action_rate_limited", "Action rate-limited"
+    ACTION_PENDING_APPROVAL = "action_pending_approval", "Action pending approval"
+    ABUSE_DETECTED = "abuse_detected", "Abuse detected — auto-suspended"
+    AUTH_FAILED = "auth_failed", "Authentication attempt failed"
 
 
 class BotActivityLog(models.Model):
@@ -372,6 +378,12 @@ class BotApprovalRequest(models.Model):
     )
     decided_at = models.DateTimeField(null=True, blank=True)
     expires_at = models.DateTimeField(null=True, blank=True)
+    # Set when approve=True but the actual execution (see services.
+    # decide_approval) raised — the human's decision to approve is still
+    # recorded (status=APPROVED), but this surfaces that the privileged
+    # action itself did not go through, e.g. the resource changed shape
+    # between request and decision.
+    execution_error = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:

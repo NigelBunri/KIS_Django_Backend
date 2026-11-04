@@ -18,11 +18,12 @@ from typing import Any
 from cryptography.fernet import Fernet, InvalidToken
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
+from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from django.utils.text import slugify
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, Throttled, ValidationError
 
 from apps.accounts.feature_gate import has_feature
 from apps.accounts.models import User
@@ -55,6 +56,73 @@ SENSITIVE_ACTIONS = {
     "financial_action",
     "change_billing",
 }
+
+# The permission scope a given sensitive action requires, on top of the
+# live grant-validity check every action already goes through. An action
+# with no entry here still runs through execute_bot_action, just without
+# an extra scope requirement beyond having an active grant at all.
+ACTION_REQUIRED_SCOPE = {
+    "ban_member": BotPermissionScope.MODERATE,
+    "remove_admin": BotPermissionScope.MODERATE,
+    "delete_content": BotPermissionScope.MODERATE,
+    "change_ownership": BotPermissionScope.MANAGE_RESOURCE,
+    "financial_action": BotPermissionScope.MANAGE_RESOURCE,
+    "change_billing": BotPermissionScope.MANAGE_RESOURCE,
+}
+
+# Abuse-detection thresholds (section 16's "complete abuse detection and
+# the necessary security controls"). Deliberately conservative/fixed for
+# Phase 1 rather than configurable — see module-level comment on
+# _record_abuse_signal for why these are counted in a shared window
+# rather than per-action-type.
+BOT_AUTH_FAIL_THRESHOLD = 10
+BOT_AUTH_FAIL_WINDOW_SECONDS = 15 * 60
+BOT_ABUSE_SIGNAL_THRESHOLD = 20
+BOT_ABUSE_SIGNAL_WINDOW_SECONDS = 60 * 60
+
+
+def _cache_incr(key: str, ttl_seconds: int) -> int:
+    """Atomic counter with a TTL — works the same way against the real
+    Redis cache backend in production and against LocMemCache in tests.
+    cache.incr() requires the key to already exist, so cache.add() seeds
+    it first (a no-op if another request already seeded it)."""
+    cache.add(key, 0, ttl_seconds)
+    try:
+        return cache.incr(key)
+    except ValueError:
+        cache.set(key, 1, ttl_seconds)
+        return 1
+
+
+def _record_abuse_signal(bot: "Bot", reason: str) -> None:
+    """Call this on every denial that could indicate abuse (rate-limit
+    trips, repeated auth failures, repeated permission denials). Once a
+    bot accumulates enough signals in the window, it is auto-suspended —
+    no human has to notice and act first."""
+    if bot.status in (BotStatus.SUSPENDED, BotStatus.DELETED):
+        return
+    key = f"bots:abuse:{bot.id}"
+    count = _cache_incr(key, BOT_ABUSE_SIGNAL_WINDOW_SECONDS)
+    if count >= BOT_ABUSE_SIGNAL_THRESHOLD:
+        auto_suspend_for_abuse(bot, f"{count} abuse signals ({reason}) within the last hour")
+
+
+def auto_suspend_for_abuse(bot: "Bot", reason: str) -> None:
+    """System-initiated suspension — distinct from set_status_admin
+    (a KIS admin's deliberate action) and set_status (the owner's own
+    action): nobody decided this, the platform did, so it always takes
+    the SUSPENDED path regardless of VALID_TRANSITIONS, and immediately
+    revokes credentials/grants exactly like an owner-initiated delete
+    does (section 15's "immediately takes effect")."""
+    Bot.objects.filter(id=bot.id).update(status=BotStatus.SUSPENDED, updated_at=timezone.now())
+    bot.status = BotStatus.SUSPENDED
+    BotCredential.objects.filter(bot=bot, is_active=True).update(
+        is_active=False, revoked_at=timezone.now(),
+    )
+    BotResourceGrant.objects.filter(bot=bot, is_active=True).update(
+        is_active=False, revoked_at=timezone.now(),
+    )
+    log_activity(bot, BotActivityAction.ABUSE_DETECTED, metadata={"reason": reason})
 
 
 # ---------------------------------------------------------------------
@@ -99,6 +167,29 @@ def ensure_can_create_bot(user: User) -> None:
 def get_bot_daily_event_limit(user) -> int | None:
     features = get_user_tier_features(user)
     return normalize_limit_value(features.get("bot_events_per_day_limit"), default=100)
+
+
+def _daily_usage_cache_key(bot_id) -> str:
+    return f"bots:usage:{bot_id}:{timezone.now().date().isoformat()}"
+
+
+def check_and_increment_bot_daily_usage(bot: "Bot") -> None:
+    """Enforced at the point of every bot-initiated action (send_message_
+    as_bot, execute_bot_action) — not merely a number read off the tier,
+    but an actual counter that blocks the Nth+1 action once the owner's
+    plan limit is reached for the day. None means unlimited (Partner Pro
+    etc.) and is never counted at all."""
+    limit = get_bot_daily_event_limit(bot.owner)
+    if limit is None:
+        return
+    count = _cache_incr(_daily_usage_cache_key(bot.id), 26 * 3600)
+    if count > limit:
+        log_activity(
+            bot, BotActivityAction.ACTION_RATE_LIMITED,
+            metadata={"limit": limit, "count": count},
+        )
+        _record_abuse_signal(bot, "daily_rate_limit_exceeded")
+        raise Throttled(detail=f"This bot has reached its daily action limit ({limit}/day).")
 
 
 # ---------------------------------------------------------------------
@@ -279,15 +370,36 @@ def revoke_credential(bot: Bot, user: User) -> None:
         log_activity(bot, BotActivityAction.CREDENTIAL_REVOKED, actor=user)
 
 
-def authenticate_bot_credential(client_id: str, client_secret: str) -> BotCredential | None:
-    try:
-        credential = BotCredential.objects.select_related("bot").get(client_id=client_id, is_active=True)
-    except BotCredential.DoesNotExist:
+def authenticate_bot_credential(client_id: str, client_secret: str, *, ip: str | None = None) -> BotCredential | None:
+    """Also the abuse-detection choke point for the OAuth2 token endpoint:
+    a client_id with too many recent wrong-secret attempts is locked out
+    (returns None without even checking the password, so a lockout can't
+    itself be used to brute-force-probe whether a client_id exists)."""
+    lockout_key = f"bots:auth_fail:{client_id}"
+    if cache.get(lockout_key, 0) >= BOT_AUTH_FAIL_THRESHOLD:
         return None
-    if credential.bot.status not in (BotStatus.ACTIVE,):
+
+    try:
+        credential = BotCredential.objects.select_related("bot", "bot__owner").get(
+            client_id=client_id, is_active=True,
+        )
+    except BotCredential.DoesNotExist:
+        _cache_incr(lockout_key, BOT_AUTH_FAIL_WINDOW_SECONDS)
+        return None
+    if credential.bot.status != BotStatus.ACTIVE:
+        return None
+    if not credential.bot.owner.is_active:
+        # Suspending/deactivating the owner's KIS account must take
+        # immediate effect on every bot they own — including blocking
+        # new token issuance, not just invalidating existing tokens.
         return None
     if not check_password(client_secret, credential.client_secret_hash):
+        fail_count = _cache_incr(lockout_key, BOT_AUTH_FAIL_WINDOW_SECONDS)
+        log_activity(credential.bot, BotActivityAction.AUTH_FAILED, metadata={"ip": ip})
+        if fail_count >= BOT_AUTH_FAIL_THRESHOLD:
+            _record_abuse_signal(credential.bot, "auth_failure_lockout")
         return None
+    cache.delete(lockout_key)
     return credential
 
 
@@ -446,6 +558,25 @@ def grant_has_scope(grant: BotResourceGrant, scope: str) -> bool:
     return scope in (grant.scopes or [])
 
 
+def _grant_is_currently_valid(grant: BotResourceGrant) -> bool:
+    """Re-derives permission from scratch on every call — section 11's
+    "enforce resource permissions every time a bot attempts an
+    operation," not just at grant-creation time. A grant row being
+    is_active=True is necessary but not sufficient: if the owner lost
+    their admin role on the underlying resource since granting it, or
+    the owner's own KIS account is now suspended, or the bot itself is
+    no longer ACTIVE, access must be denied right now regardless of what
+    the grant row says."""
+    bot = grant.bot
+    if bot.status != BotStatus.ACTIVE:
+        return False
+    if not bot.owner.is_active:
+        return False
+    if not grant.is_active:
+        return False
+    return _user_may_grant_resource(bot.owner, grant.resource_type, grant.resource_id)
+
+
 def requires_approval(grant: BotResourceGrant, action: str) -> bool:
     if action in SENSITIVE_ACTIONS:
         return action not in (grant.auto_approved_actions or [])
@@ -465,20 +596,155 @@ def request_approval(bot: Bot, grant: BotResourceGrant, action: str, details: di
 
 
 def decide_approval(approval: BotApprovalRequest, decider: User, approve: bool) -> BotApprovalRequest:
+    """Deciding APPROVED doesn't just flip a status flag — it actually
+    runs the action the bot originally requested, with the deciding
+    human as the one performing it (ACTION_EXECUTORS below), via the
+    same executor execute_bot_action would have called had the grant
+    auto-approved it. This is what makes approval meaningful: before
+    this, nothing ever read BotApprovalRequest.status back out again, so
+    "approving" a sensitive action did not make it happen — see
+    execute_bot_action's docstring for why that is the one gate nothing
+    bypasses."""
     if approval.status != BotApprovalStatus.PENDING:
         raise ValidationError({"status": "This approval request has already been decided."})
+    if approval.expires_at and approval.expires_at < timezone.now():
+        approval.status = BotApprovalStatus.EXPIRED
+        approval.save(update_fields=["status"])
+        raise ValidationError({"status": "This approval request has expired."})
     if not _user_may_grant_resource(decider, approval.resource_grant.resource_type, approval.resource_grant.resource_id):
         raise PermissionDenied("You are not authorized to decide approvals for this resource.")
+
     approval.status = BotApprovalStatus.APPROVED if approve else BotApprovalStatus.DECLINED
     approval.decided_by = decider
     approval.decided_at = timezone.now()
-    approval.save(update_fields=["status", "decided_by", "decided_at"])
+
+    execution_error = ""
+    if approve:
+        executor = ACTION_EXECUTORS.get(approval.action)
+        if not executor:
+            execution_error = f"'{approval.action}' has no registered executor."
+        elif not _grant_is_currently_valid(approval.resource_grant):
+            execution_error = "The underlying resource grant is no longer valid."
+        else:
+            try:
+                result = executor(approval.resource_grant, approval.details or {}, decider)
+            except Exception as exc:  # noqa: BLE001 — surfaced via execution_error, not raised
+                execution_error = str(exc)[:500]
+            else:
+                log_activity(
+                    approval.bot, BotActivityAction.ACTION_EXECUTED, actor=decider,
+                    resource_type=approval.resource_grant.resource_type,
+                    resource_id=approval.resource_grant.resource_id,
+                    metadata={"action": approval.action, "result": result, "via_approval": str(approval.id)},
+                )
+
+    approval.execution_error = execution_error
+    approval.save(update_fields=["status", "decided_by", "decided_at", "execution_error"])
     log_activity(
         approval.bot, BotActivityAction.APPROVAL_DECIDED, actor=decider,
         resource_type=approval.resource_grant.resource_type, resource_id=approval.resource_grant.resource_id,
-        metadata={"action": approval.action, "approved": approve},
+        metadata={"action": approval.action, "approved": approve, "execution_error": execution_error},
     )
     return approval
+
+
+# ---------------------------------------------------------------------
+# Generic sensitive-action execution (section 11/12) — the ONE path any
+# bot-initiated action beyond plain messaging must go through. Nothing
+# else in this module performs ban_member/remove_admin/etc. directly;
+# adding a new executor to ACTION_EXECUTORS is how a new action type
+# becomes real, not by calling a resource's model layer from views.py.
+# ---------------------------------------------------------------------
+
+def _execute_ban_member(grant: BotResourceGrant, details: dict, actor: User) -> dict:
+    """Mirrors apps.groups.views.GroupViewSet.ban's exact logic (same
+    three tables updated the same way) rather than calling that view —
+    this runs on behalf of a bot/approving-admin, not an HTTP request,
+    and must not depend on DRF request plumbing."""
+    if grant.resource_type != BotResourceType.GROUP:
+        raise ValidationError({"action": "ban_member is only supported for Group resources."})
+    from apps.chat.models import ConversationMember
+    from apps.groups.models import Group, GroupBan, GroupMembership
+
+    user_id = details.get("user_id")
+    if not user_id:
+        raise ValidationError({"user_id": "user_id is required."})
+    group = Group.objects.filter(id=grant.resource_id).select_related("conversation").first()
+    if not group:
+        raise ValidationError({"resource": "This group no longer exists."})
+
+    ban, _created = GroupBan.objects.update_or_create(
+        group=group, user_id=user_id,
+        defaults={
+            "reason": str(details.get("reason") or "")[:500],
+            "banned_by": actor,
+            "expires_at": details.get("expires_at"),
+        },
+    )
+    now = timezone.now()
+    GroupMembership.objects.filter(group=group, user_id=user_id).update(is_banned=True, left_at=now)
+    ConversationMember.objects.filter(conversation=group.conversation, user_id=user_id).update(left_at=now)
+    return {"ban_id": ban.id, "user_id": str(user_id)}
+
+
+ACTION_EXECUTORS = {
+    "ban_member": _execute_ban_member,
+}
+
+
+def execute_bot_action(bot: Bot, grant: BotResourceGrant, action: str, details: dict | None = None) -> dict:
+    """The single entry point for every bot-initiated action beyond
+    plain messaging (see ExternalBotExecuteActionView). On every call,
+    in order: re-verify the grant is CURRENTLY valid (not just was valid
+    at grant time), check the action's required scope, enforce the
+    owner's daily rate limit, then either queue a BotApprovalRequest
+    (never executing — see requires_approval) or run the action
+    immediately and log it. There is no second path anywhere in this
+    codebase that performs a sensitive action without going through
+    this function or decide_approval's execution branch above, which is
+    what makes "sensitive operations cannot bypass pending approval" an
+    actual guarantee rather than a convention."""
+    action = (action or "").strip()
+    if not action:
+        raise ValidationError({"action": "An action is required."})
+    if grant.bot_id != bot.id:
+        raise PermissionDenied("This bot has no active grant for that resource.")
+    if not _grant_is_currently_valid(grant):
+        log_activity(
+            bot, BotActivityAction.ACTION_DENIED, resource_type=grant.resource_type,
+            resource_id=grant.resource_id, metadata={"action": action, "reason": "grant_invalid"},
+        )
+        raise PermissionDenied("This bot no longer has valid access to that resource.")
+
+    required_scope = ACTION_REQUIRED_SCOPE.get(action)
+    if required_scope and not grant_has_scope(grant, required_scope):
+        log_activity(
+            bot, BotActivityAction.ACTION_DENIED, resource_type=grant.resource_type,
+            resource_id=grant.resource_id,
+            metadata={"action": action, "reason": "missing_scope", "required_scope": required_scope},
+        )
+        _record_abuse_signal(bot, "missing_scope_attempt")
+        raise PermissionDenied(f"This bot does not have the '{required_scope}' permission on this resource.")
+
+    check_and_increment_bot_daily_usage(bot)
+
+    if requires_approval(grant, action):
+        approval = request_approval(bot, grant, action, details or {})
+        log_activity(
+            bot, BotActivityAction.ACTION_PENDING_APPROVAL, resource_type=grant.resource_type,
+            resource_id=grant.resource_id, metadata={"action": action, "approval_id": str(approval.id)},
+        )
+        return {"status": "pending_approval", "approval_id": str(approval.id)}
+
+    executor = ACTION_EXECUTORS.get(action)
+    if not executor:
+        raise ValidationError({"action": f"'{action}' is not yet a supported executable action."})
+    result = executor(grant, details or {}, bot.owner)
+    log_activity(
+        bot, BotActivityAction.ACTION_EXECUTED, resource_type=grant.resource_type,
+        resource_id=grant.resource_id, metadata={"action": action, "result": result},
+    )
+    return {"status": "executed", "result": result}
 
 
 # ---------------------------------------------------------------------
@@ -488,14 +754,24 @@ def decide_approval(approval: BotApprovalRequest, decider: User, approve: bool) 
 # ---------------------------------------------------------------------
 
 def send_message_as_bot(bot: Bot, grant: BotResourceGrant, text: str, *, client_id: str | None = None) -> dict:
-    if bot.status != BotStatus.ACTIVE:
-        raise PermissionDenied("This bot is not active.")
-    if not grant.is_active or grant.bot_id != bot.id:
+    if grant.bot_id != bot.id:
         raise PermissionDenied("This bot has no active grant for that resource.")
+    if not _grant_is_currently_valid(grant):
+        log_activity(
+            bot, BotActivityAction.ACTION_DENIED, resource_type=grant.resource_type,
+            resource_id=grant.resource_id, metadata={"action": "send_message", "reason": "grant_invalid"},
+        )
+        raise PermissionDenied("This bot no longer has valid access to that resource.")
     if not grant_has_scope(grant, BotPermissionScope.SEND_MESSAGES):
+        log_activity(
+            bot, BotActivityAction.ACTION_DENIED, resource_type=grant.resource_type,
+            resource_id=grant.resource_id, metadata={"action": "send_message", "reason": "missing_scope"},
+        )
         raise PermissionDenied("This bot does not have send_messages permission on this resource.")
     if not grant.conversation_id:
         raise ValidationError({"resource": "This resource has no linked conversation to send into."})
+
+    check_and_increment_bot_daily_usage(bot)
 
     from apps.chat.tasks import send_system_message_as_user
 
@@ -559,11 +835,24 @@ def _attempt_delivery(subscription: BotWebhookSubscription, delivery: BotWebhook
         "delivered_at": timezone.now().isoformat(),
     }
     body_bytes = json.dumps(body).encode("utf-8")
-    signature = hmac.new(subscription.secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+    # Replay protection (section 9/16): sign over "{timestamp}.{body}",
+    # the same scheme Stripe's webhooks use, and send the timestamp as
+    # its own header. A receiver that (a) rejects a timestamp outside a
+    # short tolerance window (e.g. 5 minutes) and (b) recomputes the
+    # signature over "{header_timestamp}.{raw_body}" cannot be replayed
+    # with a captured request after that window closes — signing the
+    # body ALONE (the previous scheme) let a captured request be resent
+    # indefinitely since the signature never changed. event_id's
+    # UniqueConstraint on BotWebhookDelivery is KIS's own replay defense
+    # for redelivery from this side; this header is for the receiver's.
+    timestamp = str(int(timezone.now().timestamp()))
+    signed_payload = f"{timestamp}.".encode("utf-8") + body_bytes
+    signature = hmac.new(subscription.secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
     headers = {
         "Content-Type": "application/json",
         "X-KIS-Bot-Event": delivery.event,
         "X-KIS-Bot-Id": str(subscription.bot_id),
+        "X-KIS-Timestamp": timestamp,
         "X-KIS-Signature": signature,
     }
     request = urllib.request.Request(subscription.url, data=body_bytes, headers=headers, method="POST")

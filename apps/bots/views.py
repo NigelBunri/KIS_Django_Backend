@@ -7,6 +7,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
 from . import services
@@ -261,6 +262,21 @@ class BotApprovalDecisionView(APIView):
 # Entirely separate auth/permission stack from every endpoint above.
 # ---------------------------------------------------------------------
 
+class BotOAuthTokenThrottle(SimpleRateThrottle):
+    """Rate-limits the token endpoint itself, independent of the
+    per-client_id lockout in services.authenticate_bot_credential — that
+    one protects a single client_id from being brute-forced; this one
+    caps total attempts from a single IP regardless of which client_id
+    it tries, so rotating through many client_ids from one source still
+    gets throttled."""
+
+    scope = "bot_oauth_token"
+    rate = "30/min"
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {"scope": self.scope, "ident": self.get_ident(request)}
+
+
 class BotOAuthTokenView(APIView):
     """POST client_id + client_secret -> short-lived bot access token.
     Mirrors the standard OAuth2 client_credentials grant shape so an
@@ -269,6 +285,7 @@ class BotOAuthTokenView(APIView):
 
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_classes = [BotOAuthTokenThrottle]
 
     def post(self, request):
         grant_type = request.data.get("grant_type", "client_credentials")
@@ -278,7 +295,9 @@ class BotOAuthTokenView(APIView):
         client_secret = str(request.data.get("client_secret") or "").strip()
         if not client_id or not client_secret:
             raise ValidationError({"detail": "client_id and client_secret are required."})
-        credential = services.authenticate_bot_credential(client_id, client_secret)
+        credential = services.authenticate_bot_credential(
+            client_id, client_secret, ip=request.META.get("REMOTE_ADDR"),
+        )
         if not credential:
             raise PermissionDenied("Invalid client credentials, or this bot is not active.")
         return Response(issue_access_token(credential))
@@ -331,3 +350,26 @@ class ExternalBotSendMessageView(APIView):
             bot, grant, text, client_id=request.data.get("client_id"),
         )
         return Response(result, status=status.HTTP_201_CREATED)
+
+
+class ExternalBotExecuteActionView(APIView):
+    """POST {action, details} -> either the action's result (if it ran
+    immediately) or {status: "pending_approval", approval_id} (if the
+    action is sensitive and the grant hasn't pre-approved it). Every
+    check — live permission re-verification, required scope, daily rate
+    limit, approval gating — happens inside services.execute_bot_action;
+    this view does nothing but authenticate the caller and hand off."""
+
+    authentication_classes = [BotAccessTokenAuthentication]
+    permission_classes = [IsBotCredential]
+
+    def post(self, request, grant_id):
+        bot = request.auth.bot
+        grant = get_object_or_404(BotResourceGrant, id=grant_id, bot=bot, is_active=True)
+        action_name = str(request.data.get("action") or "").strip()
+        details = request.data.get("details") or {}
+        if not isinstance(details, dict):
+            raise ValidationError({"details": "details must be an object."})
+        result = services.execute_bot_action(bot, grant, action_name, details)
+        status_code = status.HTTP_202_ACCEPTED if result.get("status") == "pending_approval" else status.HTTP_200_OK
+        return Response(result, status=status_code)
