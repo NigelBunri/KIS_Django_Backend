@@ -27,6 +27,16 @@ bot_workflow_resume = views.BotViewSet.as_view({"post": "workflow_resume"})
 bot_workflow_versions = views.BotViewSet.as_view({"get": "workflow_versions"})
 bot_workflow_runs = views.BotViewSet.as_view({"get": "workflow_runs"})
 
+# Phase 4: Knowledge and Memory
+bot_knowledge_sources = views.BotViewSet.as_view({"get": "knowledge_sources", "post": "knowledge_sources"})
+bot_knowledge_source_detail = views.BotViewSet.as_view({"get": "knowledge_source_detail", "delete": "knowledge_source_detail"})
+bot_knowledge_source_deactivate = views.BotViewSet.as_view({"post": "knowledge_source_deactivate"})
+bot_knowledge_source_reactivate = views.BotViewSet.as_view({"post": "knowledge_source_reactivate"})
+bot_knowledge_test_retrieval = views.BotViewSet.as_view({"post": "knowledge_test_retrieval"})
+bot_memory_config = views.BotViewSet.as_view({"get": "memory_config", "put": "memory_config"})
+bot_memory_entries = views.BotViewSet.as_view({"get": "memory_entries", "delete": "memory_entries"})
+bot_memory_entry_detail = views.BotViewSet.as_view({"delete": "memory_entry_detail"})
+
 urlpatterns = [
     # Owner-facing management API
     path("bots/", bot_list, name="bot-list"),
@@ -55,6 +65,16 @@ urlpatterns = [
     path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/resume/", bot_workflow_resume, name="bot-workflow-resume"),
     path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/versions/", bot_workflow_versions, name="bot-workflow-versions"),
     path("bots/<uuid:pk>/workflows/<uuid:workflow_id>/runs/", bot_workflow_runs, name="bot-workflow-runs"),
+
+    # Phase 4: Knowledge and Memory
+    path("bots/<uuid:pk>/knowledge/", bot_knowledge_sources, name="bot-knowledge-sources"),
+    path("bots/<uuid:pk>/knowledge/test-retrieval/", bot_knowledge_test_retrieval, name="bot-knowledge-test-retrieval"),
+    path("bots/<uuid:pk>/knowledge/<uuid:source_id>/", bot_knowledge_source_detail, name="bot-knowledge-source-detail"),
+    path("bots/<uuid:pk>/knowledge/<uuid:source_id>/deactivate/", bot_knowledge_source_deactivate, name="bot-knowledge-source-deactivate"),
+    path("bots/<uuid:pk>/knowledge/<uuid:source_id>/reactivate/", bot_knowledge_source_reactivate, name="bot-knowledge-source-reactivate"),
+    path("bots/<uuid:pk>/memory-config/", bot_memory_config, name="bot-memory-config"),
+    path("bots/<uuid:pk>/memory/", bot_memory_entries, name="bot-memory-entries"),
+    path("bots/<uuid:pk>/memory/<uuid:entry_id>/", bot_memory_entry_detail, name="bot-memory-entry-detail"),
 
     # OAuth2 client-credentials + external bot API
     path("bots/oauth/token/", views.BotOAuthTokenView.as_view(), name="bot-oauth-token"),

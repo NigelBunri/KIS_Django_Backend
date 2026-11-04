@@ -27,6 +27,8 @@ import secrets
 import uuid
 
 from django.conf import settings
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVectorField
 from django.db import models
 from django.utils import timezone
 
@@ -581,4 +583,143 @@ class BotAIUsageLog(models.Model):
         db_table = "bots_ai_usage_log"
         indexes = [
             models.Index(fields=["bot", "-created_at"]),
+        ]
+
+
+# ---------------------------------------------------------------------
+# Phase 4 — bot-specific Knowledge and Memory. Deliberately built on
+# Postgres full-text search (the same SearchVectorField/GinIndex/
+# SearchRank machinery apps.broadcasts' own content search already uses
+# in production - see that app's signals.py) rather than a vector
+# database: it needs no embedding API call, so retrieval works even
+# for a bot with no AI connection at all and never depends on a
+# specific provider, and it introduces no new infrastructure beyond
+# the Postgres this project already runs. Every row below carries its
+# own `bot` FK and every query in apps.bots.knowledge/memory filters by
+# it explicitly - that FK is the entire cross-bot isolation boundary.
+# ---------------------------------------------------------------------
+
+class BotKnowledgeSourceType(models.TextChoices):
+    FILE = "file", "Uploaded file"
+    URL = "url", "Web page"
+    TEXT = "text", "Pasted text"
+
+
+class BotKnowledgeSourceStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    PROCESSING = "processing", "Processing"
+    READY = "ready", "Ready"
+    ERROR = "error", "Error"
+    DEACTIVATED = "deactivated", "Deactivated"
+
+
+def _knowledge_upload_path(instance, filename):
+    return f"bots/{instance.bot_id}/knowledge/{uuid.uuid4().hex}_{filename}"
+
+
+class BotKnowledgeSource(models.Model):
+    """One owner-supplied knowledge source, scoped to exactly one bot -
+    never shared across bots, never shared across KIS more broadly.
+    `status`/`error_message` give the owner the "processing errors and
+    indexing status" visibility the spec requires; `deactivated_at`
+    lets an owner pull a source out of retrieval without destroying it
+    (distinct from delete, which is permanent and also removes every
+    chunk via CASCADE)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    bot = models.ForeignKey(Bot, on_delete=models.CASCADE, related_name="knowledge_sources")
+    source_type = models.CharField(max_length=10, choices=BotKnowledgeSourceType.choices)
+    title = models.CharField(max_length=200)
+    status = models.CharField(max_length=12, choices=BotKnowledgeSourceStatus.choices, default=BotKnowledgeSourceStatus.PENDING)
+    error_message = models.TextField(blank=True, default="")
+    file = models.FileField(upload_to=_knowledge_upload_path, blank=True, null=True)
+    file_size_bytes = models.PositiveIntegerField(null=True, blank=True)
+    content_type = models.CharField(max_length=120, blank=True, default="")
+    source_url = models.URLField(max_length=2000, blank=True, default="")
+    # Only ever populated by this app's own extraction code (plain text
+    # pulled out of a PDF/DOCX/URL/paste) - never executed, never
+    # rendered, never treated as instructions; see apps.bots.knowledge's
+    # module docstring for the prompt-injection posture this implies.
+    extracted_text = models.TextField(blank=True, default="")
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+    deactivated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "bots_knowledge_source"
+        indexes = [
+            models.Index(fields=["bot", "-created_at"]),
+            models.Index(fields=["bot", "status"]),
+        ]
+
+
+class BotKnowledgeChunk(models.Model):
+    """A retrieval-sized slice of one source's extracted_text. Chunking
+    (rather than retrieving whole sources) is what lets a long document
+    contribute a few relevant paragraphs to one AI decision instead of
+    the AI provider receiving the entire document on every call. `bot`
+    is denormalized from `source.bot` purely so retrieval's hot-path
+    query never needs a join to enforce bot isolation."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    source = models.ForeignKey(BotKnowledgeSource, on_delete=models.CASCADE, related_name="chunks")
+    bot = models.ForeignKey(Bot, on_delete=models.CASCADE, related_name="knowledge_chunks")
+    chunk_index = models.PositiveIntegerField()
+    text = models.TextField()
+    search_vector = SearchVectorField(null=True, blank=True, editable=False)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "bots_knowledge_chunk"
+        indexes = [
+            GinIndex(fields=["search_vector"], name="bots_know_chunk_search_gin"),
+            models.Index(fields=["bot", "source"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["source", "chunk_index"], name="uniq_bot_knowledge_chunk_index"),
+        ]
+
+
+class BotMemoryConfig(models.Model):
+    """Per-bot memory settings - off by default. Distinct from
+    BotKnowledgeSource: knowledge is owner-supplied reference material,
+    memory is what the bot itself accumulates from operating (facts it
+    decided to remember, never raw conversation text unless the owner
+    explicitly opts into that via allow_message_content)."""
+
+    bot = models.OneToOneField(Bot, on_delete=models.CASCADE, related_name="memory_config")
+    enabled = models.BooleanField(default=False)
+    allow_message_content = models.BooleanField(default=False)
+    retention_days = models.PositiveIntegerField(default=30)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "bots_memory_config"
+
+
+class BotMemoryEntry(models.Model):
+    """One remembered fact/note. `subject_user_id` is a plain UUID, not
+    a FK to User - scopes a memory to one counterparty (e.g. a group
+    member) without requiring a lookup join on every write; null means
+    a bot-wide note with no single subject. `expires_at` is set from
+    the owning BotMemoryConfig's retention_days at creation time and
+    enforced both by always filtering it out of retrieval and by a
+    periodic purge (apps.bots.tasks.purge_expired_bot_memory)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    bot = models.ForeignKey(Bot, on_delete=models.CASCADE, related_name="memory_entries")
+    subject_user_id = models.UUIDField(null=True, blank=True)
+    content = models.TextField()
+    source = models.CharField(max_length=20, default="ai_decision")
+    search_vector = SearchVectorField(null=True, blank=True, editable=False)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    class Meta:
+        db_table = "bots_memory_entry"
+        indexes = [
+            models.Index(fields=["bot", "subject_user_id", "-created_at"]),
+            GinIndex(fields=["search_vector"], name="bots_memory_entry_search_gin"),
         ]

@@ -8,6 +8,9 @@ from .models import (
     BotAIUsageLog,
     BotApprovalRequest,
     BotCredential,
+    BotKnowledgeSource,
+    BotMemoryConfig,
+    BotMemoryEntry,
     BotResourceGrant,
     BotWebhookSubscription,
     BotWorkflow,
@@ -209,4 +212,45 @@ class BotWorkflowRunSerializer(serializers.ModelSerializer):
             "event_context", "condition_result", "steps_log", "error_message",
             "started_at", "finished_at",
         ]
+        read_only_fields = fields
+
+
+# ---------------------------------------------------------------------
+# Phase 4 — Knowledge and Memory
+# ---------------------------------------------------------------------
+
+class BotKnowledgeSourceSerializer(serializers.ModelSerializer):
+    chunk_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BotKnowledgeSource
+        fields = [
+            "id", "source_type", "title", "status", "error_message",
+            "file_size_bytes", "content_type", "source_url",
+            "chunk_count", "created_at", "updated_at", "deactivated_at",
+        ]
+        read_only_fields = fields
+
+    def get_chunk_count(self, obj) -> int:
+        return obj.chunks.count()
+
+
+class BotKnowledgeSourceCreateSerializer(serializers.Serializer):
+    source_type = serializers.ChoiceField(choices=["file", "url", "text"])
+    title = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
+    url = serializers.URLField(required=False, allow_blank=True, default="")
+    text = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class BotMemoryConfigSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BotMemoryConfig
+        fields = ["enabled", "allow_message_content", "retention_days", "created_at", "updated_at"]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class BotMemoryEntrySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BotMemoryEntry
+        fields = ["id", "subject_user_id", "content", "source", "created_at", "expires_at"]
         read_only_fields = fields

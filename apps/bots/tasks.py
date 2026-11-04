@@ -113,3 +113,31 @@ def run_due_scheduled_workflows() -> int:
         )
         triggered += 1
     return triggered
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=15)
+def process_knowledge_source_task(self, source_id: str):
+    """Async entry point for apps.bots.knowledge.process_source — a
+    PDF extraction or a URL fetch must never block the HTTP request
+    that created the source. process_source itself already catches
+    every expected failure mode (bad file, unreachable URL, empty
+    result) and records it on the source row rather than raising; the
+    retry here is only for genuinely unexpected infrastructure failures
+    (e.g. a transient DB error), same policy as run_workflow_task."""
+    from . import knowledge
+
+    try:
+        knowledge.process_source(source_id)
+    except Exception as exc:  # noqa: BLE001 - anything escaping process_source is infrastructure, not business logic
+        raise self.retry(exc=exc)
+
+
+@shared_task
+def purge_expired_bot_memory() -> int:
+    """Celery-beat sweep — the deletion half of Phase 4 memory
+    retention (apps.bots.memory's retrieval/list functions already
+    filter expired rows out of what they return; this actually removes
+    them from the table)."""
+    from . import memory
+
+    return memory.purge_expired_memory()

@@ -26,6 +26,10 @@ from .serializers import (
     BotApprovalRequestSerializer,
     BotCreateSerializer,
     BotCredentialSerializer,
+    BotKnowledgeSourceCreateSerializer,
+    BotKnowledgeSourceSerializer,
+    BotMemoryConfigSerializer,
+    BotMemoryEntrySerializer,
     BotResourceGrantSerializer,
     BotSerializer,
     BotWebhookSubscriptionSerializer,
@@ -353,6 +357,106 @@ class BotViewSet(viewsets.ViewSet):
         workflow = services._require_own_workflow(bot, request.user, workflow_id)
         runs = workflow.runs.order_by("-started_at")[:100]
         return Response(BotWorkflowRunSerializer(runs, many=True).data)
+
+    # ---- Phase 4: Knowledge ----
+
+    @action(detail=True, methods=["get", "post"], url_path="knowledge")
+    def knowledge_sources(self, request, pk=None):
+        from . import knowledge
+
+        bot = _owned_bot_or_404(request.user, pk)
+        if request.method == "GET":
+            sources = bot.knowledge_sources.order_by("-created_at")
+            return Response(BotKnowledgeSourceSerializer(sources, many=True).data)
+
+        serializer = BotKnowledgeSourceCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if data["source_type"] == "file":
+            upload = request.FILES.get("file")
+            if not upload:
+                raise ValidationError({"file": "A file is required for source_type=file."})
+            source = knowledge.create_file_source(bot, request.user, title=data["title"], upload=upload)
+        elif data["source_type"] == "url":
+            if not data.get("url"):
+                raise ValidationError({"url": "A url is required for source_type=url."})
+            source = knowledge.create_url_source(bot, request.user, title=data["title"], url=data["url"])
+        else:
+            if not data.get("text"):
+                raise ValidationError({"text": "text is required for source_type=text."})
+            source = knowledge.create_text_source(bot, request.user, title=data["title"], text=data["text"])
+        return Response(BotKnowledgeSourceSerializer(source).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get", "delete"], url_path="knowledge/(?P<source_id>[^/.]+)")
+    def knowledge_source_detail(self, request, pk=None, source_id=None):
+        from . import knowledge
+
+        bot = _owned_bot_or_404(request.user, pk)
+        if request.method == "DELETE":
+            knowledge.delete_source(bot, request.user, source_id)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        source = knowledge._owned_source_or_404(bot, request.user, source_id)
+        return Response(BotKnowledgeSourceSerializer(source).data)
+
+    @action(detail=True, methods=["post"], url_path="knowledge/(?P<source_id>[^/.]+)/deactivate")
+    def knowledge_source_deactivate(self, request, pk=None, source_id=None):
+        from . import knowledge
+
+        bot = _owned_bot_or_404(request.user, pk)
+        source = knowledge.deactivate_source(bot, request.user, source_id)
+        return Response(BotKnowledgeSourceSerializer(source).data)
+
+    @action(detail=True, methods=["post"], url_path="knowledge/(?P<source_id>[^/.]+)/reactivate")
+    def knowledge_source_reactivate(self, request, pk=None, source_id=None):
+        from . import knowledge
+
+        bot = _owned_bot_or_404(request.user, pk)
+        source = knowledge.reactivate_source(bot, request.user, source_id)
+        return Response(BotKnowledgeSourceSerializer(source).data)
+
+    @action(detail=True, methods=["post"], url_path="knowledge/test-retrieval")
+    def knowledge_test_retrieval(self, request, pk=None):
+        from . import knowledge
+
+        bot = _owned_bot_or_404(request.user, pk)
+        query = str(request.data.get("query") or "").strip()
+        if not query:
+            raise ValidationError({"query": "A query is required."})
+        results = knowledge.retrieve_relevant_chunks(bot, query)
+        return Response({"results": results})
+
+    # ---- Phase 4: Memory ----
+
+    @action(detail=True, methods=["get", "put"], url_path="memory-config")
+    def memory_config(self, request, pk=None):
+        from . import memory
+
+        bot = _owned_bot_or_404(request.user, pk)
+        if request.method == "GET":
+            return Response(BotMemoryConfigSerializer(memory.get_or_create_memory_config(bot)).data)
+        serializer = BotMemoryConfigSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        config = memory.update_memory_config(bot, request.user, **serializer.validated_data)
+        return Response(BotMemoryConfigSerializer(config).data)
+
+    @action(detail=True, methods=["get", "delete"], url_path="memory")
+    def memory_entries(self, request, pk=None):
+        from . import memory
+
+        bot = _owned_bot_or_404(request.user, pk)
+        if request.method == "DELETE":
+            deleted = memory.delete_all_memory(bot, request.user)
+            return Response({"deleted": deleted})
+        entries = memory.list_memory_entries(bot, request.user)[:200]
+        return Response(BotMemoryEntrySerializer(entries, many=True).data)
+
+    @action(detail=True, methods=["delete"], url_path="memory/(?P<entry_id>[^/.]+)")
+    def memory_entry_detail(self, request, pk=None, entry_id=None):
+        from . import memory
+
+        bot = _owned_bot_or_404(request.user, pk)
+        memory.delete_memory_entry(bot, request.user, entry_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class BotApprovalDecisionView(APIView):

@@ -877,6 +877,14 @@ CELERY_BEAT_SCHEDULE = {
         # to never miss a due window by more than a minute.
         "schedule": 60,
     },
+    "purge-expired-bot-memory": {
+        "task": "apps.bots.tasks.purge_expired_bot_memory",
+        # Retention is in whole days (BotMemoryConfig.retention_days),
+        # so an hourly sweep is more than fine-grained enough - memory
+        # retrieval itself already excludes expired rows regardless of
+        # how recently this last ran.
+        "schedule": 60 * 60,
+    },
     "expire-abandoned-media-uploads": {
         "task": "apps.media.tasks.expire_abandoned_media_uploads",
         # Matches the shortest default presign lifetime (10 min) with room
@@ -1163,6 +1171,14 @@ MEDIA_SAFETY_ALLOWED_MIME_TYPES = os.environ.get("MEDIA_SAFETY_ALLOWED_MIME_TYPE
 MEDIA_SAFETY_ALLOWED_MIME_PREFIXES = os.environ.get("MEDIA_SAFETY_ALLOWED_MIME_PREFIXES", "")
 MEDIA_SAFETY_ALLOWED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_ALLOWED_EXTENSIONS", "")
 MEDIA_SAFETY_BLOCKED_EXTENSIONS = os.environ.get("MEDIA_SAFETY_BLOCKED_EXTENSIONS", "")
+
+# Bot Platform Phase 4 — knowledge-source uploads are text-extracted
+# (txt/pdf/docx/csv only, see apps.bots.knowledge_extraction), not
+# served back as media, so this is deliberately much smaller than the
+# general MEDIA_SAFETY_MAX_UPLOAD_BYTES default above.
+BOTS_KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.environ.get("BOTS_KNOWLEDGE_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
+BOTS_KNOWLEDGE_MAX_URL_FETCH_BYTES = int(os.environ.get("BOTS_KNOWLEDGE_MAX_URL_FETCH_BYTES", 2 * 1024 * 1024))
+BOTS_KNOWLEDGE_MAX_SOURCES_PER_BOT = int(os.environ.get("BOTS_KNOWLEDGE_MAX_SOURCES_PER_BOT", 50))
 
 # Human moderation authority for public broadcast content (see
 # apps.broadcasts.moderation_gate). An AI scan verdict alone never makes

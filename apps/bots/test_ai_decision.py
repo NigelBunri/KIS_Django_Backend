@@ -278,3 +278,47 @@ class AIDecisionTests(TestCase):
         self.assertEqual(body["summary"]["error_calls"], 1)
         self.assertEqual(body["summary"]["total_prompt_tokens"], 42)
         self.assertEqual(len(body["recent"]), 2)
+
+    # --- Phase 4 integration: knowledge/memory actually reach the prompt ---
+
+    def test_relevant_knowledge_and_memory_are_included_in_the_prompt(self):
+        from . import knowledge as knowledge_module
+        from . import memory as memory_module
+
+        self._connect_ai()
+        memory_module.update_memory_config(self.bot, self.owner, enabled=True)
+        # Scoped to the message's own sender, matching what the real
+        # dispatch below will look up via context["subject_user_id"].
+        memory_module.remember(self.bot, content="This group prefers formal welcome messages.", subject_user_id=self.target.id)
+        knowledge_module.create_text_source(
+            self.bot, self.owner, title="Welcome Policy",
+            text="Official KIS welcome policy: greet every new volunteer by name.",
+        )
+        workflow = services.publish_workflow(
+            services.create_workflow(
+                self.bot, self.owner, resource_grant_id=self.grant.id, name=f"AIWF-know-{_uuid_suffix()}",
+                trigger_type=BotWorkflowTriggerType.MESSAGE_CREATED,
+                definition={
+                    "then_actions": [{"type": "send_notification", "params": {"title": "x", "body": "x"}}],
+                    "ai_decision": {"enabled": True},
+                },
+            ),
+            self.owner,
+        )
+        from .workflow_engine import dispatch_event_to_workflows
+
+        with patch("apps.bots.ai_decision.call_ai_provider", return_value={"text": '{"selected": []}', "prompt_tokens": None, "completion_tokens": None}) as mock_call, \
+             patch("apps.notifications.services.create_notification"):
+            dispatch_event_to_workflows(
+                resource_type=BotResourceType.GROUP, resource_id=str(self.group.id),
+                # websearch-type full-text search is literal keyword
+                # matching, not semantic - a single shared term keeps
+                # this test deterministic against both the knowledge
+                # source and the memory note below.
+                event="message.created", payload={"text": "welcome", "senderId": str(self.target.id)},
+                event_id=f"know-evt-{_uuid_suffix()}",
+            )
+        mock_call.assert_called_once()
+        user_prompt = mock_call.call_args.kwargs["user_prompt"]
+        self.assertIn("welcome policy", user_prompt)
+        self.assertIn("formal welcome messages", user_prompt)
