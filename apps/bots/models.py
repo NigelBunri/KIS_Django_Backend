@@ -421,8 +421,11 @@ class BotWorkflowTriggerType(models.TextChoices):
     # exact event-publisher audit). Adding a new one here means a real
     # publisher exists for it, not a placeholder.
     MESSAGE_CREATED = "message.created", "New message"
+    MESSAGE_EDITED = "message.edited", "Message edited"
     MEMBER_JOINED = "member.joined", "Member joined"
     MEMBER_LEFT = "member.left", "Member left"
+    POST_CREATED = "post.created", "New post"
+    COMMENT_CREATED = "comment.created", "New comment"
     SCHEDULE = "schedule", "Scheduled"
 
 

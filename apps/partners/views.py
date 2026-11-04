@@ -529,7 +529,7 @@ class PartnerViewSet(viewsets.ModelViewSet):
         status_value: str,
         membership_role: str,
     ) -> PartnerMembership:
-        membership, _ = PartnerMembership.objects.update_or_create(
+        membership, created = PartnerMembership.objects.update_or_create(
             partner=partner,
             user=user,
             defaults={
@@ -540,6 +540,10 @@ class PartnerViewSet(viewsets.ModelViewSet):
                 "removed_at": None,
             },
         )
+        if created:
+            from apps.partners.services import dispatch_partner_member_event
+
+            dispatch_partner_member_event(partner, user.id, "member.joined")
         base_role = BaseConversationRole.MEMBER
         if status_value == PartnerMembershipStatus.SUBSCRIBER or membership_role == "subscriber":
             base_role = BaseConversationRole.READONLY
@@ -4798,6 +4802,10 @@ class PartnerViewSet(viewsets.ModelViewSet):
             update_fields.extend(["is_banned", "banned_at"])
 
         membership.save(update_fields=update_fields)
+        if action_type in (PartnerModerationAction.ActionType.KICK, PartnerModerationAction.ActionType.BAN):
+            from apps.partners.services import dispatch_partner_member_event
+
+            dispatch_partner_member_event(partner, membership.user_id, "member.left")
         moderation_action = PartnerModerationAction.objects.create(
             partner=partner,
             user=membership.user,
@@ -5164,6 +5172,9 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
                 user_ids=[uid for uid in active_partner_member_ids(partner) if uid != str(self.request.user.id)],
                 data={"postId": str(post.id), "authorId": str(self.request.user.id)},
             )
+            from apps.partners.services import dispatch_partner_post_created
+
+            dispatch_partner_post_created(post)
 
     @action(detail=True, methods=["post"], url_path="comment")
     def comment(self, request, pk=None):
@@ -5206,6 +5217,9 @@ class PartnerPostViewSet(viewsets.ModelViewSet):
             user_ids=[uid for uid in active_partner_member_ids(post.partner) if uid != str(request.user.id)],
             data={"postId": str(post.id), "commentId": str(comment.id), "authorId": str(request.user.id)},
         )
+        from apps.partners.services import dispatch_partner_comment_created
+
+        dispatch_partner_comment_created(comment)
         return Response(
             PartnerPostCommentSerializer(comment, context={"request": request}).data,
             status=status.HTTP_201_CREATED,

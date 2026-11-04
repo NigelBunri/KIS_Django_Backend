@@ -67,3 +67,64 @@ def create_community_with_main_conversation(
     )
 
     return community
+
+
+# ---------------------------------------------------------------------
+# KIS Bot Platform (Phase 2 gap-closing) — event publishers. Plain
+# Django calls, never touching Nest, mirroring apps.groups.services'
+# member.joined/member.left pattern exactly but for Community
+# membership/posts/comments. Never raise: a publisher failure must
+# never break the real join/post/comment action that triggered it.
+# ---------------------------------------------------------------------
+
+def dispatch_community_member_event(community: Community, user_id, event: str) -> None:
+    try:
+        from apps.bots.models import BotPermissionScope, BotResourceType
+        from apps.bots.services import dispatch_resource_event
+        from django.utils import timezone as _tz
+
+        dispatch_resource_event(
+            BotResourceType.COMMUNITY, community.id, event, {"user_id": str(user_id)},
+            event_id=f"{event}:{community.id}:{user_id}:{_tz.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MEMBERS,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dispatch_community_post_created(post) -> None:
+    try:
+        from apps.bots.models import BotPermissionScope, BotResourceType
+        from apps.bots.services import dispatch_resource_event
+        from django.utils import timezone as _tz
+
+        dispatch_resource_event(
+            BotResourceType.COMMUNITY, post.community_id, "post.created",
+            {
+                "post_id": str(post.id), "author_id": str(post.author_id),
+                "text": getattr(post, "text_plain", "") or getattr(post, "text_preview", "") or "",
+            },
+            event_id=f"post.created:{post.id}:{_tz.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MESSAGES,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dispatch_community_comment_created(comment) -> None:
+    try:
+        from apps.bots.models import BotPermissionScope, BotResourceType
+        from apps.bots.services import dispatch_resource_event
+        from django.utils import timezone as _tz
+
+        dispatch_resource_event(
+            BotResourceType.COMMUNITY, comment.post.community_id, "comment.created",
+            {
+                "comment_id": str(comment.id), "post_id": str(comment.post_id),
+                "author_id": str(comment.author_id), "text": getattr(comment, "text", "") or "",
+            },
+            event_id=f"comment.created:{comment.id}:{_tz.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MESSAGES,
+        )
+    except Exception:  # noqa: BLE001
+        pass

@@ -91,11 +91,13 @@ def run_delayed_workflow_action(workflow_id: str, action: dict, run_id: str):
 def run_due_scheduled_workflows() -> int:
     """Celery-beat sweep for trigger_type=SCHEDULE workflows — there is
     no external event to react to, so this periodically checks whether
-    each one's own trigger_config interval has elapsed since
-    last_schedule_run_at."""
+    each one is due per workflow_engine.is_schedule_due (fixed-interval
+    or timezone-aware cron, see that function's own docstring for the
+    duplicate/missed-schedule semantics)."""
     from django.utils import timezone
 
     from .models import BotWorkflow, BotWorkflowStatus, BotWorkflowTriggerType
+    from .workflow_engine import is_schedule_due
 
     triggered = 0
     now = timezone.now()
@@ -103,11 +105,7 @@ def run_due_scheduled_workflows() -> int:
         status=BotWorkflowStatus.ACTIVE, trigger_type=BotWorkflowTriggerType.SCHEDULE,
     ).select_related("bot", "resource_grant")
     for workflow in workflows:
-        interval = int((workflow.trigger_config or {}).get("interval_minutes") or 0)
-        if interval <= 0:
-            continue
-        last_run = workflow.last_schedule_run_at
-        if last_run and (now - last_run).total_seconds() < interval * 60:
+        if not is_schedule_due(workflow.trigger_config or {}, workflow.last_schedule_run_at, now):
             continue
         BotWorkflow.objects.filter(id=workflow.id).update(last_schedule_run_at=now)
         run_workflow_task.delay(

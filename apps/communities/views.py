@@ -341,6 +341,7 @@ class CommunityViewSet(viewsets.ModelViewSet):
         """
         self._check_not_banned(community, user)
         membership = CommunityMembership.objects.filter(community=community, user=user).first()
+        activated = membership is None or membership.status != CommunityMembershipStatus.ACTIVE
         if membership is None:
             membership = CommunityMembership.objects.create(
                 community=community,
@@ -350,6 +351,10 @@ class CommunityViewSet(viewsets.ModelViewSet):
             )
         elif membership.status != CommunityMembershipStatus.ACTIVE:
             membership.reactivate(role=role)
+        if activated:
+            from apps.communities.services import dispatch_community_member_event
+
+            dispatch_community_member_event(community, user.id, "member.joined")
         self._ensure_conversation_membership(community, user)
         return membership
 
@@ -372,6 +377,9 @@ class CommunityViewSet(viewsets.ModelViewSet):
         if membership:
             membership.mark_banned()
         self._remove_conversation_membership(community, user_id)
+        from apps.communities.services import dispatch_community_member_event
+
+        dispatch_community_member_event(community, user_id, "member.left")
         return ban
 
     @action(detail=True, methods=["post"], url_path="deactivate")
@@ -480,8 +488,10 @@ class CommunityViewSet(viewsets.ModelViewSet):
         # leave() is the one other way out of a community and must too.
         self._remove_conversation_membership(community, request.user.id)
         from apps.communities.realtime import notify_member_left
+        from apps.communities.services import dispatch_community_member_event
 
         notify_member_left(community, membership, reason="left")
+        dispatch_community_member_event(community, request.user.id, "member.left")
         return Response({"detail": "Left community."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get"], url_path="join-requests")
@@ -816,9 +826,11 @@ class CommunityViewSet(viewsets.ModelViewSet):
 
         from apps.communities.realtime import notify_member_left
         from apps.communities.notifications import notify_member_removed
+        from apps.communities.services import dispatch_community_member_event
 
         notify_member_left(community, membership, reason="removed")
         notify_member_removed(community, user_id)
+        dispatch_community_member_event(community, user_id, "member.left")
         return Response({"detail": "Member removed."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["patch"], url_path="settings")
@@ -1172,8 +1184,10 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
         post = serializer.save(author=self.request.user, status=status_val)
         if status_val == CommunityPostStatus.PUBLISHED:
             from apps.communities.realtime import notify_post_created
+            from apps.communities.services import dispatch_community_post_created
 
             notify_post_created(post)
+            dispatch_community_post_created(post)
 
     @action(detail=True, methods=["post"], url_path="comment")
     def comment(self, request, pk=None):
@@ -1189,8 +1203,10 @@ class CommunityPostViewSet(viewsets.ModelViewSet):
             text=request.data.get("text", ""),
         )
         from apps.communities.realtime import notify_comment_created
+        from apps.communities.services import dispatch_community_comment_created
 
         notify_comment_created(comment)
+        dispatch_community_comment_created(comment)
         return Response(
             CommunityPostCommentSerializer(comment, context={"request": request}).data,
             status=status.HTTP_201_CREATED,

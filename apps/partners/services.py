@@ -1454,3 +1454,67 @@ def notify_nest_of_partner_event(
             resp.read()
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------
+# KIS Bot Platform (Phase 2 gap-closing) — event publishers for Partner
+# membership/posts/comments. Plain Django calls, never touching Nest.
+# Entirely separate from run_partner_automation_rules above (that is
+# PartnerAutomationRule's own, pre-existing automation system scoped to
+# assign_role/remove_role/etc. - this is the Bot Platform's, and the
+# two coexist without either depending on the other). Never raise: a
+# publisher failure must never break the real join/post/comment action
+# that triggered it.
+# ---------------------------------------------------------------------
+
+def dispatch_partner_member_event(partner, user_id, event: str) -> None:
+    try:
+        from apps.bots.models import BotPermissionScope, BotResourceType
+        from apps.bots.services import dispatch_resource_event
+        from django.utils import timezone as _tz
+
+        dispatch_resource_event(
+            BotResourceType.PARTNER, partner.id, event, {"user_id": str(user_id)},
+            event_id=f"{event}:{partner.id}:{user_id}:{_tz.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MEMBERS,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dispatch_partner_post_created(post) -> None:
+    try:
+        from apps.bots.models import BotPermissionScope, BotResourceType
+        from apps.bots.services import dispatch_resource_event
+        from django.utils import timezone as _tz
+
+        dispatch_resource_event(
+            BotResourceType.PARTNER, post.partner_id, "post.created",
+            {
+                "post_id": str(post.id), "author_id": str(post.author_id),
+                "text": getattr(post, "text_plain", "") or getattr(post, "text_preview", "") or "",
+            },
+            event_id=f"post.created:{post.id}:{_tz.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MESSAGES,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dispatch_partner_comment_created(comment) -> None:
+    try:
+        from apps.bots.models import BotPermissionScope, BotResourceType
+        from apps.bots.services import dispatch_resource_event
+        from django.utils import timezone as _tz
+
+        dispatch_resource_event(
+            BotResourceType.PARTNER, comment.post.partner_id, "comment.created",
+            {
+                "comment_id": str(comment.id), "post_id": str(comment.post_id),
+                "author_id": str(comment.author_id), "text": getattr(comment, "text", "") or "",
+            },
+            event_id=f"comment.created:{comment.id}:{_tz.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MESSAGES,
+        )
+    except Exception:  # noqa: BLE001
+        pass

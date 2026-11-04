@@ -54,6 +54,8 @@ from .models import (
 
 SENSITIVE_ACTIONS = {
     "ban_member",
+    "remove_member",
+    "mute_member",
     "remove_admin",
     "change_ownership",
     "delete_content",
@@ -67,6 +69,10 @@ SENSITIVE_ACTIONS = {
 # an extra scope requirement beyond having an active grant at all.
 ACTION_REQUIRED_SCOPE = {
     "ban_member": BotPermissionScope.MODERATE,
+    "unban_member": BotPermissionScope.MODERATE,
+    "remove_member": BotPermissionScope.MODERATE,
+    "mute_member": BotPermissionScope.MODERATE,
+    "unmute_member": BotPermissionScope.MODERATE,
     "remove_admin": BotPermissionScope.MODERATE,
     "delete_content": BotPermissionScope.MODERATE,
     "change_ownership": BotPermissionScope.MANAGE_RESOURCE,
@@ -691,8 +697,140 @@ def _execute_ban_member(grant: BotResourceGrant, details: dict, actor: User) -> 
     return {"ban_id": ban.id, "user_id": str(user_id)}
 
 
+def _execute_unban_member(grant: BotResourceGrant, details: dict, actor: User) -> dict:
+    """Corrective (restores access, doesn't restrict it) - not in
+    SENSITIVE_ACTIONS, so this never queues an approval. Supports Group
+    and Community, mirroring each one's own unban() view exactly."""
+    user_id = details.get("user_id")
+    if not user_id:
+        raise ValidationError({"user_id": "user_id is required."})
+
+    if grant.resource_type == BotResourceType.GROUP:
+        from apps.groups.models import Group, GroupBan, GroupMembership
+
+        group = Group.objects.filter(id=grant.resource_id).first()
+        if not group:
+            raise ValidationError({"resource": "This group no longer exists."})
+        GroupBan.objects.filter(group=group, user_id=user_id).delete()
+        GroupMembership.objects.filter(group=group, user_id=user_id).update(
+            is_banned=False, left_at=None, joined_at=timezone.now(),
+        )
+        return {"user_id": str(user_id)}
+
+    if grant.resource_type == BotResourceType.COMMUNITY:
+        from apps.communities.models import Community, CommunityBan, CommunityMembership, CommunityMembershipStatus
+
+        community = Community.objects.filter(id=grant.resource_id).first()
+        if not community:
+            raise ValidationError({"resource": "This community no longer exists."})
+        CommunityBan.objects.filter(community=community, user_id=user_id).delete()
+        membership = CommunityMembership.objects.filter(
+            community=community, user_id=user_id, status=CommunityMembershipStatus.BANNED,
+        ).first()
+        if membership:
+            membership.status = CommunityMembershipStatus.LEFT
+            membership.is_banned = False
+            membership.save(update_fields=["status", "is_banned"])
+        return {"user_id": str(user_id)}
+
+    raise ValidationError({"action": "unban_member is only supported for Group and Community resources."})
+
+
+def _execute_remove_member(grant: BotResourceGrant, details: dict, actor: User) -> dict:
+    """Non-permanent removal - the member can rejoin later, unlike
+    ban_member. Supports Group and Community, mirroring each one's own
+    remove_member() view exactly (same fields, same ConversationMember
+    sync)."""
+    user_id = details.get("user_id")
+    if not user_id:
+        raise ValidationError({"user_id": "user_id is required."})
+    now = timezone.now()
+
+    if grant.resource_type == BotResourceType.GROUP:
+        from apps.chat.models import ConversationMember
+        from apps.groups.models import Group, GroupMembership, GroupRole
+
+        group = Group.objects.filter(id=grant.resource_id).select_related("conversation").first()
+        if not group:
+            raise ValidationError({"resource": "This group no longer exists."})
+        membership = GroupMembership.objects.filter(group=group, user_id=user_id, left_at__isnull=True).first()
+        if not membership:
+            raise ValidationError({"resource": "Member not found."})
+        if membership.role == GroupRole.OWNER:
+            raise ValidationError({"resource": "The owner cannot be removed."})
+        membership.left_at = now
+        membership.save(update_fields=["left_at"])
+        ConversationMember.objects.filter(
+            conversation=group.conversation, user_id=user_id, left_at__isnull=True,
+        ).update(left_at=now)
+        return {"user_id": str(user_id)}
+
+    if grant.resource_type == BotResourceType.COMMUNITY:
+        from apps.communities.models import Community, CommunityMembership, CommunityRole
+
+        community = Community.objects.filter(id=grant.resource_id).first()
+        if not community:
+            raise ValidationError({"resource": "This community no longer exists."})
+        membership = CommunityMembership.objects.active().filter(community=community, user_id=user_id).first()
+        if not membership:
+            raise ValidationError({"resource": "Member not found."})
+        if membership.role == CommunityRole.OWNER:
+            raise ValidationError({"resource": "The owner cannot be removed."})
+        membership.mark_removed()
+        from apps.chat.models import ConversationMember
+
+        conversation_ids = [cid for cid in (community.main_conversation_id, community.posts_conversation_id) if cid]
+        if conversation_ids:
+            ConversationMember.objects.filter(
+                conversation_id__in=conversation_ids, user_id=user_id, left_at__isnull=True,
+            ).update(left_at=now)
+        return {"user_id": str(user_id)}
+
+    raise ValidationError({"action": "remove_member is only supported for Group and Community resources."})
+
+
+def _execute_mute_member(grant: BotResourceGrant, details: dict, actor: User) -> dict:
+    """Partner-only - Group/Community have no mute concept today (do not
+    invent one). Mirrors moderate_member's own MUTE branch."""
+    if grant.resource_type != BotResourceType.PARTNER:
+        raise ValidationError({"action": "mute_member is only supported for Partner resources."})
+    user_id = details.get("user_id")
+    if not user_id:
+        raise ValidationError({"user_id": "user_id is required."})
+    from apps.partners.models import PartnerMembership
+
+    membership = PartnerMembership.objects.filter(partner_id=grant.resource_id, user_id=user_id).first()
+    if not membership:
+        raise ValidationError({"resource": "Partner membership not found."})
+    membership.is_muted = True
+    membership.muted_until = details.get("expires_at")
+    membership.save(update_fields=["is_muted", "muted_until"])
+    return {"user_id": str(user_id)}
+
+
+def _execute_unmute_member(grant: BotResourceGrant, details: dict, actor: User) -> dict:
+    if grant.resource_type != BotResourceType.PARTNER:
+        raise ValidationError({"action": "unmute_member is only supported for Partner resources."})
+    user_id = details.get("user_id")
+    if not user_id:
+        raise ValidationError({"user_id": "user_id is required."})
+    from apps.partners.models import PartnerMembership
+
+    membership = PartnerMembership.objects.filter(partner_id=grant.resource_id, user_id=user_id).first()
+    if not membership:
+        raise ValidationError({"resource": "Partner membership not found."})
+    membership.is_muted = False
+    membership.muted_until = None
+    membership.save(update_fields=["is_muted", "muted_until"])
+    return {"user_id": str(user_id)}
+
+
 ACTION_EXECUTORS = {
     "ban_member": _execute_ban_member,
+    "unban_member": _execute_unban_member,
+    "remove_member": _execute_remove_member,
+    "mute_member": _execute_mute_member,
+    "unmute_member": _execute_unmute_member,
 }
 
 
@@ -926,19 +1064,63 @@ def dispatch_bot_events_for_conversation(
     grants = BotResourceGrant.objects.filter(
         conversation_id=conversation_id, is_active=True,
     ).select_related("bot", "bot__webhook_subscription")
+    resource_keys_dispatched = set()
     for grant in grants:
         try:
             if grant_has_scope(grant, required_scope):
                 if dispatch_bot_event(grant, event, payload, event_id=f"{event_id}:{grant.id}"):
                     delivered += 1
-                from .workflow_engine import dispatch_event_to_workflows
+                # dispatch_event_to_workflows does its own per-workflow
+                # scope check, so one call per distinct (resource_type,
+                # resource_id) pair on this conversation is enough - a
+                # second grant on the same resource would just redo an
+                # already-idempotent dispatch.
+                key = (grant.resource_type, grant.resource_id)
+                if key not in resource_keys_dispatched:
+                    resource_keys_dispatched.add(key)
+                    from .workflow_engine import dispatch_event_to_workflows
 
-                dispatch_event_to_workflows(
-                    resource_type=grant.resource_type, resource_id=grant.resource_id,
-                    event=event, payload=payload, event_id=event_id,
-                )
+                    dispatch_event_to_workflows(
+                        resource_type=grant.resource_type, resource_id=grant.resource_id,
+                        event=event, payload=payload, event_id=event_id, required_scope=required_scope,
+                    )
         except Exception:  # noqa: BLE001
             continue
+    return delivered
+
+
+def dispatch_resource_event(
+    resource_type: str, resource_id, event: str, payload: dict, *, event_id: str, required_scope: str,
+) -> int:
+    """The non-conversation counterpart to dispatch_bot_events_for_
+    conversation — for events that have no backing chat Conversation at
+    all (a Channel post, a Community comment, My Feed entry, Channel/
+    Community/Partner membership). Matches grants directly by
+    (resource_type, resource_id) instead of conversation_id, then does
+    the exact same webhook-delivery + workflow-trigger fan-out. Never
+    raises - a publisher failure must never break the real user action
+    (posting, joining, commenting) that triggered it."""
+    delivered = 0
+    grants = BotResourceGrant.objects.filter(
+        resource_type=resource_type, resource_id=str(resource_id), is_active=True,
+    ).select_related("bot", "bot__webhook_subscription")
+    for grant in grants:
+        try:
+            if grant_has_scope(grant, required_scope):
+                if dispatch_bot_event(grant, event, payload, event_id=f"{event_id}:{grant.id}"):
+                    delivered += 1
+        except Exception:  # noqa: BLE001
+            continue
+
+    try:
+        from .workflow_engine import dispatch_event_to_workflows
+
+        dispatch_event_to_workflows(
+            resource_type=resource_type, resource_id=str(resource_id),
+            event=event, payload=payload, event_id=event_id, required_scope=required_scope,
+        )
+    except Exception:  # noqa: BLE001
+        pass
     return delivered
 
 

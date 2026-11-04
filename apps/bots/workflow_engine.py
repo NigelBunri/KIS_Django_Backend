@@ -37,6 +37,7 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
@@ -64,7 +65,16 @@ WORKFLOW_ABUSE_THRESHOLD = 5  # consecutive storm-detections before auto-pause
 CONDITION_OPS = {
     "equals", "not_equals", "contains", "not_contains",
     "starts_with", "ends_with", "in", "not_in",
+    "gt", "lt", "gte", "lte",
+    "is_empty", "is_not_empty",
+    "before", "after",
+    "within_last_minutes", "within_last_hours",
 }
+
+# Ops that describe the field itself rather than comparing it against a
+# second value - validate_definition must not require "value" for these,
+# and evaluate_conditions must not KeyError looking it up.
+CONDITION_OPS_WITHOUT_VALUE = {"is_empty", "is_not_empty"}
 
 ACTION_TYPES = {"send_message", "send_notification", "execute_action"}
 
@@ -82,8 +92,16 @@ def _validate_rule(rule: dict) -> None:
         raise ValidationError({"conditions": "Each rule needs a 'field'."})
     if op not in CONDITION_OPS:
         raise ValidationError({"conditions": f"Unsupported condition operator '{op}'."})
-    if "value" not in rule:
+    if op not in CONDITION_OPS_WITHOUT_VALUE and "value" not in rule:
         raise ValidationError({"conditions": "Each rule needs a 'value'."})
+    if op in ("within_last_minutes", "within_last_hours"):
+        # Accept a numeric string too (e.g. "15") - the mobile builder's
+        # value field is a plain text input, so being liberal here about
+        # what counts as "numeric" avoids rejecting a perfectly valid
+        # workflow just because JSON round-tripped it as a string.
+        window = _as_number(rule.get("value"))
+        if window is None or window <= 0:
+            raise ValidationError({"conditions": f"{op} needs a positive numeric 'value'."})
 
 
 def _validate_conditions(conditions: dict) -> None:
@@ -140,16 +158,102 @@ def validate_definition(definition: dict) -> dict:
     }
 
 
+def _validate_timezone(tz_name: str) -> str:
+    tz_name = (tz_name or "UTC").strip() or "UTC"
+    try:
+        ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001 - ZoneInfoNotFoundError / ValueError, both mean "bad name"
+        raise ValidationError({"trigger_config": f"'{tz_name}' is not a recognized timezone."})
+    return tz_name
+
+
 def validate_trigger_config(trigger_type: str, trigger_config: dict) -> dict:
     trigger_config = trigger_config or {}
-    if trigger_type == BotWorkflowTriggerType.SCHEDULE:
-        interval = trigger_config.get("interval_minutes")
-        if not isinstance(interval, int) or interval < 5 or interval > 10080:
+    if trigger_type != BotWorkflowTriggerType.SCHEDULE:
+        return {}
+
+    tz_name = _validate_timezone(trigger_config.get("timezone", "UTC"))
+    cron = trigger_config.get("cron")
+    if cron:
+        if not isinstance(cron, str) or len(cron.split()) != 5:
             raise ValidationError({
-                "trigger_config": "interval_minutes must be an integer between 5 and 10080 (one week).",
+                "trigger_config": "cron must be a 5-field crontab string: 'minute hour day_of_month month day_of_week'.",
             })
-        return {"interval_minutes": interval}
-    return {}
+        minute, hour, day_of_month, month_of_year, day_of_week = cron.split()
+        try:
+            from celery.schedules import crontab
+
+            parsed = crontab(
+                minute=minute, hour=hour, day_of_month=day_of_month,
+                month_of_year=month_of_year, day_of_week=day_of_week,
+            )
+        except Exception as exc:  # noqa: BLE001 - celery raises a bare ValueError on a bad cronspec
+            raise ValidationError({"trigger_config": f"Invalid cron expression: {exc}"})
+        # Re-serialize from celery's own parsed sets rather than storing the
+        # raw string verbatim - catches e.g. an out-of-range value celery
+        # silently wraps, and guarantees what gets stored is exactly what
+        # run_due_scheduled_workflows will later match against.
+        return {
+            "cron": cron, "timezone": tz_name,
+            "_parsed": {
+                "minute": sorted(parsed.minute), "hour": sorted(parsed.hour),
+                "day_of_month": sorted(parsed.day_of_month), "month_of_year": sorted(parsed.month_of_year),
+                "day_of_week": sorted(parsed.day_of_week),
+            },
+        }
+
+    interval = trigger_config.get("interval_minutes")
+    if not isinstance(interval, int) or interval < 5 or interval > 10080:
+        raise ValidationError({
+            "trigger_config": "Either provide 'cron' (a 5-field crontab string) or "
+                              "'interval_minutes' as an integer between 5 and 10080 (one week).",
+        })
+    return {"interval_minutes": interval, "timezone": tz_name}
+
+
+def is_schedule_due(trigger_config: dict, last_run_at, now) -> bool:
+    """Section 4's extended scheduler - supports both the original
+    fixed-interval mode and a new cron mode, both timezone-aware (DST
+    included, since zoneinfo converts correctly across transitions by
+    construction - there is no DST-specific branch to get wrong).
+
+    Duplicate protection: cron mode never fires twice for the same
+    localized (year, month, day, hour, minute) - comparing truncated-to-
+    the-minute timestamps rather than relying on the sweep interval
+    being exactly 60s. Missed schedules: if the sweep itself didn't run
+    for a while (worker down), a cron schedule simply waits for its next
+    matching minute rather than firing a backlog - documented, not a
+    silent bug - and an interval schedule fires on the very next sweep
+    once the elapsed time exceeds the interval, so it "catches up"
+    immediately rather than waiting a full extra interval."""
+    tz_name = trigger_config.get("timezone") or "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001
+        tz = ZoneInfo("UTC")
+
+    cron = trigger_config.get("cron")
+    if cron:
+        parsed = trigger_config.get("_parsed") or {}
+        local_now = now.astimezone(tz).replace(second=0, microsecond=0)
+        if last_run_at is not None:
+            local_last = last_run_at.astimezone(tz).replace(second=0, microsecond=0)
+            if local_last == local_now:
+                return False
+        return (
+            local_now.minute in set(parsed.get("minute", range(60)))
+            and local_now.hour in set(parsed.get("hour", range(24)))
+            and local_now.day in set(parsed.get("day_of_month", range(1, 32)))
+            and local_now.month in set(parsed.get("month_of_year", range(1, 13)))
+            and (local_now.isoweekday() % 7) in set(parsed.get("day_of_week", range(7)))
+        )
+
+    interval = int(trigger_config.get("interval_minutes") or 0)
+    if interval <= 0:
+        return False
+    if last_run_at is None:
+        return True
+    return (now - last_run_at).total_seconds() >= interval * 60
 
 
 # ---------------------------------------------------------------------
@@ -159,20 +263,44 @@ def validate_trigger_config(trigger_type: str, trigger_config: dict) -> dict:
 
 def build_event_context(trigger_type: str, payload: dict) -> dict:
     payload = payload or {}
-    if trigger_type == BotWorkflowTriggerType.MESSAGE_CREATED:
-        return {
+    received_at = timezone.now().isoformat()
+    if trigger_type in (BotWorkflowTriggerType.MESSAGE_CREATED, BotWorkflowTriggerType.MESSAGE_EDITED):
+        context = {
             "message": {"text": payload.get("text") or ""},
             "sender": {"id": str(payload.get("senderId") or payload.get("sender_id") or "")},
             "subject_user_id": str(payload.get("senderId") or payload.get("sender_id") or ""),
         }
-    if trigger_type in (BotWorkflowTriggerType.MEMBER_JOINED, BotWorkflowTriggerType.MEMBER_LEFT):
-        return {
+    elif trigger_type in (BotWorkflowTriggerType.MEMBER_JOINED, BotWorkflowTriggerType.MEMBER_LEFT):
+        context = {
             "member": {"id": str(payload.get("user_id") or "")},
             "subject_user_id": str(payload.get("user_id") or ""),
         }
-    if trigger_type == BotWorkflowTriggerType.SCHEDULE:
-        return {"schedule": {"ran_at": timezone.now().isoformat()}}
-    return dict(payload)
+    elif trigger_type == BotWorkflowTriggerType.POST_CREATED:
+        context = {
+            "post": {
+                "id": str(payload.get("post_id") or ""),
+                "title": payload.get("title") or "",
+                "text": payload.get("text") or "",
+            },
+            "author": {"id": str(payload.get("author_id") or "")},
+            "subject_user_id": str(payload.get("author_id") or ""),
+        }
+    elif trigger_type == BotWorkflowTriggerType.COMMENT_CREATED:
+        context = {
+            "comment": {"id": str(payload.get("comment_id") or ""), "text": payload.get("text") or ""},
+            "post": {"id": str(payload.get("post_id") or "")},
+            "author": {"id": str(payload.get("author_id") or "")},
+            "subject_user_id": str(payload.get("author_id") or ""),
+        }
+    elif trigger_type == BotWorkflowTriggerType.SCHEDULE:
+        context = {"schedule": {"ran_at": received_at}}
+    else:
+        context = dict(payload)
+    # Always available regardless of trigger_type - the anchor
+    # "within_last_minutes"/"before"/"after" conditions compare other
+    # timestamp fields against (section 3's time-window helpers).
+    context["received_at"] = received_at
+    return context
 
 
 def _get_field(context: dict, dotted_field: str) -> Any:
@@ -184,23 +312,100 @@ def _get_field(context: dict, dotted_field: str) -> Any:
     return node
 
 
+def _as_number(value: Any) -> float | None:
+    """Safe numeric coercion - section 3's "safe handling of missing or
+    incorrectly typed fields": a gt/lt/gte/lte against a field that
+    turns out to be missing, a string, a dict, etc. must evaluate to
+    False, never raise and crash the execution worker."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _as_datetime(value: Any):
+    """Safe ISO-8601 parsing - returns None (never raises) for anything
+    that isn't a recognizable datetime, same safety guarantee as
+    _as_number above."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        from django.utils.dateparse import parse_datetime
+
+        parsed = parse_datetime(value.strip())
+    except Exception:  # noqa: BLE001
+        return None
+    if parsed is None:
+        return None
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed, timezone.utc)
+    return parsed
+
+
+def _is_empty_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (str, list, dict, tuple, set)):
+        return len(value) == 0
+    return False
+
+
 def _apply_op(actual: Any, op: str, expected: Any) -> bool:
-    if op == "equals":
-        return actual == expected
-    if op == "not_equals":
-        return actual != expected
-    if op == "contains":
-        return isinstance(actual, str) and isinstance(expected, str) and expected.lower() in actual.lower()
-    if op == "not_contains":
-        return not (isinstance(actual, str) and isinstance(expected, str) and expected.lower() in actual.lower())
-    if op == "starts_with":
-        return isinstance(actual, str) and isinstance(expected, str) and actual.lower().startswith(expected.lower())
-    if op == "ends_with":
-        return isinstance(actual, str) and isinstance(expected, str) and actual.lower().endswith(expected.lower())
-    if op == "in":
-        return isinstance(expected, list) and actual in expected
-    if op == "not_in":
-        return not (isinstance(expected, list) and actual in expected)
+    try:
+        if op == "equals":
+            return actual == expected
+        if op == "not_equals":
+            return actual != expected
+        if op == "contains":
+            return isinstance(actual, str) and isinstance(expected, str) and expected.lower() in actual.lower()
+        if op == "not_contains":
+            return not (isinstance(actual, str) and isinstance(expected, str) and expected.lower() in actual.lower())
+        if op == "starts_with":
+            return isinstance(actual, str) and isinstance(expected, str) and actual.lower().startswith(expected.lower())
+        if op == "ends_with":
+            return isinstance(actual, str) and isinstance(expected, str) and actual.lower().endswith(expected.lower())
+        if op == "in":
+            return isinstance(expected, list) and actual in expected
+        if op == "not_in":
+            return not (isinstance(expected, list) and actual in expected)
+        if op == "is_empty":
+            return _is_empty_value(actual)
+        if op == "is_not_empty":
+            return not _is_empty_value(actual)
+        if op in ("gt", "lt", "gte", "lte"):
+            actual_num, expected_num = _as_number(actual), _as_number(expected)
+            if actual_num is None or expected_num is None:
+                return False
+            if op == "gt":
+                return actual_num > expected_num
+            if op == "lt":
+                return actual_num < expected_num
+            if op == "gte":
+                return actual_num >= expected_num
+            return actual_num <= expected_num
+        if op in ("before", "after"):
+            actual_dt, expected_dt = _as_datetime(actual), _as_datetime(expected)
+            if actual_dt is None or expected_dt is None:
+                return False
+            return actual_dt < expected_dt if op == "before" else actual_dt > expected_dt
+        if op in ("within_last_minutes", "within_last_hours"):
+            actual_dt = _as_datetime(actual)
+            window = _as_number(expected)
+            if actual_dt is None or window is None:
+                return False
+            seconds = window * 60 if op == "within_last_minutes" else window * 3600
+            delta = (timezone.now() - actual_dt).total_seconds()
+            return 0 <= delta <= seconds
+    except Exception:  # noqa: BLE001
+        # Any unexpected shape (e.g. a dict where a string was expected)
+        # must fail the condition, never crash the worker evaluating it.
+        return False
     return False
 
 
@@ -209,9 +414,12 @@ def evaluate_conditions(conditions: dict, context: dict) -> bool:
         return True
     op = conditions.get("op", "AND")
     results = [
-        _apply_op(_get_field(context, rule["field"]), rule["op"], rule["value"])
+        _apply_op(_get_field(context, rule.get("field", "")), rule.get("op", ""), rule.get("value"))
         for rule in conditions["rules"]
+        if isinstance(rule, dict)
     ]
+    if not results:
+        return True
     return all(results) if op == "AND" else any(results)
 
 
@@ -419,18 +627,28 @@ def run_workflow(workflow: BotWorkflow, *, event: str, event_id: str, payload: d
         _release_workflow_lock(workflow.id)
 
 
-def dispatch_event_to_workflows(*, resource_type: str, resource_id: str, event: str, payload: dict, event_id: str) -> int:
+def dispatch_event_to_workflows(
+    *, resource_type: str, resource_id: str, event: str, payload: dict, event_id: str,
+    required_scope: str | None = None,
+) -> int:
     """Entry point called from apps.bots.services.dispatch_bot_events_for_
     conversation (messages, on the critical message-send path) and from
-    the new membership-event publishers (apps.groups). Finds every
-    matching ACTIVE workflow and hands each one to Celery
-    (tasks.run_workflow_task) rather than running it inline — the actual
-    "asynchronous execution using the existing Celery/Redis
-    infrastructure" requirement: the caller (a message send, a group
-    join) must never be slowed down by however long a workflow's own
-    actions take. Returns the number of workflows ENQUEUED, not the
-    number that finished running (that's in BotWorkflowRun once each
-    task completes)."""
+    apps.bots.services.dispatch_resource_event (every non-conversation
+    event: member/post/comment publishers across Groups/Channels/
+    Communities/Partners/My Feed). Finds every matching ACTIVE workflow
+    and hands each one to Celery (tasks.run_workflow_task) rather than
+    running it inline — the actual "asynchronous execution using the
+    existing Celery/Redis infrastructure" requirement: the caller (a
+    message send, a group join) must never be slowed down by however
+    long a workflow's own actions take. Returns the number of workflows
+    ENQUEUED, not the number that finished running (that's in
+    BotWorkflowRun once each task completes).
+
+    required_scope re-checks that the MATCHING workflow's own grant (not
+    just whichever grant the caller happened to be iterating) actually
+    holds the scope this event requires — a workflow must never react to
+    something its own resource grant isn't scoped to see, independent of
+    how many other grants/bots exist on the same resource."""
     if event not in BotWorkflowTriggerType.values:
         return 0
     from .tasks import run_workflow_task
@@ -441,18 +659,22 @@ def dispatch_event_to_workflows(*, resource_type: str, resource_id: str, event: 
         resource_grant__resource_type=resource_type,
         resource_grant__resource_id=str(resource_id),
         resource_grant__is_active=True,
-    )
+    ).select_related("resource_grant")
     sender_id = str(payload.get("senderId") or payload.get("sender_id") or "")
-    if event == BotWorkflowTriggerType.MESSAGE_CREATED and sender_id:
-        # The single most direct infinite-loop guard: a bot's own
-        # send_message action re-enters this exact event (the bot's
-        # message goes through the normal Nest send path, which fires
-        # message.created like any other message) - a workflow must
-        # never react to a message its own bot just sent. The storm/
-        # rate-limit protection in run_workflow is the second, broader
-        # safety net for every other recursion shape.
-        candidates = candidates.exclude(bot_id=sender_id)
-    workflow_ids = list(candidates.values_list("id", flat=True))
+    workflow_ids = []
+    for workflow in candidates:
+        if required_scope and required_scope not in (workflow.resource_grant.scopes or []):
+            continue
+        if event in (BotWorkflowTriggerType.MESSAGE_CREATED, BotWorkflowTriggerType.MESSAGE_EDITED) and sender_id and str(workflow.bot_id) == sender_id:
+            # The single most direct infinite-loop guard: a bot's own
+            # send_message action re-enters this exact event (the bot's
+            # message goes through the normal Nest send path, which fires
+            # message.created like any other message) - a workflow must
+            # never react to a message its own bot just sent. The storm/
+            # rate-limit protection in run_workflow is the second, broader
+            # safety net for every other recursion shape.
+            continue
+        workflow_ids.append(workflow.id)
     for workflow_id in workflow_ids:
         run_workflow_task.delay(str(workflow_id), event, f"{event_id}:{workflow_id}", payload)
     return len(workflow_ids)

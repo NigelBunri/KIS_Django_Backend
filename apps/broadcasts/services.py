@@ -44,3 +44,64 @@ def cleanup_expired_broadcast_items() -> int:
     if expired_count:
         expired_qs.delete()
     return expired_count
+
+
+# ---------------------------------------------------------------------
+# KIS Bot Platform (Phase 2 gap-closing) — event publishers for
+# Channels (post.created, member.joined on free-tier activation) and
+# My Feed (post.created). Plain Django calls, never touching Nest.
+# Never raise: a publisher failure must never break the real post/join
+# action that triggered it.
+# ---------------------------------------------------------------------
+
+def dispatch_channel_post_created(content) -> None:
+    try:
+        from apps.bots.models import BotPermissionScope, BotResourceType
+        from apps.bots.services import dispatch_resource_event
+        from django.utils import timezone as _tz
+
+        dispatch_resource_event(
+            BotResourceType.CHANNEL, content.channel_id, "post.created",
+            {
+                "post_id": str(content.id), "author_id": str(content.created_by_id or ""),
+                "title": getattr(content, "title", "") or "", "text": getattr(content, "text_plain", "") or "",
+            },
+            event_id=f"post.created:{content.id}:{_tz.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MESSAGES,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dispatch_channel_member_event(channel_id, user_id, event: str) -> None:
+    try:
+        from apps.bots.models import BotPermissionScope, BotResourceType
+        from apps.bots.services import dispatch_resource_event
+        from django.utils import timezone as _tz
+
+        dispatch_resource_event(
+            BotResourceType.CHANNEL, channel_id, event, {"user_id": str(user_id)},
+            event_id=f"{event}:{channel_id}:{user_id}:{_tz.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MEMBERS,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dispatch_feed_post_created(user_id, feed_entry: dict) -> None:
+    try:
+        from apps.bots.models import BotPermissionScope, BotResourceType
+        from apps.bots.services import dispatch_resource_event
+        from django.utils import timezone as _tz
+
+        dispatch_resource_event(
+            BotResourceType.FEED_PROFILE, user_id, "post.created",
+            {
+                "post_id": str(feed_entry.get("id") or ""), "author_id": str(user_id),
+                "title": feed_entry.get("title") or "", "text": feed_entry.get("summary") or "",
+            },
+            event_id=f"post.created:{feed_entry.get('id')}:{_tz.now().timestamp()}",
+            required_scope=BotPermissionScope.READ_MESSAGES,
+        )
+    except Exception:  # noqa: BLE001
+        pass

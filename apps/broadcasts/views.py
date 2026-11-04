@@ -16944,7 +16944,9 @@ class ChannelContentPublishView(APIView):
             metadata={'title': content.title, 'content_type': content.content_type},
         )
         from apps.broadcasts.realtime import notify_channel_content_published
+        from apps.broadcasts.services import dispatch_channel_post_created
         notify_channel_content_published(content)
+        dispatch_channel_post_created(content)
         return Response(ChannelContentDetailSerializer(content, context={"request": request}).data)
 
 
@@ -19105,6 +19107,9 @@ class BroadcastFeedEntriesView(APIView):
         profile['updated_at'] = timezone.now().isoformat()
         profiles['broadcast_feed'] = profile
         _save_user_profiles(request.user, profiles)
+        from apps.broadcasts.services import dispatch_feed_post_created
+
+        dispatch_feed_post_created(request.user.id, feed_entry)
         normalized_entry = _normalize_feed_entry(request, feed_entry)
         return Response(
             {'profile': profile, 'feeds': [_normalize_feed_entry(request, item) for item in feeds], 'feed': normalized_entry},
@@ -23036,6 +23041,10 @@ class ChannelMembershipView(APIView):
                 )
             except Exception:
                 logger.warning("Membership notification failed for user_id=%s channel_id=%s", request.user.id, channel.id)
+            if created:
+                from apps.broadcasts.services import dispatch_channel_member_event
+
+                dispatch_channel_member_event(channel.id, request.user.id, "member.joined")
             return Response({"joined": True, "tier_id": str(tier.id), "created": created}, status=201 if created else 200)
 
     def delete(self, request, channel_id):
@@ -23045,6 +23054,9 @@ class ChannelMembershipView(APIView):
         if tier_id:
             qs = qs.filter(tier_id=tier_id)
         qs.update(status=ChannelMembership.Status.CANCELLED)
+        from apps.broadcasts.services import dispatch_channel_member_event
+
+        dispatch_channel_member_event(channel.id, request.user.id, "member.left")
         return Response({"cancelled": True})
 
 
