@@ -334,6 +334,8 @@ class BotActivityAction(models.TextChoices):
     WORKFLOW_RESUMED = "workflow_resumed", "Workflow resumed"
     WORKFLOW_DELETED = "workflow_deleted", "Workflow deleted"
     WORKFLOW_RUN_FAILED = "workflow_run_failed", "Workflow run failed"
+    AI_DECISION_MADE = "ai_decision_made", "AI selected action(s)"
+    AI_DECISION_FAILED = "ai_decision_failed", "AI decision failed"
 
 
 class BotActivityLog(models.Model):
@@ -541,4 +543,42 @@ class BotWorkflowRun(models.Model):
         indexes = [
             models.Index(fields=["workflow", "-started_at"]),
             models.Index(fields=["status", "-started_at"]),
+        ]
+
+
+class BotAIUsageLogStatus(models.TextChoices):
+    SUCCESS = "success", "Success"
+    ERROR = "error", "Error"
+
+
+class BotAIUsageLog(models.Model):
+    """Phase 3 — one row per AI-decision call, giving the bot owner the
+    "clear AI usage visibility, error reporting and cost/usage
+    information" the feature requires. provider/model are denormalized
+    (copied from BotAIConnection at call time) so this history survives
+    the owner later reconnecting a different provider or deleting the
+    connection entirely. Token counts are best-effort - not every
+    provider response includes them, and KIS does not compute a dollar
+    cost here (pricing varies by provider/model and changes over time;
+    surfacing raw token/request counts is honest, a fabricated $ figure
+    would not be)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    bot = models.ForeignKey(Bot, on_delete=models.CASCADE, related_name="ai_usage_log")
+    workflow = models.ForeignKey(BotWorkflow, on_delete=models.SET_NULL, null=True, blank=True, related_name="ai_usage_log")
+    workflow_run = models.ForeignKey(BotWorkflowRun, on_delete=models.SET_NULL, null=True, blank=True, related_name="ai_usage_log")
+    provider = models.CharField(max_length=20, choices=BotAIProvider.choices)
+    model = models.CharField(max_length=120, blank=True, default="")
+    status = models.CharField(max_length=10, choices=BotAIUsageLogStatus.choices)
+    selected_indices = models.JSONField(default=list, blank=True)
+    error_message = models.TextField(blank=True, default="")
+    prompt_tokens = models.PositiveIntegerField(null=True, blank=True)
+    completion_tokens = models.PositiveIntegerField(null=True, blank=True)
+    latency_ms = models.PositiveIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "bots_ai_usage_log"
+        indexes = [
+            models.Index(fields=["bot", "-created_at"]),
         ]

@@ -5,6 +5,7 @@ from .models import (
     Bot,
     BotActivityLog,
     BotAIConnection,
+    BotAIUsageLog,
     BotApprovalRequest,
     BotCredential,
     BotResourceGrant,
@@ -95,6 +96,22 @@ class BotActivityLogSerializer(serializers.ModelSerializer):
 
     def get_actor_display_name(self, obj):
         return getattr(obj.actor, "display_name", None) if obj.actor_id else None
+
+
+class BotAIUsageLogSerializer(serializers.ModelSerializer):
+    workflow_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BotAIUsageLog
+        fields = [
+            "id", "workflow", "workflow_name", "workflow_run", "provider", "model", "status",
+            "selected_indices", "error_message", "prompt_tokens", "completion_tokens",
+            "latency_ms", "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_workflow_name(self, obj):
+        return obj.workflow.name if obj.workflow_id else None
 
 
 class BotApprovalRequestSerializer(serializers.ModelSerializer):

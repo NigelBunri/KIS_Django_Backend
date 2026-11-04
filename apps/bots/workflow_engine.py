@@ -144,17 +144,35 @@ def _validate_actions(actions: list, *, key: str) -> None:
             raise ValidationError({key: "send_notification requires non-empty params.body."})
 
 
+MAX_AI_INSTRUCTIONS_LEN = 2000
+
+
+def _validate_ai_decision(ai_decision: dict, then_actions: list) -> dict:
+    if not isinstance(ai_decision, dict):
+        raise ValidationError({"ai_decision": "ai_decision must be an object."})
+    enabled = bool(ai_decision.get("enabled", False))
+    if enabled and not then_actions:
+        raise ValidationError({
+            "ai_decision": "ai_decision.enabled requires at least one then_actions entry for the AI to choose from.",
+        })
+    instructions = str(ai_decision.get("instructions") or "")[:MAX_AI_INSTRUCTIONS_LEN]
+    return {"enabled": enabled, "instructions": instructions}
+
+
 def validate_definition(definition: dict) -> dict:
     if not isinstance(definition, dict):
         raise ValidationError({"definition": "definition must be an object."})
     conditions = definition.get("conditions", {})
     _validate_conditions(conditions)
-    _validate_actions(definition.get("then_actions", []), key="then_actions")
+    then_actions = definition.get("then_actions", [])
+    _validate_actions(then_actions, key="then_actions")
     _validate_actions(definition.get("else_actions", []), key="else_actions")
+    ai_decision = _validate_ai_decision(definition.get("ai_decision") or {}, then_actions)
     return {
         "conditions": conditions,
-        "then_actions": definition.get("then_actions", []),
+        "then_actions": then_actions,
         "else_actions": definition.get("else_actions", []),
+        "ai_decision": ai_decision,
     }
 
 
@@ -587,6 +605,37 @@ def run_workflow(workflow: BotWorkflow, *, event: str, event_id: str, payload: d
         actions = workflow.definition.get("then_actions" if condition_result else "else_actions") or []
 
         steps: list[dict] = []
+
+        # Phase 3 — AI-assisted action selection. Only ever applies to
+        # the then_actions branch: the AI filters DOWN the owner's own
+        # pre-approved actions, it never adds to or replaces them, and
+        # any failure here means NO action runs at all (fail safe, never
+        # fail open) - see apps.bots.ai_decision's module docstring.
+        ai_decision_cfg = (workflow.definition.get("ai_decision") or {}) if condition_result else {}
+        if ai_decision_cfg.get("enabled") and actions:
+            connection = getattr(bot, "ai_connection", None)
+            if not connection or not connection.is_active:
+                return _finish(
+                    BotWorkflowRunStatus.FAILED,
+                    error="AI decision mode is enabled but this bot has no active AI connection configured.",
+                    condition_result=condition_result,
+                )
+            from . import ai_decision as ai_decision_module
+
+            try:
+                selected_indices = ai_decision_module.select_candidate_actions(
+                    bot=bot, connection=connection, workflow=workflow, run=run, context=context,
+                    candidate_actions=actions, instructions=str(ai_decision_cfg.get("instructions") or ""),
+                )
+            except Exception as exc:  # noqa: BLE001 - an AI/provider failure must never execute an unintended action
+                return _finish(
+                    BotWorkflowRunStatus.FAILED, error=f"AI decision failed: {str(exc)[:400]}",
+                    steps=[{"action": "ai_decision", "status": "error", "error": str(exc)[:300]}],
+                    condition_result=condition_result,
+                )
+            steps.append({"action": "ai_decision", "status": "ok", "selected_indices": selected_indices})
+            actions = [actions[i] for i in selected_indices]
+
         deadline = timezone.now() + timedelta(seconds=RUN_WALL_CLOCK_BUDGET_SECONDS)
         for action in actions:
             if timezone.now() > deadline:

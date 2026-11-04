@@ -22,6 +22,7 @@ from .permissions import IsBotCredential
 from .serializers import (
     BotActivityLogSerializer,
     BotAIConnectionSerializer,
+    BotAIUsageLogSerializer,
     BotApprovalRequestSerializer,
     BotCreateSerializer,
     BotCredentialSerializer,
@@ -244,6 +245,31 @@ class BotViewSet(viewsets.ViewSet):
         bot = _owned_bot_or_404(request.user, pk)
         logs = bot.activity_log.order_by("-created_at")[:200]
         return Response(BotActivityLogSerializer(logs, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path="ai-usage")
+    def ai_usage(self, request, pk=None):
+        """Phase 3's usage-visibility surface: recent AI-decision calls
+        plus simple aggregate counts/token totals. Deliberately no
+        dollar-cost figure - provider pricing varies and changes, so a
+        hardcoded conversion here would be misleading rather than
+        informative; token/request counts are the honest version of
+        this."""
+        from django.db.models import Count, Q, Sum
+
+        from .models import BotAIUsageLogStatus
+
+        bot = _owned_bot_or_404(request.user, pk)
+        logs = bot.ai_usage_log.order_by("-created_at")[:200]
+        aggregates = bot.ai_usage_log.aggregate(
+            total_calls=Count("id"),
+            error_calls=Count("id", filter=Q(status=BotAIUsageLogStatus.ERROR)),
+            total_prompt_tokens=Sum("prompt_tokens"),
+            total_completion_tokens=Sum("completion_tokens"),
+        )
+        return Response({
+            "summary": aggregates,
+            "recent": BotAIUsageLogSerializer(logs, many=True).data,
+        })
 
     @action(detail=True, methods=["get"], url_path="approvals")
     def approvals(self, request, pk=None):
