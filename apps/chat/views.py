@@ -47,7 +47,12 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
-from .services import allocate_conversation_seq, get_or_create_direct_conversation, user_is_active_member
+from .services import (
+    allocate_conversation_seq,
+    get_or_create_direct_conversation,
+    user_is_active_member,
+    HIDDEN_FROM_MESSAGES_TAB_Q,
+)
 from apps.notifications.realtime import notify_main_tab_badges_updated
 
 from apps.accounts.models import User
@@ -267,32 +272,11 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if self.action == "list":
             qs = qs.exclude(type=ConversationType.POST)
             qs = qs.exclude(type=ConversationType.THREAD)
-            qs = qs.exclude(
-                Q(group__partner__isnull=False)
-                | Q(group__community__partner__isnull=False)
-                | Q(channel__partner__isnull=False)
-                | Q(channel__community__partner__isnull=False)
-                | Q(community_main__partner__isnull=False)
-                | Q(community_posts__partner__isnull=False)
-                | Q(partner_main__isnull=False)
-                # A course's own "classroom" group chat (see KIS's
-                # courseGroupChat.ts — one persistent group per course,
-                # found by the deterministic slug "edu-course-{courseId}")
-                # is reachable only from the course itself or its live-class
-                # tab, the same way a partner-channel conversation above is
-                # reachable only from Partners — never from the main
-                # Messages tab.
-                | Q(group__slug__startswith="edu-course-")
-                # Same principle for the 24 permanent Prayer Watch rooms
-                # (apps.prayer.provisioning — slug "prayer-watch-{hour:02d}"):
-                # reachable only from the Bible section's Prayer Calendar
-                # tab, never surfaced in the main Messages chat list, even
-                # though self-joining one (apps.prayer's open join_policy,
-                # required for the call/text buttons to work at all — see
-                # PrayerWatchRoomScreen.tsx's ensureWatchGroupMembership)
-                # creates a completely ordinary GroupMembership underneath.
-                | Q(group__slug__startswith="prayer-watch-")
-            )
+            # Shared with apps.notifications.badge_counts (see
+            # HIDDEN_FROM_MESSAGES_TAB_Q's docstring in chat/services.py) so
+            # the Messages tab-bar badge can never count an unread message
+            # from a conversation the Messages tab itself would never show.
+            qs = qs.exclude(HIDDEN_FROM_MESSAGES_TAB_Q)
         q = (self.request.query_params.get('q') or self.request.query_params.get('search') or '').strip()
         if q:
             qs = qs.filter(

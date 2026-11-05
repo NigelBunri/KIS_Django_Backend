@@ -7,6 +7,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from apps.chat.models import ConversationMember, ConversationNotificationLevel, ConversationType
+from apps.chat.services import partner_conversation_q, non_partner_hidden_conversation_q
 from apps.notifications.models import Notification
 
 
@@ -87,32 +88,26 @@ def _notification_text_filter(tokens: Iterable[str]) -> Q:
 
 
 def _conversation_unread_counts(user) -> tuple[int, int]:
-    partner_conversation_ids = set()
-    try:
-        from apps.partners.models import Partner
-
-        partner_conversation_ids.update(
-            str(value)
-            for value in Partner.objects.filter(main_conversation__memberships__user=user, main_conversation__memberships__left_at__isnull=True)
-            .exclude(main_conversation_id__isnull=True)
-            .values_list("main_conversation_id", flat=True)
-        )
-    except Exception:
-        partner_conversation_ids = set()
-
-    try:
-        from apps.channels.models import Channel
-
-        partner_conversation_ids.update(
-            str(value)
-            for value in Channel.objects.filter(
-                partner__isnull=False,
-                conversation__memberships__user=user,
-                conversation__memberships__left_at__isnull=True,
-            ).values_list("conversation_id", flat=True)
-        )
-    except Exception:
-        pass
+    # Every relation path here must stay in lock-step with
+    # ConversationViewSet.get_queryset()'s own Messages-tab exclusions -
+    # see apps.chat.services.hidden_from_messages_tab_q's docstring.
+    # Building the partner-conversation id set from that SAME Q object
+    # (rather than a hand-rolled, independently-maintained subset of it -
+    # the previous version only covered Partner.main_conversation and a
+    # partner-owned Channel's conversation, missing partner-owned Group/
+    # Community conversations entirely) is what keeps this badge from ever
+    # counting an unread message in a conversation the Messages tab would
+    # never show. That was the bug: such a conversation's unread count
+    # leaked into message_unread, so the Messages badge looked permanently
+    # stuck even once everything actually visible in the Messages tab had
+    # been read - there was nothing there for the user to open and clear
+    # it with.
+    partner_conversation_ids = {
+        str(value)
+        for value in ConversationMember.objects.filter(user=user, left_at__isnull=True, is_hidden=False)
+        .filter(partner_conversation_q("conversation"))
+        .values_list("conversation_id", flat=True)
+    }
 
     message_unread = 0
     partner_unread = 0
@@ -122,6 +117,11 @@ def _conversation_unread_counts(user) -> tuple[int, int]:
         .exclude(notification_level=ConversationNotificationLevel.NONE)
         .exclude(conversation__type=ConversationType.POST)
         .exclude(conversation__type=ConversationType.THREAD)
+        # Hidden from the Messages tab for a non-Partner reason (course
+        # classroom chats, Prayer Watch rooms) - must not count toward
+        # ANY main-tab badge, since neither Messages nor Partners will
+        # ever surface them for the user to read and clear.
+        .exclude(non_partner_hidden_conversation_q("conversation"))
         .only("last_read_seq", "conversation_id", "conversation__last_message_seq", "conversation__type")
     )
 
