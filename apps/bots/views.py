@@ -32,6 +32,7 @@ from .serializers import (
     BotMemoryEntrySerializer,
     BotResourceGrantSerializer,
     BotSerializer,
+    BotWebhookDeliverySerializer,
     BotWebhookSubscriptionSerializer,
     BotWorkflowCreateSerializer,
     BotWorkflowRunSerializer,
@@ -214,6 +215,18 @@ class BotViewSet(viewsets.ViewSet):
         subscription.secret = _generate_webhook_secret()
         subscription.save(update_fields=["secret"])
         return Response(BotWebhookSubscriptionSerializer(subscription, context={"reveal_secret": True}).data)
+
+    @action(detail=True, methods=["get"], url_path="webhook/deliveries")
+    def webhook_deliveries(self, request, pk=None):
+        bot = _owned_bot_or_404(request.user, pk)
+        deliveries = services.list_webhook_deliveries(bot, request.user)[:200]
+        return Response(BotWebhookDeliverySerializer(deliveries, many=True).data)
+
+    @action(detail=True, methods=["post"], url_path="webhook/deliveries/(?P<delivery_id>[^/.]+)/retry")
+    def webhook_delivery_retry(self, request, pk=None, delivery_id=None):
+        bot = _owned_bot_or_404(request.user, pk)
+        delivery = services.retry_webhook_delivery(bot, request.user, delivery_id)
+        return Response(BotWebhookDeliverySerializer(delivery).data)
 
     # ---- Optional AI connection ----
 
@@ -467,6 +480,81 @@ class BotApprovalDecisionView(APIView):
         approve = bool(request.data.get("approve"))
         approval = services.decide_approval(approval, request.user, approve)
         return Response(BotApprovalRequestSerializer(approval).data)
+
+
+class BotOverviewView(APIView):
+    """Phase 5 — GET /api/v1/bots/overview/. The owner's dashboard
+    landing data: counts/recent-activity across every bot THIS user
+    owns. Not bot-id-scoped (that's the whole point - it's the summary
+    across all of them), so it lives outside BotViewSet."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(services.get_owner_dashboard_overview(request.user))
+
+
+def _parse_analytics_filters(request) -> dict:
+    from django.utils.dateparse import parse_datetime
+
+    filters = {}
+    for key in ("bot_id", "workflow_id", "event_type"):
+        value = request.query_params.get(key)
+        if value:
+            filters[key] = value
+    run_status = request.query_params.get("status")
+    if run_status:
+        filters["run_status"] = run_status
+    for key in ("date_from", "date_to"):
+        raw = request.query_params.get(key)
+        if raw:
+            parsed = parse_datetime(raw) or parse_datetime(f"{raw}T00:00:00")
+            if parsed:
+                filters[key] = parsed
+    return filters
+
+
+class BotAnalyticsView(APIView):
+    """Phase 5 — GET /api/v1/bots/analytics/?date_from=&date_to=&bot_id=
+    &workflow_id=&event_type=&status=. Owner-scoped only - same
+    ownership boundary as BotOverviewView."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        filters = _parse_analytics_filters(request)
+        return Response(services.get_owner_analytics(request.user, filters))
+
+
+class BotAnalyticsExportView(APIView):
+    """Phase 5 — GET /api/v1/bots/analytics/export/ — same filters
+    and same ownership scoping as BotAnalyticsView (a CSV export must
+    never be able to see more than the on-screen dashboard already
+    allows). One row per workflow run."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        import csv
+        import io
+
+        from django.http import HttpResponse
+
+        filters = _parse_analytics_filters(request)
+        rows = services.get_owner_analytics_rows(request.user, filters)
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["run_id", "bot_name", "workflow_name", "trigger_event", "status", "started_at", "finished_at", "error_message"])
+        for run in rows:
+            writer.writerow([
+                str(run.id), run.workflow.bot.name, run.workflow.name, run.trigger_event,
+                run.status, run.started_at.isoformat() if run.started_at else "",
+                run.finished_at.isoformat() if run.finished_at else "", (run.error_message or "")[:500],
+            ])
+        response = HttpResponse(buf.getvalue(), content_type="text/csv")
+        response["Content-Disposition"] = 'attachment; filename="bot_platform_analytics.csv"'
+        return response
 
 
 # ---------------------------------------------------------------------

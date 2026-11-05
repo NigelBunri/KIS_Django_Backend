@@ -62,6 +62,13 @@ from admin_control.views import (
     AdminRevenueStatsView,
     AdminEngagementStatsView,
     AdminAnalyticsDashboardsView,
+    # Bot Platform oversight
+    AdminBotListView,
+    AdminBotDetailView,
+    AdminBotCredentialRevokeView,
+    AdminBotNoteView,
+    AdminBotStatsView,
+    AdminBotAbuseMonitoringView,
 )
 
 urlpatterns = [
@@ -153,4 +160,12 @@ urlpatterns = [
     path("analytics/revenue/", AdminRevenueStatsView.as_view(), name="admin-revenue-stats"),
     path("analytics/engagement/", AdminEngagementStatsView.as_view(), name="admin-engagement-stats"),
     path("analytics/dashboards/", AdminAnalyticsDashboardsView.as_view(), name="admin-analytics-dashboards"),
+
+    # ── Bot Platform oversight ──────────────────────────────────────────────
+    path("bots/", AdminBotListView.as_view(), name="admin-bots-list"),
+    path("bots/stats/", AdminBotStatsView.as_view(), name="admin-bots-stats"),
+    path("bots/abuse/", AdminBotAbuseMonitoringView.as_view(), name="admin-bots-abuse"),
+    path("bots/<str:bot_id>/", AdminBotDetailView.as_view(), name="admin-bot-detail"),
+    path("bots/<str:bot_id>/credential/revoke/", AdminBotCredentialRevokeView.as_view(), name="admin-bot-credential-revoke"),
+    path("bots/<str:bot_id>/notes/", AdminBotNoteView.as_view(), name="admin-bot-notes"),
 ]

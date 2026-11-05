@@ -12,6 +12,7 @@ from .models import (
     BotMemoryConfig,
     BotMemoryEntry,
     BotResourceGrant,
+    BotWebhookDelivery,
     BotWebhookSubscription,
     BotWorkflow,
     BotWorkflowRun,
@@ -58,14 +59,33 @@ class BotCredentialSerializer(serializers.ModelSerializer):
 
 
 class BotResourceGrantSerializer(serializers.ModelSerializer):
+    resource_display_name = serializers.SerializerMethodField()
+    granted_by_display_name = serializers.SerializerMethodField()
+    is_currently_valid = serializers.SerializerMethodField()
+
     class Meta:
         model = BotResourceGrant
         fields = [
-            "id", "resource_type", "resource_id", "conversation_id", "scopes",
-            "auto_approved_actions", "is_active", "granted_by", "created_at",
-            "updated_at", "revoked_at",
+            "id", "resource_type", "resource_id", "resource_display_name", "conversation_id", "scopes",
+            "auto_approved_actions", "is_active", "is_currently_valid", "granted_by", "granted_by_display_name",
+            "created_at", "updated_at", "revoked_at",
         ]
         read_only_fields = ["id", "conversation_id", "granted_by", "created_at", "updated_at", "revoked_at", "is_active"]
+
+    def get_resource_display_name(self, obj) -> str:
+        from .services import resolve_resource_display_name
+
+        return resolve_resource_display_name(obj.resource_type, obj.resource_id)
+
+    def get_granted_by_display_name(self, obj):
+        if not obj.granted_by_id:
+            return None
+        return obj.granted_by.display_name or obj.granted_by.username or obj.granted_by.phone
+
+    def get_is_currently_valid(self, obj) -> bool:
+        from .services import _grant_is_currently_valid
+
+        return _grant_is_currently_valid(obj)
 
 
 class BotWebhookSubscriptionSerializer(serializers.ModelSerializer):
@@ -84,6 +104,16 @@ class BotWebhookSubscriptionSerializer(serializers.ModelSerializer):
         # posture as BotCredentialSerializer's client_secret above.
         reveal = self.context.get("reveal_secret")
         return obj.secret if reveal else None
+
+
+class BotWebhookDeliverySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BotWebhookDelivery
+        fields = [
+            "id", "event", "event_id", "status", "attempt_count", "response_code",
+            "error_message", "next_retry_at", "created_at", "updated_at",
+        ]
+        read_only_fields = fields
 
 
 class BotActivityLogSerializer(serializers.ModelSerializer):

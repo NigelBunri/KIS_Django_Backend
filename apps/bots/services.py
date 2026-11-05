@@ -443,6 +443,55 @@ def _resolve_conversation_id_for_resource(resource_type: str, resource_id: str) 
     return None
 
 
+def resolve_resource_display_name(resource_type: str, resource_id: str) -> str:
+    """Phase 5 dashboard — turns a (resource_type, resource_id) pair into
+    something a human can actually read, instead of a bare UUID. Same
+    per-type dispatch as _resolve_conversation_id_for_resource above
+    (and the same lazy imports, for the same reason: avoid an app-
+    loading-order cycle). Returns a clearly-marked placeholder rather
+    than raising if the underlying resource was deleted after the
+    grant was created - the grant row itself is the source of truth
+    for "this bot was once connected to X", not the resource's current
+    existence."""
+    try:
+        if resource_type == BotResourceType.DIRECT_CONVERSATION:
+            from apps.chat.models import Conversation
+
+            conversation = Conversation.objects.filter(id=resource_id).first()
+            if conversation and conversation.title:
+                return conversation.title
+            return "Direct conversation"
+        if resource_type == BotResourceType.GROUP:
+            from apps.groups.models import Group
+
+            group = Group.objects.filter(id=resource_id).first()
+            return group.name if group else "Deleted group"
+        if resource_type == BotResourceType.CHANNEL:
+            from apps.broadcasts.models import BroadcastChannel
+
+            channel = BroadcastChannel.objects.filter(id=resource_id).first()
+            return channel.display_name if channel else "Deleted channel"
+        if resource_type == BotResourceType.COMMUNITY:
+            from apps.communities.models import Community
+
+            community = Community.objects.filter(id=resource_id).first()
+            return community.name if community else "Deleted community"
+        if resource_type == BotResourceType.PARTNER:
+            from apps.partners.models import Partner
+
+            partner = Partner.objects.filter(id=resource_id).first()
+            return partner.name if partner else "Deleted partner"
+        if resource_type == BotResourceType.FEED_PROFILE:
+            user = User.objects.filter(id=resource_id).first()
+            if not user:
+                return "Deleted user's feed"
+            label = user.display_name or user.username or user.phone or "User"
+            return f"{label}'s feed"
+    except (ValueError, TypeError):
+        pass
+    return "Unknown resource"
+
+
 def _user_may_grant_resource(user: User, resource_type: str, resource_id: str) -> bool:
     """A bot must never receive more authority than its owner possesses
     (section 12) - this is the one gate that enforces it for every
@@ -1135,6 +1184,312 @@ def retry_pending_bot_webhook_deliveries(limit: int = 200) -> int:
         if _attempt_delivery(delivery.subscription, delivery):
             retried += 1
     return retried
+
+
+def list_webhook_deliveries(bot: Bot, user: User):
+    """Phase 5 dashboard — owner-facing delivery history. Deliberately
+    excludes `payload` at the serializer layer (not here) - this is
+    for inspecting delivery STATUS, not for re-reading event content
+    the owner already has through its original source."""
+    _require_owner(bot, user)
+    subscription = getattr(bot, "webhook_subscription", None)
+    if not subscription:
+        return BotWebhookDelivery.objects.none()
+    return subscription.deliveries.order_by("-created_at")
+
+
+SECURITY_RELEVANT_ACTIONS = [
+    BotActivityAction.SUSPENDED_BY_ADMIN,
+    BotActivityAction.ABUSE_DETECTED,
+    BotActivityAction.AUTH_FAILED,
+    BotActivityAction.ACTION_DENIED,
+    BotActivityAction.ACTION_RATE_LIMITED,
+    BotActivityAction.CREDENTIAL_REVOKED,
+    BotActivityAction.RESOURCE_REVOKED,
+]
+
+
+def get_owner_dashboard_overview(user: User) -> dict:
+    """Phase 5 — single aggregation call backing the owner's dashboard
+    Overview. Every count/list here is scoped to `user`'s OWN bots via
+    the `bot__owner=user` (or `bot_id__in=owner_bot_ids`) filter on
+    each query - there is no code path here that can return another
+    owner's data. All numbers come from real persisted rows; nothing
+    here is a placeholder."""
+    from django.db.models import Count, Q
+
+    from .models import (
+        BotAIUsageLog, BotAIUsageLogStatus, BotKnowledgeSource,
+        BotKnowledgeSourceStatus, BotMemoryConfig, BotMemoryEntry, BotWorkflowRunStatus,
+    )
+
+    bots_qs = Bot.objects.filter(owner=user).exclude(status=BotStatus.DELETED)
+    bot_ids = list(bots_qs.values_list("id", flat=True))
+    status_counts = dict(bots_qs.values_list("status").annotate(count=Count("id")))
+
+    since_7d = timezone.now() - timedelta(days=7)
+
+    runs_qs = BotWorkflowRun.objects.filter(workflow__bot_id__in=bot_ids)
+    recent_runs = list(
+        runs_qs.select_related("workflow", "workflow__bot").order_by("-started_at")[:10]
+    )
+
+    pending_approvals = list(
+        BotApprovalRequest.objects.filter(bot_id__in=bot_ids, status=BotApprovalStatus.PENDING)
+        .select_related("bot").order_by("-created_at")[:20]
+    )
+
+    recent_security_events = list(
+        BotActivityLog.objects.filter(bot_id__in=bot_ids, action__in=SECURITY_RELEVANT_ACTIONS)
+        .select_related("bot").order_by("-created_at")[:20]
+    )
+
+    webhook_deliveries = BotWebhookDelivery.objects.filter(subscription__bot_id__in=bot_ids)
+    webhook_status = {
+        "bots_with_webhook": BotWebhookSubscription.objects.filter(bot_id__in=bot_ids, is_active=True).count(),
+        "pending": webhook_deliveries.filter(status=BotWebhookDeliveryStatus.PENDING).count(),
+        "failed": webhook_deliveries.filter(status=BotWebhookDeliveryStatus.FAILED).count(),
+        "dead_letter": webhook_deliveries.filter(status=BotWebhookDeliveryStatus.DEAD_LETTER).count(),
+    }
+
+    ai_usage_qs = BotAIUsageLog.objects.filter(bot_id__in=bot_ids)
+    ai_usage_summary = {
+        "bots_with_ai_connected": BotAIConnection.objects.filter(bot_id__in=bot_ids, is_active=True).count(),
+        "calls_7d": ai_usage_qs.filter(created_at__gte=since_7d).count(),
+        "errors_7d": ai_usage_qs.filter(created_at__gte=since_7d, status=BotAIUsageLogStatus.ERROR).count(),
+    }
+
+    knowledge_qs = BotKnowledgeSource.objects.filter(bot_id__in=bot_ids)
+    knowledge_summary = dict(knowledge_qs.values_list("status").annotate(count=Count("id")))
+
+    memory_summary = {
+        "bots_with_memory_enabled": BotMemoryConfig.objects.filter(bot_id__in=bot_ids, enabled=True).count(),
+        "total_entries": BotMemoryEntry.objects.filter(bot_id__in=bot_ids).count(),
+    }
+
+    return {
+        "bots": {
+            "total": len(bot_ids),
+            "active": status_counts.get(BotStatus.ACTIVE, 0),
+            "paused": status_counts.get(BotStatus.PAUSED, 0),
+            "suspended": status_counts.get(BotStatus.SUSPENDED, 0),
+            "disconnected": status_counts.get(BotStatus.DISCONNECTED, 0),
+            "draft": status_counts.get(BotStatus.DRAFT, 0),
+        },
+        "executions": {
+            "succeeded_7d": runs_qs.filter(started_at__gte=since_7d, status=BotWorkflowRunStatus.SUCCEEDED).count(),
+            "failed_7d": runs_qs.filter(started_at__gte=since_7d, status=BotWorkflowRunStatus.FAILED).count(),
+            "recent": [
+                {
+                    "id": str(r.id), "bot_id": str(r.workflow.bot_id), "bot_name": r.workflow.bot.name,
+                    "workflow_id": str(r.workflow_id), "workflow_name": r.workflow.name,
+                    "trigger_event": r.trigger_event, "status": r.status, "started_at": r.started_at.isoformat(),
+                }
+                for r in recent_runs
+            ],
+        },
+        "pending_approvals": [
+            {
+                "id": str(a.id), "bot_id": str(a.bot_id), "bot_name": a.bot.name,
+                "action": a.action, "created_at": a.created_at.isoformat(),
+            }
+            for a in pending_approvals
+        ],
+        "recent_security_events": [
+            {
+                "id": str(e.id), "bot_id": str(e.bot_id), "bot_name": e.bot.name,
+                "action": e.action, "created_at": e.created_at.isoformat(),
+            }
+            for e in recent_security_events
+        ],
+        "webhooks": webhook_status,
+        "ai_usage": ai_usage_summary,
+        "knowledge": {
+            "total_sources": sum(knowledge_summary.values()),
+            "ready": knowledge_summary.get(BotKnowledgeSourceStatus.READY, 0),
+            "processing": knowledge_summary.get(BotKnowledgeSourceStatus.PROCESSING, 0) + knowledge_summary.get(BotKnowledgeSourceStatus.PENDING, 0),
+            "error": knowledge_summary.get(BotKnowledgeSourceStatus.ERROR, 0),
+        },
+        "memory": memory_summary,
+    }
+
+
+def retry_webhook_delivery(bot: Bot, user: User, delivery_id) -> BotWebhookDelivery:
+    """Manual retry, owner-triggered. Only ever re-attempts a delivery
+    that is FAILED or DEAD_LETTER - a DELIVERED one is never re-sent
+    from here, since _attempt_delivery re-POSTs the exact same payload
+    to the owner's own endpoint and re-sending something that already
+    succeeded is exactly the duplicate-business-action risk this must
+    not create. The idempotency guarantee itself (the same event_id
+    never producing two delivery ROWS) is the DB UniqueConstraint on
+    BotWebhookDelivery - unaffected either way."""
+    _require_owner(bot, user)
+    subscription = getattr(bot, "webhook_subscription", None)
+    if not subscription:
+        raise ValidationError({"detail": "This bot has no webhook configured."})
+    delivery = subscription.deliveries.filter(id=delivery_id).first()
+    if not delivery:
+        raise ValidationError({"detail": "Delivery not found."})
+    if delivery.status not in (BotWebhookDeliveryStatus.FAILED, BotWebhookDeliveryStatus.DEAD_LETTER):
+        raise ValidationError({"detail": f"Only failed or dead-lettered deliveries can be retried (this one is {delivery.status})."})
+    _attempt_delivery(subscription, delivery)
+    delivery.refresh_from_db()
+    return delivery
+
+
+# ---------------------------------------------------------------------
+# Phase 5 — owner-facing analytics, with the same filters the CSV
+# export below applies: date range, bot, workflow, event type, run
+# status. Every query here is scoped to `user`'s own bots - the same
+# bot_id__in=owner_bot_ids boundary as get_owner_dashboard_overview.
+# ---------------------------------------------------------------------
+
+def _owner_bot_ids(user: User, bot_id: str | None = None) -> list:
+    qs = Bot.objects.filter(owner=user).exclude(status=BotStatus.DELETED)
+    if bot_id:
+        qs = qs.filter(id=bot_id)
+    return list(qs.values_list("id", flat=True))
+
+
+def _filtered_workflow_runs(user: User, filters: dict):
+    bot_ids = _owner_bot_ids(user, filters.get("bot_id"))
+    qs = BotWorkflowRun.objects.filter(workflow__bot_id__in=bot_ids).select_related("workflow", "workflow__bot")
+    if filters.get("workflow_id"):
+        qs = qs.filter(workflow_id=filters["workflow_id"])
+    if filters.get("event_type"):
+        qs = qs.filter(trigger_event=filters["event_type"])
+    if filters.get("run_status"):
+        qs = qs.filter(status=filters["run_status"])
+    if filters.get("date_from"):
+        qs = qs.filter(started_at__gte=filters["date_from"])
+    if filters.get("date_to"):
+        qs = qs.filter(started_at__lte=filters["date_to"])
+    return qs
+
+
+def get_owner_analytics(user: User, filters: dict) -> dict:
+    """Phase 5 — GET /api/v1/bots/analytics/. Same filter set as the
+    CSV export (get_owner_analytics_rows) so the numbers shown on
+    screen and the rows in the download always describe the same
+    underlying query."""
+    from django.db.models import Avg, DurationField, ExpressionWrapper, F, Sum
+
+    from .models import (
+        BotApprovalRequest, BotApprovalStatus, BotWebhookDelivery,
+        BotWebhookDeliveryStatus, BotWorkflowRunStatus,
+    )
+
+    bot_ids = _owner_bot_ids(user, filters.get("bot_id"))
+    runs = _filtered_workflow_runs(user, filters)
+
+    duration_expr = ExpressionWrapper(F("finished_at") - F("started_at"), output_field=DurationField())
+    finished_runs = runs.filter(finished_at__isnull=False)
+    avg_duration = finished_runs.annotate(duration=duration_expr).aggregate(avg=Avg("duration"))["avg"]
+
+    action_counts: dict[str, int] = {}
+    for run in finished_runs[:5000]:
+        for step in (run.steps_log or []):
+            action = step.get("action")
+            if action:
+                action_counts[action] = action_counts.get(action, 0) + 1
+
+    webhook_qs = BotWebhookDelivery.objects.filter(subscription__bot_id__in=bot_ids)
+    approvals_qs = BotApprovalRequest.objects.filter(bot_id__in=bot_ids)
+
+    return {
+        "events_received": runs.count(),
+        "executions": {
+            "total": runs.count(),
+            "succeeded": runs.filter(status=BotWorkflowRunStatus.SUCCEEDED).count(),
+            "failed": runs.filter(status=BotWorkflowRunStatus.FAILED).count(),
+            "denied": runs.filter(status=BotWorkflowRunStatus.DENIED).count(),
+            "skipped": runs.filter(status=BotWorkflowRunStatus.SKIPPED).count(),
+            "avg_duration_seconds": avg_duration.total_seconds() if avg_duration else None,
+        },
+        "action_counts": action_counts,
+        "webhooks": {
+            "deliveries": webhook_qs.count(),
+            "delivered": webhook_qs.filter(status=BotWebhookDeliveryStatus.DELIVERED).count(),
+            "failed": webhook_qs.filter(status=BotWebhookDeliveryStatus.FAILED).count(),
+            "dead_letter": webhook_qs.filter(status=BotWebhookDeliveryStatus.DEAD_LETTER).count(),
+            "total_retry_attempts": webhook_qs.aggregate(s=Sum("attempt_count"))["s"] or 0,
+        },
+        "approvals": {
+            "total": approvals_qs.count(),
+            "pending": approvals_qs.filter(status=BotApprovalStatus.PENDING).count(),
+            "approved": approvals_qs.filter(status=BotApprovalStatus.APPROVED).count(),
+            "declined": approvals_qs.filter(status=BotApprovalStatus.DECLINED).count(),
+            "expired": approvals_qs.filter(status=BotApprovalStatus.EXPIRED).count(),
+        },
+        "suspensions": BotActivityLog.objects.filter(
+            bot_id__in=bot_ids, action=BotActivityAction.SUSPENDED_BY_ADMIN,
+        ).count(),
+        "rate_limit_events": BotActivityLog.objects.filter(
+            bot_id__in=bot_ids, action=BotActivityAction.ACTION_RATE_LIMITED,
+        ).count(),
+        "ai": _owner_ai_analytics(bot_ids),
+        "knowledge": _owner_knowledge_analytics(bot_ids),
+        "memory": _owner_memory_analytics(bot_ids),
+    }
+
+
+def _owner_ai_analytics(bot_ids: list) -> dict:
+    from django.db.models import Count, Sum
+
+    from .models import BotAIUsageLog, BotAIUsageLogStatus
+
+    qs = BotAIUsageLog.objects.filter(bot_id__in=bot_ids)
+    by_provider = list(qs.values("provider", "model").annotate(requests=Count("id")).order_by("-requests")[:10])
+    totals = qs.aggregate(
+        prompt_tokens=Sum("prompt_tokens"), completion_tokens=Sum("completion_tokens"),
+    )
+    return {
+        "total_requests": qs.count(),
+        "error_requests": qs.filter(status=BotAIUsageLogStatus.ERROR).count(),
+        "by_provider_model": by_provider,
+        "total_prompt_tokens": totals["prompt_tokens"] or 0,
+        "total_completion_tokens": totals["completion_tokens"] or 0,
+        # Deliberately no dollar figure - provider pricing varies by
+        # model and changes over time; billing is between the bot
+        # owner and their own chosen provider, never KIS.
+        "billing_note": "Usage quantities only. Billing is determined by the bot owner's own AI provider, not KIS.",
+    }
+
+
+def _owner_knowledge_analytics(bot_ids: list) -> dict:
+    from django.db.models import Count
+
+    from .models import BotKnowledgeSource
+
+    qs = BotKnowledgeSource.objects.filter(bot_id__in=bot_ids)
+    by_status = dict(qs.values_list("status").annotate(c=Count("id")))
+    return {
+        "total_sources": qs.count(),
+        "by_status": by_status,
+        # Per-retrieval-call analytics (requests/results/sources
+        # returned) are not separately instrumented beyond this:
+        # every AI decision call already attempts exactly one
+        # retrieval, so `ai.total_requests` above is that count: a
+        # second counter logging the identical event on every single
+        # AI decision would be pure write-amplification for no new
+        # information. The "test retrieval" tool is explicitly a
+        # one-off manual check, not a production metric.
+    }
+
+
+def _owner_memory_analytics(bot_ids: list) -> dict:
+    from .models import BotMemoryConfig, BotMemoryEntry
+
+    return {
+        "bots_with_memory_enabled": BotMemoryConfig.objects.filter(bot_id__in=bot_ids, enabled=True).count(),
+        "total_entries": BotMemoryEntry.objects.filter(bot_id__in=bot_ids).count(),
+    }
+
+
+def get_owner_analytics_rows(user: User, filters: dict):
+    """Row-level data backing the CSV export - one row per workflow
+    run, same filters as get_owner_analytics above."""
+    return _filtered_workflow_runs(user, filters).order_by("-started_at")[:10000]
 
 
 # ---------------------------------------------------------------------

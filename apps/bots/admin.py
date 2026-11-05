@@ -28,6 +28,12 @@ def suspend_bots(modeladmin, request, queryset):
         services.set_status_admin(bot, request.user, BotStatus.SUSPENDED, reason="Suspended via admin console.")
 
 
+@admin.action(description="Reinstate selected bots (suspended → active)")
+def reinstate_bots(modeladmin, request, queryset):
+    for bot in queryset.filter(status=BotStatus.SUSPENDED):
+        services.set_status_admin(bot, request.user, BotStatus.ACTIVE, reason="Reinstated via admin console.")
+
+
 @admin.action(description="Revoke credentials for selected bots")
 def revoke_credentials(modeladmin, request, queryset):
     for bot in queryset:
@@ -40,7 +46,7 @@ class BotAdmin(admin.ModelAdmin):
     list_filter = ("status", "kind")
     search_fields = ("name", "handle", "owner__email", "owner__phone")
     readonly_fields = ("id", "created_at", "updated_at", "deleted_at")
-    actions = [suspend_bots, revoke_credentials]
+    actions = [suspend_bots, reinstate_bots, revoke_credentials]
 
 
 @admin.register(BotCredential)

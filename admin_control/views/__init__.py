@@ -66,6 +66,14 @@ from .partner_oversight import (
     AdminEngagementStatsView,
     AdminAnalyticsDashboardsView,
 )
+from .bot_oversight import (
+    AdminBotListView,
+    AdminBotDetailView,
+    AdminBotCredentialRevokeView,
+    AdminBotNoteView,
+    AdminBotStatsView,
+    AdminBotAbuseMonitoringView,
+)
 
 __all__ = [
     "DashboardOverviewView",
@@ -123,6 +131,13 @@ __all__ = [
     "AdminRevenueStatsView",
     "AdminEngagementStatsView",
     "AdminAnalyticsDashboardsView",
+    # Bot Platform oversight
+    "AdminBotListView",
+    "AdminBotDetailView",
+    "AdminBotCredentialRevokeView",
+    "AdminBotNoteView",
+    "AdminBotStatsView",
+    "AdminBotAbuseMonitoringView",
     # Books moderation (Christian publishing policy)
     "AdminBookQueueView",
     "AdminBookDetailReaderView",
