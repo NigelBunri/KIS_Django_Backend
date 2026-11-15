@@ -12,6 +12,7 @@ from django.db.models import Q
 from django.db.models.functions import Coalesce
 
 from .internal_auth import require_internal_auth
+from .tasks import notify_nest_conversation_members_removed
 from rest_framework import viewsets, mixins, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -628,6 +629,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
         member.left_at = timezone.now()
         member.save(update_fields=["left_at"])
+        notify_nest_conversation_members_removed(str(conversation.id), [str(user_id)])
 
         # Mirror of the sync in add_member above - without this, removing
         # someone via the chat UI would leave their GroupMembership row
@@ -665,6 +667,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 ConversationMember.objects.filter(
                     conversation_id__in=other_conversation_ids, user_id=user_id, left_at__isnull=True,
                 ).update(left_at=timezone.now())
+                for other_conversation_id in other_conversation_ids:
+                    notify_nest_conversation_members_removed(str(other_conversation_id), [str(user_id)])
 
         return Response(ConversationMemberSerializer(member, context={'request': request}).data, status=200)
 

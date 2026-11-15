@@ -656,6 +656,124 @@ class AccountsE2EEBundleTests(APITestCase):
         self.assertFalse(E2EPreKey.objects.filter(user=self.target, device=self.target_a).exists())
 
 
+class AccountsE2EEIdentityChangeTests(APITestCase):
+    """Defect D3/D4 (KIS_E2EE_KEY_LIFECYCLE_AUDIT.md): a device re-registering
+    E2EE keys with a DIFFERENT identity key than it had on file used to be
+    silently accepted - indistinguishable from an attacker who stole the
+    session substituting their own identity key. This must now be detected,
+    audit-logged, and surfaced to the user (never blocked - a legitimate
+    reinstall looks identical, and the audit is explicit that we must not
+    break legitimate account recovery)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            phone="+237670000099", password="TestPass123!", country="CM",
+        )
+        self.client.force_authenticate(user=self.user)
+        self.client.credentials(HTTP_X_DEVICE_ID="dev_1")
+
+    def _payload(self, identity_key: str, signed_prekey_id: int = 1):
+        return {
+            "device_id": "dev_1",
+            "identity_key": identity_key,
+            "signed_prekey": {"id": signed_prekey_id, "key": "spk", "signature": "sig"},
+            "prekeys": [{"id": 1, "key": "pk1"}],
+            "registration_id": 42,
+        }
+
+    def test_first_time_registration_is_not_treated_as_an_identity_change(self):
+        from apps.notifications.models import Notification
+
+        from .models import AuditLog
+
+        response = self.client.post(
+            reverse("auth-e2ee-keys"), self._payload("identity_v1"), format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(AuditLog.objects.filter(action="security.e2ee.identity_changed").exists())
+        self.assertFalse(
+            Notification.objects.filter(user_id=self.user.id, type="security.e2ee.identity_changed").exists()
+        )
+
+    def test_reregistering_the_same_identity_key_is_not_flagged(self):
+        from apps.notifications.models import Notification
+
+        from .models import AuditLog
+
+        self.client.post(reverse("auth-e2ee-keys"), self._payload("identity_v1"), format="json")
+        response = self.client.post(reverse("auth-e2ee-keys"), self._payload("identity_v1"), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(AuditLog.objects.filter(action="security.e2ee.identity_changed").exists())
+        self.assertFalse(
+            Notification.objects.filter(user_id=self.user.id, type="security.e2ee.identity_changed").exists()
+        )
+
+    def test_reregistering_a_different_identity_key_is_audited_and_notified(self):
+        from apps.notifications.models import Notification
+
+        from .models import AuditLog
+
+        self.client.post(reverse("auth-e2ee-keys"), self._payload("identity_v1"), format="json")
+        response = self.client.post(reverse("auth-e2ee-keys"), self._payload("identity_v2"), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        event = AuditLog.objects.filter(action="security.e2ee.identity_changed").first()
+        self.assertIsNotNone(event)
+        self.assertEqual(event.meta.get("device_id"), "dev_1")
+        self.assertEqual(event.meta.get("severity"), "warning")
+
+        notif = Notification.objects.filter(
+            user_id=self.user.id, type="security.e2ee.identity_changed",
+        ).first()
+        self.assertIsNotNone(notif)
+        self.assertEqual(notif.priority, "HIGH")
+
+        # The DB still ends up with the NEW key - a changed identity is
+        # detected and reported, never silently rejected or rolled back
+        # (TOFU: the server can't tell a legitimate reinstall from an
+        # attacker, so it must not block legitimate account recovery).
+        key_record = E2EDeviceKey.objects.get(user=self.user, device__device_id="dev_1")
+        self.assertEqual(key_record.identity_key, "identity_v2")
+
+
+class AccountsDeviceRevokeNotificationTests(APITestCase):
+    """Defect D4: device revocation was audit-logged but never surfaced to
+    the user. User-initiated revokes now notify; routine logout does not
+    (every ordinary sign-out would otherwise spam the user who just did it
+    themselves)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            phone="+237670000098", password="TestPass123!", country="CM",
+        )
+        self.device = Device.objects.create(
+            user=self.user, device_id="dev_x", platform="ios", last_seen_at=timezone.now(),
+        )
+
+    def test_user_initiated_revoke_notifies_the_user(self):
+        from apps.notifications.models import Notification
+
+        from .views import revoke_device_session
+
+        revoke_device_session(self.user, self.device, reason="user_device_revoke")
+
+        self.assertTrue(
+            Notification.objects.filter(user_id=self.user.id, type="security.device.revoked").exists()
+        )
+
+    def test_routine_logout_revoke_does_not_notify_the_user(self):
+        from apps.notifications.models import Notification
+
+        from .views import revoke_device_session
+
+        revoke_device_session(self.user, self.device, reason="logout")
+
+        self.assertFalse(
+            Notification.objects.filter(user_id=self.user.id, type="security.device.revoked").exists()
+        )
+
+
 class AccountsProfileCoreTests(APITestCase):
     def setUp(self):
         self.owner = User.objects.create_user(

@@ -100,3 +100,35 @@ def notify_nest_conversation_created_task(self, conversation_id: str, user_ids: 
         notify_nest_conversation_created(conversation_id, user_ids)
     except Exception as exc:
         raise self.retry(exc=exc)
+
+
+def notify_nest_conversation_members_removed(conversation_id: str, user_ids: list[str]) -> None:
+    """Tells Nest's DjangoConversationClient to drop its cached wsPerms
+    (and member-id) entries for these users in this conversation right
+    now, instead of waiting out its own TTL (up to
+    DJANGO_CONV_PERMS_TTL_MS, 2 minutes by default).
+
+    Without this (KIS_E2EE_KEY_LIFECYCLE_AUDIT.md Defect D5), a member
+    removed from a conversation keeps passing Nest's assertMember check -
+    and can keep receiving that conversation's live messages/events over
+    an already-open socket - until that cache entry happens to expire.
+    assertMember itself still fails closed against Django whenever the
+    cache misses, so this is a latency fix on top of an already-sound
+    check, not the only thing standing between a removed member and the
+    conversation; losing this call changes nothing about correctness,
+    only how fast it takes effect.
+    """
+    clean_user_ids = [str(uid) for uid in user_ids if uid]
+    if not clean_user_ids:
+        return
+    payload = {"conversationId": str(conversation_id), "userIds": clean_user_ids}
+    try:
+        _post_to_nest("conversations/members/removed", payload)
+    except Exception:
+        logger.warning(
+            "[chat.tasks] Failed to push membership-removal cache invalidation to Nest "
+            "for conversation=%s users=%s",
+            conversation_id,
+            clean_user_ids,
+            exc_info=True,
+        )

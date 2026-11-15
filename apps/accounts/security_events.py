@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any
 
 from django.core.cache import cache
@@ -14,6 +15,8 @@ try:
 except Exception:
     AuditLogger = None
     AdminAuditEntry = None
+
+logger = logging.getLogger(__name__)
 
 
 FAILED_AUTH_WINDOW_SECONDS = 15 * 60
@@ -70,6 +73,46 @@ def log_security_event(actor, action: str, request=None, severity: str = "info",
         except Exception:
             pass
     return event
+
+
+def notify_security_event(
+    user,
+    *,
+    type: str,
+    title: str,
+    body: str,
+    dedup_key: str | None = None,
+    context: dict | None = None,
+) -> None:
+    """Best-effort in-app + push + email delivery for a security-relevant
+    event (device revoked, E2EE identity key changed, etc). Deliberately
+    separate from log_security_event (the audit trail, written
+    unconditionally): until this existed, a "security.*" AuditLog entry was
+    the ONLY record of these events anywhere — nothing ever reached the
+    affected user (KIS_E2EE_KEY_LIFECYCLE_AUDIT.md Defect D4). Routes
+    through the same create_notification() pipeline every other in-app
+    notification uses, so it gets real IN_APP/PUSH/EMAIL delivery rows,
+    retry/backoff, and stale-token cleanup for free.
+    Never raises: a failed security *notification* must not fail the
+    security *action* it's reporting on (key rotation, device revoke, ...).
+    """
+    try:
+        from apps.notifications.services import create_notification
+
+        create_notification(
+            user_id=user.id,
+            type=type,
+            title=title,
+            body=body,
+            priority="HIGH",
+            channels=["IN_APP", "PUSH", "EMAIL"],
+            dedup_key=dedup_key,
+            context=context or {},
+        )
+    except Exception:
+        logger.exception(
+            "Failed to deliver security notification %s to user %s", type, getattr(user, "id", None)
+        )
 
 
 def record_failed_auth(request, *, identifier: str | None = None, reason: str = "invalid_credentials") -> dict:

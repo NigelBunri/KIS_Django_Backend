@@ -85,7 +85,13 @@ from .models import (
     UserConnection,
     GDPRRequest,
 )
-from .security_events import log_security_event, record_failed_auth, request_meta
+from .security_events import (
+    log_security_event,
+    notify_security_event,
+    record_failed_auth,
+    request_meta,
+    safe_identifier,
+)
 
 from .serializers import (
     UserSerializer,
@@ -938,6 +944,18 @@ def upsert_device(
         return _write(promote=False)
 
 
+# Reasons that don't warrant a push/email to the user: "logout" fires on
+# every ordinary sign-out (the user is doing it themselves, right now —
+# notifying them would just be noise), and "account_deletion_scheduled"
+# fires as a side effect of an account going away entirely, where a
+# separate deletion-confirmation notice already covers it. Every other
+# reason (an explicit "remove this device" action, a parent/guardian
+# revoking devices, account-recovery device replacement, password change
+# invalidating other sessions) is exactly the class of event Defect D4
+# flagged as going completely unnoticed by the affected user.
+_DEVICE_REVOKE_REASONS_SKIP_NOTIFY = frozenset({"logout", "account_deletion_scheduled"})
+
+
 def revoke_device_session(user: User, device: Device, *, reason: str, request=None) -> Device:
     device.token_version = int(device.token_version or 1) + 1
     device.revoked_at = timezone.now()
@@ -965,6 +983,15 @@ def revoke_device_session(user: User, device: Device, *, reason: str, request=No
         device_id=device.device_id,
         reason=reason,
     )
+    if reason not in _DEVICE_REVOKE_REASONS_SKIP_NOTIFY:
+        notify_security_event(
+            user,
+            type="security.device.revoked",
+            title="A device was removed from your account",
+            body="A signed-in device lost access to your account. If this wasn't you, change your password now.",
+            dedup_key=f"security.device.revoked:{device.id}:{device.revoked_at.isoformat()}",
+            context={"device_id": device.device_id, "reason": reason},
+        )
     return device
 
 
@@ -1512,8 +1539,15 @@ class E2EERegisterKeysView(APIView):
                 device=device,
             ).order_by("-updated_at", "-created_at", "-id")
             key_record = device_keys.first()
+            identity_changed = False
+            previous_identity_key = None
             if key_record:
                 device_keys.exclude(pk=key_record.pk).delete()
+                previous_identity_key = key_record.identity_key
+                identity_changed = bool(
+                    previous_identity_key
+                    and previous_identity_key != data.validated_data["identity_key"]
+                )
                 key_record.identity_key = data.validated_data["identity_key"]
                 key_record.signed_prekey_id = signed["id"]
                 key_record.signed_prekey = signed["key"]
@@ -1555,6 +1589,39 @@ class E2EERegisterKeysView(APIView):
                 )
 
         AuditLog.log(actor=request.user, action="e2ee.keys.register", meta={"device_id": device_id})
+
+        if identity_changed:
+            # A device that was already registered re-registered with a
+            # DIFFERENT Signal identity key. This is expected on a
+            # legitimate reinstall/key-reset, but it's exactly the same
+            # observable signature as an attacker who has stolen this
+            # account's session and is substituting their own identity key
+            # so messages addressed to this device decrypt for them instead
+            # (classic MITM-after-compromise, same risk class Signal/
+            # WhatsApp's "safety number changed" notice exists for). TOFU
+            # means nothing on this server can tell those two cases apart,
+            # so — per the audit — we never block or roll back the key
+            # change (that would break legitimate recovery); we record it
+            # so it's reviewable, and notify_identity_key_changed (D4) warns
+            # the account's other devices.
+            event = log_security_event(
+                request.user,
+                "security.e2ee.identity_changed",
+                request=request,
+                severity="warning",
+                device_id=device_id,
+                previous_identity_key_fingerprint=safe_identifier(previous_identity_key),
+                new_identity_key_fingerprint=safe_identifier(data.validated_data["identity_key"]),
+            )
+            notify_security_event(
+                request.user,
+                type="security.e2ee.identity_changed",
+                title="Your encryption keys changed",
+                body="A device on your account registered new end-to-end encryption keys. If you didn't just reinstall the app or link a new device, secure your account now.",
+                dedup_key=f"security.e2ee.identity_changed:{event.id}",
+                context={"device_id": device_id},
+            )
+
         return Response({"ok": True}, status=status.HTTP_200_OK)
 
 
@@ -1583,8 +1650,19 @@ class E2EEFetchBundleView(APIView):
 
         prekey = None
         with transaction.atomic():
+            # skip_locked: without it, a concurrent request already holding
+            # the lock on the oldest unconsumed row makes this one BLOCK on
+            # that same row rather than move on - and once unblocked,
+            # Postgres re-checks consumed_at__isnull=True under READ
+            # COMMITTED, finds the other transaction already consumed it,
+            # and returns no row at all even though other, unlocked
+            # one-time prekeys exist for this device (Defect D6,
+            # KIS_E2EE_KEY_LIFECYCLE_AUDIT.md) - two callers racing to
+            # fetch this device's bundle could spuriously get a
+            # signed-prekey-only bundle (weaker forward secrecy) despite a
+            # perfectly good prekey sitting unclaimed one row down.
             candidate = (
-                E2EPreKey.objects.select_for_update()
+                E2EPreKey.objects.select_for_update(skip_locked=True)
                 .filter(user=target, device=device, consumed_at__isnull=True)
                 .order_by("created_at")
                 .first()
@@ -1620,8 +1698,11 @@ def _serialize_e2ee_bundle_for_device(target: User, device: Device) -> Optional[
 
     prekey = None
     with transaction.atomic():
+        # See E2EEFetchBundleView.get's identical comment above (Defect D6,
+        # KIS_E2EE_KEY_LIFECYCLE_AUDIT.md) for why skip_locked is required
+        # here, not just select_for_update.
         candidate = (
-            E2EPreKey.objects.select_for_update()
+            E2EPreKey.objects.select_for_update(skip_locked=True)
             .filter(user=target, device=device, consumed_at__isnull=True)
             .order_by("created_at")
             .first()

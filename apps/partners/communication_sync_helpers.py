@@ -27,6 +27,7 @@ from apps.communities.models import (
     CommunityRole,
 )
 from apps.groups.models import Group, GroupMembership, GroupRole
+from apps.chat.tasks import notify_nest_conversation_members_removed
 
 
 def unique_slug(model, base: str, **scope_filter) -> str:
@@ -61,9 +62,11 @@ def join_conversation(conversation: Conversation, user) -> None:
 
 
 def leave_conversation(conversation: Conversation, user) -> None:
-    ConversationMember.objects.filter(
+    updated = ConversationMember.objects.filter(
         conversation=conversation, user=user, left_at__isnull=True,
     ).update(left_at=timezone.now())
+    if updated:
+        notify_nest_conversation_members_removed(str(conversation.id), [str(user.id)])
 
 
 def grant_conversation_admin(conversation: Conversation, user) -> None:

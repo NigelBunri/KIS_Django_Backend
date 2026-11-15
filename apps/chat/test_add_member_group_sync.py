@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
@@ -103,6 +105,28 @@ class ConversationAddMemberGroupSyncTests(APITestCase):
             "conversation.",
         )
 
+    def test_remove_member_pushes_a_nest_cache_invalidation_for_the_removed_user(self):
+        # Defect D5 (KIS_E2EE_KEY_LIFECYCLE_AUDIT.md): removing a member
+        # must immediately tell Nest to drop its cached wsPerms/member-id
+        # entries for them, rather than leaving them able to pass
+        # assertMember and receive this conversation's live events for
+        # up to DJANGO_CONV_PERMS_TTL_MS (2 minutes default).
+        self.client.post(
+            f"/api/v1/chats/conversations/{self.group.conversation_id}/members/",
+            {"user_id": str(self.newcomer.id), "base_role": "member"},
+            format="json",
+        )
+
+        with patch("apps.chat.views.notify_nest_conversation_members_removed") as notify:
+            response = self.client.post(
+                f"/api/v1/chats/conversations/{self.group.conversation_id}/members/remove/",
+                {"user_id": str(self.newcomer.id)},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        notify.assert_called_once_with(str(self.group.conversation_id), [str(self.newcomer.id)])
+
     def test_rejoin_after_remove_restores_group_membership(self):
         self.client.post(
             f"/api/v1/chats/conversations/{self.group.conversation_id}/members/",
@@ -190,6 +214,39 @@ class ConversationAddMemberCommunitySyncTests(APITestCase):
                 conversation=self.posts_conversation, user=self.newcomer, left_at__isnull=True,
             ).exists()
         )
+
+    def test_removing_a_member_from_the_community_main_conversation_pushes_nest_invalidation_for_the_mirrored_posts_conversation(self):
+        # remove_member's community-mirror block only fires when the call
+        # TARGETS one of the community's own conversations (main/posts) -
+        # it keeps the other one in sync, same as the community's own
+        # remove_member action. It's unrelated to - and does not cascade
+        # from - a sub-group's own conversation (see
+        # test_remove_member_pushes_a_nest_cache_invalidation_for_the_removed_user
+        # above for that case).
+        ConversationMember.objects.create(
+            conversation=self.main_conversation, user=self.owner, base_role=BaseConversationRole.OWNER,
+        )
+        ConversationMember.objects.create(
+            conversation=self.main_conversation, user=self.newcomer, base_role=BaseConversationRole.MEMBER,
+        )
+        ConversationMember.objects.create(
+            conversation=self.posts_conversation, user=self.newcomer, base_role=BaseConversationRole.MEMBER,
+        )
+        CommunityMembership.objects.create(community=self.community, user=self.newcomer, role=CommunityRole.MEMBER)
+
+        with patch("apps.chat.views.notify_nest_conversation_members_removed") as notify:
+            response = self.client.post(
+                f"/api/v1/chats/conversations/{self.main_conversation.id}/members/remove/",
+                {"user_id": str(self.newcomer.id)},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        notified_conversation_ids = {call.args[0] for call in notify.call_args_list}
+        self.assertIn(str(self.main_conversation.id), notified_conversation_ids)
+        self.assertIn(str(self.posts_conversation.id), notified_conversation_ids)
+        for call in notify.call_args_list:
+            self.assertEqual(call.args[1], [str(self.newcomer.id)])
 
     def test_cannot_add_a_community_banned_user_via_conversation_endpoint(self):
         response = self.client.post(
