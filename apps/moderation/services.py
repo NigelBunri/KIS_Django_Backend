@@ -242,6 +242,12 @@ def apply_ai_flag_consequence(scan: MediaSafetyScan, flag: "models.Flag | None")
             # away by the strike_applied guard above, but this is a second,
             # independent line of defense at the notification layer itself.
             dedup_key=f"media_safety_strike:{scan.id}",
+            # Same target_type ModerationAppealSubmitSerializer.target_type
+            # accepts - lets the app's notification detail screen offer a
+            # real "Appeal this decision" action, same as the staff-action
+            # notifications in views.py's _notify_moderation_target.
+            target_type="media_safety_scan",
+            target_id=scan.id,
         )
     except Exception as exc:
         # Never let a notification-delivery failure block the takedown/

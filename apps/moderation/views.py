@@ -532,14 +532,27 @@ class StaffModerationOperationsQueueView(APIView):
         )
 
 
-def _notify_moderation_target(*, user_id, title: str, body: str, notif_type: str, dedup_key: str, actor, audit_meta: dict) -> None:
+def _notify_moderation_target(
+    *, user_id, title: str, body: str, notif_type: str, dedup_key: str, actor, audit_meta: dict,
+    appeal_target_type: str | None = None, appeal_target_id=None,
+) -> None:
     """Shared notify-the-affected-user step for StaffModerationOperationActionView's
     flag/channel_moderation_record branches (email-system audit, Priority 2
     discovery #2b: staff-driven moderation actions previously told the
     affected user nothing at all, unlike the automated AI-strike pipeline's
     equivalent WARN/SUSPEND notifications). Never lets a notification
     failure block the moderation action itself, which has already been
-    applied and saved by the time this runs."""
+    applied and saved by the time this runs.
+
+    appeal_target_type/appeal_target_id (when given) are set as the
+    Notification's own target_type/target_id - using exactly the same
+    vocabulary ModerationAppealSubmitSerializer.target_type accepts
+    ("flag"/"channel_moderation_record"/"media_safety_scan"), so the app's
+    notification detail screen can offer a real "Appeal this decision"
+    action instead of the affected user having no way to even discover
+    which Flag/record id their notification was about (FlagViewSet's own
+    queryset only ever returns flags the requesting user reported, never
+    ones filed against them)."""
     try:
         from apps.notifications.services import create_notification
 
@@ -551,6 +564,8 @@ def _notify_moderation_target(*, user_id, title: str, body: str, notif_type: str
             priority="HIGH",
             channels=["IN_APP", "PUSH", "EMAIL"],
             dedup_key=dedup_key,
+            target_type=appeal_target_type,
+            target_id=appeal_target_id,
         )
     except Exception as exc:
         logger.warning("Moderation staff-action notification failed for user_id=%s: %s", user_id, exc)
@@ -625,6 +640,8 @@ class StaffModerationOperationActionView(APIView):
                     dedup_key=f"moderation_staff_flag_action:{flag.id}",
                     actor=request.user,
                     audit_meta={"flag_id": str(flag.id)},
+                    appeal_target_type="flag",
+                    appeal_target_id=flag.id,
                 )
             return Response({"ok": True, "target_type": target_type, "result": serializers.FlagSerializer(flag).data})
 
@@ -684,6 +701,8 @@ class StaffModerationOperationActionView(APIView):
                         dedup_key=f"moderation_staff_channel_block:{record.id}",
                         actor=request.user,
                         audit_meta={"record_id": str(record.id)},
+                        appeal_target_type="channel_moderation_record",
+                        appeal_target_id=record.id,
                     )
             return Response({"ok": True, "target_type": target_type, "result": ChannelModerationRecordSerializer(record).data})
 
