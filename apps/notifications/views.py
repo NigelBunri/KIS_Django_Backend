@@ -282,6 +282,37 @@ class NotificationViewSet(viewsets.ModelViewSet):
         return Response({"updated": updated})
 
     @swagger_auto_schema(
+        operation_id="notifications_clear_all",
+        operation_description="Soft delete every non-deleted notification for the authenticated user.",
+        responses={200: openapi.Response("Updated count", schema=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={"updated": openapi.Schema(type=openapi.TYPE_INTEGER)}
+        ))}
+    )
+    @action(detail=False, methods=["post"], url_path="clear-all")
+    def clear_all(self, request):
+        """
+        Soft delete every notification the user currently has (read or
+        unread). Mirrors mark_all_read's shape/semantics but sets
+        is_deleted instead of is_read - get_queryset already excludes
+        is_deleted=True rows, so this is what actually empties the list,
+        not just marks it read.
+        """
+        base_qs = models.Notification.objects.filter(user_id=request.user.id, is_deleted=False)
+        updated = base_qs.update(
+            is_deleted=True,
+            updated_at=timezone.now(),
+        )
+        if updated:
+            notify_main_tab_badges_updated(
+                [str(request.user.id)],
+                source="notifications",
+                reason="clear_all",
+                extra={"updated": int(updated)},
+            )
+        return Response({"updated": updated})
+
+    @swagger_auto_schema(
         operation_id="notifications_mark_source_read",
         operation_description=(
             "Mark notifications read for a source/target group. Used by tab surfaces when content is opened "
